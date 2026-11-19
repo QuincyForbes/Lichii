@@ -19,8 +19,8 @@ Device::Device() {
     if (device == nil) {
         throw std::runtime_error("No Metal device");
     }
-    // Command buffers kept alive by the queue: the present one and a few in flight.
-    queue = [device newCommandQueueWithMaxCommandBufferCount:64];
+    // Command buffers kept alive by the queue: the present one and in-flight work.
+    queue = [device newCommandQueueWithMaxCommandBufferCount:256];
     if (queue == nil) {
         throw std::runtime_error("Metal command queue creation failed");
     }

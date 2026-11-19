@@ -36,6 +36,10 @@ struct BlitImagePipelineKey {
 
     VkRenderPass renderpass;
     Tegra::Engines::Fermi2D::Operation operation;
+    u32 color_attachment_count = 1;
+    u32 target_rt = 0;
+    u8 color_mask = 0xf;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
 };
 
 struct BlitDepthStencilPipelineKey {
@@ -46,6 +50,8 @@ struct BlitDepthStencilPipelineKey {
     u8 stencil_mask;
     u32 stencil_compare_mask;
     u32 stencil_ref;
+    u32 color_attachment_count = 0;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
 };
 
 enum class MSAACopyFormatClass : u32 {
@@ -83,7 +89,18 @@ public:
 
     void BlitColor(const Framebuffer* dst_framebuffer, VkImageView src_image_view,
                    VkImage src_image, VkSampler src_sampler, const Region2D& dst_region,
-                   const Region2D& src_region, const Extent3D& src_size);
+                   const Region2D& src_region, const Extent3D& src_size,
+                   VkImageSubresourceRange src_subresource_range = {
+                       .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                       .baseMipLevel = 0,
+                       .levelCount = VK_REMAINING_MIP_LEVELS,
+                       .baseArrayLayer = 0,
+                       .layerCount = VK_REMAINING_ARRAY_LAYERS,
+                   });
+
+    void BlitColor(const Framebuffer* dst_framebuffer, const ImageView& src_image_view,
+                   VkSampler src_sampler, const Region2D& dst_region, const Region2D& src_region,
+                   const Extent3D& src_size);
 
     /// Temporal upscale (temporal_upscale.frag) into dst_framebuffer: the jittered input colour,
     /// accumulated with the history image reprojected along the motion vectors. The result is also
@@ -141,7 +158,8 @@ public:
     void ConvertS8D24ToABGR8(const Framebuffer* dst_framebuffer, ImageView& src_image_view);
 
     void ClearColor(const Framebuffer* dst_framebuffer, u8 color_mask,
-                    const std::array<f32, 4>& clear_color, const Region2D& dst_region);
+                    const std::array<f32, 4>& clear_color, const Region2D& dst_region,
+                    u32 color_attachment = 0);
 
     void ClearDepthStencil(const Framebuffer* dst_framebuffer, bool depth_clear, f32 clear_depth,
                            u8 stencil_mask, u32 stencil_ref, u32 stencil_compare_mask,
@@ -208,7 +226,7 @@ private:
     [[nodiscard]] VkPipeline FindOrEmplaceBlitColorMSAAPipeline(const BlitMSAAPipelineKey& key);
     [[nodiscard]] VkPipeline FindOrEmplaceBlitDepthStencilMSAAPipeline(
         const BlitMSAAPipelineKey& key, bool blit_stencil);
-    [[nodiscard]] VkPipeline FindOrEmplaceBlitDepthPipeline(VkRenderPass renderpass);
+    [[nodiscard]] VkPipeline FindOrEmplaceBlitDepthPipeline(const BlitImagePipelineKey& key);
     [[nodiscard]] VkPipeline FindOrEmplaceResolveDepthStencilPipeline(VkRenderPass renderpass,
                                                                       bool resolve_stencil);
 
@@ -257,6 +275,7 @@ private:
     vk::ShaderModule blit_depth_stencil_msaa_frag;
     vk::ShaderModule clear_color_vert;
     vk::ShaderModule clear_color_frag;
+    std::array<vk::ShaderModule, 8> clear_color_mrt_frags{};
     vk::ShaderModule clear_stencil_frag;
     vk::ShaderModule convert_depth_to_float_frag;
     vk::ShaderModule convert_float_to_depth_frag;
@@ -300,7 +319,7 @@ private:
     std::vector<vk::Pipeline> msaa_copy_depth_stencil_pipelines;
     std::vector<BlitMSAAPipelineKey> blit_msaa_color_keys;
     std::vector<vk::Pipeline> blit_msaa_color_pipelines;
-    std::vector<VkRenderPass> blit_depth_keys;
+    std::vector<BlitImagePipelineKey> blit_depth_keys;
     std::vector<vk::Pipeline> blit_depth_pipelines;
     std::vector<BlitMSAAPipelineKey> blit_msaa_depth_keys;
     std::vector<vk::Pipeline> blit_msaa_depth_pipelines;

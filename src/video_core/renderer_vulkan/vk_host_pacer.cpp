@@ -15,6 +15,9 @@
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
 #include "common/platform_events.h"
+#else
+#include <CoreGraphics/CoreGraphics.h>
+#include <CoreVideo/CoreVideo.h>
 #endif
 #endif
 
@@ -186,6 +189,54 @@ std::optional<DisplayRefresh> DisplayRefreshQuery::Query([[maybe_unused]] void* 
     // The frontend reports UIScreen.maximumFramesPerSecond (120 on ProMotion devices).
     if (const u32 fps = Common::PlatformEvents::DisplayMaxFps(); fps != 0) {
         return DisplayRefresh{1e9 / fps, "UIScreen"};
+    }
+#elif defined(__APPLE__)
+    const CGDirectDisplayID main_display = CGMainDisplayID();
+    double cg_hz = 0.0;
+    if (const CGDisplayModeRef mode = CGDisplayCopyDisplayMode(main_display)) {
+        cg_hz = CGDisplayModeGetRefreshRate(mode);
+        CGDisplayModeRelease(mode);
+    }
+    const std::string display_id = std::to_string(main_display);
+    const u32 hz = cg_hz > 0.0 ? static_cast<u32>(std::lround(cg_hz)) : 0U;
+    const auto now = std::chrono::steady_clock::now();
+    if (display_id != device || hz != nominal_hz || now >= stale_at) {
+        device = display_id;
+        nominal_hz = hz;
+        rational_ns = 0.0;
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+        CVDisplayLinkRef link = nullptr;
+        if ((main_display != kCGNullDirectDisplay &&
+             CVDisplayLinkCreateWithCGDisplay(main_display, &link) == kCVReturnSuccess) ||
+            CVDisplayLinkCreateWithActiveCGDisplays(&link) == kCVReturnSuccess) {
+            const CVTime period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(link);
+            CVDisplayLinkRelease(link);
+            if ((period.flags & kCVTimeIsIndefinite) == 0 && period.timeValue > 0 &&
+                period.timeScale > 0) {
+                rational_ns = 1e9 * static_cast<double>(period.timeValue) /
+                              static_cast<double>(period.timeScale);
+            }
+        }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+        stale_at = now + std::chrono::seconds{30};
+    }
+    if (cg_hz > 0.0) {
+        const double cg_period_ns = 1e9 / cg_hz;
+        if (rational_ns > 0.0 && std::abs(rational_ns - cg_period_ns) < cg_period_ns * 0.01) {
+            return DisplayRefresh{rational_ns, "main, CVDisplayLink"};
+        }
+        return DisplayRefresh{cg_period_ns, "main, CGDisplayMode"};
+    }
+    if (rational_ns > 0.0) {
+        return DisplayRefresh{rational_ns, "main, CVDisplayLink"};
+    }
+    if (main_display != kCGNullDirectDisplay) {
+        return DisplayRefresh{1e9 / 60.0, "main, 60 Hz fallback"};
     }
 #endif
     return std::nullopt;

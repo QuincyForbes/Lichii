@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cerrno>
+#include <limits>
 #include <vector>
 
 #include "common/assert.h"
@@ -17,6 +20,7 @@
 #ifdef _WIN32
 #include <io.h>
 #include <share.h>
+#include <windows.h>
 #else
 #include <unistd.h>
 #endif
@@ -222,6 +226,12 @@ IOFile::IOFile(IOFile&& other) noexcept {
     std::swap(file_access_mode, other.file_access_mode);
     std::swap(file_type, other.file_type);
     std::swap(file, other.file);
+#ifdef _WIN32
+    const auto a = pread_handle.load(std::memory_order_relaxed);
+    const auto b = other.pread_handle.load(std::memory_order_relaxed);
+    pread_handle.store(b, std::memory_order_relaxed);
+    other.pread_handle.store(a, std::memory_order_relaxed);
+#endif
 }
 
 IOFile& IOFile::operator=(IOFile&& other) noexcept {
@@ -229,6 +239,12 @@ IOFile& IOFile::operator=(IOFile&& other) noexcept {
     std::swap(file_access_mode, other.file_access_mode);
     std::swap(file_type, other.file_type);
     std::swap(file, other.file);
+#ifdef _WIN32
+    const auto a = pread_handle.load(std::memory_order_relaxed);
+    const auto b = other.pread_handle.load(std::memory_order_relaxed);
+    pread_handle.store(b, std::memory_order_relaxed);
+    other.pread_handle.store(a, std::memory_order_relaxed);
+#endif
     return *this;
 }
 
@@ -288,6 +304,12 @@ void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, File
 }
 
 void IOFile::Close() {
+#ifdef _WIN32
+    const std::intptr_t handle = pread_handle.exchange(0, std::memory_order_acq_rel);
+    if (handle != 0 && handle != -1) {
+        CloseHandle(reinterpret_cast<HANDLE>(handle));
+    }
+#endif
     if (!IsOpen()) {
         return;
     }
@@ -307,6 +329,121 @@ void IOFile::Close() {
 
 bool IOFile::IsOpen() const {
     return file != nullptr;
+}
+
+size_t IOFile::ReadBytesAt(std::span<u8> data, u64 offset) const {
+    if (!IsOpen() || data.empty()) {
+        return 0;
+    }
+#ifdef _WIN32
+    std::intptr_t raw_handle = pread_handle.load(std::memory_order_acquire);
+    if (raw_handle == 0) {
+        if (file_access_mode == FileAccessMode::Read && file_type == FileType::BinaryFile) {
+            const HANDLE opened = CreateFileW(
+                file_path.c_str(), GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+            if (opened != INVALID_HANDLE_VALUE && opened != nullptr) {
+                std::intptr_t expected = 0;
+                const auto desired = reinterpret_cast<std::intptr_t>(opened);
+                if (pread_handle.compare_exchange_strong(expected, desired,
+                                                         std::memory_order_acq_rel)) {
+                    raw_handle = desired;
+                } else {
+                    CloseHandle(opened);
+                    raw_handle = expected;
+                }
+            } else {
+                std::intptr_t expected = 0;
+                if (pread_handle.compare_exchange_strong(expected, -1, std::memory_order_acq_rel)) {
+                    raw_handle = -1;
+                } else {
+                    raw_handle = expected;
+                }
+            }
+        } else {
+            raw_handle = -1;
+            pread_handle.store(-1, std::memory_order_release);
+        }
+    }
+    if (raw_handle != -1 && raw_handle != 0) {
+        struct OverlappedEvent {
+            HANDLE handle{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+            ~OverlappedEvent() {
+                if (handle != nullptr) {
+                    CloseHandle(handle);
+                }
+            }
+        };
+        thread_local OverlappedEvent tl_event;
+        if (tl_event.handle != nullptr) {
+            const auto handle = reinterpret_cast<HANDLE>(raw_handle);
+            size_t total_read = 0;
+            while (total_read < data.size()) {
+                if (offset > (std::numeric_limits<u64>::max)() - total_read) {
+                    break;
+                }
+                const DWORD chunk =
+                    static_cast<DWORD>((std::min<size_t>)(data.size() - total_read, 0x40000000u));
+                const u64 pos = offset + total_read;
+                ResetEvent(tl_event.handle);
+                OVERLAPPED ov{};
+                ov.Offset = static_cast<DWORD>(pos);
+                ov.OffsetHigh = static_cast<DWORD>(pos >> 32);
+                ov.hEvent = tl_event.handle;
+                DWORD bytes_read = 0;
+                BOOL ok = ReadFile(handle, data.data() + total_read, chunk, &bytes_read, &ov);
+                if (!ok) {
+                    const DWORD err = GetLastError();
+                    if (err == ERROR_IO_PENDING) {
+                        ok = GetOverlappedResult(handle, &ov, &bytes_read, TRUE);
+                        if (!ok && GetLastError() == ERROR_HANDLE_EOF) {
+                            break;
+                        }
+                    } else if (err == ERROR_HANDLE_EOF) {
+                        break;
+                    }
+                }
+                if (!ok || bytes_read == 0) {
+                    break;
+                }
+                total_read += bytes_read;
+                if (bytes_read < chunk) {
+                    break;
+                }
+            }
+            return total_read;
+        }
+    }
+    std::scoped_lock lk{io_mutex};
+    if (offset > static_cast<u64>((std::numeric_limits<s64>::max)()) ||
+        !Seek(static_cast<s64>(offset))) {
+        return 0;
+    }
+    return ReadSpan(data);
+#else
+    const int fd = fileno(file);
+    if (fd < 0) {
+        return 0;
+    }
+    size_t total_read = 0;
+    while (total_read < data.size()) {
+        if (offset > static_cast<u64>((std::numeric_limits<off_t>::max)()) - total_read) {
+            break;
+        }
+        const size_t chunk = (std::min<size_t>)(data.size() - total_read, 0x7ffff000u);
+        const ssize_t rc =
+            ::pread(fd, data.data() + total_read, chunk, static_cast<off_t>(offset + total_read));
+        if (rc > 0) {
+            total_read += static_cast<size_t>(rc);
+        } else if (rc == 0) {
+            break;
+        } else if (errno != EINTR) {
+            break;
+        }
+    }
+    return total_read;
+#endif
 }
 
 std::string IOFile::ReadString(size_t length) const {
@@ -393,8 +530,10 @@ u64 IOFile::GetSize() const {
         return 0;
     }
 
-    // Flush any unwritten buffered data into the file prior to retrieving the file size.
-    std::fflush(file);
+    if (file_access_mode != FileAccessMode::Read) {
+        // Flush any unwritten buffered data into the file prior to retrieving the file size.
+        std::fflush(file);
+    }
 
 #ifdef __ANDROID__
     u64 file_size = 0;

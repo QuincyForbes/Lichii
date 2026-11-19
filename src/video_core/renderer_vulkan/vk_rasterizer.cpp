@@ -1330,6 +1330,16 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     SCOPE_EXIT {
         staging_pool.HoldSubmits(false);
     };
+    if (maxwell3d->dirty.flags[VideoCommon::Dirty::RenderTargets]) {
+        auto& dirty_flags = maxwell3d->dirty.flags;
+        dirty_flags[Dirty::LogicOpEnable] = true;
+        dirty_flags[Dirty::Blending] = true;
+        dirty_flags[Dirty::BlendEnable] = true;
+        if (!maxwell3d->regs.viewport_scale_offset_enabled) {
+            dirty_flags[Dirty::Viewports] = true;
+            dirty_flags[Dirty::Scissors] = true;
+        }
+    }
     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
         report_failure("configure failed");
         TraceRenderState(is_indexed, "configure-failed", nullptr);
@@ -2290,6 +2300,16 @@ void RasterizerVulkan::DrawTexture() {
 
     std::scoped_lock l{texture_cache.mutex};
     texture_cache.SynchronizeDescriptors(false);
+    if (maxwell3d->dirty.flags[VideoCommon::Dirty::RenderTargets]) {
+        auto& dirty_flags = maxwell3d->dirty.flags;
+        dirty_flags[Dirty::LogicOpEnable] = true;
+        dirty_flags[Dirty::Blending] = true;
+        dirty_flags[Dirty::BlendEnable] = true;
+        if (!maxwell3d->regs.viewport_scale_offset_enabled) {
+            dirty_flags[Dirty::Viewports] = true;
+            dirty_flags[Dirty::Scissors] = true;
+        }
+    }
     texture_cache.UpdateRenderTargets(false);
 
     UpdateDynamicStates(nullptr);
@@ -2502,19 +2522,20 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                               !can_defer_clear && regs.zpass_pixel_count_enable);
 
     if (clear_color) {
-        const auto format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[color_attachment].format);
-        bool is_integer = IsPixelFormatInteger(format);
-        bool is_signed = IsPixelFormatSignedInteger(format);
-        size_t int_size = PixelComponentSizeBitsInteger(format);
+        const auto format =
+            VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[color_attachment].format);
         VkClearValue clear_value{};
-        if (!is_integer) {
-            std::memcpy(clear_value.color.float32, regs.clear_color.data(), regs.clear_color.size() * sizeof(f32));
-        } else if (!is_signed) {
-            for (size_t i = 0; i < 4; i++)
-                clear_value.color.uint32[i] = u32(f32(u64(int_size) << 1U) * regs.clear_color[i]);
+        if (!IsPixelFormatInteger(format)) {
+            std::memcpy(clear_value.color.float32, regs.clear_color.data(),
+                        regs.clear_color.size() * sizeof(f32));
+        } else if (!IsPixelFormatSignedInteger(format)) {
+            for (size_t i = 0; i < 4; ++i) {
+                clear_value.color.uint32[i] = std::bit_cast<u32>(regs.clear_color[i]);
+            }
         } else {
-            for (size_t i = 0; i < 4; i++)
-                clear_value.color.int32[i] = s32(f32(s64(int_size - 1) << 1) * (regs.clear_color[i] - 0.5f));
+            for (size_t i = 0; i < 4; ++i) {
+                clear_value.color.int32[i] = std::bit_cast<s32>(regs.clear_color[i]);
+            }
         }
 
         if (color_full_channels) {
@@ -2536,7 +2557,8 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                 Offset2D{.x = clear_rect.rect.offset.x, .y = clear_rect.rect.offset.y},
                 Offset2D{.x = clear_rect.rect.offset.x + s32(clear_rect.rect.extent.width),
                          .y = clear_rect.rect.offset.y + s32(clear_rect.rect.extent.height)}};
-            blit_image.ClearColor(framebuffer, color_mask, regs.clear_color, dst_region);
+            blit_image.ClearColor(framebuffer, color_mask, regs.clear_color, dst_region,
+                                  regs.clear_surface.RT);
         }
     }
 
@@ -2690,20 +2712,19 @@ void RasterizerVulkan::DispatchCompute() {
                                              VideoCommon::BufferDependencyTrace::Input::Indirect);
         }
     }
-    // The full-size 1080p pass and the 3/4-scale pass ef542df87cacfe9e are replaced only by FSR.
-    // DLSS and MetalFX keep the passes they replaced before FSR 3.1 came.
-    constexpr u64 three_quarter_shader = 0xef542df87cacfe9eULL;
-    const bool fsr_only_pass = pipeline->ShaderHash() == ComputePipeline::OcarinaFullSizeShader ||
-                               pipeline->ShaderHash() == three_quarter_shader;
-    const bool can_replace = pipeline->CanReplaceOcarinaUpscale() && !indirect_address &&
-                             OcarinaTemporalEnabled() &&
-                             (!fsr_only_pass ||
-                              oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr) &&
-                             !frame_dump.Capturing();
-    const bool can_bilinear = OcarinaBilinearUpscaleEnabled() &&
-                              pipeline->CanReplaceOcarinaUpscale() && !indirect_address &&
-                              program_id == VideoCommon::OotNetwork::ProgramId &&
-                              !frame_dump.Capturing();
+    const auto oot_pass = VideoCommon::FindOcarinaUpscalePass(native_key, pipeline->ShaderHash());
+    const bool can_replace =
+        OcarinaTemporalEnabled() &&
+        oot_pass != VideoCommon::OcarinaUpscalePass::None &&
+        pipeline->CanReplaceOcarinaUpscale() && !indirect_address &&
+        !frame_dump.Capturing();
+    const bool can_bilinear =
+        OcarinaBilinearUpscaleEnabled() &&
+        (oot_pass == VideoCommon::OcarinaUpscalePass::Scaled ||
+         oot_pass == VideoCommon::OcarinaUpscalePass::ThreeQuarter) &&
+        pipeline->CanReplaceOcarinaUpscale() && !indirect_address &&
+        program_id == VideoCommon::OotNetwork::ProgramId &&
+        !frame_dump.Capturing();
     const bool marking_effects = oot_effects_frame == render_trace_frame &&
                                  OcarinaTemporalEnabled() && !indirect_address &&
                                  !frame_dump.Capturing();
@@ -2845,7 +2866,7 @@ void RasterizerVulkan::DispatchCompute() {
         }
     }
     const auto* const replacement =
-        can_replace && !byte_addressed_shadow && TryOcarinaUpscale(*pipeline, true)
+        can_replace && !byte_addressed_shadow && TryOcarinaUpscale(*pipeline, native_key, true)
             ? oot_live_dlss.get()
             : nullptr;
     if (can_bilinear && !can_replace) {
@@ -2853,7 +2874,8 @@ void RasterizerVulkan::DispatchCompute() {
                                                             : "no temporal upscaler chosen");
     }
     const bool bilinear =
-        !replacement && can_bilinear && !byte_addressed_shadow && TryOcarinaBilinear(*pipeline);
+        !replacement && can_bilinear && !byte_addressed_shadow &&
+        TryOcarinaBilinear(*pipeline, native_key);
     if (!replacement && !bilinear) {
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
     } else if (replacement) {
@@ -2870,7 +2892,9 @@ void RasterizerVulkan::DispatchCompute() {
                      hash);
         }
     }
-    if (program_id == VideoCommon::OotNetwork::ProgramId && pipeline->CanReplaceOcarinaUpscale()) {
+    if (program_id == VideoCommon::OotNetwork::ProgramId &&
+        oot_pass != VideoCommon::OcarinaUpscalePass::None &&
+        pipeline->CanReplaceOcarinaUpscale()) {
         NoteOcarinaScene(*pipeline, replacement != nullptr, bilinear);
     }
     const bool plain_dispatch{!can_replace && !can_bilinear && !byte_addressed_shadow};
@@ -2918,7 +2942,7 @@ void RasterizerVulkan::DispatchCompute() {
     SubmitNx2ListCopies(pipeline->ShaderHash());
 
     if (!can_replace) {
-        TryOcarinaUpscale(*pipeline, false);
+        TryOcarinaUpscale(*pipeline, native_key, false);
     }
 
     // Log compute dispatch
@@ -3814,19 +3838,6 @@ void RasterizerVulkan::TrackOcarinaCamera() {
                                   sizeof(oot_motion.previous));
 }
 
-namespace {
-f32 Halton(u32 index, u32 base) {
-    f32 fraction = 1.0f;
-    f32 result = 0.0f;
-    while (index > 0) {
-        fraction /= static_cast<f32>(base);
-        result += fraction * static_cast<f32>(index % base);
-        index /= base;
-    }
-    return result;
-}
-} // Anonymous namespace
-
 void RasterizerVulkan::UpdateOcarinaJitter() {
     if (!oot_dlss_frame) {
         return;
@@ -3845,9 +3856,12 @@ void RasterizerVulkan::UpdateOcarinaJitter() {
         if (targets.depth_buffer_id) {
             const auto& depth = texture_cache.GetImageView(targets.depth_buffer_id);
             if (oot_motion.SceneSized(depth.size.width, depth.size.height) && !depth.IsRescaled()) {
-                // Halton (2, 3) with AMD's phase count for the last upscaled frame's scale.
+                // AMD's phase count for the last upscaled frame's scale.
                 const u32 index = static_cast<u32>(render_trace_frame % oot_jitter_phases) + 1;
-                want = {Halton(index, 2) - 0.5f, Halton(index, 3) - 0.5f};
+                const auto driver = device.GetDriverID();
+                want = VideoCommon::OcarinaJitter(
+                    index, driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                               driver == VK_DRIVER_ID_AMD_OPEN_SOURCE);
                 oot_jitter_frame = render_trace_frame;
                 oot_jitter_offset = want;
             }
@@ -4018,18 +4032,17 @@ void RasterizerVulkan::CountOcarinaUpscale(bool upscaled, const char* reason) {
 }
 
 /// Track the scene depth on its reader dispatch, or try to replace a recognized upscale dispatch.
-bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace) {
-    constexpr u64 depth_reader = 0x1fc7a0423116281fULL;
+bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, u64 native_key,
+                                         bool replace) {
     const u64 upscale_hash = pipeline.ShaderHash();
-    bool upscale_4k =
-        replace && (upscale_hash == ComputePipeline::Ocarina1440pShader ||
-                    upscale_hash == ComputePipeline::Ocarina1440pScaledShader ||
-                    upscale_hash == ComputePipeline::Ocarina1440pScaledFieldShader ||
-                    upscale_hash == ComputePipeline::OcarinaScaledUnderHalfShader ||
-                    upscale_hash == ComputePipeline::OcarinaScaledLowShader);
-    if ((!replace && pipeline.ShaderHash() != depth_reader) || !OcarinaTemporalEnabled()) {
+    const bool depth_reader = native_key == VideoCommon::OcarinaDepthReaderKey ||
+                              upscale_hash == VideoCommon::OcarinaDepthReaderShader;
+    if ((!replace && !depth_reader) || !OcarinaTemporalEnabled()) {
         return false;
     }
+    const bool native_resolution =
+        oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
+        Settings::values.nvidia_dlss_quality.GetValue() == Settings::DlssQuality::Dlaa;
     const auto read_tic = [this](u32 index) -> std::optional<Tegra::Texture::TICEntry> {
         const auto& table = kepler_compute->regs.tic;
         using Entry = Tegra::Texture::TICEntry;
@@ -4121,44 +4134,34 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         oot_logged_extent = extent;
         oot_logged_target = {target.size.width, target.size.height};
     }
-    const bool native_size = pipeline.ShaderHash() == ComputePipeline::OcarinaFullSizeShader;
-    bool handheld_scaled = false;
-    // At the Performance render scale (1920x1080) the game runs its 3/4 pass to 2560x1440.
-    constexpr u64 three_quarter_pass = 0xe40f5efb5480e692ULL;
-    if (upscale_hash == three_quarter_pass && target.size.width == 2560 &&
-        target.size.height == 1440 &&
+    using enum VideoCommon::OcarinaUpscalePass;
+    const auto pass = VideoCommon::FindOcarinaUpscalePass(native_key, upscale_hash);
+    const bool target_1440p = target.size.width == 2560 && target.size.height == 1440;
+    // At the DLSS Performance render scale (1920x1080) the game upscales to 2560x1440 with its
+    // 3/4 pass instead (QuincyForbes' f7d0938b5b).
+    const bool performance_scale =
         Settings::NvidiaDlssChosen() &&
         Settings::OcarinaDlssModeFor(Settings::values.oot_resolution.GetValue()) ==
-            Settings::OcarinaDlssMode::Performance) {
-        upscale_4k = true;
+            Settings::OcarinaDlssMode::Performance;
+    const bool pass_1440p = target_1440p && (pass == OneToOne || pass == Scaled ||
+                                             (pass == ThreeQuarter && performance_scale));
+    // Handheld with the Max Resolution add-on: FSR runs as native AA. DLAA through it is untested.
+    const bool native_size = pass == OneToOne && !target_1440p;
+    if (native_size && oot_backend != VideoCommon::OcarinaUpscaleBackend::Fsr) {
+        return fail("the full-size pass is replaced only by FSR");
     }
-    const bool sixteen_by_nine =
-        std::abs(static_cast<int>(extent.width * 9) - static_cast<int>(extent.height * 16)) <= 32;
-    // Handheld the scaled passes write 1920x1080 from the lower scales (50 %: 960x540, 2x).
-    // EDEN_NX2_OOT_TEMPORAL_HANDHELD (boot): on by default on Apple only, where MetalFX takes them.
-    static const bool temporal_handheld = [] {
-        const char* const value = std::getenv("EDEN_NX2_OOT_TEMPORAL_HANDHELD");
-#ifdef __APPLE__
-        return value == nullptr || value[0] != '0';
-#else
-        return value != nullptr && value[0] == '1';
-#endif
-    }();
-    if (upscale_4k && temporal_handheld && target.size.width == 1920 &&
-        target.size.height == 1080 && upscale_hash != ComputePipeline::Ocarina1440pShader &&
-        extent.width < 1920 && sixteen_by_nine) {
-        upscale_4k = false;
-        handheld_scaled = true;
-    }
-    // 4K: any 16:9 scene up to 2560x1440 (the lower oot_resolution scales).
-    const bool valid_extents = handheld_scaled ? true
-        : upscale_4k
-        ? extent.width <= 2560 && sixteen_by_nine &&
-            target.size.width == 2560 && target.size.height == 1440
-        : native_size
-        ? target.size.width == extent.width && target.size.height == extent.height
-        : target.size.width == extent.width * 4 / 3 &&
-            target.size.height == extent.height * 4 / 3;
+    const bool upscale_4k = pass_1440p && !native_resolution;
+    // The 1440p and scaled passes take any 16:9 scene up to their target: the DLSS render scales
+    // shrink it docked, and the game's dynamic resolution handheld (854x480 at its floor).
+    const bool scaled_scene = extent.width <= target.size.width &&
+                              extent.height <= target.size.height &&
+                              std::abs(static_cast<int>(extent.width * 9) -
+                                       static_cast<int>(extent.height * 16)) <= 32;
+    const bool valid_extents =
+        pass_1440p || pass == Scaled ? scaled_scene
+        : native_size ? target.size.width == extent.width && target.size.height == extent.height
+                      : target.size.width == extent.width * 4 / 3 &&
+                            target.size.height == extent.height * 4 / 3;
     if (!valid_extents || !color.BackingImage() || !target.BackingImage() ||
         color.IsRescaled() || target.IsRescaled() ||
         color.Samples() != VK_SAMPLE_COUNT_1_BIT || target.Samples() != VK_SAMPLE_COUNT_1_BIT ||
@@ -4211,7 +4214,9 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         // write the game's 1440p target instead.
         constexpr bool present_4k = false;
 #endif
-        const VkExtent2D output_extent = present_4k ? VkExtent2D{3840, 2160} : target_extent;
+        const VkExtent2D output_extent = native_resolution ? extent
+                                         : present_4k      ? VkExtent2D{3840, 2160}
+                                                           : target_extent;
         // The offset this frame's scene was drawn with (none when no scene draw was offset).
         std::array<f32, 2> jitter{};
         if (oot_jitter_frame == render_trace_frame) {
@@ -4248,13 +4253,11 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
 
 /// The game's scaled upscale passes cost a phone GPU ~30 ms a frame (IPA 150); where no temporal
 /// upscaler takes the frame, one bilinear tap of the same scene writes the same target instead.
-bool RasterizerVulkan::TryOcarinaBilinear(const ComputePipeline& pipeline) {
-    const u64 hash = pipeline.ShaderHash();
-    if (oot_bilinear_failed || (hash != ComputePipeline::Ocarina1440pScaledShader &&
-                                hash != ComputePipeline::Ocarina1440pScaledFieldShader &&
-                                hash != ComputePipeline::OcarinaScaledUnderHalfShader &&
-                                hash != ComputePipeline::OcarinaScaledLowShader &&
-                                hash != 0xe40f5efb5480e692ULL)) {
+bool RasterizerVulkan::TryOcarinaBilinear(const ComputePipeline& pipeline, u64 native_key) {
+    const auto pass = VideoCommon::FindOcarinaUpscalePass(native_key, pipeline.ShaderHash());
+    if (oot_bilinear_failed ||
+        (pass != VideoCommon::OcarinaUpscalePass::Scaled &&
+         pass != VideoCommon::OcarinaUpscalePass::ThreeQuarter)) {
         return false;
     }
     const auto sampled = pipeline.SampledImages();
@@ -4332,7 +4335,9 @@ void RasterizerVulkan::NoteOcarinaScene(const ComputePipeline& pipeline, bool re
     constexpr const char* live = "MetalFX Temporal";
 #endif
     const char* const upscaler =
-        replaced ? oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr ? "FSR 3.1" : live
+        replaced ? oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr
+                       ? (oot_live_dlss && oot_live_dlss->UsedFsr4() ? "FSR 4" : "FSR 3.1")
+                       : live
                  : bilinear ? "bilinear" : "the game's pass";
     VideoCore::Probe::StoreScene(scene.width, scene.height, target.size.width, target.size.height,
                                  upscaler);
@@ -6102,9 +6107,6 @@ void RasterizerVulkan::BuildDynamicStateMask() {
         if (device.IsExtLineRasterizationSupported()) {
             set({Dirty::LineRasterizationMode});
         }
-        const auto driver = device.GetDriverID();
-        dyn_state_never_skip = driver == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
-                               driver == VK_DRIVER_ID_AMD_PROPRIETARY;
     }
     if (device.IsExtExtendedDynamicState3BlendingSupported()) {
         set({Dirty::Blending});
@@ -6127,14 +6129,33 @@ void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* draw_pipeline) {
     }
     const auto topology = maxwell3d->draw_manager.draw_state.topology;
     const bool topology_changed = !emulated_mesh && state_tracker.ChangePrimitiveTopology(topology);
+    const u64 cb_epoch = state_tracker.CommandBufferEpoch();
     const bool color_output_changed =
         device.IsExtExtendedDynamicState3BlendingSupported() &&
-        (draw_pipeline ? draw_pipeline->ColorOutputMask() : ~0U) != last_color_output_mask;
+        ((draw_pipeline ? draw_pipeline->ColorOutputMask() : ~0U) != last_color_output_mask ||
+         cb_epoch != last_blend_epoch);
+    const bool a2c_changed =
+        device.IsExtExtendedDynamicState3EnablesSupported() &&
+        device.SupportsDynamicState3AlphaToCoverageEnable() &&
+        ((draw_pipeline != nullptr && draw_pipeline->SupportsAlphaToCoverage()) !=
+             last_a2c_supported ||
+         cb_epoch != last_a2c_epoch);
+    const bool a2o_changed =
+        device.IsExtExtendedDynamicState3EnablesSupported() &&
+        device.SupportsDynamicState3AlphaToOneEnable() &&
+        ((draw_pipeline != nullptr && draw_pipeline->SupportsAlphaToOne()) != last_a2o_supported ||
+         cb_epoch != last_a2o_epoch);
     if (DynamicStateCacheEnabled()) {
         if (!dyn_state_mask_built) [[unlikely]] {
             BuildDynamicStateMask();
         }
-        if (!topology_changed && !dyn_state_never_skip && !(flags & dyn_state_mask).any()) {
+        if (!topology_changed && !(flags & dyn_state_mask).any()) {
+            if (a2c_changed) [[unlikely]] {
+                UpdateAlphaToCoverageEnable(regs, draw_pipeline);
+            }
+            if (a2o_changed) [[unlikely]] {
+                UpdateAlphaToOneEnable(regs, draw_pipeline);
+            }
             if (color_output_changed) [[unlikely]] {
                 UpdateBlending(regs, draw_pipeline);
             }
@@ -6186,27 +6207,13 @@ void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* draw_pipeline) {
     }
 
     if (device.IsExtExtendedDynamicState3EnablesSupported()) {
-        using namespace Tegra::Engines;
-        // AMD Workaround: LogicOp incompatible with float render targets
-        if (device.GetDriverID() == VkDriverIdKHR::VK_DRIVER_ID_AMD_OPEN_SOURCE ||
-            device.GetDriverID() == VkDriverIdKHR::VK_DRIVER_ID_AMD_PROPRIETARY) {
-            const auto has_float = std::any_of(
-                regs.vertex_attrib_format.begin(), regs.vertex_attrib_format.end(),
-                [](const auto& attrib) {
-                    return attrib.type == Maxwell3D::Regs::VertexAttribute::Type::Float;
-                }
-            );
-            if (regs.logic_op.enable) {
-                regs.logic_op.enable = static_cast<u32>(!has_float);
-            }
-        }
         UpdateLogicOpEnable(regs);
         UpdateDepthClampEnable(regs);
         UpdateLineRasterizationMode(regs);
         UpdateLineStippleEnable(regs);
         UpdateConservativeRasterizationMode(regs);
-        UpdateAlphaToCoverageEnable(regs);
-        UpdateAlphaToOneEnable(regs);
+        UpdateAlphaToCoverageEnable(regs, draw_pipeline);
+        UpdateAlphaToOneEnable(regs, draw_pipeline);
     }
 
     if (device.IsExtExtendedDynamicState3BlendingSupported()) {
@@ -6254,6 +6261,25 @@ void RasterizerVulkan::HandleTransformFeedback() {
     }
 }
 
+namespace {
+/// Active guest render target extent when surface_clip is unset (0x0), or {0, 0} if targetless.
+VkExtent2D FallbackGuestSurfaceExtent(const Tegra::Engines::Maxwell3D::Regs& regs) {
+    const u32 count = (std::min<u32>)(regs.rt_control.count, Tegra::Engines::Maxwell3D::Regs::NumRenderTargets);
+    for (u32 i = 0; i < count; ++i) {
+        const auto& rt = regs.rt[regs.rt_control.Map(i)];
+        if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE && rt.width != 0 &&
+            rt.height != 0) {
+            return {rt.width, rt.height};
+        }
+    }
+    if (regs.zeta_enable != 0 && regs.zeta.Address() != 0 && regs.zeta_size.width != 0 &&
+        regs.zeta_size.height != 0) {
+        return {regs.zeta_size.width, regs.zeta_size.height};
+    }
+    return {};
+}
+} // Anonymous namespace
+
 void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& regs) {
     if (!state_tracker.TouchViewports()) {
         return;
@@ -6263,6 +6289,21 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
 
     const bool is_rescaling{texture_cache.IsRescaling()};
     const float scale = is_rescaling ? Settings::values.resolution_info.up_factor : 1.0f;
+    VkExtent2D fallback_extent{};
+    if (!regs.viewport_scale_offset_enabled &&
+        (regs.surface_clip.width == 0 || regs.surface_clip.height == 0)) {
+        fallback_extent = FallbackGuestSurfaceExtent(regs);
+        if (fallback_extent.width == 0 || fallback_extent.height == 0) {
+            if (const Framebuffer* const fb = texture_cache.GetFramebuffer()) {
+                fallback_extent = fb->RenderArea();
+            }
+        } else {
+            fallback_extent.width =
+                static_cast<u32>((std::max)(1.0f, static_cast<float>(fallback_extent.width) * scale));
+            fallback_extent.height =
+                static_cast<u32>((std::max)(1.0f, static_cast<float>(fallback_extent.height) * scale));
+        }
+    }
     if (DynamicStateCacheEnabled()) {
         static_assert(sizeof(Maxwell::WindowOrigin) == 4 && sizeof(Maxwell::SurfaceClip) == 8 &&
                       sizeof(Maxwell::DepthMode) == 4 && Maxwell::NumViewports == 16);
@@ -6271,6 +6312,8 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
         AppendWords(out, regs.viewport_scale_offset_enabled);
         AppendWords(out, regs.window_origin);
         AppendWords(out, regs.surface_clip);
+        AppendWords(out, fallback_extent.width);
+        AppendWords(out, fallback_extent.height);
         AppendWords(out, regs.depth_mode);
         AppendWords(out, scale);
         AppendWords(out, oot_jitter_applied[0]);
@@ -6292,12 +6335,19 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
     }
 
     if (!regs.viewport_scale_offset_enabled) {
-        float x = static_cast<float>(regs.surface_clip.x);
-        float y = static_cast<float>(regs.surface_clip.y);
-        float width = (std::max)(1.0f, static_cast<float>(regs.surface_clip.width));
-        float height = (std::max)(1.0f, static_cast<float>(regs.surface_clip.height));
+        const bool use_clip = regs.surface_clip.width != 0 && regs.surface_clip.height != 0;
+        float x = use_clip ? static_cast<float>(regs.surface_clip.x) * scale : 0.0f;
+        float y = use_clip ? static_cast<float>(regs.surface_clip.y) * scale : 0.0f;
+        float width = use_clip
+                          ? (std::max)(1.0f, static_cast<float>(regs.surface_clip.width) * scale)
+                          : (std::max)(1.0f, static_cast<float>(fallback_extent.width));
+        float height = use_clip
+                           ? (std::max)(1.0f, static_cast<float>(regs.surface_clip.height) * scale)
+                           : (std::max)(1.0f, static_cast<float>(fallback_extent.height));
         if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
-            y += height;
+            const float clip_h =
+                use_clip ? static_cast<float>(regs.surface_clip.height) * scale : height;
+            y = clip_h - y;
             height = -height;
         }
         VkViewport viewport{
@@ -6352,16 +6402,34 @@ void RasterizerVulkan::UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs
     if (!state_tracker.TouchScissors()) {
         return;
     }
+    const bool rescaling = texture_cache.IsRescaling();
+    const u32 up_scale = rescaling ? Settings::values.resolution_info.up_scale : 1U;
+    const u32 down_shift = rescaling ? Settings::values.resolution_info.down_shift : 0U;
+    VkExtent2D fallback_extent{};
+    if (!regs.viewport_scale_offset_enabled &&
+        (regs.surface_clip.width == 0 || regs.surface_clip.height == 0)) {
+        fallback_extent = FallbackGuestSurfaceExtent(regs);
+        if (fallback_extent.width == 0 || fallback_extent.height == 0) {
+            if (const Framebuffer* const fb = texture_cache.GetFramebuffer()) {
+                fallback_extent = fb->RenderArea();
+            }
+        } else if (rescaling) {
+            fallback_extent.width = Settings::values.resolution_info.ScaleUp(fallback_extent.width);
+            fallback_extent.height =
+                Settings::values.resolution_info.ScaleUp(fallback_extent.height);
+        }
+    }
     if (DynamicStateCacheEnabled()) {
         static_assert(sizeof(Maxwell::ScissorTest) == 16 && Maxwell::NumViewports == 16);
         std::array<u32, std::tuple_size_v<decltype(dyn_cache.scissors)>> key;
         u32* out = key.data();
-        const bool rescaling = texture_cache.IsRescaling();
         AppendWords(out, regs.viewport_scale_offset_enabled);
         AppendWords(out, regs.window_origin);
         AppendWords(out, regs.surface_clip);
-        AppendWords(out, rescaling ? Settings::values.resolution_info.up_scale : 1U);
-        AppendWords(out, rescaling ? Settings::values.resolution_info.down_shift : 0U);
+        AppendWords(out, fallback_extent.width);
+        AppendWords(out, fallback_extent.height);
+        AppendWords(out, up_scale);
+        AppendWords(out, down_shift);
         for (const auto& scissor : regs.scissor_test) {
             std::memcpy(out, &scissor, 3 * sizeof(u32));
             out += 3;
@@ -6371,17 +6439,24 @@ void RasterizerVulkan::UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs
         }
     }
     if (!regs.viewport_scale_offset_enabled) {
-        u32 x = regs.surface_clip.x;
-        u32 y = regs.surface_clip.y;
-        u32 width = (std::max)(1u, static_cast<u32>(regs.surface_clip.width));
-        u32 height = (std::max)(1u, static_cast<u32>(regs.surface_clip.height));
+        const bool use_clip = regs.surface_clip.width != 0 && regs.surface_clip.height != 0;
+        const auto scale_val = [&](u32 val) -> u32 {
+            return rescaling ? Settings::values.resolution_info.ScaleUp(val) : val;
+        };
+        const u32 x = use_clip ? scale_val(regs.surface_clip.x) : 0U;
+        u32 y = use_clip ? scale_val(regs.surface_clip.y) : 0U;
+        const u32 width = (std::max)(1u, use_clip ? scale_val(regs.surface_clip.width)
+                                                  : fallback_extent.width);
+        const u32 height = (std::max)(1u, use_clip ? scale_val(regs.surface_clip.height)
+                                                   : fallback_extent.height);
         if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
-            y = regs.surface_clip.height - (y + height);
+            const u32 clip_h = use_clip ? scale_val(regs.surface_clip.height) : height;
+            y = clip_h > y + height ? clip_h - (y + height) : 0U;
         }
         VkRect2D scissor{};
         scissor.offset.x = static_cast<int32_t>(x);
         scissor.offset.y = static_cast<int32_t>(y);
-        scissor.extent.width  = width;
+        scissor.extent.width = width;
         scissor.extent.height = height;
         scheduler.Record([this, scissor](vk::CommandBuffer cmdbuf) {
             const u32 num_scissors = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
@@ -6391,12 +6466,6 @@ void RasterizerVulkan::UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs
             cmdbuf.SetScissor(0, scissors);
         });
         return;
-    }
-    u32 up_scale = 1;
-    u32 down_shift = 0;
-    if (texture_cache.IsRescaling()) {
-        up_scale = Settings::values.resolution_info.up_scale;
-        down_shift = Settings::values.resolution_info.down_shift;
     }
     const std::array scissor_list{
         GetScissorState(regs, 0, up_scale, down_shift),
@@ -6823,8 +6892,49 @@ void RasterizerVulkan::UpdateLogicOpEnable(Tegra::Engines::Maxwell3D::Regs& regs
     if (!device.SupportsDynamicState3LogicOpEnable()) {
         return;
     }
-    scheduler.Record([enable = regs.logic_op.enable](vk::CommandBuffer cmdbuf) {
-        cmdbuf.SetLogicOpEnableEXT(enable != 0);
+    bool enable = regs.logic_op.enable != 0;
+    if (enable) {
+        using VideoCore::Surface::IsPixelFormatSRGB;
+        using VideoCore::Surface::PixelFormat;
+        using VideoCore::Surface::TryPixelFormatFromRenderTargetFormat;
+        const auto is_float_or_srgb = [](PixelFormat pf) {
+            if (IsPixelFormatSRGB(pf)) {
+                return true;
+            }
+            switch (pf) {
+            case PixelFormat::R16G16B16A16_FLOAT:
+            case PixelFormat::R16G16B16X16_FLOAT:
+            case PixelFormat::B10G11R11_FLOAT:
+            case PixelFormat::E5B9G9R9_FLOAT:
+            case PixelFormat::R32G32B32A32_FLOAT:
+            case PixelFormat::R32G32B32_FLOAT:
+            case PixelFormat::R32G32_FLOAT:
+            case PixelFormat::R32_FLOAT:
+            case PixelFormat::R16G16_FLOAT:
+            case PixelFormat::R16_FLOAT:
+            case PixelFormat::BC6H_UFLOAT:
+            case PixelFormat::BC6H_SFLOAT:
+                return true;
+            default:
+                return false;
+            }
+        };
+        const u32 rt_count =
+            (std::min<u32>)(regs.rt_control.count, Maxwell::NumRenderTargets);
+        for (u32 i = 0; i < rt_count; ++i) {
+            const auto& rt = regs.rt[regs.rt_control.Map(i)];
+            if (rt.Address() == 0 || rt.format == Tegra::RenderTargetFormat::NONE) {
+                continue;
+            }
+            const auto pf = TryPixelFormatFromRenderTargetFormat(rt.format);
+            if (!pf || is_float_or_srgb(*pf)) {
+                enable = false;
+                break;
+            }
+        }
+    }
+    scheduler.Record([enable](vk::CommandBuffer cmdbuf) {
+        cmdbuf.SetLogicOpEnableEXT(enable ? VK_TRUE : VK_FALSE);
     });
 }
 
@@ -6845,29 +6955,39 @@ void RasterizerVulkan::UpdateDepthClampEnable(Tegra::Engines::Maxwell3D::Regs& r
         [is_enabled](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthClampEnableEXT(is_enabled); });
 }
 
-void RasterizerVulkan::UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs) {
+void RasterizerVulkan::UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs,
+                                                   const GraphicsPipeline* draw_pipeline) {
     // The enable also depends on the pipeline writing colour 0, which the dirty flag does not
-    // track. EDEN_NX2_A2C_REFRESH=1 records it on every draw so it never outlives its pipeline.
+    // track. Track last_a2c_supported so switching from depth-only to color refreshes A2C.
     static const bool refresh{std::getenv("EDEN_NX2_A2C_REFRESH") != nullptr};
-    if (!state_tracker.TouchAlphaToCoverageEnable() && !refresh) {
+    const bool supported = draw_pipeline != nullptr && draw_pipeline->SupportsAlphaToCoverage();
+    const u64 epoch = state_tracker.CommandBufferEpoch();
+    const bool support_changed = supported != last_a2c_supported || epoch != last_a2c_epoch;
+    if (!state_tracker.TouchAlphaToCoverageEnable() && !support_changed && !refresh) {
         return;
     }
+    last_a2c_supported = supported;
+    last_a2c_epoch = epoch;
     if (!device.SupportsDynamicState3AlphaToCoverageEnable()) {
         return;
     }
-    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
-    const bool enable = pipeline != nullptr && pipeline->SupportsAlphaToCoverage() &&
-                        regs.anti_alias_alpha_control.alpha_to_coverage != 0;
+    const bool enable = supported && regs.anti_alias_alpha_control.alpha_to_coverage != 0;
     alpha_to_coverage_enable = enable;
     scheduler.Record([enable](vk::CommandBuffer cmdbuf) {
         cmdbuf.SetAlphaToCoverageEnableEXT(enable ? VK_TRUE : VK_FALSE);
     });
 }
 
-void RasterizerVulkan::UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& regs) {
-    if (!state_tracker.TouchAlphaToOneEnable()) {
+void RasterizerVulkan::UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& regs,
+                                              const GraphicsPipeline* draw_pipeline) {
+    const bool supported = draw_pipeline != nullptr && draw_pipeline->SupportsAlphaToOne();
+    const u64 epoch = state_tracker.CommandBufferEpoch();
+    const bool support_changed = supported != last_a2o_supported || epoch != last_a2o_epoch;
+    if (!state_tracker.TouchAlphaToOneEnable() && !support_changed) {
         return;
     }
+    last_a2o_supported = supported;
+    last_a2o_epoch = epoch;
     if (!device.SupportsDynamicState3AlphaToOneEnable()) {
         static std::once_flag warn_alpha_to_one;
         std::call_once(warn_alpha_to_one, [] {
@@ -6876,9 +6996,7 @@ void RasterizerVulkan::UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& r
         });
         return;
     }
-    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
-    const bool enable = pipeline != nullptr && pipeline->SupportsAlphaToOne() &&
-                        regs.anti_alias_alpha_control.alpha_to_one != 0;
+    const bool enable = supported && regs.anti_alias_alpha_control.alpha_to_one != 0;
     scheduler.Record([enable](vk::CommandBuffer cmdbuf) {
         cmdbuf.SetAlphaToOneEnableEXT(enable ? VK_TRUE : VK_FALSE);
     });
@@ -6955,11 +7073,56 @@ void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs,
                                       const GraphicsPipeline* pipeline) {
     // The write mask also excludes components the fragment shader doesn't output, so it has to be
     // recorded again whenever the bound pipeline outputs a different set of components.
+    const u64 epoch = state_tracker.CommandBufferEpoch();
+    const bool epoch_changed = epoch != last_blend_epoch;
     const u32 color_output_mask = pipeline ? pipeline->ColorOutputMask() : ~0U;
-    const bool color_output_changed = color_output_mask != last_color_output_mask;
-    if (!state_tracker.TouchBlending() && !color_output_changed) {
+    const bool color_output_changed = color_output_mask != last_color_output_mask || epoch_changed;
+
+    const auto is_src1 = [](Maxwell::Blend::Factor factor) {
+        const VkBlendFactor vk = MaxwellToVK::BlendFactor(factor);
+        return vk == VK_BLEND_FACTOR_SRC1_COLOR ||
+               vk == VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR ||
+               vk == VK_BLEND_FACTOR_SRC1_ALPHA ||
+               vk == VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+    };
+    const auto uses_dual_src = [&](const auto& guest_blend) {
+        return is_src1(guest_blend.color_source) || is_src1(guest_blend.color_dest) ||
+               is_src1(guest_blend.alpha_source) || is_src1(guest_blend.alpha_dest);
+    };
+
+    u32 integer_rt_mask = 0;
+    u32 dual_src_mask = 0;
+    const u32 rt_count = (std::min<u32>)(regs.rt_control.count, Maxwell::NumRenderTargets);
+    for (size_t index = 0; index < Maxwell::NumRenderTargets; index++) {
+        const u32 slot = index < rt_count ? regs.rt_control.Map(index) : static_cast<u32>(index);
+        if (slot < Maxwell::NumRenderTargets &&
+            regs.rt[slot].format != Tegra::RenderTargetFormat::NONE) {
+            const auto rt_format =
+                VideoCore::Surface::TryPixelFormatFromRenderTargetFormat(regs.rt[slot].format);
+            if (!rt_format || VideoCore::Surface::IsPixelFormatInteger(*rt_format)) {
+                integer_rt_mask |= 1U << index;
+            }
+        }
+        if (index != 0) {
+            const bool src1 = regs.blend_per_target_enabled
+                                  ? uses_dual_src(regs.blend_per_target[index])
+                                  : (!(regs.iterated_blend.enable &&
+                                       Settings::values.use_squashed_iterated_blend) &&
+                                     uses_dual_src(regs.blend));
+            if (src1) {
+                dual_src_mask |= 1U << index;
+            }
+        }
+    }
+    const bool blend_enable_override_changed =
+        integer_rt_mask != last_integer_rt_mask || dual_src_mask != last_dual_src_mask ||
+        epoch_changed;
+
+    if (!state_tracker.TouchBlending() && !color_output_changed &&
+        !blend_enable_override_changed) {
         return;
     }
+    last_blend_epoch = epoch;
 
     if (state_tracker.TouchColorMask() || color_output_changed) {
         last_color_output_mask = color_output_mask;
@@ -6986,17 +7149,15 @@ void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs,
         });
     }
 
-    if (state_tracker.TouchBlendEnable()) {
+    if (state_tracker.TouchBlendEnable() || blend_enable_override_changed) {
+        last_integer_rt_mask = integer_rt_mask;
+        last_dual_src_mask = dual_src_mask;
+        const u32 disable_mask = integer_rt_mask | dual_src_mask;
         std::array<VkBool32, Maxwell::NumRenderTargets> setup_enables{};
         for (size_t index = 0; index < Maxwell::NumRenderTargets; index++) {
-            bool is_integer = false;
-            if (regs.rt[index].format != Tegra::RenderTargetFormat::NONE) {
-                const auto format =
-                    VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[index].format);
-                is_integer = IsPixelFormatInteger(format);
-            }
+            const bool blocked = ((disable_mask >> index) & 1U) != 0;
             setup_enables[index] =
-                (!is_integer && regs.blend.enable[index] != 0) ? VK_TRUE : VK_FALSE;
+                (!blocked && regs.blend.enable[index] != 0) ? VK_TRUE : VK_FALSE;
         }
         scheduler.Record([setup_enables](vk::CommandBuffer cmdbuf) {
             cmdbuf.SetColorBlendEnableEXT(0, setup_enables);
@@ -7112,12 +7273,26 @@ void RasterizerVulkan::BuildVertexInputLayout(const Tegra::Engines::Maxwell3D::R
         if (attribute.constant || binding >= max_bindings) {
             continue;
         }
+        const VkFormat format =
+            attribute.type == Maxwell::VertexAttribute::Type::UnusedEnumDoNotUseBecauseItWillGoAway
+                ? VK_FORMAT_UNDEFINED
+                : MaxwellToVK::VertexFormat(device, attribute.type, attribute.size);
+        if (format == VK_FORMAT_UNDEFINED) [[unlikely]] {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(Render_Vulkan,
+                            "Dynamic vertex attribute {} left out (type {}, size {}, stream {})",
+                            index, static_cast<u32>(attribute.type.Value()),
+                            static_cast<u32>(attribute.size.Value()), binding);
+            }
+            continue;
+        }
         attributes.push_back({
             .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
             .pNext = nullptr,
             .location = index,
             .binding = binding,
-            .format = MaxwellToVK::VertexFormat(device, attribute.type, attribute.size),
+            .format = format,
             .offset = attribute.offset +
                       (buffer_cache_runtime.IsVertexRepacked(binding) && attribute.offset >= 65 ? 3 : 0),
         });

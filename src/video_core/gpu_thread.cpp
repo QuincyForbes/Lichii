@@ -51,7 +51,8 @@ template <typename StopToken>
 void HoldForGpuLatency(const SubmitListCommand& list, const StopToken& stop_token) {
     const auto latency = Nx2GpuLatency::Latency();
     if (latency.count() <= 0 || !Nx2GpuLatency::Steady() ||
-        !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+        !Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+        Tegra::DmaPusher::TrustSubmitted()) {
         return;
     }
     const auto until = list.submit_time + latency;
@@ -80,94 +81,6 @@ void SignalCommand(SynchState& state, u64 fence, bool block) {
     }
 }
 
-// pending_wake: the GPU thread's pending sleeps, logged per second under EDEN_NX2_PERF_VERIFY or
-// EDEN_NX2_GPU_PROFILE (GPU thread only).
-struct PendingWakeStats {
-    u64 waits{}, by_push{}, by_latch{}, timeouts{}, stale{}, skipped{};
-    std::array<u32, 24> latency{}; ///< Latch to resume, bucket k: under 2^k us
-    u32 latency_samples{};
-    s64 window_start_ns{};
-};
-
-void NotePendingLatchResume(PendingWakeStats& stats, s64 latch_ns) {
-    const s64 us = (Tegra::Nx2PendingWake::NowNs() - latch_ns) / 1000;
-    const size_t bucket = std::min<size_t>(
-        us <= 0 ? 0 : static_cast<size_t>(std::bit_width(static_cast<u64>(us))),
-        stats.latency.size() - 1);
-    ++stats.latency[bucket];
-    ++stats.latency_samples;
-}
-
-void ReportPendingWake(PendingWakeStats& stats) {
-    const s64 now = Tegra::Nx2PendingWake::NowNs();
-    if (stats.window_start_ns == 0) {
-        stats.window_start_ns = now;
-        return;
-    }
-    if (now - stats.window_start_ns < 1'000'000'000) {
-        return;
-    }
-    u64 p50_us = 0;
-    for (u32 k = 0, seen = 0; k < stats.latency.size() && stats.latency_samples != 0; ++k) {
-        seen += stats.latency[k];
-        if (seen * 2 >= stats.latency_samples) {
-            p50_us = u64{1} << k;
-            break;
-        }
-    }
-    LOG_INFO(HW_GPU,
-             "Nx2Perf pending_wake: {} sleeps/s ended by push {}, latch {}, timeout {}, stale {} "
-             "({} skipped before the wait); latch to resume p50 under {} us ({} samples); "
-             "{} resumed unmet so far",
-             stats.waits, stats.by_push, stats.by_latch, stats.timeouts, stats.stale,
-             stats.skipped, p50_us, stats.latency_samples,
-             Tegra::Nx2PendingWake::verify_unmet.load(std::memory_order_relaxed));
-    stats = {};
-    stats.window_start_ns = now;
-}
-
-/// pending_wake's form of the pending 1 ms sleep: ends early on a command queued or a latch
-/// since the poll that saw `push_seen` and `latch_seen`.
-void PendingWakeSleep(PendingWakeStats& stats, u64 push_seen, u64 latch_seen) {
-    namespace Wake = Tegra::Nx2PendingWake;
-    namespace Profile = VideoCommon::Nx2Profile;
-    Wake::wake_event.Reset();
-    Wake::wake_reasons.store(0, std::memory_order_relaxed);
-    Wake::front_sleeping.store(true, std::memory_order_seq_cst);
-    u32 reason = 0;
-    if (Wake::push_seq.load(std::memory_order_seq_cst) != push_seen) {
-        reason |= Wake::ByPush;
-    }
-    if (Wake::latch_seq.load(std::memory_order_seq_cst) != latch_seen) {
-        reason |= Wake::ByLatch;
-    }
-    const bool skipped = reason != 0;
-    bool woke = skipped;
-    if (!skipped) {
-        woke = Wake::wake_event.WaitFor(std::chrono::milliseconds{1});
-        reason = woke ? Wake::wake_reasons.load(std::memory_order_relaxed) : 0;
-    }
-    Wake::front_sleeping.store(false, std::memory_order_seq_cst);
-    // Verify checks the resumes the next polls make.
-    Wake::verify_resume = reason != 0 && VideoCommon::Nx2Perf::Verify();
-
-    const bool by_push = (reason & Wake::ByPush) != 0;
-    const bool by_latch = !by_push && (reason & Wake::ByLatch) != 0;
-    ++stats.waits;
-    stats.by_push += by_push ? 1 : 0;
-    stats.by_latch += by_latch ? 1 : 0;
-    stats.timeouts += woke ? 0 : 1;
-    stats.stale += woke && reason == 0 ? 1 : 0;
-    stats.skipped += skipped ? 1 : 0;
-    Profile::Add(Profile::Counter::PendingWaits, 1);
-    Profile::Add(Profile::Counter::PendingWakePush, by_push ? 1 : 0);
-    Profile::Add(Profile::Counter::PendingWakeLatch, by_latch ? 1 : 0);
-    Profile::Add(Profile::Counter::PendingWakeTimeout, woke ? 0 : 1);
-    if (VideoCommon::Nx2Perf::Verify() || Profile::Enabled()) {
-        ReportPendingWake(stats);
-    }
-}
-
 } // Anonymous namespace
 
 ThreadManager::ThreadManager(Core::System& system_)
@@ -190,76 +103,64 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
 
         auto current_context = context.Acquire();
         CommandDataContainer next;
-        // When a pending channel last moved or a command arrived (see the polling below).
+        // When a pending channel last moved or a command arrived (see the waits below).
         auto last_progress = std::chrono::steady_clock::now();
+        constexpr std::chrono::nanoseconds PendingPoll = std::chrono::microseconds{500};
+        constexpr std::chrono::nanoseconds PendingPollPeriod = std::chrono::microseconds{20};
+        constexpr std::chrono::nanoseconds WordCheckPeriod = std::chrono::microseconds{2};
+        auto& wake = Tegra::Nx2PendingWake::Get();
+        auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
         namespace Profile = VideoCommon::Nx2Profile;
         // Before the split's back thread starts, which reads it too.
         Profile::Initialize();
         auto& split = VideoCommon::GpuSplit::Get();
-        const bool pending_wake = Tegra::Nx2PendingWake::On();
-        PendingWakeStats pending_wake_stats;
         while (!stop_token.stop_requested()) {
             Profile::Report();
             Common::FrameDeadline::Tick();
             split.MaybeStart(system);
             if (scheduler.HasPendingChannels()) {
-                // pending_wake: the sleep below ends early on what comes after these.
-                u64 push_seen{};
-                u64 latch_seen{};
-                s64 latch_ns_seen{};
-                if (pending_wake) [[unlikely]] {
-                    namespace Wake = Tegra::Nx2PendingWake;
-                    push_seen = Wake::push_seq.load(std::memory_order_seq_cst);
-                    latch_seen = Wake::latch_seq.load(std::memory_order_seq_cst);
-                    latch_ns_seen = Wake::last_latch_ns.load(std::memory_order_relaxed);
-                }
-                // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
+                // Suspended channels wait on semaphores: a new command or a GPU release wakes the
+                // wait below at once (Nx2PendingWake), so arm it before looking.
+                wake.Arm();
+                bool resumed = false;
                 {
                     Profile::Scope scope{Profile::Zone::ResumePending};
-                    if (scheduler.ResumePending(system.GPU())) {
-                        last_progress = std::chrono::steady_clock::now();
-                        if (pending_wake) [[unlikely]] {
-                            const s64 latch_ns = Tegra::Nx2PendingWake::last_latch_ns.exchange(
-                                0, std::memory_order_relaxed);
-                            if (latch_ns != 0) {
-                                NotePendingLatchResume(pending_wake_stats, latch_ns);
-                            }
-                        }
-                    } else if (pending_wake && latch_ns_seen != 0) [[unlikely]] {
-                        // A latch this poll did not resume on: not one to time.
-                        Tegra::Nx2PendingWake::last_latch_ns.compare_exchange_strong(
-                            latch_ns_seen, 0, std::memory_order_relaxed);
+                    resumed = scheduler.ResumePending(system.GPU());
+                }
+                const bool popped = state.queue.TryPop(next);
+                if (resumed || popped) {
+                    last_progress = std::chrono::steady_clock::now();
+                }
+                if (!popped) {
+                    if (!scheduler.HasPendingChannels()) {
+                        continue;
                     }
-                }
-                if (pending_wake) [[unlikely]] {
-                    Tegra::Nx2PendingWake::verify_resume = false;
-                }
-                if (!state.queue.TryPop(next)) {
                     // EDEN_NX2_PUBLISH_WAITS: what the resumed channels sent goes to the back
-                    // before this thread yields or sleeps (Commit publishes every 64 words).
+                    // before this thread waits or sleeps (Commit publishes every 64 words).
                     if (split.Active()) {
                         split.PublishBeforeWait();
                     }
-                    // The CPU usually releases the semaphore soon after: poll for half a
-                    // millisecond before sleeping, or every wait also waits out a host sleep
-                    // (title 1 waits ~25 times a second).
-                    // EDEN_NX2_EXP6 (zortos293/Lichii#446): 1 = 50 us sleeps (Ocarina waits here
-                    // ~330 times a second and its present waits for the work behind them; on
-                    // Windows a sleep still lasts one timer tick, ~0.5 ms), 2 = always yield.
-                    // EDEN_NX2_POLL_YIELD=0 (phones): 50 us sleeps from the start.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
                     const int poll = VideoCore::Nx2Debug::Experiment(6);
+                    const auto now = std::chrono::steady_clock::now();
                     if (!Common::PollYield()) {
-                        std::this_thread::sleep_for(std::chrono::microseconds{50});
-                    } else if (poll == 2 || std::chrono::steady_clock::now() - last_progress <
-                                                std::chrono::microseconds{500}) {
-                        std::this_thread::yield();
-                    } else if (poll == 1) {
-                        std::this_thread::sleep_for(std::chrono::microseconds{50});
-                    } else if (pending_wake) [[unlikely]] {
-                        PendingWakeSleep(pending_wake_stats, push_seen, latch_seen);
+                        wake.Sleep(std::chrono::microseconds{50});
+                    } else if (now - last_progress < PendingPoll) {
+                        const auto poll_end =
+                            (std::min)(now + PendingPollPeriod, last_progress + PendingPoll);
+                        auto until = now;
+                        do {
+                            until = (std::min)(std::chrono::steady_clock::now() + WordCheckPeriod,
+                                               poll_end);
+                            if (wake.Poll(until) || waiters.WordStored()) {
+                                break;
+                            }
+                        } while (until < poll_end);
                     } else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                        Profile::Add(Profile::Counter::PendingWaits, 1);
+                        const bool woken = wake.Sleep(poll == 1 ? std::chrono::microseconds{50}
+                                                                : std::chrono::microseconds{500});
+                        Profile::Add(Profile::Counter::PendingWakeTimeout, woken ? 0 : 1);
                     }
                     continue;
                 }
@@ -407,9 +308,7 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
     state.queue.EmplaceWait(std::move(command_data), fence, block);
-    if (Tegra::Nx2PendingWake::On()) [[unlikely]] {
-        Tegra::Nx2PendingWake::Wake(Tegra::Nx2PendingWake::push_seq, Tegra::Nx2PendingWake::ByPush);
-    }
+    Tegra::Nx2PendingWake::Get().Notify();
 
     if (block) {
         state.cv.wait(lk, thread.get_stop_token(), [this, fence] {

@@ -10,6 +10,7 @@
 #pragma once
 
 #include <algorithm>
+#include <concepts>
 #include <cstdlib>
 #include <span>
 #include <vector>
@@ -51,6 +52,7 @@ constexpr u32 ImageBuffer = 2;
 constexpr u32 Texture = 3;
 constexpr u32 Image = 4;
 constexpr u32 ClassMask = 7;
+constexpr u32 ComputeBit = 1U << 31;
 } // namespace Kind
 
 /// Appends the kind of each binding of a stage in the order its views are read: texel buffers,
@@ -64,7 +66,8 @@ inline void AppendKinds(const Shader::Info& info, u32 compute_bit, std::vector<u
     }
     for (const auto& desc : info.texture_descriptors) {
         const u32 kind = compute_bit | Kind::Texture | (static_cast<u32>(desc.type) << 3) |
-                         (desc.is_depth ? 1U << 7 : 0U);
+                         (desc.is_depth ? 1U << 7 : 0U) |
+                         (desc.handle_program != ~0U ? 1U << 14 : 0U);
         kinds.insert(kinds.end(), desc.count, kind);
     }
     for (const auto& desc : info.image_descriptors) {
@@ -82,6 +85,19 @@ struct Counts {
     u64 misses{};
     u64 full_resolves{}; ///< Draws whose misses had every binding resolved again
 };
+
+template <typename Cache>
+[[nodiscard]] inline bool IsMemoStillValid(Cache& cache, const typename Cache::BindingMemo& memo) {
+    if constexpr (requires {
+                      { cache.MemoStillValid(memo) } -> std::convertible_to<bool>;
+                  }) {
+        return cache.MemoStillValid(memo);
+    } else {
+        (void)cache;
+        (void)memo;
+        return false;
+    }
+}
 
 /// Resolves `views` (TIC handles in, view ids out) and `samplers` (one per texture binding, from
 /// `sampler_handles`) through the memo, as FindImageBindings, ResolveMissedBindings and
@@ -101,6 +117,8 @@ void Resolve(Cache& cache, bool compute, bool blacklist, std::span<const u32> ki
     struct Scratch {
         std::vector<Memo*> memos;
         std::vector<Miss> misses;
+        std::vector<Miss> stale_hits;
+        std::vector<VideoCommon::ImageViewInOut> subset;
         std::vector<typename Cache::BindingProbe> probes;
         std::vector<u32> tsc_indices;
         bool taken = false;
@@ -180,23 +198,71 @@ void Resolve(Cache& cache, bool compute, bool blacklist, std::span<const u32> ki
         return value == nullptr || value[0] != '0';
     }();
     bool resolved = false;
-    if (misses.size() != views.size() && !aliased_hit && partial) {
+    if (misses.size() != views.size() && partial) {
         for (const Miss& miss : misses) {
             if (miss.sampler != ~0U) {
                 samplers[miss.sampler] = cache.GetSamplerId(sampler_handles[miss.sampler], compute);
             }
         }
-        std::vector<VideoCommon::ImageViewInOut> subset;
+        std::vector<VideoCommon::ImageViewInOut>& subset = lists.subset;
+        subset.clear();
         subset.reserve(misses.size());
         for (const Miss& miss : misses) {
             subset.push_back(views[miss.view]);
         }
         cache.FillImageViews(subset, compute, blacklist);
-        if (cache.BindingClock() == lookup.clock) {
-            for (size_t index = 0; index < misses.size(); ++index) {
-                views[misses[index].view].id = subset[index].id;
-            }
+        for (size_t index = 0; index < misses.size(); ++index) {
+            views[misses[index].view].id = subset[index].id;
+        }
+        if (cache.BindingClock() == lookup.clock && !aliased_hit) {
             resolved = true;
+        } else {
+            std::vector<Miss>& stale_hits = lists.stale_hits;
+            stale_hits.clear();
+            u32 hit_sampler_index = 0;
+            for (size_t index = 0; index < views.size(); ++index) {
+                const bool is_texture = (kinds[index] & Kind::ClassMask) == Kind::Texture;
+                if (Memo* const memo = memos[index]) {
+                    if (!IsMemoStillValid(cache, *memo)) {
+                        memos[index] = nullptr;
+                        stale_hits.push_back(
+                            {static_cast<u32>(index), is_texture ? hit_sampler_index : ~0U});
+                    }
+                }
+                if (is_texture) {
+                    ++hit_sampler_index;
+                }
+            }
+            if (stale_hits.empty()) {
+                resolved = true;
+            } else if (stale_hits.size() + misses.size() < views.size()) {
+                const u64 retry_clock = cache.BindingClock();
+                for (const Miss& stale : stale_hits) {
+                    if (stale.sampler != ~0U) {
+                        samplers[stale.sampler] =
+                            cache.GetSamplerId(sampler_handles[stale.sampler], compute);
+                    }
+                }
+                subset.clear();
+                subset.reserve(stale_hits.size());
+                for (const Miss& stale : stale_hits) {
+                    subset.push_back(views[stale.view]);
+                }
+                cache.FillImageViews(subset, compute, blacklist);
+                for (size_t index = 0; index < stale_hits.size(); ++index) {
+                    views[stale_hits[index].view].id = subset[index].id;
+                }
+                bool all_remaining_valid = true;
+                if (cache.BindingClock() != retry_clock || aliased_hit) {
+                    for (size_t index = 0; index < views.size(); ++index) {
+                        if (memos[index] != nullptr && !IsMemoStillValid(cache, *memos[index])) {
+                            all_remaining_valid = false;
+                            break;
+                        }
+                    }
+                }
+                resolved = all_remaining_valid;
+            }
         }
     }
     if (!resolved) {

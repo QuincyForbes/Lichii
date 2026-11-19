@@ -353,6 +353,21 @@ size_t ComputePipelineKey::Hash() const noexcept {
 
 PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_mesh_)
     : native_mesh{native_mesh_ && NativeMeshEnabled()}, native_mesh_capable{native_mesh_} {
+    enum class PreciseMode : u8 { All, Mixed, Fma, Strip };
+    static const PreciseMode precise_mode = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_PRECISE");
+        const std::string_view mode{value != nullptr ? value : ""};
+        if (mode == "all" || mode == "0") {
+            return PreciseMode::All;
+        }
+        if (mode == "fma") {
+            return PreciseMode::Fma;
+        }
+        if (mode == "strip") {
+            return PreciseMode::Strip;
+        }
+        return PreciseMode::Mixed;
+    }();
     // What Apple GPUs run through SPIRV-Cross (MoltenVK's defaults for Apple7+).
     profile = Shader::Profile{
         .supported_spirv = 0x00010300,
@@ -388,6 +403,10 @@ PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_m
         .support_scaled_attributes = false,
         .support_multi_viewport = true,
         .support_geometry_streams = false,
+        .support_sampled_image_array_nonuniform_indexing = true,
+        .support_storage_image_array_nonuniform_indexing = true,
+        .support_uniform_texel_buffer_array_nonuniform_indexing = true,
+        .support_storage_texel_buffer_array_nonuniform_indexing = true,
         .warp_size_potentially_larger_than_guest = false,
         .lower_left_origin_mode = false,
         .need_declared_frag_colors = false,
@@ -398,6 +417,10 @@ PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_m
         .max_subgroup_size = 32,
         .min_ssbo_alignment = 16,
         .max_user_clip_distances = 8,
+        .fp_no_contraction_as_fma =
+            precise_mode == PreciseMode::Mixed || precise_mode == PreciseMode::Fma,
+        .fp_contraction_in_fragment_compute =
+            precise_mode == PreciseMode::Mixed || precise_mode == PreciseMode::Strip,
     };
     constexpr u32 Limit = Shader::HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT;
     host_info = Shader::HostTranslateInfo{
@@ -623,13 +646,27 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
         return GeometryPipeline(key, programs);
     }
     if (mesh_index != 0) {
+        static const bool eager_fallback = [] {
+            const char* const value = std::getenv("EDEN_NX2_METAL_MESH_EAGER_FALLBACK");
+            return value != nullptr && value[0] == '1';
+        }();
         std::optional<NativeMesh> native;
         if (native_mesh) {
             native = NativeMeshPipeline(key, programs, mesh_index);
+            if (native && !eager_fallback) {
+                cause.clear();
+                detail.clear();
+                return TranslatedPipeline{.native_mesh = std::move(native)};
+            }
             // The emulation (the fallback) from programs of its own: translating one IR program
             // to SPIR-V twice is not something the recompiler promises.
             programs = {};
             if (!TranslatePrograms(key, envs, programs, mesh_index)) {
+                if (native) {
+                    cause.clear();
+                    detail.clear();
+                    return TranslatedPipeline{.native_mesh = std::move(native)};
+                }
                 return std::nullopt;
             }
         } else {
@@ -694,7 +731,7 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
         // The vertex program once more as capture kernels, from the same SPIR-V.
         ConvertLegacyToGeneric(programs[1], vertex_info);
         const std::vector<u32> spirv = EmitSPIRV(profile, vertex_info, programs[1], bindings);
-        vertex = FromSpirv(spirv, programs[1], ShaderTranslate::Stage::Vertex, translate_options);
+        vertex = FromSpirv(spirv, programs[1], ShaderTranslate::Stage::Vertex, vertex_options);
         xfb = XfbPrograms(key, spirv, programs[1]);
         if (!xfb) {
             if (!expands) {
@@ -964,6 +1001,7 @@ std::optional<TranslatedPipeline> PipelineTranslator::GeometryPipeline(
                                       translate_options.flip_vertex_y, point_size),
         .entry_point = std::string{Geometry::ReaderEntry},
     };
+    reader.info.stores = geometry_stores;
     static std::atomic<u32> logged{};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
         LOG_INFO(Render_Metal, "Metal: geometry pipeline {:016x} (geometry {:016x}) through the compute "
@@ -1136,13 +1174,15 @@ std::optional<TranslatedPipeline> PipelineTranslator::Mesh(
         .topology = topology,
     };
     // Task, then mesh, then pixel program: the bindings count up in that order.
+    static const bool invariant_mesh_kernel = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_INVARIANT_POSITION");
+        return value != nullptr && value[0] == '1';
+    }();
     const std::array<size_t, 2> kernel_programs{1, mesh_index};
     for (size_t kernel = 0; kernel < (has_task ? 2U : 1U); ++kernel) {
         const size_t index = kernel_programs[kernel];
-        // The mesh program's kernel computes the positions: exact as a vertex program's
-        // (ShaderTranslate::Options::invariant_float_math).
         ShaderTranslate::Options kernel_options = translate_options;
-        kernel_options.invariant_float_math = index == mesh_index;
+        kernel_options.invariant_float_math = invariant_mesh_kernel && index == mesh_index;
         auto translated = Translate(programs[index], ShaderTranslate::Stage::Compute, bindings,
                                     kernel_info, &kernel_options);
         if (!translated) {
@@ -1225,11 +1265,11 @@ std::optional<TranslatedPipeline> PipelineTranslator::Mesh(
 
 bool NativeMeshEnabled() {
     static const bool enabled = [] {
-        // Off unless EDEN_NX2_METAL_MESH_NATIVE=1: in OoT (Link's house) native mesh pipelines
-        // lit the wall leaves almost black and ran at 33 fps, against correctly lit leaves at
-        // 36-40 fps through the compute emulation (the path MoltenVK takes too).
-        const char* const value = std::getenv("EDEN_NX2_METAL_MESH_NATIVE");
-        return value != nullptr && value[0] == '1';
+        const char* value = std::getenv("EDEN_NX2_METAL_MESH_NATIVE");
+        if (value == nullptr) {
+            value = std::getenv("EDEN_NX2_METAL_NATIVE_MESH");
+        }
+        return value == nullptr || value[0] != '0';
     }();
     return enabled;
 }
@@ -1237,7 +1277,7 @@ bool NativeMeshEnabled() {
 bool NativeMeshPerPrimitive() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_METAL_MESH_PER_PRIMITIVE");
-        return value != nullptr && value[0] == '1';
+        return value == nullptr || value[0] != '0';
     }();
     return enabled;
 }
@@ -1497,6 +1537,7 @@ std::optional<TranslatedPipeline> PipelineTranslator::Tessellated(
             types[(key.attribute_types >> (attribute * 2)) & 3];
     }
     ApplyVertexState(vertex_info, key);
+    vertex_info.convert_depth_mode = false;
     ConvertLegacyToGeneric(programs[1], vertex_info);
     const std::vector<u32> vertex_spirv = EmitSPIRV(profile, vertex_info, programs[1], bindings);
     for (size_t variant = 0; variant < Tessellation::IndexSizes.size(); ++variant) {
@@ -1511,11 +1552,17 @@ std::optional<TranslatedPipeline> PipelineTranslator::Tessellated(
         tessellation.vertex[variant] = StageProgram{
             .stage = ShaderTranslate::Stage::VertexForTessellation,
             .msl = std::move(result.source),
+            .msl_without_reduction = std::move(result.source_without_reduction),
             .entry_point = std::move(result.entry_point),
             .slots = std::move(result.slots),
             .info = programs[1].info,
             .outputs = std::move(result.outputs),
             .tessellation_slots = result.tessellation_slots,
+            .reduction_slot = result.reduction_slot,
+            .spill_slot = result.spill_slot,
+            .sampler_spill_slot = result.sampler_spill_slot,
+            .array_spill_slot = result.array_spill_slot,
+            .array_spill_entries = result.array_spill_entries,
         };
     }
     const StageProgram& vertex = tessellation.vertex[0];
@@ -1563,6 +1610,8 @@ std::optional<TranslatedPipeline> PipelineTranslator::Tessellated(
                                        : Shader::TessSpacing::Equal;
     evaluation_info.tess_clockwise = tessellation.modes.clockwise;
     evaluation_info.y_negate = !feeds_geometry && (key.state & StateLowerLeftOrigin) != 0;
+    evaluation_info.convert_depth_mode =
+        !feeds_geometry && (key.state & StateDepthMinusOneToOne) != 0;
     // The raster state patches are for the stage the rasterizer sees.
     const GraphicsPipelineKey* const saved_patch_key = patch_key;
     if (feeds_geometry) {
@@ -1630,10 +1679,20 @@ std::optional<TranslatedPipeline> PipelineTranslator::Tessellated(
         domain_kernels.evaluate.program.slots = evaluation->slots;
         domain_kernels.evaluate.program.info = evaluation->info;
         domain_kernels.evaluate.program.tessellation_slots = evaluation->tessellation_slots;
+        domain_kernels.evaluate.program.reduction_slot = evaluation->reduction_slot;
+        domain_kernels.evaluate.program.spill_slot = evaluation->spill_slot;
+        domain_kernels.evaluate.program.sampler_spill_slot = evaluation->sampler_spill_slot;
+        domain_kernels.evaluate.program.array_spill_slot = evaluation->array_spill_slot;
+        domain_kernels.evaluate.program.array_spill_entries = evaluation->array_spill_entries;
         evaluation->msl = std::move(emulation.source);
         evaluation->entry_point = emulation.vertex_entry;
         evaluation->slots.clear();
         evaluation->tessellation_slots = {};
+        evaluation->reduction_slot = ~0U;
+        evaluation->spill_slot = ~0U;
+        evaluation->sampler_spill_slot = ~0U;
+        evaluation->array_spill_slot = ~0U;
+        evaluation->array_spill_entries = 0;
         emulation.source.clear();
         emulation.vertex_entry.clear();
         domain_kernels.emulation = std::move(emulation);

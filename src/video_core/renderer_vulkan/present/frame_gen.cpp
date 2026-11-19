@@ -16,11 +16,17 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "video_core/frame_gen_choice.h"
 #include "video_core/renderer_vulkan/present/frame_gen.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#include "video_core/vulkan_common/streamline_frame_gen.h"
+#endif
 
 namespace Vulkan {
 
@@ -30,9 +36,48 @@ constexpr size_t COLOR_CHANNELS = 4;
 constexpr u64 LSFG_REQUIRED_FRAMES = 2;
 constexpr u32 LSFG_RECURRENCE_FRAMES = 2;
 
+/// Why NVIDIA DLSS Frame Generation isn't this session's frame generator, if it isn't. Streamline
+/// decided that when the game started.
+[[nodiscard]] VideoCore::DlssgBlock DlssgBlocked() {
+#ifdef EGLANTINE_STREAMLINE
+    if (Streamline::FrameGenSession()) {
+        return VideoCore::DlssgBlock::None;
+    }
+    return VideoCore::BlockedDlssg({
+        .streamline = true,
+        .dlss = Settings::NvidiaDlssChosen(),
+        .program_id = Settings::GetCurrentProgramID(),
+        .loaded = false,
+    });
+#else
+    return VideoCore::DlssgBlock::NoStreamline;
+#endif
+}
+
+[[nodiscard]] std::string DlssgBlockedText(VideoCore::DlssgBlock block) {
+    switch (block) {
+    case VideoCore::DlssgBlock::None:
+        break;
+    case VideoCore::DlssgBlock::NoStreamline:
+        return "this build has no NVIDIA Streamline";
+    case VideoCore::DlssgBlock::DlssOff:
+        return "NVIDIA DLSS is off, and DLSS-G takes its inputs from DLSS";
+    case VideoCore::DlssgBlock::NoGameInputs:
+        return fmt::format("no game motion vectors for {:016X}", Settings::GetCurrentProgramID());
+    case VideoCore::DlssgBlock::NotLoaded:
+#ifdef EGLANTINE_STREAMLINE
+        if (std::string reason = Streamline::FrameGenUnavailableReason(); !reason.empty()) {
+            return reason;
+        }
+#endif
+        return "NVIDIA Streamline did not start";
+    }
+    return {};
+}
+
 /// FSR 3 and MetalFX frame generation both run on the built-in optical flow; LSFG has its own.
-[[nodiscard]] bool UsesOpticalFlow() {
-    return Settings::values.frame_gen_type.GetValue() != Settings::FrameGenType::Lsfg;
+[[nodiscard]] bool UsesOpticalFlow(Settings::FrameGenType type) {
+    return type != Settings::FrameGenType::Lsfg;
 }
 
 [[nodiscard]] f32 ManualFlowScale() {
@@ -210,7 +255,27 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
                        VkExtent2D guest_extent) {
     generated = false;
 
-    if (unavailable || !Settings::values.frame_gen.GetValue()) {
+    const Settings::FrameGenType chosen = Settings::values.frame_gen_type.GetValue();
+    const VideoCore::DlssgBlock dlssg_block =
+        chosen == Settings::FrameGenType::NvidiaDlssG ? DlssgBlocked() : VideoCore::DlssgBlock::None;
+    const Settings::FrameGenType type = VideoCore::ActiveFrameGenType(chosen, dlssg_block);
+    const bool nvidia_frame_gen = type == Settings::FrameGenType::NvidiaDlssG;
+
+    if (!Settings::values.frame_gen.GetValue()) {
+        logged_dlssg_state = false;
+    }
+
+    if (unavailable || !Settings::values.frame_gen.GetValue() || nvidia_frame_gen) {
+#ifdef EGLANTINE_STREAMLINE
+        if (nvidia_frame_gen && Settings::values.frame_gen.GetValue() && !logged_dlssg_state) {
+            logged_dlssg_state = true;
+            LOG_INFO(Render_Vulkan,
+                     "Frame generation on: NVIDIA DLSS-G {}x (numFramesToGenerateMax {}), "
+                     "presenting {}",
+                     Streamline::FrameGenGenerated() + 1, Streamline::FrameGenMaxGenerated(),
+                     string_VkFormat(format));
+        }
+#endif
         if (chain || fsr3_chain) {
             scheduler.Finish();
             chain.reset();
@@ -220,7 +285,15 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
         return;
     }
 
-    if (!UsesOpticalFlow()) {
+    if (chosen == Settings::FrameGenType::NvidiaDlssG && !logged_dlssg_state) {
+        logged_dlssg_state = true;
+        LOG_INFO(Render_Vulkan,
+                 "Frame generation: NVIDIA DLSS-G unavailable ({}), using FSR3 {}x, presenting {}",
+                 DlssgBlockedText(dlssg_block), Settings::FrameGenMultiplier(),
+                 string_VkFormat(format));
+    }
+
+    if (!UsesOpticalFlow(type)) {
         if (!shaders) {
             shaders.emplace(device);
         }
@@ -259,7 +332,7 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     // A type changed from the quick settings has to build the other chain. Only LSFG uses the flow
     // scale; rebuilding the built-in chain for it would drop its history.
     const bool flow_scale_changed = chain && built_flow_scale != flow_scale;
-    if ((!chain && !fsr3_chain) || fsr3_chain.has_value() != UsesOpticalFlow() ||
+    if ((!chain && !fsr3_chain) || fsr3_chain.has_value() != UsesOpticalFlow(type) ||
         built_extent.width != extent.width || built_extent.height != extent.height ||
         built_format != format || flow_scale_changed) {
         Rebuild(device, extent, format, flow_scale);
@@ -272,6 +345,9 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     const bool warm = plan.warm && count + 1 >= LSFG_REQUIRED_FRAMES;
     warm_streak = warm ? warm_streak + 1 : 0;
     generated = warm && warm_streak >= LSFG_RECURRENCE_FRAMES && plan.generations > 0;
+    if (generated) {
+        total_generated_frames.fetch_add(last_generations, std::memory_order_relaxed);
+    }
 
     if (fsr3_chain) {
         scheduler.RequestOutsideRenderPassOperationContext();
@@ -353,7 +429,12 @@ void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format,
 
     built_flow_scale = flow_scale;
 
-    if (UsesOpticalFlow()) {
+    const Settings::FrameGenType chosen = Settings::values.frame_gen_type.GetValue();
+    const Settings::FrameGenType type =
+        chosen == Settings::FrameGenType::NvidiaDlssG
+            ? VideoCore::ActiveFrameGenType(chosen, DlssgBlocked())
+            : chosen;
+    if (UsesOpticalFlow(type)) {
         fsr3_chain.emplace(device, memory_allocator, extent, format);
     } else {
         if (!shaders) {

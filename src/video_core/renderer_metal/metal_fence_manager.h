@@ -3,10 +3,7 @@
 
 #pragma once
 
-#include <condition_variable>
-#include <functional>
 #include <memory>
-#include <mutex>
 
 #include "video_core/fence_manager.h"
 #include "video_core/renderer_metal/metal_buffer_cache.h"
@@ -27,20 +24,10 @@ public:
     bool ShouldWaitAsyncFlushes() const {
         return false;
     }
+    [[nodiscard]] bool HasPendingFenceWork() const noexcept {
+        return false;
+    }
     void PopAsyncFlushes() {}
-};
-
-/// A one-shot event between the GPU thread and the fencing thread.
-class FenceGate {
-public:
-    void Open();
-    bool IsOpen() const;
-    void WaitOpen();
-
-private:
-    mutable std::mutex mutex;
-    std::condition_variable cv;
-    bool open{};
 };
 
 /// A guest fence: the scheduler tick of the command buffer that ends with it.
@@ -52,13 +39,9 @@ public:
     bool IsSignaled() const;
     void Wait();
 
-    /// Not signalled before `gate` opens (FenceManager::SignalWithTextureDownloads).
-    void SetHandoff(std::shared_ptr<FenceGate> gate);
-
 private:
     Scheduler& scheduler;
     u64 tick{};
-    std::shared_ptr<FenceGate> handoff;
 };
 
 using Fence = std::shared_ptr<InnerFence>;
@@ -86,12 +69,6 @@ public:
                           QueryCache& query_cache, Scheduler& scheduler);
     ~FenceManager() override;
 
-    // Hide the base's: with asynchronous fences, a fence carrying texture downloads has the
-    // fencing thread record and wait for them on the scheduler (the texture cache's synchronous
-    // downloads), which only one thread may use at a time. The GPU thread hands the scheduler
-    // over and waits for those downloads (SignalWithTextureDownloads).
-    void SignalFence(std::function<void()>&& func, bool force_completion = false);
-    void SignalSyncPoint(u32 value);
     void WaitPendingFences(bool force);
 
 protected:
@@ -102,15 +79,7 @@ protected:
     void SubmitDeferredWork() override;
 
 private:
-    /// Whether the texture cache has downloads the next fence would commit.
-    bool TextureDownloadsPending();
-
-    template <typename Signal>
-    void SignalWithTextureDownloads(Signal&& signal);
-
     Scheduler& scheduler;
-    /// GPU thread: given to the next fence queued (SignalWithTextureDownloads).
-    std::shared_ptr<FenceGate> next_handoff;
 };
 
 } // namespace Metal

@@ -431,13 +431,18 @@ Id BitTest(EmitContext& ctx, Id mask, Id bit) {
     return ctx.OpINotEqual(ctx.U1, bit_value, ctx.u32_zero_value);
 }
 
-Id ImageGatherSubpixelOffset(EmitContext& ctx, const IR::TextureInstInfo& info, Id texture,
+Id ImageGatherSubpixelOffset(EmitContext& ctx, const IR::TextureInstInfo& info, Id sampled,
                              Id coords) {
     // Apply a subpixel offset of 1/512 the texel size of the texture to ensure same rounding on
     // AMD hardware as on Maxwell or other Nvidia architectures.
     const auto calculate_coords{[&](size_t dim) {
+        const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
+        const Id image{ctx.OpImage(def.image_type, sampled)};
+        if (ctx.non_uniform_ids.contains(sampled.value)) {
+            DecorateNonUniform(ctx, image);
+        }
         const Id nudge{ctx.Const(0x1p-9f)};
-        const Id image_size{ctx.OpImageQuerySizeLod(ctx.U32[dim], texture, ctx.u32_zero_value)};
+        const Id image_size{ctx.OpImageQuerySizeLod(ctx.U32[dim], image, ctx.u32_zero_value)};
         Id offset{dim == 2 ? ctx.ConstantComposite(ctx.F32[dim], nudge, nudge)
                            : ctx.ConstantComposite(ctx.F32[dim], nudge, nudge, ctx.f32_zero_value)};
         offset = ctx.OpFDiv(ctx.F32[dim], offset, ctx.OpConvertUToF(ctx.F32[dim], image_size));
@@ -667,15 +672,15 @@ Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id 
     const auto info{inst->Flags<IR::TextureInstInfo>()};
     const bool is_integer{IsTextureInteger(ctx, info)};
     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
-    if (ctx.profile.need_gather_subpixel_offset) {
-        coords = ImageGatherSubpixelOffset(ctx, info, TextureImage(ctx, info, index), coords);
+    const Id sampled{Texture(ctx, info, index)};
+    if (ctx.profile.need_gather_subpixel_offset && info.type != TextureType::Buffer) {
+        coords = ImageGatherSubpixelOffset(ctx, info, sampled, coords);
     }
     if (IsDynamicPtp(inst, offset, offset2)) {
-        const Id texture{Texture(ctx, info, index)};
         const Id component{ctx.Const(info.gather_component)};
         const Id color{GatherDynamicPtp(ctx, is_integer, result_type, offset, offset2, [&](Id tap_offset) {
             return Decorate(ctx, inst,
-                            ctx.OpImageGather(result_type, texture, coords, component,
+                            ctx.OpImageGather(result_type, sampled, coords, component,
                                               spv::ImageOperandsMask::Offset,
                                               std::span<const Id>{&tap_offset, 1}));
         })};
@@ -683,7 +688,7 @@ Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id 
     }
     const ImageOperands operands(ctx, offset, offset2);
     const Id color{Emit(&EmitContext::OpImageSparseGather, &EmitContext::OpImageGather, ctx, inst,
-                        result_type, Texture(ctx, info, index), coords,
+                        result_type, sampled, coords,
                         ctx.Const(info.gather_component), operands.MaskOptional(),
                         operands.Span())};
     return is_integer ? ctx.OpBitcast(ctx.F32[4], color) : color;
@@ -694,14 +699,14 @@ Id EmitImageGatherDref(EmitContext& ctx, IR::Inst* inst, const IR::Value& index,
     const auto info{inst->Flags<IR::TextureInstInfo>()};
     const bool is_integer{IsTextureInteger(ctx, info)};
     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
-    if (ctx.profile.need_gather_subpixel_offset) {
-        coords = ImageGatherSubpixelOffset(ctx, info, TextureImage(ctx, info, index), coords);
+    const Id sampled{Texture(ctx, info, index)};
+    if (ctx.profile.need_gather_subpixel_offset && info.type != TextureType::Buffer) {
+        coords = ImageGatherSubpixelOffset(ctx, info, sampled, coords);
     }
     if (IsDynamicPtp(inst, offset, offset2)) {
-        const Id texture{Texture(ctx, info, index)};
         const Id color{GatherDynamicPtp(ctx, is_integer, result_type, offset, offset2, [&](Id tap_offset) {
             return Decorate(ctx, inst,
-                            ctx.OpImageDrefGather(result_type, texture, coords, dref,
+                            ctx.OpImageDrefGather(result_type, sampled, coords, dref,
                                                   spv::ImageOperandsMask::Offset,
                                                   std::span<const Id>{&tap_offset, 1}));
         })};
@@ -709,7 +714,7 @@ Id EmitImageGatherDref(EmitContext& ctx, IR::Inst* inst, const IR::Value& index,
     }
     const ImageOperands operands(ctx, offset, offset2);
     const Id color{Emit(&EmitContext::OpImageSparseDrefGather, &EmitContext::OpImageDrefGather,
-                        ctx, inst, result_type, Texture(ctx, info, index), coords, dref,
+                        ctx, inst, result_type, sampled, coords, dref,
                         operands.MaskOptional(), operands.Span())};
     return is_integer ? ctx.OpBitcast(ctx.F32[4], color) : color;
 }

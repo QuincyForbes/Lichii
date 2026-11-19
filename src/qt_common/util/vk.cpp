@@ -16,6 +16,8 @@
 #include "common/dynamic_library.h"
 #include "common/logging.h"
 #include "qt_common/util/vk.h"
+#include "video_core/fsr4_support.h"
+#include "video_core/vulkan_common/ffx_files.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
 #include "video_core/vulkan_common/vulkan_library.h"
@@ -29,10 +31,11 @@ namespace VkDeviceInfo {
 Record::Record(std::string_view name_, const std::vector<VkPresentModeKHR>& vsync_modes_,
                bool has_broken_compute_, VkDriverId driver_id_, bool dlss_capable_,
                std::string_view driver_version_, bool integrated_, u64 vram_mib_,
-               Capabilities capabilities_)
+               Capabilities capabilities_, bool fsr4_capable_)
     : name{name_}, vsync_support{vsync_modes_}, has_broken_compute{has_broken_compute_},
-      driver_id{driver_id_}, dlss_capable{dlss_capable_}, driver_version{driver_version_},
-      integrated{integrated_}, vram_mib{vram_mib_}, capabilities{std::move(capabilities_)} {}
+      driver_id{driver_id_}, dlss_capable{dlss_capable_}, fsr4_capable{fsr4_capable_},
+      driver_version{driver_version_}, integrated{integrated_}, vram_mib{vram_mib_},
+      vendor_id{capabilities_.vendor_id}, capabilities{std::move(capabilities_)} {}
 
 Record::~Record() = default;
 
@@ -49,77 +52,121 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
     const auto library = OpenLibrary();
     const vk::Instance instance = CreateInstance(*library, dld, VK_API_VERSION_1_1, wsi.type);
     const std::vector<VkPhysicalDevice> physical_devices = instance.EnumeratePhysicalDevices();
-    vk::SurfaceKHR surface = CreateSurface(instance, wsi);
+    vk::SurfaceKHR surface;
+    try {
+        surface = CreateSurface(instance, wsi);
+    } catch (const Vulkan::vk::Exception& exception) {
+        LOG_WARNING(Frontend, "Could not create test Vulkan surface: {}", exception.what());
+    }
 
     records.clear();
     records.reserve(physical_devices.size());
     for (const VkPhysicalDevice device : physical_devices) {
-        const auto physical_device = vk::PhysicalDevice(device, dld);
-        std::string name = physical_device.GetProperties().deviceName;
+        try {
+            const auto physical_device = vk::PhysicalDevice(device, dld);
+            const VkPhysicalDeviceProperties base_props = physical_device.GetProperties();
+            const std::string raw_name = base_props.deviceName;
 
-        const std::vector<VkPresentModeKHR> present_modes =
-            physical_device.GetSurfacePresentModesKHR(*surface);
-
-        VkPhysicalDeviceDriverProperties driver_properties{};
-        driver_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
-        driver_properties.pNext = nullptr;
-        VkPhysicalDeviceProperties2 properties{};
-        properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR;
-        properties.pNext = &driver_properties;
-        dld.vkGetPhysicalDeviceProperties2(physical_device, &properties);
-
-        const auto driverID = driver_properties.driverID;
-
-        bool has_broken_compute{
-            Vulkan::Device::CheckBrokenCompute(driverID, properties.properties.driverVersion)};
-
-        // Tensor cores came with RTX; GTX 16 cards are Turing without them. Ray tracing pipelines
-        // cover RTX parts whose name lacks it.
-        bool dlss_capable = false;
-        if (driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY) {
-            dlss_capable = name.find("RTX") != std::string::npos;
-            for (const auto& extension : physical_device.EnumerateDeviceExtensionProperties()) {
-                if (std::string_view{extension.extensionName} ==
-                    VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) {
-                    dlss_capable = true;
+            std::vector<VkPresentModeKHR> present_modes = default_present_modes;
+            if (*surface) {
+                try {
+                    const auto modes = physical_device.GetSurfacePresentModesKHR(*surface);
+                    if (!modes.empty()) {
+                        present_modes = modes;
+                    }
+                } catch (const Vulkan::vk::Exception& exception) {
+                    LOG_WARNING(Frontend, "Could not query present modes of {}: {}", raw_name,
+                                exception.what());
                 }
             }
-        }
 
-        std::string driver_string = Vulkan::vk::GetDriverName(driver_properties);
-
-        if (driver_string.empty())
-            driver_string = "Unknown";
-
-        name = fmt::format("{} ({})", name, driver_string);
-
-        const auto memory = physical_device.GetMemoryProperties().memoryProperties;
-        u64 vram = 0;
-        for (u32 i = 0; i < memory.memoryHeapCount; ++i) {
-            if ((memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
-                vram = (std::max)(vram, u64{memory.memoryHeaps[i].size});
+            VkPhysicalDeviceDriverProperties driver_properties{};
+            driver_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+            driver_properties.pNext = nullptr;
+            VkPhysicalDeviceProperties2 properties{};
+            properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR;
+            properties.pNext = &driver_properties;
+            properties.properties = base_props;
+            if (base_props.apiVersion >= VK_API_VERSION_1_1 &&
+                dld.vkGetPhysicalDeviceProperties2 != nullptr) {
+                dld.vkGetPhysicalDeviceProperties2(physical_device, &properties);
             }
-        }
-        const bool integrated =
-            properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
 
-        Capabilities capabilities;
-        capabilities.vendor_id = properties.properties.vendorID;
-        capabilities.driver_id = static_cast<u32>(driverID);
-        try {
-            for (const VkExtensionProperties& extension :
-                 physical_device.EnumerateDeviceExtensionProperties()) {
-                capabilities.extensions.emplace_back(extension.extensionName);
+            const auto driverID = driver_properties.driverID;
+            const bool has_broken_compute{
+                Vulkan::Device::CheckBrokenCompute(driverID, properties.properties.driverVersion)};
+
+            Capabilities capabilities;
+            capabilities.vendor_id = properties.properties.vendorID;
+            capabilities.driver_id = static_cast<u32>(driverID);
+            try {
+                for (const VkExtensionProperties& extension :
+                     physical_device.EnumerateDeviceExtensionProperties()) {
+                    capabilities.extensions.emplace_back(extension.extensionName);
+                }
+            } catch (const Vulkan::vk::Exception& exception) {
+                LOG_WARNING(Frontend, "Could not list the extensions of {}: {}", raw_name,
+                            exception.what());
             }
+
+            // Tensor cores came with RTX; GTX 16 cards are Turing without them. Ray tracing
+            // pipelines and cooperative matrices cover RTX / workstation parts whose name lacks it.
+            const bool dlss_capable =
+                driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
+                (raw_name.find("RTX") != std::string::npos ||
+                 capabilities.HasExtension(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) ||
+                 capabilities.HasExtension(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME));
+
+#if defined(_WIN32)
+            const bool fsr4_capable = VideoCommon::IsFsr4CapableGpu(
+                properties.properties.vendorID, driverID == VK_DRIVER_ID_AMD_PROPRIETARY, raw_name);
+#elif defined(__linux__) && !defined(__ANDROID__)
+            VkPhysicalDeviceShaderIntegerDotProductProperties dot_properties{};
+            dot_properties.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
+            if (properties.properties.apiVersion >= VK_API_VERSION_1_3) {
+                VkPhysicalDeviceProperties2 dot_query{};
+                dot_query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+                dot_query.pNext = &dot_properties;
+                dld.vkGetPhysicalDeviceProperties2(physical_device, &dot_query);
+            }
+            const bool fsr4_capable =
+                !Vulkan::FfxRuntime::PortLibraryPath().empty() &&
+                VideoCommon::IsFsr4PortGpu(
+                    properties.properties.vendorID, properties.properties.deviceID,
+                    driverID == VK_DRIVER_ID_MESA_RADV,
+                    dot_properties.integerDotProduct4x8BitPackedMixedSignednessAccelerated !=
+                        VK_FALSE);
+#else
+            constexpr bool fsr4_capable = false;
+#endif
+
+            std::string driver_string = Vulkan::vk::GetDriverName(driver_properties);
+            if (driver_string.empty()) {
+                driver_string = "Unknown";
+            }
+            const std::string name = fmt::format("{} ({})", raw_name, driver_string);
+
+            const auto memory = physical_device.GetMemoryProperties().memoryProperties;
+            u64 vram = 0;
+            for (u32 i = 0; i < memory.memoryHeapCount; ++i) {
+                if ((memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+                    vram = (std::max)(vram, u64{memory.memoryHeaps[i].size});
+                }
+            }
+            const bool integrated =
+                properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+
+            records.push_back(VkDeviceInfo::Record(
+                name, present_modes, has_broken_compute, driverID, dlss_capable,
+                static_cast<const char*>(driver_properties.driverInfo), integrated, vram >> 20,
+                std::move(capabilities), fsr4_capable));
         } catch (const Vulkan::vk::Exception& exception) {
-            LOG_WARNING(Frontend, "Could not list the extensions of {}: {}", name,
+            LOG_WARNING(Frontend, "Could not query Vulkan physical device {}: {}", records.size(),
                         exception.what());
+            records.push_back(VkDeviceInfo::Record("Unknown Vulkan Device", default_present_modes,
+                                                   false, VkDriverId{}, false));
         }
-
-        records.push_back(VkDeviceInfo::Record(
-            name, present_modes, has_broken_compute, driverID, dlss_capable,
-            static_cast<const char*>(driver_properties.driverInfo), integrated, vram >> 20,
-            std::move(capabilities)));
     }
 } catch (const Vulkan::vk::Exception& exception) {
     LOG_ERROR(Frontend, "Failed to enumerate devices with error: {}", exception.what());

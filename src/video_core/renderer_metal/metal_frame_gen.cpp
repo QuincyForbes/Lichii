@@ -152,6 +152,8 @@ void FrameGen::Rebuild(std::array<u32, 2> size, u32 format, f32 scale, bool lsfg
     flow_size = {(std::max)(1U, size[0] / 2), (std::max)(1U, size[1] / 2)};
     lsfg.reset();
     built_lsfg = lsfg_type;
+    const bool metalfx_type =
+        !lsfg_type && Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::MetalFx;
     for (Object& frame : frames) {
         if (lsfg_type) {
             break;
@@ -159,7 +161,8 @@ void FrameGen::Rebuild(std::array<u32, 2> size, u32 format, f32 scale, bool lsfg
         frame = CreateTexture(device, {.kind = TextureKind::e2D,
                                        .format = format,
                                        .width = size[0],
-                                       .height = size[1]});
+                                       .height = size[1],
+                                       .pixel_format_view = metalfx_type});
     }
     // R16G16F: per current pixel, the offset in flow texels to the previous frame.
     if (!lsfg_type) {
@@ -167,14 +170,16 @@ void FrameGen::Rebuild(std::array<u32, 2> size, u32 format, f32 scale, bool lsfg
                                         .format = Fmt::RG16Float,
                                         .width = flow_size[0],
                                         .height = flow_size[1],
-                                        .shader_write = true});
+                                        .shader_write = true,
+                                        .pixel_format_view = false});
     }
     generated = CreateTexture(device, {.kind = TextureKind::e2D,
                                        .format = format,
                                        .width = size[0],
                                        .height = size[1],
                                        .render_target = true,
-                                       .shader_write = true});
+                                       .shader_write = true,
+                                       .pixel_format_view = false});
     parity = 0;
     has_history = false;
     flow_valid = false;
@@ -196,6 +201,12 @@ void FrameGen::Rebuild(std::array<u32, 2> size, u32 format, f32 scale, bool lsfg
         failed = true;
         LOG_WARNING(Render_Metal, "Metal: frame generation textures not made for {}x{}", size[0],
                     size[1]);
+        return;
+    }
+    if (metalfx_type && !interpolator_unsupported && FrameInterpolator::IsSupported(device)) {
+        if (!interpolator->Prepare(device, frames[0].Get(), generated.Get(), size)) {
+            interpolator_unsupported = true;
+        }
     }
 }
 

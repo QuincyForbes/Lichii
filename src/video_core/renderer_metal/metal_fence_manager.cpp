@@ -5,8 +5,6 @@
 
 #include "common/logging.h"
 #include "video_core/gpu_split.h"
-#include "video_core/gpu_wait_site.h"
-#include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/renderer_metal/metal_fence_manager.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
 
@@ -24,24 +22,6 @@ bool FenceManagerParams::AsyncCheck() {
     return enabled;
 }
 
-void FenceGate::Open() {
-    {
-        std::scoped_lock lock{mutex};
-        open = true;
-    }
-    cv.notify_all();
-}
-
-bool FenceGate::IsOpen() const {
-    std::scoped_lock lock{mutex};
-    return open;
-}
-
-void FenceGate::WaitOpen() {
-    std::unique_lock lock{mutex};
-    cv.wait(lock, [this] { return open; });
-}
-
 InnerFence::InnerFence(Scheduler& scheduler_, bool is_stubbed_)
     : FenceBase{is_stubbed_}, scheduler{scheduler_} {}
 
@@ -52,17 +32,10 @@ void InnerFence::Queue() {
 }
 
 bool InnerFence::IsSignaled() const {
-    if (handoff && !handoff->IsOpen()) {
-        return false;
-    }
     return is_stubbed || scheduler.IsFree(tick);
 }
 
 void InnerFence::Wait() {
-    if (handoff) {
-        // The GPU thread still uses the scheduler: this fence's texture downloads record on it.
-        handoff->WaitOpen();
-    }
     if (is_stubbed) {
         return;
     }
@@ -74,10 +47,6 @@ void InnerFence::Wait() {
     } else {
         scheduler.Wait(tick, CommitReason::Fence);
     }
-}
-
-void InnerFence::SetHandoff(std::shared_ptr<FenceGate> gate) {
-    handoff = std::move(gate);
 }
 
 FenceManager::FenceManager(VideoCore::RasterizerInterface& rasterizer_, Tegra::GPU& gpu_,
@@ -100,70 +69,13 @@ FenceManager::~FenceManager() {
     }
 }
 
-bool FenceManager::TextureDownloadsPending() {
-    std::scoped_lock lock{texture_cache.mutex};
-    return texture_cache.HasAsyncFlushWork();
-}
-
-template <typename Signal>
-void FenceManager::SignalWithTextureDownloads(Signal&& signal) {
-    if (!AsyncFences() || !TextureDownloadsPending()) {
-        signal();
-        return;
-    }
-    // The texture cache downloads synchronously (IMPLEMENTS_ASYNC_DOWNLOADS false): the fencing
-    // thread pops the fence's downloads by recording copies and Scheduler::Finish. The fence is
-    // held (IsSignaled false, Wait blocks) until this thread is done with the scheduler, and this
-    // thread then waits for an operation the fencing thread runs after the fence's pops.
-    const auto handoff = std::make_shared<FenceGate>();
-    const auto popped = std::make_shared<FenceGate>();
-    SyncOperation([popped] { popped->Open(); });
-    next_handoff = handoff;
-    signal();
-    const bool handed = next_handoff == nullptr;
-    next_handoff.reset();
-    if (!handed) {
-        // No fence took the downloads; the operation goes with a later fence, nobody waits.
-        return;
-    }
-    // Nothing commits while this thread waits: every tick the fencing thread waits for first
-    // (earlier fences', RequestCommit's) is committed now. FenceTick leaves them pending only
-    // as flush_pending, which FlushDeferred commits.
-    scheduler.FlushDeferred();
-    handoff->Open();
-    VideoCommon::BackWaitScope wait_scope{"Metal::FenceManager (texture downloads popped on the "
-                                          "fencing thread)"};
-    popped->WaitOpen();
-}
-
-void FenceManager::SignalFence(std::function<void()>&& func, bool force_completion) {
-    SignalWithTextureDownloads(
-        [&] { GenericFenceManager::SignalFence(std::move(func), force_completion); });
-}
-
-void FenceManager::SignalSyncPoint(u32 value) {
-    if (value >= Tegra::Host1x::SyncpointManager::NUM_MAX_SYNCPOINTS) {
-        // Ignored by the base without a fence.
-        GenericFenceManager::SignalSyncPoint(value);
-        return;
-    }
-    SignalWithTextureDownloads([&] { GenericFenceManager::SignalSyncPoint(value); });
-}
-
 void FenceManager::WaitPendingFences(bool force) {
-    if (AsyncFences()) {
-        if (force && TextureDownloadsPending()) {
-            // The base's own fence would have the fencing thread pop the downloads while this
-            // thread still submits (SubmitDeferredWork): a fence of their own first.
-            SignalFence([] {});
-        }
-        if (!force && !VideoCommon::GpuSplit::OnBackThread() &&
-            VideoCommon::GpuSplit::OwnsScheduler()) {
-            // Without the split nothing runs an idle hook: work left pending for the fencing
-            // thread (FenceTick with EDEN_NX2_METAL_FENCE_BATCH=2, RequestCommit) is committed
-            // at each command list end.
-            scheduler.FlushDeferred();
-        }
+    if (AsyncFences() && !force && !VideoCommon::GpuSplit::OnBackThread() &&
+        VideoCommon::GpuSplit::OwnsScheduler()) {
+        // Without the split nothing runs an idle hook: work left pending for the fencing
+        // thread (FenceTick with EDEN_NX2_METAL_FENCE_BATCH=2, RequestCommit) is committed
+        // at each command list end.
+        scheduler.FlushDeferred();
     }
     GenericFenceManager::WaitPendingFences(force);
 }
@@ -173,10 +85,6 @@ Fence FenceManager::CreateFence(bool is_stubbed) {
 }
 
 void FenceManager::QueueFence(Fence& fence) {
-    if (next_handoff && !fence->IsStubbed()) {
-        fence->SetHandoff(std::move(next_handoff));
-        next_handoff.reset();
-    }
     fence->Queue();
 }
 

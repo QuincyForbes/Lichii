@@ -255,6 +255,8 @@ class BufferCache : public VideoCommon::ChannelSetupCaches<BufferCacheChannelInf
 
     struct OverlapResult {
         boost::container::small_vector<BufferId, 16> ids;
+        /// Large buffers that only touch the range: deleted, not joined
+        boost::container::small_vector<BufferId, 2> cut;
         DAddr begin;
         DAddr end;
         bool has_stream_leap = false;
@@ -526,6 +528,9 @@ public:
     /// Commit asynchronous downloads
     void CommitAsyncFlushes();
     void CommitAsyncFlushesHigh();
+    /// Commits asynchronous downloads, returning false (with no empty slot queued) when 0 GPU
+    /// copies were recorded.
+    [[nodiscard]] bool TryCommitAsyncFlushes();
 
     /// Pop asynchronous downloads
     void PopAsyncFlushes();
@@ -1266,6 +1271,9 @@ private:
         if (!exact) {
             if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
                 uncommitted_gpu_modified_ranges.Add(device_addr, size);
+                if (Nx2Perf::On(Nx2Perf::Opt::PreflushAging)) {
+                    Nx2NotePreflushWrite(device_addr, device_addr + size);
+                }
             }
             ArmReadTraps(device_addr, size);
             return;
@@ -1278,6 +1286,9 @@ private:
             if (lower < upper) {
                 uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
                 queued += upper - lower;
+                if (Nx2Perf::On(Nx2Perf::Opt::PreflushAging)) {
+                    Nx2NotePreflushWrite(lower, upper);
+                }
             }
         });
         ArmReadTraps(device_addr, size);
@@ -1314,16 +1325,33 @@ private:
     void Nx2AgePreflushBlocks();
 
     static constexpr u64 NX2_PREFLUSH_BLOCK_BITS = 16; ///< 64 KiB blocks
-    static constexpr u32 NX2_PREFLUSH_MIN_LIMIT = 120;  ///< Frames unread before a drop
+    static constexpr u32 NX2_PREFLUSH_MIN_LIMIT = 256; ///< Unread GPU-write frames before a drop
     static constexpr u32 NX2_PREFLUSH_MAX_LIMIT = 3600;
-    /// A 64 KiB block with Preflushable marks. Without PreflushAging reads of marked ranges are
-    /// not trapped, so `last_read_frame` is when the block was first marked. Guarded by `mutex`.
+    /// A 64 KiB block with Preflushable marks. Aged by frames in which QueueFenceDownload queued
+    /// downloads from the block without a CPU read, so quiet blocks keep their marks at zero cost.
+    /// Guarded by `mutex`.
     struct Nx2PreflushBlock {
         u64 last_read_frame{};
+        u64 last_write_frame{~u64{0}}; ///< Last frame_tick QueueFenceDownload counted for this block
         u64 limit_frame{};  ///< Dropped: start of the decay period (the drop or the last halving)
+        u32 unread_write_frames{};     ///< Distinct frame_ticks with queued downloads since last read
         u32 limit_frames{NX2_PREFLUSH_MIN_LIMIT};
         bool dropped{};     ///< Marks dropped (PreflushAging) and not marked again since
     };
+    void Nx2NotePreflushWrite(DAddr begin, DAddr end) {
+        if (begin >= end || nx2_preflush_blocks.empty()) {
+            return;
+        }
+        for (u64 block = begin >> NX2_PREFLUSH_BLOCK_BITS;
+             block <= (end - 1) >> NX2_PREFLUSH_BLOCK_BITS; ++block) {
+            if (const auto it = nx2_preflush_blocks.find(block);
+                it != nx2_preflush_blocks.end() && !it->second.dropped &&
+                it->second.last_write_frame != frame_tick) {
+                it->second.last_write_frame = frame_tick;
+                ++it->second.unread_write_frames;
+            }
+        }
+    }
     std::unordered_map<u64, Nx2PreflushBlock> nx2_preflush_blocks;
     u64 nx2_preflush_drops{};   ///< Blocks dropped since start
     u64 nx2_preflush_remarks{}; ///< Reads of dropped blocks that flushed (stalled) and marked them
@@ -1365,6 +1393,8 @@ private:
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
     u64 frame_tick = 0;
+    /// Buffers created since the last TickFrame; ResolveOverlaps does not cut these
+    std::vector<BufferId> frame_created_buffers;
     bool fence_behavior_accurate = true; ///< Settings::IsGPUFenceBehaviorAccurate, per frame
 
     /// EDEN_NX2_EXP18 (zortos293/Lichii#641): resolved bindings are kept while the GPU mappings

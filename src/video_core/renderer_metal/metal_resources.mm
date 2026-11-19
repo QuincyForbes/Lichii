@@ -208,9 +208,13 @@ MTLTextureDescriptor* MakeTextureDescriptor(const TextureDesc& desc) {
     descriptor.sampleCount = (std::max)(desc.samples, 1U);
     descriptor.storageMode = MTLStorageModePrivate;
     // Format views reinterpret texture cache images (ImageView formats, copies between
-    // compatible formats). It costs lossless compression on some GPUs; narrowing it to images
-    // that need it is a later step (docs/nx2/metal-renderer.md).
-    MTLTextureUsage usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    // compatible formats); internal targets, MSAA textures and pure depth omit the flag so Apple
+    // GPUs keep lossless compression on them.
+    const bool pure_depth = desc.format == Fmt::Depth32Float || desc.format == Fmt::Depth16Unorm;
+    MTLTextureUsage usage = MTLTextureUsageShaderRead;
+    if (desc.pixel_format_view && desc.samples <= 1 && !pure_depth) {
+        usage |= MTLTextureUsagePixelFormatView;
+    }
     if (desc.render_target) {
         usage |= MTLTextureUsageRenderTarget;
     }
@@ -224,6 +228,10 @@ MTLTextureDescriptor* MakeTextureDescriptor(const TextureDesc& desc) {
 }
 
 } // Anonymous namespace
+
+const void* DeviceHandle(const Device& device) {
+    return (__bridge const void*)device.GetDevice();
+}
 
 u64 DeviceMemoryBudget(const Device& device) {
     return device.MemoryBudget();
@@ -406,6 +414,9 @@ Object CreateTextureView(TextureHandle texture, u32 format, TextureKind kind, u3
         if (levels == 0 || layers == 0 || u64{base_level} + levels > base.mipmapLevelCount ||
             u64{base_layer} + layers > slices) {
             reason = "levels or slices past the texture";
+        } else if (base.pixelFormat != static_cast<MTLPixelFormat>(format) &&
+                   (base.usage & MTLTextureUsagePixelFormatView) == 0) {
+            reason = "made without format views";
         } else if (reason = CheckTextureView(KindOf(base.textureType), kind, layers);
                    reason.empty()) {
             if (const char* const cast = ViewFormatReason(
@@ -573,14 +584,19 @@ Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc,
         // Tegra's DepthCompareFunc has MTLCompareFunction's values.
         descriptor.compareFunction = static_cast<MTLCompareFunction>(tsc.depth_compare_func.Value());
     }
-    descriptor.lodMinClamp = tsc.MinLod();
-    descriptor.lodMaxClamp = (std::max)(tsc.MaxLod(), tsc.MinLod());
-    // Vulkan's EDEN_NX2_FORCE_LOD0 (read under EDEN_NX2_METAL_VULKAN_SWITCHES): mipmapped
-    // samplers read the top level only (a debug aid for mip layout problems).
-    static const bool force_lod0 = VulkanSwitch("EDEN_NX2_FORCE_LOD0") != nullptr;
-    if (force_lod0 && tsc.mipmap_filter != TextureMipmapFilter::None) {
+    if (descriptor.mipFilter == MTLSamplerMipFilterNotMipmapped) {
         descriptor.lodMinClamp = 0.0f;
         descriptor.lodMaxClamp = 0.25f;
+    } else {
+        descriptor.lodMinClamp = tsc.MinLod();
+        descriptor.lodMaxClamp = (std::max)(tsc.MaxLod(), tsc.MinLod());
+        // Vulkan's EDEN_NX2_FORCE_LOD0 (read under EDEN_NX2_METAL_VULKAN_SWITCHES): mipmapped
+        // samplers read the top level only (a debug aid for mip layout problems).
+        static const bool force_lod0 = VulkanSwitch("EDEN_NX2_FORCE_LOD0") != nullptr;
+        if (force_lod0) {
+            descriptor.lodMinClamp = 0.0f;
+            descriptor.lodMaxClamp = 0.25f;
+        }
     }
     f32 anisotropy = std::clamp(tsc.MaxAnisotropy(), 1.0f, 16.0f);
     if (options.force_nearest) {

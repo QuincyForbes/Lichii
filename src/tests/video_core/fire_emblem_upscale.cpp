@@ -26,7 +26,9 @@ TICEntry Image(u32 address, u32 width, u32 height) {
 
 TEST_CASE("FE upscale substitute only selects the captured output pass", "[fe_upscale]") {
     REQUIRE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, nullptr));
-    REQUIRE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, "fsr"));
+    for (const char* option : {"fsr", "fsr4", "dlss", "spatial"}) {
+        REQUIRE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, option));
+    }
     for (const char* option : {"native", "standin", "0", "", "10", "invalid"}) {
         REQUIRE_FALSE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, option));
     }
@@ -126,7 +128,8 @@ TEST_CASE("Star Fox spatial replacement selects only its captured output", "[sta
     constexpr u64 program_id = 0x0400E88025B1A000ULL;
     constexpr u64 prepass = 0xd686ca0b9fad9e6dULL;
     constexpr u64 output = 0x7d3764ff101bec27ULL;
-    for (const char* option : {static_cast<const char*>(nullptr), "fsr", "dlss"}) {
+    for (const char* option :
+         {static_cast<const char*>(nullptr), "fsr", "fsr4", "dlss", "spatial"}) {
         REQUIRE(FE::UseReplacement(program_id, output, option));
         REQUIRE_FALSE(FE::UseReplacement(program_id, prepass, option));
         REQUIRE_FALSE(FE::UseReplacement(program_id, FE::OutputProgramKey, option));

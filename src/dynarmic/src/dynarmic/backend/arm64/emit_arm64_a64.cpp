@@ -7,6 +7,7 @@
  */
 
 #include <bit>
+#include <cstdlib>
 #include <oaknut/oaknut.hpp>
 
 #include "dynarmic/backend/arm64/a64_jitstate.h"
@@ -24,11 +25,25 @@ namespace Dynarmic::Backend::Arm64 {
 
 using namespace oaknut::util;
 
-oaknut::Label EmitA64Cond(oaknut::CodeGenerator& code, EmitContext&, IR::Cond cond) {
+namespace {
+
+bool ReuseHostFlagsOn() {
+    static const bool on = [] {
+        const char* const value = std::getenv("EDEN_NX2_JIT_FLAGS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+
+}  // namespace
+
+oaknut::Label EmitA64Cond(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Cond cond) {
     oaknut::Label pass;
-    // TODO: Flags in host flags
-    code.LDR(Wscratch0, Xstate, offsetof(A64JitState, cpsr_nzcv));
-    code.MSR(oaknut::SystemReg::NZCV, Xscratch0);
+    if (ctx.conf.enable_cycle_counting || !ReuseHostFlagsOn() || ctx.ebi.nzcv_live_pos == nullptr ||
+        code.xptr<const void*>() != ctx.ebi.nzcv_live_pos) {
+        code.LDR(Wscratch0, Xstate, offsetof(A64JitState, cpsr_nzcv));
+        code.MSR(oaknut::SystemReg::NZCV, Xscratch0);
+    }
     code.B(static_cast<oaknut::Cond>(cond), pass);
     return pass;
 }
@@ -228,19 +243,24 @@ void EmitIR<IR::Opcode::A64SetNZCVRaw>(oaknut::CodeGenerator& code, EmitContext&
     RegAlloc::Realize(Wnzcv);
 
     code.STR(Wnzcv, Xstate, offsetof(A64JitState, cpsr_nzcv));
+    ctx.ebi.nzcv_live_pos = nullptr;
 }
 
 template<>
 void EmitIR<IR::Opcode::A64SetNZCV>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const bool from_flags = ReuseHostFlagsOn() && !args[0].IsImmediate() &&
+                            args[0].CurrentLocationKind(ctx.reg_alloc) == HostLoc::Kind::Flags;
     auto Wnzcv = ctx.reg_alloc.ReadW(args[0]);
     RegAlloc::Realize(Wnzcv);
 
     code.STR(Wnzcv, Xstate, offsetof(A64JitState, cpsr_nzcv));
+    ctx.ebi.nzcv_live_pos = from_flags ? code.xptr<const void*>() : nullptr;
 }
 
 template<>
 void EmitIR<IR::Opcode::A64GetW>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
 
     auto Wresult = ctx.reg_alloc.WriteW(inst);
@@ -249,10 +269,14 @@ void EmitIR<IR::Opcode::A64GetW>(oaknut::CodeGenerator& code, EmitContext& ctx, 
     // TODO: Detect if Gpr vs Fpr is more appropriate
 
     code.LDR(Wresult, Xstate, offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg));
+    if (flags_live) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
 }
 
 template<>
 void EmitIR<IR::Opcode::A64GetX>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
 
     auto Xresult = ctx.reg_alloc.WriteX(inst);
@@ -261,6 +285,9 @@ void EmitIR<IR::Opcode::A64GetX>(oaknut::CodeGenerator& code, EmitContext& ctx, 
     // TODO: Detect if Gpr vs Fpr is more appropriate
 
     code.LDR(Xresult, Xstate, offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg));
+    if (flags_live) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
 }
 
 template<>
@@ -313,6 +340,7 @@ void EmitIR<IR::Opcode::A64GetFPSR>(oaknut::CodeGenerator&, EmitContext& ctx, IR
 
 template<>
 void EmitIR<IR::Opcode::A64SetW>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
 
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
@@ -323,10 +351,14 @@ void EmitIR<IR::Opcode::A64SetW>(oaknut::CodeGenerator& code, EmitContext& ctx, 
     // TODO: Detect if Gpr vs Fpr is more appropriate
     code.MOV(*Wvalue, Wvalue);
     code.STR(Wvalue->toX(), Xstate, offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg));
+    if (flags_live) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
 }
 
 template<>
 void EmitIR<IR::Opcode::A64SetX>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
 
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
@@ -337,28 +369,56 @@ void EmitIR<IR::Opcode::A64SetX>(oaknut::CodeGenerator& code, EmitContext& ctx, 
     // TODO: Detect if Gpr vs Fpr is more appropriate
 
     code.STR(Xvalue, Xstate, offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg));
+    if (flags_live) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
 }
 
 template<>
 void EmitIR<IR::Opcode::A64SetS>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const A64::Vec vec = inst->GetArg(0).GetA64VecRef();
-    auto Svalue = ctx.reg_alloc.ReadS(args[1]);
-    RegAlloc::Realize(Svalue);
+    const std::size_t reg_off = offsetof(A64JitState, vec) + sizeof(u64) * 2 * static_cast<size_t>(vec);
 
-    code.FMOV(Svalue, Svalue);
-    code.STR(Svalue->toQ(), Xstate, offsetof(A64JitState, vec) + sizeof(u64) * 2 * static_cast<size_t>(vec));
+    if (args[1].IsImmediate() && args[1].GetImmediateU32() == 0) {
+        code.STR(XZR, Xstate, reg_off);
+        code.STR(XZR, Xstate, reg_off + 8);
+        return;
+    }
+    if (args[1].IsInGpr(ctx.reg_alloc)) {
+        auto Wvalue = ctx.reg_alloc.ReadW(args[1]);
+        RegAlloc::Realize(Wvalue);
+        code.STR(Wvalue, Xstate, reg_off);
+    } else {
+        auto Svalue = ctx.reg_alloc.ReadS(args[1]);
+        RegAlloc::Realize(Svalue);
+        code.STR(Svalue, Xstate, reg_off);
+    }
+    code.STR(WZR, Xstate, reg_off + 4);
+    code.STR(XZR, Xstate, reg_off + 8);
 }
 
 template<>
 void EmitIR<IR::Opcode::A64SetD>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const A64::Vec vec = inst->GetArg(0).GetA64VecRef();
-    auto Dvalue = ctx.reg_alloc.ReadD(args[1]);
-    RegAlloc::Realize(Dvalue);
+    const std::size_t reg_off = offsetof(A64JitState, vec) + sizeof(u64) * 2 * static_cast<size_t>(vec);
 
-    code.FMOV(Dvalue, Dvalue);
-    code.STR(Dvalue->toQ(), Xstate, offsetof(A64JitState, vec) + sizeof(u64) * 2 * static_cast<size_t>(vec));
+    if (args[1].IsImmediate() && args[1].GetImmediateU64() == 0) {
+        code.STR(XZR, Xstate, reg_off);
+        code.STR(XZR, Xstate, reg_off + 8);
+        return;
+    }
+    if (args[1].IsInGpr(ctx.reg_alloc)) {
+        auto Xvalue = ctx.reg_alloc.ReadX(args[1]);
+        RegAlloc::Realize(Xvalue);
+        code.STR(Xvalue, Xstate, reg_off);
+    } else {
+        auto Dvalue = ctx.reg_alloc.ReadD(args[1]);
+        RegAlloc::Realize(Dvalue);
+        code.STR(Dvalue, Xstate, reg_off);
+    }
+    code.STR(XZR, Xstate, reg_off + 8);
 }
 
 template<>
@@ -500,6 +560,28 @@ void EmitIR<IR::Opcode::A64GetCNTFRQ>(oaknut::CodeGenerator& code, EmitContext& 
 
 template<>
 void EmitIR<IR::Opcode::A64GetCNTPCT>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    if (ctx.conf.wall_clock_cntpct && ctx.conf.inline_cntpct) {
+        auto Xresult = ctx.reg_alloc.WriteX(inst);
+        RegAlloc::Realize(Xresult);
+
+        code.ISB();
+        code.MRS(*Xresult, oaknut::SystemReg::CNTVCT_EL0);
+        if (ctx.conf.cntpct_scale_hi == 0) {
+            code.MOV(Xscratch0, ctx.conf.cntpct_scale_lo);
+            code.UMULH(*Xresult, *Xresult, Xscratch0);
+        } else if (ctx.conf.cntpct_scale_hi == 1) {
+            code.MOV(Xscratch0, ctx.conf.cntpct_scale_lo);
+            code.UMULH(Xscratch1, *Xresult, Xscratch0);
+            code.ADD(*Xresult, Xscratch1, *Xresult);
+        } else {
+            code.MOV(Xscratch0, ctx.conf.cntpct_scale_lo);
+            code.UMULH(Xscratch1, *Xresult, Xscratch0);
+            code.MOV(Xscratch0, ctx.conf.cntpct_scale_hi);
+            code.MADD(*Xresult, *Xresult, Xscratch0, Xscratch1);
+        }
+        return;
+    }
+
     ctx.reg_alloc.PrepareForCall();
     if (!ctx.conf.wall_clock_cntpct && ctx.conf.enable_cycle_counting) {
         code.LDR(X1, SP, offsetof(StackLayout, cycles_to_run));

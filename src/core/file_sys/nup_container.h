@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <condition_variable>
 #include <filesystem>
 #include <functional>
 #include <list>
@@ -39,40 +40,48 @@ struct NupSpillFile {
 struct NupDecompressCache {
     static constexpr std::size_t DefaultCap = 512 * 1024 * 1024;
 
-    using Entry = std::pair<std::size_t, std::vector<u8>>;
+    using DataPtr = std::shared_ptr<const std::vector<u8>>;
+    using Entry = std::pair<std::size_t, DataPtr>;
+
+    struct InFlight {
+        std::condition_variable cv;
+        DataPtr result;
+        bool done{};
+    };
 
     std::mutex mutex;
     std::list<Entry> lru;
     std::unordered_map<std::size_t, std::list<Entry>::iterator> index;
+    std::unordered_map<std::size_t, std::shared_ptr<InFlight>> in_flight;
     std::size_t bytes{};
     std::size_t cap{DefaultCap};
     std::filesystem::path spill_dir;
     std::unordered_map<std::size_t, std::shared_ptr<NupSpillFile>> spills;
 
-    std::vector<u8>* Find(std::size_t file_index) {
+    DataPtr Find(std::size_t file_index) {
         const auto it = index.find(file_index);
         if (it == index.end()) {
             return nullptr;
         }
         lru.splice(lru.begin(), lru, it->second);
-        return &it->second->second;
+        return it->second->second;
     }
 
-    /// Takes ownership of `data` only when it is inserted.
-    void Insert(std::size_t file_index, std::vector<u8>& data) {
-        if (index.contains(file_index)) {
+    void Insert(std::size_t file_index, const DataPtr& data) {
+        if (!data || index.contains(file_index)) {
             return;
         }
-        while (bytes + data.size() > cap && !lru.empty()) {
-            bytes -= lru.back().second.size();
+        const std::size_t data_size = data->size();
+        while (bytes + data_size > cap && !lru.empty()) {
+            bytes -= lru.back().second->size();
             index.erase(lru.back().first);
             lru.pop_back();
         }
-        if (bytes + data.size() > cap) {
+        if (bytes + data_size > cap) {
             return;
         }
-        bytes += data.size();
-        lru.emplace_front(file_index, std::move(data));
+        bytes += data_size;
+        lru.emplace_front(file_index, data);
         index.emplace(file_index, lru.begin());
     }
 

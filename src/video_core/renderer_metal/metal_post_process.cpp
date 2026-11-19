@@ -228,7 +228,8 @@ bool PostProcess::BuildEffects() {
                                                      .format = out.format,
                                                      .width = (std::max)(out.size[0], 1U),
                                                      .height = (std::max)(out.size[1], 1U),
-                                                     .render_target = true});
+                                                     .render_target = true,
+                                                     .pixel_format_view = false});
             }
             effect.textures.push_back(std::move(out));
         }
@@ -560,13 +561,15 @@ TextureHandle PostProcess::Apply(TextureHandle source, std::array<u32, 2> size) 
                                            .format = BACKBUFFER_FORMAT,
                                            .width = size[0],
                                            .height = size[1],
-                                           .render_target = true});
+                                           .render_target = true,
+                                           .pixel_format_view = false});
         }
         fallback = CreateTexture(device, {.kind = TextureKind::e2D,
                                           .format = Fmt::RGBA8Unorm,
                                           .width = 1,
                                           .height = 1,
-                                          .render_target = true});
+                                          .render_target = true,
+                                          .pixel_format_view = false});
         fallback_sampler = CreateLinearClampSampler(device);
         if (!frames[0] || !frames[1] || !fallback || !fallback_sampler) {
             effects.clear();

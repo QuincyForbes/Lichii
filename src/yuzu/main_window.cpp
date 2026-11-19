@@ -199,6 +199,12 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#endif
+#if defined(_WIN32) || defined(__linux__)
+#include "video_core/vulkan_common/ffx_runtime.h"
+#endif
 
 #include <SDL3/SDL.h>
 
@@ -1576,6 +1582,7 @@ void MainWindow::InitializeWidgets() {
     shader_building_label->setToolTip(tr("The amount of shaders currently being built"));
     res_scale_label = new QLabel();
     res_scale_label->setToolTip(tr("The current selected resolution scaling multiplier."));
+    upscaler_status_label = new QLabel();
     emu_speed_label = new QLabel();
     emu_speed_label->setToolTip(
         tr("Current emulation speed. Values higher or lower than 100% "
@@ -1591,8 +1598,8 @@ void MainWindow::InitializeWidgets() {
         tr("Time taken to emulate a Switch frame, not counting framelimiting or v-sync. For "
            "full-speed emulation this should be at most 16.67 ms."));
 
-    for (auto& label : {shader_building_label, res_scale_label, emu_speed_label, game_fps_label,
-                        emu_frametime_label}) {
+    for (auto& label : {shader_building_label, res_scale_label, upscaler_status_label,
+                        emu_speed_label, game_fps_label, emu_frametime_label}) {
         label->setVisible(false);
         label->setFrameStyle(QFrame::NoFrame);
         label->setContentsMargins(4, 0, 4, 0);
@@ -1755,6 +1762,11 @@ void MainWindow::InitializeWidgets() {
             [this](const QPoint& menu_location) {
                 QMenu context_menu;
                 for (auto const& filter_text_pair : UiText::ChoiceNames<Settings::ScalingFilter>()) {
+#ifndef LICHII_METALFX
+                    if (filter_text_pair.first == Settings::ScalingFilter::MetalFxSpatial) {
+                        continue;
+                    }
+#endif
                     context_menu.addAction(filter_text_pair.second, [this, filter_text_pair] {
                         Settings::values.scaling_filter.SetValue(filter_text_pair.first);
                         UpdateFilterText();
@@ -3077,9 +3089,13 @@ void MainWindow::OnEmulationStopped() {
     status_bar_update_timer.stop();
     shader_building_label->setVisible(false);
     res_scale_label->setVisible(false);
+    upscaler_status_label->setVisible(false);
     emu_speed_label->setVisible(false);
     game_fps_label->setVisible(false);
     emu_frametime_label->setVisible(false);
+    renderer_gen_fps_timer.invalidate();
+    last_renderer_generated_frames = 0;
+    nvidia_frame_gen_active = false;
     renderer_status_button->setEnabled(!UISettings::values.has_broken_vulkan);
     refresh_button->setEnabled(true);
 
@@ -4661,11 +4677,18 @@ void MainWindow::OnIncreaseVolume() {
 }
 
 void MainWindow::OnToggleAdaptingFilter() {
-    auto filter = Settings::values.scaling_filter.GetValue();
-    filter = Settings::ScalingFilter(u32(filter) + 1);
-    if (u32(filter) > u32(Settings::EnumMetadata<Settings::ScalingFilter>::GetLast()))
-        filter = Settings::EnumMetadata<Settings::ScalingFilter>::GetFirst();
-    Settings::values.scaling_filter.SetValue(filter);
+    auto names = UiText::ChoiceNames<Settings::ScalingFilter>();
+#ifndef LICHII_METALFX
+    names.erase(Settings::ScalingFilter::MetalFxSpatial);
+#endif
+    if (names.empty()) {
+        return;
+    }
+    auto it = names.upper_bound(Settings::values.scaling_filter.GetValue());
+    if (it == names.end()) {
+        it = names.begin();
+    }
+    Settings::values.scaling_filter.SetValue(it->first);
     filter_status_button->setChecked(true);
     UpdateFilterText();
 }
@@ -5783,6 +5806,26 @@ void MainWindow::UpdateStatusBar() {
         tas_label->clear();
 
     auto results = QtCommon::system->GetAndResetPerfStats();
+    auto& renderer = QtCommon::system->GPU().Renderer();
+    nvidia_frame_gen_active = renderer.IsNvidiaFrameGenActive();
+    const u64 total_gen_frames = renderer.GeneratedFrames();
+    if (!renderer_gen_fps_timer.isValid()) {
+        renderer_gen_fps_timer.start();
+        last_renderer_generated_frames = total_gen_frames;
+    } else {
+        const qint64 elapsed_ms = renderer_gen_fps_timer.restart();
+        const u64 delta_frames = total_gen_frames >= last_renderer_generated_frames
+                                     ? (total_gen_frames - last_renderer_generated_frames)
+                                     : 0;
+        last_renderer_generated_frames = total_gen_frames;
+        if (nvidia_frame_gen_active && results.generated_fps < 0.5 && elapsed_ms > 0 &&
+            delta_frames > 0) {
+            results.generated_fps =
+                static_cast<double>(delta_frames) * 1000.0 / static_cast<double>(elapsed_ms);
+            results.total_fps = results.average_game_fps + results.generated_fps;
+        }
+    }
+
     auto& shader_notify = QtCommon::system->GPU().ShaderNotify();
     const int shaders_building = shader_notify.ShadersBuilding();
 
@@ -5800,6 +5843,48 @@ void MainWindow::UpdateStatusBar() {
     res_scale_label->setText(
         tr("Scale: %1x", "%1 is the resolution scaling factor").arg(res_scale));
 
+    QString upscaler_text;
+    QString upscaler_tooltip;
+#ifdef EGLANTINE_STREAMLINE
+    if (Settings::NvidiaDlssChosen()) {
+        const auto dlss = Vulkan::Streamline::GetSessionStatus();
+        if (dlss.available && dlss.frames > 0) {
+            upscaler_text = QStringLiteral("DLSS");
+            if (!dlss.mode_name.empty()) {
+                upscaler_text +=
+                    QLatin1Char(' ') + QString::fromStdString(dlss.mode_name).toUpper();
+            }
+            if (!dlss.preset_name.empty()) {
+                upscaler_text +=
+                    QLatin1Char(' ') + QString::fromStdString(dlss.preset_name).toUpper();
+            }
+            upscaler_tooltip =
+                tr("%1 (%2) active — %3 frames upscaled. Screen filter runs after it.")
+                    .arg(UiText::ChoiceLabel("upscaler", "Dlss"),
+                         dlss.version.empty() ? QStringLiteral("Streamline")
+                                              : QString::fromStdString(dlss.version))
+                    .arg(dlss.frames);
+        }
+    }
+#endif
+#if defined(_WIN32) || defined(__linux__)
+    if (upscaler_text.isEmpty() && Settings::AmdFsr4Chosen()) {
+        const auto fsr4 = Vulkan::FfxRuntime::GetSessionStatus();
+        if (fsr4.available && fsr4.frames > 0) {
+            const QString ver = QString::fromStdString(fsr4.version);
+            upscaler_text = ver.startsWith(QStringLiteral("4."))
+                                ? QStringLiteral("FSR %1").arg(ver)
+                                : QStringLiteral("FSR 4");
+            upscaler_tooltip = tr("%1 active — %2 frames upscaled. Screen filter runs after it.")
+                                   .arg(UiText::ChoiceLabel("upscaler", "Fsr4"))
+                                   .arg(fsr4.frames);
+        }
+    }
+#endif
+    upscaler_status_label->setText(upscaler_text);
+    upscaler_status_label->setToolTip(upscaler_tooltip);
+    upscaler_status_label->setVisible(!upscaler_text.isEmpty());
+
     if (Settings::values.use_speed_limit.GetValue()) {
         emu_speed_label->setText(tr("Speed: %1% / %2%")
                                      .arg(results.emulation_speed * 100.0, 0, 'f', 0)
@@ -5808,8 +5893,15 @@ void MainWindow::UpdateStatusBar() {
         emu_speed_label->setText(tr("Speed: %1%").arg(results.emulation_speed * 100.0, 0, 'f', 0));
     }
 
-    const auto fg_method_name = [] {
-        return UiText::ChoiceNames<Settings::FrameGenType>()[Settings::values.frame_gen_type.GetValue()];
+    const auto fg_method_name = [this] {
+        auto fg_type = Settings::values.frame_gen_type.GetValue();
+        if (nvidia_frame_gen_active) {
+            fg_type = Settings::FrameGenType::NvidiaDlssG;
+        } else if (fg_type == Settings::FrameGenType::NvidiaDlssG) {
+            fg_type = Settings::FrameGenType::Fsr3;
+        }
+        return UiText::ChoiceLabel(Settings::EnumMetadata<Settings::FrameGenType>::Index(),
+                                   static_cast<u32>(fg_type));
     };
 
     QString fpsText;
@@ -5820,6 +5912,10 @@ void MainWindow::UpdateStatusBar() {
                       .arg(results.generated_fps, 0, 'f', 1)
                       .arg(results.total_fps, 0, 'f', 1)
                       .arg(mult, 0, 'f', 1)
+                      .arg(fg_method_name());
+    } else if (nvidia_frame_gen_active) {
+        fpsText = tr("Real: %1 FPS | FG (%2): Paused")
+                      .arg(results.average_game_fps, 0, 'f', 1)
                       .arg(fg_method_name());
     } else if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan &&
                Settings::values.frame_gen.GetValue()) {
@@ -5906,7 +6002,8 @@ void MainWindow::UpdateAPIText() {
 
 void MainWindow::UpdateFilterText() {
     const auto filter = Settings::values.scaling_filter.GetValue();
-    const auto filter_text = UiText::ChoiceNames<Settings::ScalingFilter>().find(filter)->second;
+    const auto filter_text = UiText::ChoiceLabel(
+        Settings::EnumMetadata<Settings::ScalingFilter>::Index(), static_cast<u32>(filter));
     filter_status_button->setText(filter_text.toUpper());
 }
 

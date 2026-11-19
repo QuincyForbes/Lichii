@@ -26,7 +26,14 @@ public:
     void Refresh();
 
     /// The GPU the renderer uses (the Graphics tab's device).
-    void SetDevice(const QString& name);
+    void SetDevice(const QString& name, bool capable = true);
+
+    /// Whether DLSS Frame Generation is the chosen frame generation type: the panel then lists
+    /// its files and downloads them with the rest.
+    void SetFrameGenWanted(bool wanted);
+
+    /// Whether NVIDIA DLSS is currently chosen in the Upscaler combobox.
+    void SetUpscalerSelected(bool selected);
 
 protected:
     void showEvent(QShowEvent* event) override;
@@ -42,6 +49,9 @@ private:
     QPushButton* folder_button;
     QTimer* refresh_timer;
     QString device_name;
+    bool device_capable{true};
+    bool frame_gen_wanted{};
+    bool upscaler_selected{true};
 };
 
 #endif

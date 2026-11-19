@@ -129,7 +129,9 @@ VertexProgramUse VertexUse(const StageProgram& program) {
     }
     const ShaderTranslate::TessellationSlots& slots = program.tessellation_slots;
     for (const u32 slot : {slots.output, slots.patch_output, slots.tess_factors, slots.input,
-                           slots.patch_input, slots.indirect_params, slots.index}) {
+                           slots.patch_input, slots.indirect_params, slots.index,
+                           program.spill_slot, program.sampler_spill_slot,
+                           program.array_spill_slot, program.reduction_slot}) {
         if (slot != ~0U) {
             use.resource_slots = (std::max)(use.resource_slots, slot + 1);
         }
@@ -156,21 +158,109 @@ void ApplyTessellation(RenderPipelineDesc& desc, const Tessellation& tessellatio
     desc.tess_winding = tessellation.modes.clockwise ? 1U : 0U;
 }
 
+namespace {
+
+[[nodiscard]] u64 PackCompare(Maxwell::ComparisonOp op) noexcept {
+    using C = Maxwell::ComparisonOp;
+    switch (op) {
+    case C::Never_D3D:
+    case C::Never_GL:
+        return 0;
+    case C::Less_D3D:
+    case C::Less_GL:
+        return 1;
+    case C::Equal_D3D:
+    case C::Equal_GL:
+        return 2;
+    case C::LessEqual_D3D:
+    case C::LessEqual_GL:
+        return 3;
+    case C::Greater_D3D:
+    case C::Greater_GL:
+        return 4;
+    case C::NotEqual_D3D:
+    case C::NotEqual_GL:
+        return 5;
+    case C::GreaterEqual_D3D:
+    case C::GreaterEqual_GL:
+        return 6;
+    case C::Always_D3D:
+    case C::Always_GL:
+        return 7;
+    }
+    return 7;
+}
+
+[[nodiscard]] u64 PackStencilOp(Maxwell::StencilOp::Op op) noexcept {
+    using S = Maxwell::StencilOp::Op;
+    switch (op) {
+    case S::Zero_D3D:
+    case S::Zero_GL:
+        return 0;
+    case S::Replace_D3D:
+    case S::Replace_GL:
+        return 1;
+    case S::IncrSaturate_D3D:
+    case S::IncrSaturate_GL:
+        return 2;
+    case S::DecrSaturate_D3D:
+    case S::DecrSaturate_GL:
+        return 3;
+    case S::Invert_D3D:
+    case S::Invert_GL:
+        return 4;
+    case S::Incr_D3D:
+    case S::Incr_GL:
+        return 5;
+    case S::Decr_D3D:
+    case S::Decr_GL:
+        return 6;
+    default:
+        return 7;
+    }
+}
+
+[[nodiscard]] u64 PackStencilFace(const StencilFaceState& face) noexcept {
+    return PackStencilOp(face.fail) | (PackStencilOp(face.depth_fail) << 3) |
+           (PackStencilOp(face.pass) << 6) | (PackCompare(face.func) << 9) |
+           (u64{face.read_mask & 0xFFU} << 12) | (u64{face.write_mask & 0xFFU} << 20);
+}
+
+} // Anonymous namespace
+
 DepthStencilDesc DepthStencilState(const Maxwell& regs, bool has_depth, bool has_stencil) {
     auto desc = Zeroed<DepthStencilDesc>();
-    desc.depth_test = regs.depth_test_enable != 0 && has_depth ? 1U : 0U;
-    desc.depth_write = regs.depth_write_enabled != 0 ? 1U : 0U;
-    desc.depth_func = regs.depth_test_func;
-    desc.stencil_test = regs.stencil_enable != 0 && has_stencil ? 1U : 0U;
-    desc.front = {regs.stencil_front_op.fail,  regs.stencil_front_op.zfail,
-                  regs.stencil_front_op.zpass, regs.stencil_front_op.func,
-                  regs.stencil_front_func_mask, regs.stencil_front_mask};
-    desc.back = regs.stencil_two_side_enable != 0
-                    ? StencilFaceState{regs.stencil_back_op.fail,  regs.stencil_back_op.zfail,
-                                       regs.stencil_back_op.zpass, regs.stencil_back_op.func,
-                                       regs.stencil_back_func_mask, regs.stencil_back_mask}
-                    : desc.front;
+    if (has_depth && regs.depth_test_enable != 0) {
+        desc.depth_test = 1U;
+        desc.depth_write = regs.depth_write_enabled != 0 ? 1U : 0U;
+        desc.depth_func = regs.depth_test_func;
+    } else {
+        desc.depth_func = Maxwell::ComparisonOp::Always_GL;
+    }
+    if (has_stencil && regs.stencil_enable != 0) {
+        desc.stencil_test = 1U;
+        desc.front = {regs.stencil_front_op.fail,  regs.stencil_front_op.zfail,
+                      regs.stencil_front_op.zpass, regs.stencil_front_op.func,
+                      regs.stencil_front_func_mask & 0xFFU, regs.stencil_front_mask & 0xFFU};
+        desc.back = regs.stencil_two_side_enable != 0
+                        ? StencilFaceState{regs.stencil_back_op.fail,  regs.stencil_back_op.zfail,
+                                           regs.stencil_back_op.zpass, regs.stencil_back_op.func,
+                                           regs.stencil_back_func_mask & 0xFFU,
+                                           regs.stencil_back_mask & 0xFFU}
+                        : desc.front;
+    }
     return desc;
+}
+
+u64 PackDepthStencilKey(const DepthStencilDesc& desc) noexcept {
+    u64 key = (desc.depth_test != 0 ? 1ULL : 0ULL) |
+              (desc.depth_test != 0 && desc.depth_write != 0 ? 2ULL : 0ULL) |
+              ((desc.depth_test != 0 ? PackCompare(desc.depth_func) : 7ULL) << 2) |
+              (desc.stencil_test != 0 ? (1ULL << 5) : 0ULL);
+    if (desc.stencil_test != 0) {
+        key |= (PackStencilFace(desc.front) << 6) | (PackStencilFace(desc.back) << 34);
+    }
+    return key;
 }
 
 } // namespace Metal

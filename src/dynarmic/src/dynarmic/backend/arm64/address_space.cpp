@@ -11,6 +11,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <shared_mutex>
 #include <span>
@@ -62,10 +63,13 @@ bool EnvIs(const char* name, char wanted) {
     return value != nullptr && value[0] == wanted;
 }
 
-// EDEN_NX2_JIT_PACKED_LISTS=1 (the iOS device profile sets it): StoredBlockInfo keeps a block's
-// lists in one packed heap block.
+// EDEN_NX2_JIT_PACKED_LISTS=0 turns it off: StoredBlockInfo keeps a block's lists in one packed
+// heap block.
 bool PackedListsOn() {
-    static const bool on = EnvIs("EDEN_NX2_JIT_PACKED_LISTS", '1');
+    static const bool on = [] {
+        const char* const value = std::getenv("EDEN_NX2_JIT_PACKED_LISTS");
+        return value == nullptr || value[0] != '0';
+    }();
     return on;
 }
 
@@ -438,7 +442,23 @@ CodePtr AddressSpace::Emit(IR::Block block) {
 
     UnprotectCodeMemory();
 
-    EmittedBlockInfo block_info = EmitArm64(code, std::move(block), GetEmitConfig(), fastmem_manager);
+    EmitConfig emit_conf = GetEmitConfig();
+    if (!emit_conf.inline_cntpct && emit_conf.emit_terminal == EmitA64Terminal &&
+        prelude_info.exclusive_read_memory_8 != nullptr) {
+        const auto* tramp = static_cast<const u32*>(prelude_info.exclusive_read_memory_8);
+        if ((tramp[0] & 0xFF00001FU) == 0x58000000U) {
+            const std::size_t byte_off = ((tramp[0] >> 5) & 0x7FFFFU) * sizeof(u32);
+            u64 conf_addr = 0;
+            std::memcpy(&conf_addr, reinterpret_cast<const std::byte*>(tramp) + byte_off, sizeof(conf_addr));
+            const auto* user_conf = std::bit_cast<const A64::UserConfig*>(conf_addr);
+            if (user_conf != nullptr && user_conf->inline_cntpct) {
+                emit_conf.inline_cntpct = true;
+                emit_conf.cntpct_scale_lo = user_conf->cntpct_scale_lo;
+                emit_conf.cntpct_scale_hi = user_conf->cntpct_scale_hi;
+            }
+        }
+    }
+    EmittedBlockInfo block_info = EmitArm64(code, std::move(block), emit_conf, fastmem_manager);
     const CodePtr entry_point = block_info.entry_point;
 
     ASSERT(block_entries.insert({block.Location(), entry_point}).second);

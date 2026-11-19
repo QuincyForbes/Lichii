@@ -204,7 +204,8 @@ Fsr3Upscaler::Texture Fsr3Upscaler::MakeTexture(u32 format, u32 width, u32 heigh
                                          .height = out.size[1],
                                          .levels = levels,
                                          .render_target = !lut,
-                                         .shader_write = !lut});
+                                         .shader_write = !lut,
+                                         .pixel_format_view = false});
     if (out.texture && levels > 1) {
         for (u32 level = 0; level < levels; ++level) {
             out.levels.push_back(CreateTextureView(out.texture.Get(), format, TextureKind::e2D,

@@ -645,13 +645,13 @@ const Win32CacheTopology& GetWin32CacheTopology() {
             return result;
         }
         DWORD length = 0;
-        GetLogicalProcessorInformationEx(RelationCache, nullptr, &length);
+        GetLogicalProcessorInformationEx(RelationAll, nullptr, &length);
         if (length == 0) {
             return result;
         }
         std::vector<u8> buffer(length);
         auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data());
-        if (!GetLogicalProcessorInformationEx(RelationCache, info, &length)) {
+        if (!GetLogicalProcessorInformationEx(RelationAll, info, &length)) {
             return result;
         }
         DWORD max_l3_size = 0;
@@ -661,14 +661,35 @@ const Win32CacheTopology& GetWin32CacheTopology() {
             DWORD_PTR mask;
         };
         std::vector<L3Domain> domains;
+        std::vector<DWORD_PTR> physical_cores;
+        u8 first_efficiency_class = 0;
+        bool has_efficiency_class = false;
+        bool uniform_efficiency_class = true;
         for (DWORD offset = 0; offset < length;) {
             const auto* entry =
                 reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
             if (entry->Size == 0) {
                 break;
             }
-            if (entry->Relationship == RelationCache && entry->Cache.Level == 3 &&
-                (entry->Cache.Type == CacheUnified || entry->Cache.Type == CacheData)) {
+            if (entry->Relationship == RelationProcessorCore) {
+                const PROCESSOR_RELATIONSHIP& core = entry->Processor;
+                DWORD_PTR core_mask = 0;
+                for (WORD g = 0; g < core.GroupCount; ++g) {
+                    if (core.GroupMask[g].Group == 0) {
+                        core_mask |= core.GroupMask[g].Mask & result.process_mask;
+                    }
+                }
+                if (core_mask != 0) {
+                    physical_cores.push_back(core_mask);
+                    if (!has_efficiency_class) {
+                        first_efficiency_class = core.EfficiencyClass;
+                        has_efficiency_class = true;
+                    } else if (core.EfficiencyClass != first_efficiency_class) {
+                        uniform_efficiency_class = false;
+                    }
+                }
+            } else if (entry->Relationship == RelationCache && entry->Cache.Level == 3 &&
+                       (entry->Cache.Type == CacheUnified || entry->Cache.Type == CacheData)) {
                 DWORD_PTR domain_mask = 0;
                 const WORD group_count = entry->Cache.GroupCount > 0 ? entry->Cache.GroupCount : 1;
                 for (WORD g = 0; g < group_count; ++g) {
@@ -685,21 +706,47 @@ const Win32CacheTopology& GetWin32CacheTopology() {
             offset += entry->Size;
         }
         if (domains.size() >= 2 && max_l3_size > min_l3_size) {
+            const int domain_threads = std::popcount(static_cast<u64>(domains.front().mask));
+            const bool uniform_domains = std::all_of(
+                domains.begin(), domains.end(), [domain_threads](const L3Domain& domain) {
+                    return std::popcount(static_cast<u64>(domain.mask)) == domain_threads;
+                });
+            size_t largest_domain_cores = 0;
             for (const auto& domain : domains) {
                 if (domain.size == max_l3_size) {
-                    result.performance_mask |= domain.mask;
-                } else {
-                    result.efficiency_mask |= domain.mask;
+                    size_t count = 0;
+                    for (const DWORD_PTR core_mask : physical_cores) {
+                        if ((core_mask & domain.mask) != 0) {
+                            ++count;
+                        }
+                    }
+                    largest_domain_cores = (std::max)(largest_domain_cores, count);
                 }
             }
-            result.efficiency_mask &= ~result.performance_mask;
-            result.asymmetric = result.performance_mask != 0 && result.efficiency_mask != 0;
-            if (result.asymmetric) {
+            if (uniform_efficiency_class && uniform_domains && largest_domain_cores >= 8) {
+                for (const auto& domain : domains) {
+                    if (domain.size == max_l3_size) {
+                        result.performance_mask |= domain.mask;
+                    } else {
+                        result.efficiency_mask |= domain.mask;
+                    }
+                }
+                result.efficiency_mask &= ~result.performance_mask;
+                result.asymmetric = result.performance_mask != 0 && result.efficiency_mask != 0;
+                if (result.asymmetric) {
+                    LOG_INFO(Common,
+                             "Detected asymmetric L3 cache ({} MiB vs {} MiB, {} physical cores on "
+                             "V-Cache CCD): 3D V-Cache mask={:#x}, secondary CCD mask={:#x}",
+                             max_l3_size >> 20, min_l3_size >> 20, largest_domain_cores,
+                             result.performance_mask, result.efficiency_mask);
+                }
+            } else {
                 LOG_INFO(Common,
-                         "Detected asymmetric L3 cache ({} MiB vs {} MiB): 3D V-Cache mask={:#x}, "
-                         "secondary CCD mask={:#x}",
-                         max_l3_size >> 20, min_l3_size >> 20, result.performance_mask,
-                         result.efficiency_mask);
+                         "Skipping 3D V-Cache CCD pinning for asymmetric L3 ({} MiB vs {} MiB, "
+                         "largest L3 domain has {} physical cores, uniform domain threads={}, "
+                         "uniform efficiency={})",
+                         max_l3_size >> 20, min_l3_size >> 20, largest_domain_cores,
+                         uniform_domains, uniform_efficiency_class);
             }
         }
         return result;

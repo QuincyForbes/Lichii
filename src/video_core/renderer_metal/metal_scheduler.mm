@@ -169,6 +169,35 @@ fragment int4 clear_sint(constant int4& color [[buffer(0)]]) {
     return color;
 }
 
+fragment void clear_none() {}
+
+#define CLEAR_RT_FN(idx) \
+    struct ClearFloatRt##idx { float4 c [[color(idx)]]; }; \
+    fragment ClearFloatRt##idx clear_float_rt##idx(constant float4& color [[buffer(0)]]) { return {color}; } \
+    struct ClearUintRt##idx { uint4 c [[color(idx)]]; }; \
+    fragment ClearUintRt##idx clear_uint_rt##idx(constant uint4& color [[buffer(0)]]) { return {color}; } \
+    struct ClearSintRt##idx { int4 c [[color(idx)]]; }; \
+    fragment ClearSintRt##idx clear_sint_rt##idx(constant int4& color [[buffer(0)]]) { return {color}; }
+CLEAR_RT_FN(0) CLEAR_RT_FN(1) CLEAR_RT_FN(2) CLEAR_RT_FN(3)
+CLEAR_RT_FN(4) CLEAR_RT_FN(5) CLEAR_RT_FN(6) CLEAR_RT_FN(7)
+#undef CLEAR_RT_FN
+
+struct ClearFloatMrt {
+    float4 c0 [[color(0)]];
+    float4 c1 [[color(1)]];
+    float4 c2 [[color(2)]];
+    float4 c3 [[color(3)]];
+    float4 c4 [[color(4)]];
+    float4 c5 [[color(5)]];
+    float4 c6 [[color(6)]];
+    float4 c7 [[color(7)]];
+};
+
+fragment ClearFloatMrt clear_float_mrt(constant float4* colors [[buffer(0)]]) {
+    return {colors[0], colors[1], colors[2], colors[3],
+            colors[4], colors[5], colors[6], colors[7]};
+}
+
 // Sample copies: the guest sees a multisampled image as a plain one holding sample s of pixel p
 // at texel (p << shift) | (s & (2^shift.x - 1), s >> shift.x), as Vulkan's MSAA copy passes.
 struct SampleParams {
@@ -291,7 +320,8 @@ fragment float4 convert_s8d24_to_abgr8(ClearOut in [[stage_in]],
                                        depth2d<float> src [[texture(0)]],
                                        texture2d<uint> src_stencil [[texture(1)]]) {
     const uint2 texel = uint2(in.position.xy);
-    return float4(DepthStencilBytes(src.read(texel), src_stencil.read(texel).r, false)) / 255.0;
+    const uint4 bytes = DepthStencilBytes(src.read(texel), src_stencil.read(texel).r, false);
+    return float4(bytes.wzyx) / 255.0;
 }
 
 fragment DepthStencilOut convert_abgr8_to_d24s8(ClearOut in [[stage_in]],
@@ -371,6 +401,10 @@ DepthStencilOut DepthFromWords(uint2 texel, device const uint* words,
         const uint word = words[texel.y * p.row_words + texel.x];
         out.depth = float(word >> 8) / 16777215.0;
         out.stencil = word & 0xFFu;
+    } else if (p.layout == 2) {
+        const uint word = words[texel.y * p.row_words + texel.x];
+        out.depth = float(word & 0xFFFFFFu) / 16777215.0;
+        out.stencil = word >> 24;
     } else {
         const uint index = texel.y * p.row_words + texel.x * 2;
         out.depth = as_type<float>(words[index]);
@@ -541,6 +575,9 @@ kernel void depth_to_buffer(uint2 id [[thread_position_in_grid]],
     if (p.layout == 0) {
         words[id.y * p.row_words + id.x] =
             (uint(round(saturate(value) * 16777215.0)) << 8) | stencil_value;
+    } else if (p.layout == 2) {
+        words[id.y * p.row_words + id.x] =
+            (stencil_value << 24) | uint(round(saturate(value) * 16777215.0));
     } else {
         const uint index = id.y * p.row_words + id.x * 2;
         words[index] = as_type<uint>(value);
@@ -686,9 +723,18 @@ bool FenceIdleEnabled() {
     return enabled;
 }
 
-// Vulkan's EDEN_NX2_FENCE_FLUSH_US (read under EDEN_NX2_METAL_VULKAN_SWITCHES; phones get 2000
-// from their device profile, else 0 unless the FenceFlush perf option is on); 0 with
-// EDEN_NX2_METAL_FENCE_BATCH=0, as before.
+// Vulkan's EDEN_NX2_FENCE_FLUSH_US (read under EDEN_NX2_METAL_VULKAN_SWITCHES); 0 with
+// EDEN_NX2_METAL_FENCE_BATCH=0, else defaults to a bounded 300 us window on GPUBack while the GPU
+// already has >= 2 committed command buffers in flight.
+bool FenceFlushExplicit() {
+    static const bool explicit_window = [] {
+        return VulkanSwitch("EDEN_NX2_FENCE_FLUSH_US") != nullptr ||
+               (VulkanSwitchesEnabled() &&
+                VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush));
+    }();
+    return explicit_window;
+}
+
 s64 FenceFlushIntervalUs() {
     static const s64 interval_us = [] {
         const char* const batch = std::getenv("EDEN_NX2_METAL_FENCE_BATCH");
@@ -702,9 +748,7 @@ s64 FenceFlushIntervalUs() {
             VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush)) {
             return s64{5000};
         }
-        // Not batched by default: a fence left pending here was never committed by the idle
-        // GPU thread in an OoT lab run, and the channels waiting on it hung.
-        return s64{0};
+        return s64{300};
     }();
     return interval_us;
 }
@@ -777,13 +821,17 @@ bool EmptySkipEnabled() {
 }
 
 // EDEN_NX2_METAL_LIST_END_DEFER=<n>: a command list end leaves its work pending while the GPU has
-// at least n committed ticks not done yet (default 0: commit at every list end; the OoT lab run
-// measured the same 39 fps with 2, with half again as many command buffers from idle commits).
+// at least n committed ticks not done yet (default 2, bounded within 300 us).
+bool ListEndDeferExplicit() {
+    static const bool explicit_depth = std::getenv("EDEN_NX2_METAL_LIST_END_DEFER") != nullptr;
+    return explicit_depth;
+}
+
 u64 ListEndDeferDepth() {
     static const u64 depth = [] {
         const char* const value = std::getenv("EDEN_NX2_METAL_LIST_END_DEFER");
         const u64 parsed = value != nullptr ? static_cast<u64>(std::strtoull(value, nullptr, 10))
-                                            : u64{0};
+                                            : u64{2};
         LOG_INFO(Render_Metal,
                  "Metal: list ends left pending while the GPU is {} ticks behind: {} "
                  "(EDEN_NX2_METAL_LIST_END_DEFER={})",
@@ -794,16 +842,21 @@ u64 ListEndDeferDepth() {
 }
 
 // EDEN_NX2_METAL_IDLE_COMMIT_ALL=1: the split's idle hook commits everything recorded, not only
-// work a fence or list end left pending (on by itself with EDEN_NX2_METAL_LIST_END_DEFER, which
-// relies on it).
+// work a fence or list end left pending.
 bool IdleCommitAllEnabled() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_METAL_IDLE_COMMIT_ALL");
-        const bool on = value != nullptr ? value[0] != '0' : ListEndDeferDepth() != 0;
+        const bool on = value != nullptr && value[0] != '0';
         LOG_INFO(Render_Metal, "Metal: idle GPU thread commits all recorded work: {}",
                  on ? "on" : "off");
         return on;
     }();
+    return enabled;
+}
+
+bool InPassClearEnabled() {
+    static const bool enabled =
+        SwitchOn("EDEN_NX2_METAL_INPASS_CLEAR", "same-target mid-pass clears drawn in pass");
     return enabled;
 }
 
@@ -1099,21 +1152,128 @@ bool MergeClear(ClearPass& pending, const ClearPass& clear) {
     return true;
 }
 
-/// Whether a render pass on `targets` can clear what `clear` does as its load actions.
-bool ClearFitsTargets(const ClearPass& clear, const RenderTargetSet& targets) {
+/// Whether a render pass on `targets` can fold all or a non-conflicting non-empty subset of
+/// `clear` into its load actions, leaving any unconsumed attachments in `pending_clear`.
+bool CanFoldClearInto(const ClearPass& clear, const RenderTargetSet& targets) {
     if (clear.width != targets.width || clear.height != targets.height) {
         return false;
     }
+    const auto same_root = [](TextureHandle a, TextureHandle b) {
+        return a != nullptr && b != nullptr && RootOf(AsTexture(a)) == RootOf(AsTexture(b));
+    };
+    const auto targets_use_root = [&](TextureHandle tex) {
+        if (tex == nullptr) {
+            return false;
+        }
+        for (const Attachment& att : targets.color) {
+            if (same_root(att.texture, tex)) {
+                return true;
+            }
+        }
+        return (targets.has_depth || targets.has_stencil) && same_root(targets.depth.texture, tex);
+    };
+    bool any_match = false;
     for (size_t index = 0; index < clear.color.size(); ++index) {
-        if (clear.clear_color[index] && clear.color[index] != targets.color[index]) {
+        if (!clear.clear_color[index]) {
+            continue;
+        }
+        if (targets.color[index] == clear.color[index]) {
+            any_match = true;
+        } else if (targets.color[index].texture != nullptr ||
+                   targets_use_root(clear.color[index].texture)) {
             return false;
         }
     }
-    if (clear.clear_depth && (!targets.has_depth || clear.depth != targets.depth)) {
-        return false;
+    if (clear.clear_depth) {
+        if (targets.has_depth && clear.depth == targets.depth) {
+            any_match = true;
+        } else if (targets.has_depth || targets_use_root(clear.depth.texture)) {
+            return false;
+        }
     }
-    return !clear.clear_stencil || (targets.has_stencil && clear.stencil == targets.depth);
+    if (clear.clear_stencil) {
+        if (targets.has_stencil && clear.stencil == targets.depth) {
+            any_match = true;
+        } else if (targets.has_stencil || targets_use_root(clear.stencil.texture)) {
+            return false;
+        }
+    }
+    return any_match;
 }
+
+/// Consumes the attachments of `pending` that match `targets`, keeping any remaining ones in
+/// `pending` (`has_remainder` tells whether `pending` still holds anything).
+ClearPass ConsumeClearSubset(ClearPass& pending, const RenderTargetSet& targets,
+                             bool& has_remainder) {
+    ClearPass consumed{};
+    consumed.width = pending.width;
+    consumed.height = pending.height;
+    has_remainder = false;
+    for (size_t index = 0; index < pending.color.size(); ++index) {
+        if (!pending.clear_color[index]) {
+            continue;
+        }
+        if (targets.color[index] == pending.color[index]) {
+            consumed.color[index] = pending.color[index];
+            consumed.clear_color[index] = true;
+            consumed.color_value[index] = pending.color_value[index];
+            pending.color[index] = {};
+            pending.clear_color[index] = false;
+        } else {
+            has_remainder = true;
+        }
+    }
+    if (pending.clear_depth) {
+        if (targets.has_depth && pending.depth == targets.depth) {
+            consumed.depth = pending.depth;
+            consumed.clear_depth = true;
+            consumed.depth_value = pending.depth_value;
+            pending.depth = {};
+            pending.clear_depth = false;
+        } else {
+            has_remainder = true;
+        }
+    }
+    if (pending.clear_stencil) {
+        if (targets.has_stencil && pending.stencil == targets.depth) {
+            consumed.stencil = pending.stencil;
+            consumed.clear_stencil = true;
+            consumed.stencil_value = pending.stencil_value;
+            pending.stencil = {};
+            pending.clear_stencil = false;
+        } else {
+            has_remainder = true;
+        }
+    }
+    return consumed;
+}
+
+struct InPassClearKey {
+    std::array<u32, 8> color_formats{};
+    u32 depth_format{};
+    u32 stencil_format{};
+    u8 samples{};
+    u8 color_clear_mask{};
+
+    bool operator==(const InPassClearKey&) const noexcept = default;
+};
+
+struct InPassClearKeyHash {
+    size_t operator()(const InPassClearKey& key) const noexcept {
+        u64 h = 14695981039346656037ULL;
+        const auto mix = [&h](u64 v) {
+            h ^= v;
+            h *= 1099511628211ULL;
+        };
+        for (const u32 fmt : key.color_formats) {
+            mix(fmt);
+        }
+        mix(key.depth_format);
+        mix(key.stencil_format);
+        mix((u64{key.samples} << 8) | key.color_clear_mask);
+        return static_cast<size_t>(h);
+    }
+};
 
 } // Anonymous namespace
 
@@ -1142,6 +1302,7 @@ struct Scheduler::Impl {
         visibility = [device.GetDevice() newBufferWithLength:VisibilitySlots * sizeof(u64)
                                                      options:MTLResourceStorageModeShared];
         std::memset(visibility.contents, 0, VisibilitySlots * sizeof(u64));
+        event = [device.GetDevice() newSharedEvent];
         if (RecorderEnabled()) {
             recorder = std::make_unique<Rec::Recorder>(queue);
         }
@@ -1221,6 +1382,7 @@ struct Scheduler::Impl {
         if (active_compute == kernel_compute) {
             active_compute = nil;
             active_bound = nullptr;
+            compute_clobbered_by_copy = false;
         }
         [kernel_compute endEncoding];
         kernel_compute = nil;
@@ -1326,13 +1488,17 @@ struct Scheduler::Impl {
     void NextSegment() {
         ++segment_serial;
         segment_encoders = 0;
+        segment_render_passes = 0;
         ahead_blocked = false;
         in_order_buffers.clear();
         segment_bound.clear();
+        segment_written_textures.clear();
+        segment_touched_textures.clear();
         segment_shared_writes = false;
         segment_opaque = false;
         checked_failed = false;
         ahead_query_relaxed = false;
+        compute_clobbered_by_copy = false;
     }
 
     /// A copy recorded in order reads or writes `buffer`: no copy into it goes ahead any more.
@@ -1346,10 +1512,7 @@ struct Scheduler::Impl {
     /// In-order work writes `buffer` (a copy's destination).
     void NoteInOrderWrite(BufferHandle buffer) {
         NoteInOrder(buffer);
-        if (buffer != nullptr && AheadAnyEnabled() &&
-            AsBuffer(buffer).storageMode == MTLStorageModeShared) {
-            segment_shared_writes = true;
-        }
+        NoteSegmentBuffer(buffer, true);
     }
 
     /// EDEN_NX2_METAL_SEGMENT_NOTE_CACHE: whether the segment noted `object` (a buffer or a
@@ -1375,27 +1538,56 @@ struct Scheduler::Impl {
         return false;
     }
 
-    /// EDEN_NX2_METAL_AHEAD_ANY: in-order work of the segment binds `buffer`; `writes_shared`:
-    /// it may write it if CPU-visible.
-    void NoteSegmentBuffer(const void* buffer, bool writes_shared) {
-        if (buffer == nullptr || !AheadAnyEnabled() || NotedInSegment(buffer, writes_shared)) {
+    /// EDEN_NX2_METAL_AHEAD_ANY: in-order work of the segment modifies `buffer`; read-only UBO/SSBO
+    /// binds (`writes` false) do not conflict with ahead compute kernels.
+    void NoteSegmentBuffer(const void* buffer, bool writes) {
+        if (!writes || buffer == nullptr || !AheadAnyEnabled() || NotedInSegment(buffer, true)) {
             return;
         }
         if (AsBuffer(const_cast<void*>(buffer)).storageMode == MTLStorageModeShared) {
-            segment_shared_writes |= writes_shared;
+            segment_shared_writes = true;
         } else {
             segment_bound.insert(buffer);
         }
     }
 
+    void NoteTextureTouched(const void* texture) {
+        if (texture == nullptr) {
+            return;
+        }
+        const uintptr_t key = reinterpret_cast<uintptr_t>(texture);
+        TouchedNote& cached =
+            segment_touched_cache[((key >> 4) ^ (key >> 12)) % segment_touched_cache.size()];
+        if (cached.object == texture && cached.serial == segment_serial) {
+            return;
+        }
+        cached = {texture, segment_serial};
+        const id<MTLTexture> root = RootOf(AsTexture(const_cast<void*>(texture)));
+        if (root != nil) {
+            segment_touched_textures.insert((__bridge const void*)root);
+        }
+    }
+
+    void NoteTextureWrite(const void* texture) {
+        if (texture == nullptr) {
+            return;
+        }
+        const id<MTLTexture> root = RootOf(AsTexture(const_cast<void*>(texture)));
+        if (root != nil) {
+            const void* const raw_root = (__bridge const void*)root;
+            segment_written_textures.insert(raw_root);
+            segment_touched_textures.insert(raw_root);
+        }
+    }
+
     /// The buffer a texture view of a buffer is on.
-    void NoteSegmentTexture(const void* texture, bool writes_shared) {
-        if (texture == nullptr || !AheadAnyEnabled() || NotedInSegment(texture, writes_shared)) {
+    void NoteSegmentTexture(const void* texture, bool writes) {
+        if (!writes || texture == nullptr || !AheadAnyEnabled() || NotedInSegment(texture, true)) {
             return;
         }
         const id<MTLBuffer> buffer = RootOf(AsTexture(const_cast<void*>(texture))).buffer;
         if (buffer != nil) {
-            NoteSegmentBuffer((__bridge const void*)buffer, writes_shared);
+            NoteSegmentBuffer((__bridge const void*)buffer, true);
         }
     }
 
@@ -1409,9 +1601,7 @@ struct Scheduler::Impl {
             // Ring allocations the kernel writes or CPU uploads it reads.
             return segment_shared_writes;
         }
-        return segment_bound.contains(buffer) ||
-               std::find(in_order_buffers.begin(), in_order_buffers.end(), buffer) !=
-                   in_order_buffers.end();
+        return segment_bound.contains(buffer);
     }
 
     void LogComputeBind(ComputeBind::Kind kind, u32 slot, void* object, u32 offset, bool write) {
@@ -1511,41 +1701,43 @@ struct Scheduler::Impl {
                 return false;
             }
         }
-        [encoder setComputePipelineState:copy_kernel];
-        [encoder setBuffer:AsBuffer(src) offset:0 atIndex:0];
-        [encoder setBuffer:AsBuffer(dst) offset:0 atIndex:1];
+        const void* const copy_pipe = (__bridge const void*)copy_kernel;
+        if (!StateCacheEnabled() || *bound_pipeline != copy_pipe) {
+            *bound_pipeline = copy_pipe;
+            ++state_sets;
+            [encoder setComputePipelineState:copy_kernel];
+        } else {
+            ++state_skips;
+        }
+        switch (NoteBuffer(bound, 0, src, 0)) {
+        case Bound::Same:
+            break;
+        case Bound::Offset:
+            [encoder setBufferOffset:0 atIndex:0];
+            break;
+        case Bound::Other:
+            [encoder setBuffer:AsBuffer(src) offset:0 atIndex:0];
+            break;
+        }
+        switch (NoteBuffer(bound, 1, dst, 0)) {
+        case Bound::Same:
+            break;
+        case Bound::Offset:
+            [encoder setBufferOffset:0 atIndex:1];
+            break;
+        case Bound::Other:
+            [encoder setBuffer:AsBuffer(dst) offset:0 atIndex:1];
+            break;
+        }
+        bound.buffers[2] = &InlineBytes;
+        ++state_sets;
         const std::array<u64, 3> params{src_offset, dst_offset, size};
         [encoder setBytes:params.data() length:sizeof(params) atIndex:2];
         const u64 threads = (size + 15) / 16;
         [encoder dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((threads + 63) / 64), 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        state_sets += 4;
-        // What the encoder has now: the next kernel sets its own pipeline and these slots.
-        *bound_pipeline = (__bridge const void*)copy_kernel;
-        for (u32 slot = 0; slot < 3; ++slot) {
-            bound.buffers[slot] = &InlineBytes;
-        }
         if (active_compute == encoder) {
-            // A kernel being bound on it: its pipeline and binds of those slots back.
-            if (compute_bind_pipeline != nullptr) {
-                *bound_pipeline = compute_bind_pipeline;
-                [encoder setComputePipelineState:(__bridge id<MTLComputePipelineState>)
-                                                     compute_bind_pipeline];
-            }
-            for (const ComputeBind& bind : compute_binds) {
-                if (bind.slot >= 3) {
-                    continue;
-                }
-                if (bind.kind == ComputeBind::Kind::Buffer) {
-                    SetBuffer(ShaderStage::Compute, bind.slot, bind.object, bind.offset);
-                } else if (bind.kind == ComputeBind::Kind::Bytes) {
-                    bound.buffers[bind.slot] = &InlineBytes;
-                    ++state_sets;
-                    [encoder setBytes:compute_bind_bytes.data() + bind.offset
-                               length:bind.size
-                              atIndex:bind.slot];
-                }
-            }
+            compute_clobbered_by_copy = true;
         }
         return true;
     }
@@ -1563,18 +1755,50 @@ struct Scheduler::Impl {
         }
         active_compute = compute;
         active_bound = &compute_bound;
+        compute_clobbered_by_copy = false;
     }
 
     /// Before a compute bind or dispatch: the ahead kernel an upload interrupted goes on in a
-    /// new encoder.
+    /// new encoder, or restores slots 0..2 if CopyByCompute used the active encoder.
     void ResumeKernel() {
-        if (!kernel_resume) {
+        if (kernel_resume) {
+            kernel_resume = false;
+            compute_clobbered_by_copy = false;
+            active_compute = KernelEncoder();
+            active_bound = &kernel_bound;
+            ReplayComputeBinds(&kernel_pipeline, false);
             return;
         }
-        kernel_resume = false;
-        active_compute = KernelEncoder();
-        active_bound = &kernel_bound;
-        ReplayComputeBinds(&kernel_pipeline, false);
+        if (!compute_clobbered_by_copy) {
+            return;
+        }
+        compute_clobbered_by_copy = false;
+        if (active_compute == nil) {
+            return;
+        }
+        const void** const bound_pipeline =
+            active_compute == kernel_compute ? &kernel_pipeline : &compute_pipeline;
+        if (compute_bind_pipeline != nullptr &&
+            (!StateCacheEnabled() || *bound_pipeline != compute_bind_pipeline)) {
+            *bound_pipeline = compute_bind_pipeline;
+            ++state_sets;
+            [active_compute
+                setComputePipelineState:(__bridge id<MTLComputePipelineState>)compute_bind_pipeline];
+        }
+        for (const ComputeBind& bind : compute_binds) {
+            if (bind.slot >= 3) {
+                continue;
+            }
+            if (bind.kind == ComputeBind::Kind::Buffer) {
+                SetBuffer(ShaderStage::Compute, bind.slot, bind.object, bind.offset);
+            } else if (bind.kind == ComputeBind::Kind::Bytes) {
+                active_bound->buffers[bind.slot] = &InlineBytes;
+                ++state_sets;
+                [active_compute setBytes:compute_bind_bytes.data() + bind.offset
+                                  length:bind.size
+                                 atIndex:bind.slot];
+            }
+        }
     }
 
     /// The checked kernel conflicts with in-order work: it goes in order from here on, with the
@@ -1608,21 +1832,31 @@ struct Scheduler::Impl {
         }
     }
 
-    /// Before a compute bind of `texture`: a checked kernel goes in order (it may read what the
-    /// segment rendered); an in-order one records a waiting clear of it first
-    /// (EDEN_NX2_METAL_CLEAR_NARROW leaves the clear waiting past BeginCompute).
-    void ComputeTexture(TextureHandle texture) {
+    /// Before a compute bind of `texture`: a checked kernel only falls back in order when the
+    /// root texture (or its backing buffer) was modified in the segment or has a pending clear;
+    /// an in-order one records a waiting clear of it first.
+    void ComputeTexture(TextureHandle texture, bool write = true) {
         ResumeKernel();
         if (texture == nullptr) {
             return;
         }
+        NoteTextureTouched(texture);
         if (kernel_checked) {
-            LeaveChecked(texture);
+            const id<MTLTexture> root_tex = RootOf(AsTexture(texture));
+            const void* const raw_root = (__bridge const void*)root_tex;
+            const id<MTLBuffer> backing = root_tex != nil ? root_tex.buffer : nil;
+            if (segment_written_textures.contains(raw_root) || PendingClearOn(texture) ||
+                (backing != nil && CheckedConflict((__bridge const void*)backing))) {
+                LeaveChecked(texture);
+            }
         }
         if (active_compute == nil || active_compute != compute) {
             return;
         }
-        NoteSegmentTexture(texture, true);
+        if (write) {
+            NoteTextureWrite(texture);
+        }
+        NoteSegmentTexture(texture, write);
         if (pending_clear && PendingClearOn(texture)) {
             EndEncoder();
             FlushClear();
@@ -1911,6 +2145,7 @@ struct Scheduler::Impl {
 
     /// Something reads the samples of `texture`.
     void SamplesNeeded(const void* texture) {
+        NoteTextureTouched(texture);
         if (shadows.empty()) {
             return;
         }
@@ -1952,6 +2187,7 @@ struct Scheduler::Impl {
             if (active_compute == compute) {
                 active_compute = nil;
                 active_bound = nullptr;
+                compute_clobbered_by_copy = false;
             }
             [compute endEncoding];
             compute = nil;
@@ -1977,7 +2213,28 @@ struct Scheduler::Impl {
         ++passes_begun[why == PassEnd::NewPass ? 0 : why == PassEnd::Clear ? 1 : 2];
         ++encoders;
         ++segment_encoders;
+        ++segment_render_passes;
         ++render_passes;
+        for (u32 i = 0; i < 8; ++i) {
+            if (const id<MTLTexture> tex = pass.colorAttachments[i].texture; tex != nil) {
+                NoteTextureWrite((__bridge const void*)tex);
+            }
+            if (const id<MTLTexture> res = pass.colorAttachments[i].resolveTexture; res != nil) {
+                NoteTextureWrite((__bridge const void*)res);
+            }
+        }
+        if (const id<MTLTexture> tex = pass.depthAttachment.texture; tex != nil) {
+            NoteTextureWrite((__bridge const void*)tex);
+        }
+        if (const id<MTLTexture> res = pass.depthAttachment.resolveTexture; res != nil) {
+            NoteTextureWrite((__bridge const void*)res);
+        }
+        if (const id<MTLTexture> tex = pass.stencilAttachment.texture; tex != nil) {
+            NoteTextureWrite((__bridge const void*)tex);
+        }
+        if (const id<MTLTexture> res = pass.stencilAttachment.resolveTexture; res != nil) {
+            NoteTextureWrite((__bridge const void*)res);
+        }
         // A timed frame (EDEN_NX2_PASS_TIMES): the pass's start and end on the GPU's clock.
         const size_t sample = pass_records.size() * 2;
         const bool timed =
@@ -2434,6 +2691,197 @@ struct Scheduler::Impl {
         return state;
     }
 
+    id<MTLRenderPipelineState> InPassClearPipeline(const InPassClearKey& key) {
+        if (const auto it = inpass_clear_pipelines.find(key); it != inpass_clear_pipelines.end()) {
+            return it->second;
+        }
+        id<MTLRenderPipelineState> pipeline = nil;
+        NSString* fragment = nil;
+        const u32 clear_count = static_cast<u32>(std::popcount(key.color_clear_mask));
+        if (clear_count == 0) {
+            fragment = @"clear_none";
+        } else if (clear_count == 1) {
+            const u32 rt = static_cast<u32>(std::countr_zero(key.color_clear_mask));
+            switch (ClassOf(key.color_formats[rt])) {
+            case FormatClass::Float:
+                fragment = [NSString stringWithFormat:@"clear_float_rt%u", rt];
+                break;
+            case FormatClass::Uint:
+                fragment = [NSString stringWithFormat:@"clear_uint_rt%u", rt];
+                break;
+            case FormatClass::Sint:
+                fragment = [NSString stringWithFormat:@"clear_sint_rt%u", rt];
+                break;
+            default:
+                break;
+            }
+        } else {
+            bool all_float = true;
+            for (const u32 fmt : key.color_formats) {
+                if (fmt != 0 && ClassOf(fmt) != FormatClass::Float) {
+                    all_float = false;
+                    break;
+                }
+            }
+            if (all_float) {
+                fragment = @"clear_float_mrt";
+            }
+        }
+        if (library != nil && fragment != nil) {
+            MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+            desc.label = @"In-pass clear";
+            desc.vertexFunction = [library newFunctionWithName:@"clear_vertex"];
+            desc.fragmentFunction = [library newFunctionWithName:fragment];
+            desc.rasterSampleCount = (std::max)(u32{key.samples}, 1U);
+            for (u32 i = 0; i < 8; ++i) {
+                if (key.color_formats[i] != 0) {
+                    desc.colorAttachments[i].pixelFormat =
+                        static_cast<MTLPixelFormat>(key.color_formats[i]);
+                    desc.colorAttachments[i].writeMask =
+                        ((key.color_clear_mask >> i) & 1U) != 0 ? MTLColorWriteMaskAll
+                                                                : MTLColorWriteMaskNone;
+                }
+            }
+            if (key.depth_format != 0) {
+                desc.depthAttachmentPixelFormat = static_cast<MTLPixelFormat>(key.depth_format);
+            }
+            if (key.stencil_format != 0) {
+                desc.stencilAttachmentPixelFormat =
+                    static_cast<MTLPixelFormat>(key.stencil_format);
+            }
+            NSError* error = nil;
+            pipeline = [device.GetDevice() newRenderPipelineStateWithDescriptor:desc error:&error];
+            if (pipeline == nil) {
+                LOG_ERROR(Render_Metal, "Metal: in-pass clear pipeline failed: {}",
+                          error != nil ? error.localizedDescription.UTF8String : "no reason");
+            }
+        }
+        inpass_clear_pipelines.emplace(key, pipeline);
+        return pipeline;
+    }
+
+    bool TryDrawInPassClear(const ClearPass& clear_pass) {
+        if (!InPassClearEnabled() || render == nil || render_targets.layers > 1 ||
+            render_targets.width == 0 || render_targets.height == 0 ||
+            clear_pass.width < render_targets.width || clear_pass.height < render_targets.height) {
+            return false;
+        }
+        u8 color_clear_mask = 0;
+        for (size_t i = 0; i < clear_pass.color.size(); ++i) {
+            if (!clear_pass.clear_color[i]) {
+                continue;
+            }
+            if (render_targets.color[i].texture == nullptr ||
+                clear_pass.color[i] != render_targets.color[i]) {
+                return false;
+            }
+            color_clear_mask |= static_cast<u8>(1U << i);
+        }
+        if (clear_pass.clear_depth &&
+            (!render_targets.has_depth || clear_pass.depth != render_targets.depth)) {
+            return false;
+        }
+        if (clear_pass.clear_stencil &&
+            (!render_targets.has_stencil || clear_pass.stencil != render_targets.depth)) {
+            return false;
+        }
+        InPassClearKey key{};
+        key.color_clear_mask = color_clear_mask;
+        for (size_t i = 0; i < render_targets.color.size(); ++i) {
+            if (const id<MTLTexture> tex = AsTexture(render_targets.color[i].texture); tex != nil) {
+                key.color_formats[i] = static_cast<u32>(tex.pixelFormat);
+                if (key.samples == 0) {
+                    key.samples = static_cast<u8>(tex.sampleCount);
+                }
+            }
+        }
+        if (render_targets.has_depth || render_targets.has_stencil) {
+            if (const id<MTLTexture> tex = AsTexture(render_targets.depth.texture); tex != nil) {
+                if (render_targets.has_depth) {
+                    key.depth_format = static_cast<u32>(tex.pixelFormat);
+                }
+                if (render_targets.has_stencil) {
+                    key.stencil_format = static_cast<u32>(tex.pixelFormat);
+                }
+                if (key.samples == 0) {
+                    key.samples = static_cast<u8>(tex.sampleCount);
+                }
+            }
+        }
+        if (key.samples == 0) {
+            return false;
+        }
+        const id<MTLRenderPipelineState> pipeline = InPassClearPipeline(key);
+        if (pipeline == nil) {
+            return false;
+        }
+        if (visibility_slot != -1) {
+            [render setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+            visibility_slot = -1;
+        }
+        [render setRenderPipelineState:pipeline];
+        if (render_targets.has_depth || render_targets.has_stencil) {
+            [render setDepthStencilState:ClearDepthState(clear_pass.clear_depth,
+                                                         clear_pass.clear_stencil, 0xFF)];
+            if (clear_pass.clear_stencil) {
+                [render setStencilReferenceValue:clear_pass.stencil_value];
+            }
+        }
+        const u32 target_w = std::clamp(render_targets.width, 1U, MaxRenderTargetSize);
+        const u32 target_h = std::clamp(render_targets.height, 1U, MaxRenderTargetSize);
+        [render setViewport:MTLViewport{0.0, 0.0, static_cast<f64>(target_w),
+                                        static_cast<f64>(target_h), 0.0, 1.0}];
+        [render setScissorRect:MTLScissorRect{0, 0, target_w, target_h}];
+        [render setCullMode:MTLCullModeNone];
+        [render setTriangleFillMode:MTLTriangleFillModeFill];
+        [render setDepthClipMode:MTLDepthClipModeClip];
+        [render setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+        if (depth_bounds) {
+#if defined(__MAC_26_0) || defined(__IPHONE_26_0)
+            if (@available(macOS 26.0, iOS 26.0, *)) {
+                [render setDepthTestMinBound:0.0f maxBound:1.0f];
+            }
+#endif
+        }
+        const f32 depth_val = std::clamp(static_cast<f32>(clear_pass.depth_value), 0.0f, 1.0f);
+        [render setVertexBytes:&depth_val length:sizeof(depth_val) atIndex:0];
+        vertex_bound.buffers[0] = &InlineBytes;
+        if (color_clear_mask != 0) {
+            if (std::popcount(color_clear_mask) == 1) {
+                const u32 rt = static_cast<u32>(std::countr_zero(color_clear_mask));
+                std::array<u32, 4> bits{};
+                const FormatClass fmt_class = ClassOf(key.color_formats[rt]);
+                for (size_t component = 0; component < bits.size(); ++component) {
+                    const f64 val = clear_pass.color_value[rt][component];
+                    if (fmt_class == FormatClass::Uint) {
+                        bits[component] = static_cast<u32>(val);
+                    } else if (fmt_class == FormatClass::Sint) {
+                        bits[component] = static_cast<u32>(static_cast<s32>(val));
+                    } else {
+                        bits[component] = std::bit_cast<u32>(static_cast<f32>(val));
+                    }
+                }
+                [render setFragmentBytes:bits.data() length:sizeof(bits) atIndex:0];
+            } else {
+                std::array<f32, 32> colors{};
+                for (size_t i = 0; i < 8; ++i) {
+                    for (size_t c = 0; c < 4; ++c) {
+                        colors[i * 4 + c] = static_cast<f32>(clear_pass.color_value[i][c]);
+                    }
+                }
+                [render setFragmentBytes:colors.data() length:sizeof(colors) atIndex:0];
+            }
+            fragment_bound.buffers[0] = &InlineBytes;
+        }
+        [render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        written_color |= color_clear_mask;
+        written_depth = written_depth || clear_pass.clear_depth;
+        written_stencil = written_stencil || clear_pass.clear_stencil;
+        render_state_valid = false;
+        ++inpass_clears;
+        return true;
+    }
+
     const Device& device;
     id<MTLCommandQueue> queue;
     /// EDEN_NX2_METAL_CB_PREMAKE; after `queue`: destroyed (its refills drained) before it.
@@ -2441,6 +2889,8 @@ struct Scheduler::Impl {
     id<MTLDepthStencilState> depth_write_always = nil;
     /// By ClearPipeline's formats, mask and sample count.
     std::unordered_map<u64, id<MTLRenderPipelineState>> clear_pipelines;
+    std::unordered_map<InPassClearKey, id<MTLRenderPipelineState>, InPassClearKeyHash>
+        inpass_clear_pipelines;
     std::unordered_map<u32, id<MTLDepthStencilState>> clear_depth_states;
     std::unordered_map<u64, id<MTLRenderPipelineState>> sample_pipelines;
     std::unordered_map<u64, id<MTLRenderPipelineState>> convert_pipelines;
@@ -2508,14 +2958,22 @@ struct Scheduler::Impl {
     /// An upload ended the ahead kernel being bound: its encoder is opened again, its binds
     /// replayed, by the next bind or dispatch.
     bool kernel_resume{};
+    bool compute_clobbered_by_copy{};
     /// The binds of the kernel since its BeginCompute, to replay on another encoder.
     std::vector<ComputeBind> compute_binds;
     std::vector<u8> compute_bind_bytes;
     void* compute_bind_pipeline{};
-    /// EDEN_NX2_METAL_AHEAD_ANY: buffers (not CPU-visible) bound to in-order work of the
-    /// segment, whether in-order work may have written a CPU-visible (ring) buffer, and whether
+    /// EDEN_NX2_METAL_AHEAD_ANY: private buffers modified in order in the segment, root textures
+    /// written or touched in the segment, whether in-order work wrote a shared buffer, and whether
     /// it did something not tracked at all.
     std::unordered_set<const void*> segment_bound;
+    std::unordered_set<const void*> segment_written_textures;
+    std::unordered_set<const void*> segment_touched_textures;
+    struct TouchedNote {
+        const void* object;
+        u64 serial;
+    };
+    std::array<TouchedNote, 512> segment_touched_cache{};
     bool segment_shared_writes{};
     /// Buffers and textures noted in the segment, by address
     /// (EDEN_NX2_METAL_SEGMENT_NOTE_CACHE).
@@ -2543,8 +3001,10 @@ struct Scheduler::Impl {
     bool kill_depth{};
     bool kill_stencil{};
     u64 segment_serial{1};
-    /// Encoders the segment's command buffer got so far.
+    /// Encoders and render passes the segment's command buffer got so far.
     u32 segment_encoders{};
+    u32 segment_render_passes{};
+    u64 force_split_serial{};
     bool ahead_blocked{};
     /// Buffers the segment's copies read or write in order.
     std::vector<const void*> in_order_buffers;
@@ -2557,6 +3017,7 @@ struct Scheduler::Impl {
     u64 ahead_copies{};
     u64 ahead_kernels{};
     u64 idle_fences{};
+    u64 inpass_clears{};
     /// EDEN_NX2_METAL_FENCE_BATCH: work a fence left pending, since when, and the last commit.
     bool flush_pending{};
     std::chrono::steady_clock::time_point flush_pending_since{};
@@ -2597,6 +3058,23 @@ struct Scheduler::Impl {
     u64 current_tick{1};
     std::atomic<u64> submitted_tick{0};
     std::atomic<u64> completed_tick{0};
+    id<MTLSharedEvent> event = nil;
+
+    u64 CompletedTick() noexcept {
+        u64 completed = completed_tick.load(std::memory_order_acquire);
+        if (event != nil) {
+            const u64 signaled = [event signaledValue];
+            while (completed < signaled &&
+                   !completed_tick.compare_exchange_weak(completed, signaled,
+                                                         std::memory_order_acq_rel,
+                                                         std::memory_order_acquire)) {
+            }
+            if (signaled > completed) {
+                completed = signaled;
+            }
+        }
+        return completed;
+    }
     /// Wakes WaitSubmitted when completed_tick moves.
     std::mutex completed_mutex;
     std::condition_variable completed_cv;
@@ -2649,7 +3127,10 @@ u64 Scheduler::CurrentTick() const noexcept {
 }
 
 bool Scheduler::IsFree(u64 tick) const noexcept {
-    return impl->completed_tick.load(std::memory_order_acquire) >= tick;
+    if (impl->completed_tick.load(std::memory_order_acquire) >= tick) {
+        return true;
+    }
+    return impl->CompletedTick() >= tick;
 }
 
 void Scheduler::Wait(u64 tick, CommitReason reason) {
@@ -2702,16 +3183,7 @@ void Scheduler::SetSplitHooks(const SplitHooks& hooks) noexcept {
 }
 
 void Scheduler::WaitSubmitted(u64 tick) {
-    if (IsFree(tick)) {
-        return;
-    }
-    // Work left pending (DeferListEnd) is committed by the back: have it run its idle hook, as
-    // Vulkan's WaitSubmitted does.
-    if (!IsSubmitted(tick) && SplitBackRunning() && !SplitOnBackThread()) {
-        SplitRequestIdleHook();
-    }
-    std::unique_lock lock{impl->completed_mutex};
-    impl->completed_cv.wait(lock, [&] { return IsFree(tick); });
+    WaitCompleted(tick);
 }
 
 void Scheduler::WaitCompleted(u64 tick) {
@@ -2786,8 +3258,7 @@ u64 Scheduler::Flush(CommitReason reason) {
         impl->empty_flushes.fetch_add(1, std::memory_order_relaxed);
         // Every earlier tick is done and nothing was recorded for this one: it is done too.
         const u64 empty_tick = impl->current_tick;
-        if (EmptySkipEnabled() &&
-            impl->completed_tick.load(std::memory_order_acquire) + 1 >= empty_tick) {
+        if (EmptySkipEnabled() && impl->CompletedTick() + 1 >= empty_tick) {
             impl->empty_skipped.fetch_add(1, std::memory_order_relaxed);
             ++impl->current_tick;
             impl->submitted_tick.store(empty_tick, std::memory_order_release);
@@ -2841,6 +3312,9 @@ u64 Scheduler::Flush(CommitReason reason) {
         completed_cv->notify_all();
     }];
     impl->CommitAhead(tick);
+    if (impl->event != nil) {
+        [command_buffer encodeSignalEvent:impl->event value:tick];
+    }
     [command_buffer commit];
     if (impl->recorder != nullptr) {
         // Committed by the encoder thread after what was recorded before. submitted_tick still
@@ -2888,8 +3362,15 @@ u64 Scheduler::FenceTick() {
     }
     const s64 interval_us = FenceFlushIntervalUs();
     const auto now = std::chrono::steady_clock::now();
-    if (interval_us > 0 && (VideoCommon::GpuSplit::OnBackThread() || FenceBatchAnyThread()) &&
-        now - impl->last_commit < std::chrono::microseconds{interval_us}) {
+    const bool on_back = SplitOnBackThread() || VideoCommon::GpuSplit::OnBackThread();
+    const bool explicit_window = FenceFlushExplicit() || FenceBatchAnyThread();
+    const bool can_coalesce =
+        interval_us > 0 && (on_back || FenceBatchAnyThread()) &&
+        now - impl->last_commit < std::chrono::microseconds{interval_us} &&
+        (explicit_window ||
+         (GpuBehind() && (!impl->flush_pending ||
+                          now - impl->flush_pending_since < std::chrono::microseconds{interval_us})));
+    if (can_coalesce) {
         // The tick being recorded: committed with whatever comes next, at the latest when the
         // back goes idle.
         if (!impl->flush_pending) {
@@ -2904,27 +3385,35 @@ u64 Scheduler::FenceTick() {
 
 bool Scheduler::DeferListEnd() {
     const u64 depth = ListEndDeferDepth();
-    if (depth == 0 || !SplitOnBackThread() || impl->in_flight.empty()) {
+    const bool on_back = SplitOnBackThread() || VideoCommon::GpuSplit::OnBackThread();
+    if (depth == 0 || !on_back || impl->in_flight.empty()) {
         return false;
     }
     // Committed ticks the GPU has not finished: while there are enough, a command buffer of its
     // own for this work would only wait behind them.
-    const u64 completed = impl->completed_tick.load(std::memory_order_acquire);
+    const u64 completed = impl->CompletedTick();
     if (completed + depth >= impl->current_tick) {
         return false;
     }
+    const auto now = std::chrono::steady_clock::now();
+    if (!ListEndDeferExplicit()) {
+        const auto window = std::chrono::microseconds{(std::max)(FenceFlushIntervalUs(), s64{300})};
+        if (now - impl->last_commit >= window ||
+            (impl->flush_pending && now - impl->flush_pending_since >= window)) {
+            return false;
+        }
+    }
     if (!impl->flush_pending) {
         impl->flush_pending = true;
-        impl->flush_pending_since = std::chrono::steady_clock::now();
+        impl->flush_pending_since = now;
     }
     ++impl->list_ends_deferred;
     return true;
 }
 
-bool Scheduler::FlushDeferredFromIdle(bool) {
-    // Whatever is recorded goes now (EDEN_NX2_METAL_IDLE_COMMIT_ALL): nothing else may come to
-    // commit it, and a front thread may be waiting for it (WaitSubmitted).
-    if (!impl->flush_pending && !(IdleCommitAllEnabled() && HasPendingWork())) {
+bool Scheduler::FlushDeferredFromIdle(bool requested) {
+    // Whatever is recorded goes now when pending, requested by a waiter, or under IDLE_COMMIT_ALL.
+    if (!impl->flush_pending && !((requested || IdleCommitAllEnabled()) && HasPendingWork())) {
         return false;
     }
     ++impl->idle_commits;
@@ -2945,7 +3434,7 @@ bool Scheduler::DeferredFlushMayWait() const {
 }
 
 bool Scheduler::GpuBehind() const noexcept {
-    return impl->completed_tick.load(std::memory_order_acquire) + 1 < impl->current_tick;
+    return impl->CompletedTick() + 2 < impl->current_tick;
 }
 
 std::array<u64, 2> Scheduler::TakeDeferredFences() noexcept {
@@ -2957,7 +3446,8 @@ void Scheduler::CopyBuffer(BufferHandle src, u64 src_offset, BufferHandle dst, u
     if (size == 0 || src == nullptr || dst == nullptr) {
         return;
     }
-    const bool goes_ahead = ahead && CanUploadAhead();
+    const bool goes_ahead =
+        ahead && CanUploadAhead() && (impl->render != nil || impl->segment_render_passes != 0);
     if (!goes_ahead) {
         impl->NoteInOrder(src);
         impl->NoteInOrderWrite(dst);
@@ -3005,6 +3495,18 @@ bool Scheduler::CanUploadAhead() const noexcept {
     return AheadEnabled() && !impl->ahead_blocked;
 }
 
+bool Scheduler::CanUploadTextureAhead(TextureHandle texture) const noexcept {
+    if (texture == nullptr || impl->render == nil || !CanUploadAhead() ||
+        impl->PendingClearOn(texture)) {
+        return false;
+    }
+    if (!impl->shadows.empty() && impl->shadows.contains(texture)) {
+        return false;
+    }
+    const id<MTLTexture> root = RootOf(AsTexture(texture));
+    return root != nil && !impl->segment_touched_textures.contains((__bridge const void*)root);
+}
+
 bool Scheduler::UsedInOrder(BufferHandle buffer) const noexcept {
     return std::find(impl->in_order_buffers.begin(), impl->in_order_buffers.end(), buffer) !=
            impl->in_order_buffers.end();
@@ -3014,7 +3516,7 @@ bool Scheduler::CanRecordAhead(const RenderTargetSet& targets) const noexcept {
     if (!AheadEnabled() || impl->ahead_blocked) {
         return false;
     }
-    if (impl->pending_clear && !ClearFitsTargets(*impl->pending_clear, targets)) {
+    if (impl->pending_clear && !CanFoldClearInto(*impl->pending_clear, targets)) {
         return false;
     }
     if (impl->segment_encoders == 0 || (impl->segment_encoders == 1 && IsRenderingTo(targets))) {
@@ -3040,10 +3542,15 @@ bool Scheduler::IsRenderingTo(const RenderTargetSet& targets) const noexcept {
 }
 
 void Scheduler::WantSplitBefore(const RenderTargetSet& targets) {
-    if (!AheadEnabled() || !AheadSplitEnabled() || impl->Wanted(targets)) {
+    if (!AheadEnabled() || !AheadSplitEnabled()) {
         return;
     }
-    impl->wanted[impl->wanted_count++ % impl->wanted.size()] = targets;
+    if (!IsRenderingTo(targets)) {
+        impl->force_split_serial = impl->segment_serial;
+    }
+    if (!impl->Wanted(targets)) {
+        impl->wanted[impl->wanted_count++ % impl->wanted.size()] = targets;
+    }
 }
 
 void Scheduler::SplitBefore(const RenderTargetSet& targets) {
@@ -3053,8 +3560,12 @@ void Scheduler::SplitBefore(const RenderTargetSet& targets) {
         impl->tick_splits >= MaxTickSplits || !impl->Wanted(targets)) {
         return;
     }
+    if (impl->segment_encoders == 0 ||
+        (impl->force_split_serial != impl->segment_serial && CanRecordAhead(targets))) {
+        return;
+    }
     // A clear waiting for this pass stays its load actions, in the new segment.
-    if (impl->pending_clear && !ClearFitsTargets(*impl->pending_clear, targets)) {
+    if (impl->pending_clear && !CanFoldClearInto(*impl->pending_clear, targets)) {
         impl->FlushClear();
     }
     if (impl->segment_encoders != 0) {
@@ -3072,22 +3583,28 @@ void Scheduler::FillBuffer(BufferHandle dst, u64 offset, u64 size, u8 value) {
 
 void Scheduler::CopyBufferToTexture(BufferHandle src, u64 offset, u32 bytes_per_row,
                                     u32 bytes_per_image, TextureHandle dst, u32 level, u32 slice,
-                                    Offset3D origin, Extent3D extent) {
+                                    Offset3D origin, Extent3D extent, bool ahead) {
     impl->Written(dst);
     if (src == nullptr || dst == nullptr) {
         return;
     }
-    impl->Touch(dst);
-    impl->NoteInOrder(src);
-    [impl->BlitEncoder() copyFromBuffer:AsBuffer(src)
-                           sourceOffset:offset
-                      sourceBytesPerRow:bytes_per_row
-                    sourceBytesPerImage:bytes_per_image
-                             sourceSize:MTLSizeMake(extent.width, extent.height, extent.depth)
-                              toTexture:AsTexture(dst)
-                       destinationSlice:slice
-                       destinationLevel:level
-                      destinationOrigin:MTLOriginMake(origin.x, origin.y, origin.z)];
+    const bool goes_ahead = ahead && CanUploadTextureAhead(dst) && !UsedInOrder(src);
+    if (!goes_ahead) {
+        impl->Touch(dst);
+        impl->NoteInOrder(src);
+        impl->NoteTextureWrite(dst);
+    }
+    const id<MTLBlitCommandEncoder> encoder =
+        goes_ahead ? impl->UploadEncoder() : impl->BlitEncoder();
+    [encoder copyFromBuffer:AsBuffer(src)
+               sourceOffset:offset
+          sourceBytesPerRow:bytes_per_row
+        sourceBytesPerImage:bytes_per_image
+                 sourceSize:MTLSizeMake(extent.width, extent.height, extent.depth)
+                  toTexture:AsTexture(dst)
+           destinationSlice:slice
+           destinationLevel:level
+          destinationOrigin:MTLOriginMake(origin.x, origin.y, origin.z)];
 }
 
 void Scheduler::CopyTextureToBuffer(TextureHandle src, u32 level, u32 slice, Offset3D origin,
@@ -3097,6 +3614,7 @@ void Scheduler::CopyTextureToBuffer(TextureHandle src, u32 level, u32 slice, Off
         return;
     }
     impl->Touch(src);
+    impl->NoteTextureTouched(src);
     impl->NoteInOrderWrite(dst);
     [impl->BlitEncoder() copyFromTexture:AsTexture(src)
                              sourceSlice:slice
@@ -3119,6 +3637,7 @@ void Scheduler::CopyTexture(TextureHandle src, u32 src_level, u32 src_slice, Off
     }
     impl->Touch(src);
     impl->Touch(dst);
+    impl->NoteTextureWrite(dst);
     [impl->BlitEncoder() copyFromTexture:AsTexture(src)
                              sourceSlice:src_slice
                              sourceLevel:src_level
@@ -3164,6 +3683,9 @@ void Scheduler::Clear(const ClearPass& clear) {
         any = true;
     }
     if (!any) {
+        return;
+    }
+    if (impl->TryDrawInPassClear(wanted)) {
         return;
     }
     // EDEN_NX2_METAL_DEPTH_KILL: the open pass's depth or stencil is cleared whole before
@@ -3639,6 +4161,7 @@ bool Scheduler::DepthToBuffer(TextureHandle src_handle, u32 level, u32 slice, Of
         return false;
     }
     state.EndEncoder(PassEnd::Compute);
+    state.NoteTextureTouched(src_handle);
     state.NoteInOrderWrite(dst);
     ++state.encoders;
     ++state.segment_encoders;
@@ -3665,6 +4188,7 @@ bool Scheduler::UpdateSparseTiles(TextureHandle texture_handle,
         return texture != nil;
     }
     impl->ClearBefore({texture_handle});
+    impl->NoteTextureWrite(texture_handle);
     impl->EndEncoder();
     ++impl->encoders;
     ++impl->segment_encoders;
@@ -3719,8 +4243,10 @@ bool Scheduler::Pack16(u32 mode, bool to_buffer, TextureHandle texture_handle, u
     }
     state.EndEncoder(PassEnd::Compute);
     if (to_buffer) {
+        state.NoteTextureTouched(texture_handle);
         state.NoteInOrderWrite(buffer);
     } else {
+        state.NoteTextureWrite(texture_handle);
         state.NoteInOrder(buffer);
     }
     ++state.encoders;
@@ -3876,12 +4402,19 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
     if (impl->render != nil && impl->render_targets == targets) {
         return;
     }
-    // The waiting clear: this pass's load actions, or a pass of its own first.
+    // The waiting clear: this pass's load actions (all or a matching subset), or a pass of its
+    // own first.
     std::optional<ClearPass> clear;
     if (impl->pending_clear) {
-        if (ClearFitsTargets(*impl->pending_clear, targets)) {
-            clear = std::exchange(impl->pending_clear, std::nullopt);
-            impl->pending_clear_textures.clear();
+        if (CanFoldClearInto(*impl->pending_clear, targets)) {
+            bool has_remainder = false;
+            clear = ConsumeClearSubset(*impl->pending_clear, targets, has_remainder);
+            if (has_remainder) {
+                impl->HoldClear(*impl->pending_clear);
+            } else {
+                impl->pending_clear.reset();
+                impl->pending_clear_textures.clear();
+            }
             ++impl->clears_folded;
         } else {
             impl->FlushClear();
@@ -4243,27 +4776,28 @@ void Scheduler::BindVertexBuffer(u32 slot, BufferHandle buffer, u32 offset) {
     }
 }
 
-void Scheduler::BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset) {
+void Scheduler::BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset,
+                           bool write) {
     if (SlotFits(slot, BufferSlots, "buffer")) {
         if (stage == ShaderStage::Compute) {
             impl->ComputeBuffer(buffer);
             impl->LogComputeBind(ComputeBind::Kind::Buffer, slot, buffer, offset, true);
-        } else if (impl->render != nil) {
-            impl->NoteSegmentBuffer(buffer, false);
+        } else if (write && impl->render != nil) {
+            impl->NoteSegmentBuffer(buffer, true);
         }
         impl->SetBuffer(stage, slot, buffer, offset);
     }
 }
 
-u64 Scheduler::UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset) {
+u64 Scheduler::UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset, bool write) {
     if (buffer == nullptr) {
         return 0;
     }
     if (stage == ShaderStage::Compute) {
         impl->ComputeBuffer(buffer);
         impl->LogComputeBind(ComputeBind::Kind::UseBuffer, 0, buffer, offset, true);
-    } else if (impl->render != nil) {
-        impl->NoteSegmentBuffer(buffer, false);
+    } else if (write && impl->render != nil) {
+        impl->NoteSegmentBuffer(buffer, true);
     }
     const id<MTLBuffer> metal_buffer = AsBuffer(buffer);
     switch (stage) {
@@ -4351,15 +4885,22 @@ void Scheduler::BindBytes(ShaderStage stage, u32 slot, const void* data, u32 siz
     }
 }
 
-void Scheduler::BindTexture(ShaderStage stage, u32 slot, TextureHandle texture, bool on_buffer) {
+void Scheduler::BindTexture(ShaderStage stage, u32 slot, TextureHandle texture, bool on_buffer,
+                            bool write) {
     if (!SlotFits(slot, TextureSlots, "texture")) {
         return;
     }
     if (stage == ShaderStage::Compute) {
-        impl->ComputeTexture(texture);
+        impl->ComputeTexture(texture, true);
         impl->LogComputeBind(ComputeBind::Kind::Texture, slot, texture, 0, true);
-    } else if (impl->render != nil && (on_buffer || !ImageNoteSkipEnabled())) {
-        impl->NoteSegmentTexture(texture, true);
+    } else if (impl->render != nil) {
+        impl->NoteTextureTouched(texture);
+        if (write) {
+            impl->NoteTextureWrite(texture);
+        }
+        if (on_buffer || !ImageNoteSkipEnabled()) {
+            impl->NoteSegmentTexture(texture, write);
+        }
     }
     switch (stage) {
     case ShaderStage::Vertex:
@@ -4397,10 +4938,16 @@ u64 Scheduler::UseTexture(ShaderStage stage, TextureHandle texture, bool write, 
         return 0;
     }
     if (stage == ShaderStage::Compute) {
-        impl->ComputeTexture(texture);
+        impl->ComputeTexture(texture, write);
         impl->LogComputeBind(ComputeBind::Kind::UseTexture, 0, texture, 0, write);
-    } else if (impl->render != nil && (on_buffer || !ImageNoteSkipEnabled())) {
-        impl->NoteSegmentTexture(texture, write);
+    } else if (impl->render != nil) {
+        impl->NoteTextureTouched(texture);
+        if (write) {
+            impl->NoteTextureWrite(texture);
+        }
+        if (on_buffer || !ImageNoteSkipEnabled()) {
+            impl->NoteSegmentTexture(texture, write);
+        }
     }
     const id<MTLTexture> metal_texture = AsTexture(texture);
     const MTLResourceUsage usage =
@@ -4503,10 +5050,12 @@ void Scheduler::BeginCompute(void* pipeline, bool ahead) {
     Impl& state = *impl;
     state.kernel_resume = false;
     state.kernel_checked = false;
+    state.compute_clobbered_by_copy = false;
     state.compute_binds.clear();
     state.compute_bind_bytes.clear();
     state.compute_bind_pipeline = pipeline;
-    bool goes_ahead = ahead && AheadEnabled();
+    bool goes_ahead =
+        ahead && AheadEnabled() && (state.render != nil || state.segment_render_passes != 0);
     bool checked = false;
     if (goes_ahead && AheadAnyEnabled()) {
         // Past what CanRecordAhead allowed before EDEN_NX2_METAL_AHEAD_ANY: checked by its binds.
@@ -4656,20 +5205,24 @@ void Scheduler::DrawIndexed(u32 primitive, u32 index_count, u32 index_size,
     impl->CountDraw();
 }
 
-void* Scheduler::CommandBuffer() {
+void* Scheduler::CommandBuffer(bool allow_proxy) {
     impl->FlushClear();
     impl->EndEncoder(PassEnd::CommandBuffer);
     impl->segment_opaque = true;
     // What the caller encodes is not known here: nothing goes ahead of it by its targets.
     ++impl->segment_encoders;
-    if (impl->recorder != nullptr) {
-        // Sync point: the caller (present, MetalFX) encodes on the real command buffer on this
-        // thread, after the encoder thread replayed everything before it.
+    if (impl->recorder != nullptr && !allow_proxy) {
+        // Sync point: the caller (MetalFX) encodes on the real command buffer on this thread,
+        // after the encoder thread replayed everything before it.
         const id<MTLCommandBuffer> proxy = impl->Commands();
         impl->recorder->Drain("CommandBuffer()");
         return (__bridge void*)Rec::Recorder::RealOf(proxy);
     }
     return (__bridge void*)impl->Commands();
+}
+
+void* Scheduler::SharedEvent() const noexcept {
+    return (__bridge void*)impl->event;
 }
 
 u64 Scheduler::TakeGpuNanoseconds() noexcept {
@@ -4864,10 +5417,11 @@ std::string Scheduler::TakePassEndLine(double frames) {
                         static_cast<double>(std::exchange(impl->passes_begun[2], 0)) / per);
     // EDEN_NX2_METAL_COMPUTE_COPY / EDEN_NX2_METAL_SEGMENT_NOTE_CACHE.
     line += fmt::format(" (copies as dispatches per frame: ahead={:.1f} in_order={:.1f}; texture "
-                        "notes skipped per frame {:.1f})",
+                        "notes skipped per frame {:.1f}; in-pass clears {:.1f}/frame)",
                         static_cast<double>(std::exchange(impl->compute_copies_ahead, 0)) / per,
                         static_cast<double>(std::exchange(impl->compute_copies_in_order, 0)) / per,
-                        static_cast<double>(std::exchange(impl->segment_note_skips, 0)) / per);
+                        static_cast<double>(std::exchange(impl->segment_note_skips, 0)) / per,
+                        static_cast<double>(std::exchange(impl->inpass_clears, 0)) / per);
     return line;
 }
 

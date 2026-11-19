@@ -307,22 +307,29 @@ int RunDepthBytes() {
                                   .height = Side,
                                   .render_target = true};
     const Object packed = Metal::CreateTexture(device, desc);
+    const Object packed8_24 = Metal::CreateTexture(device, desc);
     const Object floats = Metal::CreateTexture(device, desc);
     auto [packed_in, packed_in_bytes] = SharedBuffer(device, Side * Side * 4);
     auto [packed_out, packed_out_bytes] = SharedBuffer(device, Side * Side * 4);
+    auto [packed8_in, packed8_in_bytes] = SharedBuffer(device, Side * Side * 4);
+    auto [packed8_out, packed8_out_bytes] = SharedBuffer(device, Side * Side * 4);
     constexpr uint32_t Region = 4;
     constexpr Metal::Offset3D Origin{2, 3, 0};
     auto [float_in, float_in_bytes] = SharedBuffer(device, Region * Region * 8);
     auto [float_out, float_out_bytes] = SharedBuffer(device, Region * Region * 8);
-    if (!packed || !floats || packed_in_bytes == nullptr || packed_out_bytes == nullptr ||
-        float_in_bytes == nullptr || float_out_bytes == nullptr) {
+    if (!packed || !packed8_24 || !floats || packed_in_bytes == nullptr ||
+        packed_out_bytes == nullptr || packed8_in_bytes == nullptr ||
+        packed8_out_bytes == nullptr || float_in_bytes == nullptr || float_out_bytes == nullptr) {
         std::printf("metal-smoke: FAIL depth bytes: textures\n");
         return 1;
     }
     auto* const packed_words = reinterpret_cast<uint32_t*>(packed_in_bytes);
+    auto* const packed8_words = reinterpret_cast<uint32_t*>(packed8_in_bytes);
     for (uint32_t index = 0; index < Side * Side; ++index) {
         const uint32_t depth = (index * 262147U) & 0xFFFFFFU;
-        packed_words[index] = (depth << 8) | ((index * 37U) & 0xFFU);
+        const uint32_t stencil = (index * 37U) & 0xFFU;
+        packed_words[index] = (depth << 8) | stencil;
+        packed8_words[index] = (stencil << 24) | depth;
     }
     auto* const float_words = reinterpret_cast<uint32_t*>(float_in_bytes);
     for (uint32_t index = 0; index < Region * Region; ++index) {
@@ -333,23 +340,33 @@ int RunDepthBytes() {
     const bool packed_up = scheduler.DepthFromBuffer(packed_in.Get(), 0, Side * 4, packed.Get(),
                                                      0, 0, {}, {Side, Side, 1},
                                                      Metal::DepthLayout::Packed24_8);
+    const bool packed8_up = scheduler.DepthFromBuffer(packed8_in.Get(), 0, Side * 4,
+                                                      packed8_24.Get(), 0, 0, {}, {Side, Side, 1},
+                                                      Metal::DepthLayout::Packed8_24);
     const bool float_up = scheduler.DepthFromBuffer(float_in.Get(), 0, Region * 8, floats.Get(), 0,
                                                     0, Origin, {Region, Region, 1},
                                                     Metal::DepthLayout::Float32_X24S8);
     const bool packed_down = scheduler.DepthToBuffer(packed.Get(), 0, 0, {}, {Side, Side, 1},
                                                      packed_out.Get(), 0, Side * 4,
                                                      Metal::DepthLayout::Packed24_8);
+    const bool packed8_down = scheduler.DepthToBuffer(packed8_24.Get(), 0, 0, {}, {Side, Side, 1},
+                                                      packed8_out.Get(), 0, Side * 4,
+                                                      Metal::DepthLayout::Packed8_24);
     const bool float_down = scheduler.DepthToBuffer(floats.Get(), 0, 0, Origin, {Region, Region, 1},
                                                     float_out.Get(), 0, Region * 8,
                                                     Metal::DepthLayout::Float32_X24S8);
     scheduler.Finish();
     const auto* const packed_back = reinterpret_cast<const uint32_t*>(packed_out_bytes);
+    const auto* const packed8_back = reinterpret_cast<const uint32_t*>(packed8_out_bytes);
     uint32_t packed_wrong = 0;
     for (uint32_t index = 0; index < Side * Side; ++index) {
         const bool stencil = (packed_back[index] & 0xFF) == (packed_words[index] & 0xFF);
         const bool depth = Close(static_cast<int>(packed_back[index] >> 8),
                                  static_cast<int>(packed_words[index] >> 8), 1);
-        packed_wrong += stencil && depth ? 0 : 1;
+        const bool stencil8 = (packed8_back[index] >> 24) == (packed8_words[index] >> 24);
+        const bool depth8 = Close(static_cast<int>(packed8_back[index] & 0xFFFFFFU),
+                                  static_cast<int>(packed8_words[index] & 0xFFFFFFU), 1);
+        packed_wrong += stencil && depth && stencil8 && depth8 ? 0 : 1;
     }
     const auto* const float_back = reinterpret_cast<const uint32_t*>(float_out_bytes);
     uint32_t float_wrong = 0;
@@ -358,8 +375,8 @@ int RunDepthBytes() {
         const bool stencil = float_back[index * 2 + 1] == (float_words[index * 2 + 1] & 0xFF);
         float_wrong += depth && stencil ? 0 : 1;
     }
-    const bool passed = packed_up && float_up && packed_down && float_down && packed_wrong == 0 &&
-                        float_wrong == 0;
+    const bool passed = packed_up && packed8_up && float_up && packed_down && packed8_down &&
+                        float_down && packed_wrong == 0 && float_wrong == 0;
     std::printf("metal-smoke: depth bytes into Depth32Float_Stencil8 and back: D24S8 8x8 %u of "
                 "%u wrong, D32F_S8 4x4 at 2,3 %u of %u wrong: %s\n",
                 packed_wrong, Side * Side, float_wrong, Region * Region,
@@ -387,18 +404,21 @@ int RunConversions() {
     const Object colour = texture(Rgba8);
     const Object depth_stencil = texture(ds_format);
     const Object colour_back = texture(Rgba8);
+    const Object colour_s8 = texture(Rgba8);
     const Object depth = texture(d_format);
     const Object colour_x8 = texture(Rgba8);
     const Object depth_floats = texture(d_format);
     const Object reds = texture(r32f);
     auto [upload, upload_bytes] = SharedBuffer(device, Side * Side * 4);
     auto [back, back_bytes] = SharedBuffer(device, Side * Side * 4);
+    auto [s8_back, s8_bytes] = SharedBuffer(device, Side * Side * 4);
     auto [x8_back, x8_bytes] = SharedBuffer(device, Side * Side * 4);
     auto [float_in, float_in_bytes] = SharedBuffer(device, Side * Side * 8);
     auto [red_back, red_bytes] = SharedBuffer(device, Side * Side * 4);
-    if (!colour || !depth_stencil || !colour_back || !depth || !colour_x8 || !depth_floats ||
-        !reds || upload_bytes == nullptr || back_bytes == nullptr || x8_bytes == nullptr ||
-        float_in_bytes == nullptr || red_bytes == nullptr) {
+    if (!colour || !depth_stencil || !colour_back || !colour_s8 || !depth || !colour_x8 ||
+        !depth_floats || !reds || upload_bytes == nullptr || back_bytes == nullptr ||
+        s8_bytes == nullptr || x8_bytes == nullptr || float_in_bytes == nullptr ||
+        red_bytes == nullptr) {
         std::printf("metal-smoke: FAIL conversions: textures\n");
         return 1;
     }
@@ -425,6 +445,7 @@ int RunConversions() {
     };
     const bool to_d24s8 = convert(colour, depth_stencil, ds_format, ConvertKind::Abgr8ToD24s8);
     const bool from_d24s8 = convert(depth_stencil, colour_back, Rgba8, ConvertKind::D24s8ToAbgr8);
+    const bool from_s8d24 = convert(depth_stencil, colour_s8, Rgba8, ConvertKind::S8d24ToAbgr8);
     const bool to_x8d24 = convert(colour, depth, d_format, ConvertKind::Abgr8ToX8d24);
     const bool from_x8d24 = convert(depth, colour_x8, Rgba8, ConvertKind::X8d24ToAbgr8);
     const bool floats_up = scheduler.DepthFromBuffer(float_in.Get(), 0, Side * 8,
@@ -434,6 +455,8 @@ int RunConversions() {
     // Into a format no conversion writes: refused, nothing drawn.
     const bool wrong_refused = !convert(colour, colour_back, Rgba8, ConvertKind::Abgr8ToD24s8);
     scheduler.CopyTextureToBuffer(colour_back.Get(), 0, 0, {}, {Side, Side, 1}, back.Get(), 0,
+                                  Side * 4, 0);
+    scheduler.CopyTextureToBuffer(colour_s8.Get(), 0, 0, {}, {Side, Side, 1}, s8_back.Get(), 0,
                                   Side * 4, 0);
     scheduler.CopyTextureToBuffer(colour_x8.Get(), 0, 0, {}, {Side, Side, 1}, x8_back.Get(), 0,
                                   Side * 4, 0);
@@ -445,9 +468,12 @@ int RunConversions() {
     for (uint32_t index = 0; index < Side * Side; ++index) {
         const uint8_t* const in = upload_bytes + index * 4;
         const uint8_t* const out = back_bytes + index * 4;
+        const uint8_t* const s8 = s8_bytes + index * 4;
         // Red, green and blue go through 24-bit depth, alpha through the stencil.
+        const bool s8_ok = s8[0] == in[3] && Close(in[0], s8[1], 1) && Close(in[1], s8[2], 1) &&
+                           Close(in[2], s8[3], 1);
         d24s8_wrong += Close(in[0], out[0], 1) && Close(in[1], out[1], 1) &&
-                               Close(in[2], out[2], 1) && in[3] == out[3]
+                               Close(in[2], out[2], 1) && in[3] == out[3] && s8_ok
                            ? 0
                            : 1;
         const uint8_t* const x8 = x8_bytes + index * 4;
@@ -461,9 +487,9 @@ int RunConversions() {
     for (uint32_t index = 0; index < Side * Side; ++index) {
         red_wrong += red_values[index] == depths[index] ? 0 : 1;
     }
-    const bool passed = to_d24s8 && from_d24s8 && to_x8d24 && from_x8d24 && floats_up &&
-                        to_red && wrong_refused && d24s8_wrong == 0 && x8d24_wrong == 0 &&
-                        red_wrong == 0;
+    const bool passed = to_d24s8 && from_d24s8 && from_s8d24 && to_x8d24 && from_x8d24 &&
+                        floats_up && to_red && wrong_refused && d24s8_wrong == 0 &&
+                        x8d24_wrong == 0 && red_wrong == 0;
     std::printf("metal-smoke: conversions: ABGR8 -> D24S8 -> ABGR8 %u wrong, ABGR8 -> X8D24 -> "
                 "ABGR8 %u wrong, D32F -> R32F %u wrong (of %u), into the wrong kind %s: %s\n",
                 d24s8_wrong, x8d24_wrong, red_wrong, Side * Side,

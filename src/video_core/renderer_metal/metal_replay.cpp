@@ -43,6 +43,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/feature_census.h"
 #include "video_core/gpu.h"
+#include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_metal/metal_draw_desc.h"
 #include "video_core/renderer_metal/metal_formats.h"
 #include "video_core/renderer_metal/metal_graphics.h"
@@ -71,7 +72,7 @@ constexpr std::array<const char*, 11> MISC_NAMES{
     "FragmentBarrier",  "TiledCacheBarrier", "CounterReset",
 };
 constexpr std::array<char, 8> CACHE_MAGIC{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
-constexpr std::array<u32, 3> CACHE_VERSIONS{52, 53, 54};
+constexpr std::array<u32, 1> CACHE_VERSIONS{VideoCommon::VulkanPipelineCacheVersion};
 /// The sample counts Apple's GPUs take; the renderer asks the device (DevicePipelineLimits).
 constexpr PipelineLimits LIMITS{.sample_counts = (1U << 1) | (1U << 2) | (1U << 4)};
 const VideoCommon::GuessMissing GUESS{};

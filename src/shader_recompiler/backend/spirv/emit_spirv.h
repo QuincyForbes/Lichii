@@ -30,12 +30,12 @@ struct RescalingLayout {
     alignas(16) std::array<u32, NUM_IMAGE_SCALING_WORDS> rescaling_images;
     u32 down_factor;
 };
+static_assert(sizeof(RescalingLayout) == 32);
 struct RenderAreaLayout {
     std::array<f32, 4> render_area;
 };
 constexpr u32 RESCALING_LAYOUT_WORDS_OFFSET = offsetof(RescalingLayout, rescaling_textures);
 constexpr u32 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET = offsetof(RescalingLayout, down_factor);
-constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area);
 
 // EDEN_NX2_MESH_FIRST=1: the draw's first vertex is the first task (or mesh, without a task)
 // workgroup index, as in NVN and GL_NV_mesh_shader. Only the first active stage reads non-zero.
@@ -44,8 +44,10 @@ struct MeshDrawBaseLayout {
     u32 mesh;
 };
 constexpr u32 MESH_DRAW_BASE_OFFSET = sizeof(RescalingLayout);
-static_assert(MESH_DRAW_BASE_OFFSET + sizeof(MeshDrawBaseLayout) <=
-              sizeof(RescalingLayout) + sizeof(RenderAreaLayout));
+constexpr u32 RENDERAREA_LAYOUT_OFFSET = 48;
+static_assert(MESH_DRAW_BASE_OFFSET == 32);
+static_assert(MESH_DRAW_BASE_OFFSET + sizeof(MeshDrawBaseLayout) <= RENDERAREA_LAYOUT_OFFSET);
+static_assert(RENDERAREA_LAYOUT_OFFSET + sizeof(RenderAreaLayout) == 64);
 
 inline bool MeshFirstEnabled() {
     static const bool enabled{std::getenv("EDEN_NX2_MESH_FIRST") != nullptr};

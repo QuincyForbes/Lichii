@@ -66,6 +66,9 @@ enum class ImageFlagBits : u32 {
     /// EDEN_NX2_RT_EVICT_PRESSURE: a render target that started undefined (nothing was uploaded
     /// into it); deleted early once it goes unused while the cache is over its expected size.
     TransientTarget = 1 << 24,
+    /// Its own address space mapped it to more than one device range when it was made (with
+    /// Sparse only when the texture says so).
+    NonContiguous = 1 << 25,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -125,6 +128,7 @@ struct ImageBase {
     bool has_scaled = false;
 
     size_t channel = 0;
+    size_t address_space = ~size_t{0};
 
     ImageFlagBits flags = ImageFlagBits::CpuModified;
 

@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <span>
 #include <utility>
 
@@ -305,6 +306,12 @@ void MeshEpilogue(EmitContext& ctx) {
             mesh.vertex_lines.end() &&
         std::ranges::find(mesh.vertex_lines, static_cast<u32>(IR::Attribute::PositionW)) !=
             mesh.vertex_lines.end()};
+    const Id output_vec4{!direct ? ctx.TypePointer(spv::StorageClass::Output, ctx.F32[4]) : Id{}};
+    const Id default_vec4{!direct && !ctx.mesh_output_generics.empty()
+                              ? ctx.ConstantComposite(ctx.F32[4], ctx.f32_zero_value,
+                                                      ctx.f32_zero_value, ctx.f32_zero_value,
+                                                      ctx.Const(1.0f))
+                              : Id{}};
     for (u32 first = 0; (fixed_point_size || !direct || direct_depth) && first < mesh.max_vertices;
          first += threads) {
         const Id vertex{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
@@ -314,6 +321,12 @@ void MeshEpilogue(EmitContext& ctx) {
                             point_size);
             }
             if (!direct) {
+                for (const auto& generic : ctx.mesh_output_generics) {
+                    if (!generic.per_primitive) {
+                        ctx.OpStore(ctx.OpAccessChain(output_vec4, generic.variable, vertex),
+                                    default_vec4);
+                    }
+                }
                 CopyLines(ctx, vertex, 0, vertex_lines, ctx.mesh_vertex_targets);
                 if (convert_depth) {
                     ConvertDepth(ctx, vertex);
@@ -359,6 +372,12 @@ void MeshEpilogue(EmitContext& ctx) {
                                   index_type,
                                   std::span<const Id>(indices.data(), primitive_vertices)));
             if (!direct) {
+                for (const auto& generic : ctx.mesh_output_generics) {
+                    if (generic.per_primitive) {
+                        ctx.OpStore(ctx.OpAccessChain(output_vec4, generic.variable, primitive),
+                                    default_vec4);
+                    }
+                }
                 CopyLines(ctx, primitive, ctx.mesh_primitive_base, primitive_lines,
                           ctx.mesh_primitive_targets);
             }
@@ -422,25 +441,28 @@ void EmitIsbeWriteMapU32(EmitContext& ctx, const IR::Value& address, Id value) {
 void EmitMeshPrologue(EmitContext& ctx) {
     // No branches here: the entry block's label is a phi predecessor for later blocks.
     const bool as_compute{ctx.runtime_info.mesh_as_compute};
+    if (ctx.stage != Stage::Task && ctx.stage != Stage::Mesh) {
+        return;
+    }
+    const Id invocation{LocalInvocation(ctx)};
+    const u32 step{(std::max)(ctx.mesh_threads, 1U)};
+    const u32 words{ctx.mesh_info.payload_words};
     if (ctx.stage == Stage::Task) {
         if (!as_compute) {
             // A task that culls all its threads never writes the mesh workgroup count, and the
-            // payload starts undefined. Intel's garbage there launches enough workgroups to lose
-            // the device.
-            ctx.OpStore(PayloadWord(ctx, ctx.Const(1U)), ctx.u32_zero_value);
+            // payload starts undefined. Zero every payload word across invocations.
+            for (u32 first = 0; first < words; first += step) {
+                ctx.OpStore(PayloadWord(ctx, ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))),
+                            ctx.u32_zero_value);
+            }
             Barrier(ctx);
             return;
         }
-    } else if (ctx.stage != Stage::Mesh) {
-        return;
     } else {
         // Every invocation stores the zero.
         ctx.OpStore(ctx.mesh_primitive_count, ctx.u32_zero_value);
     }
     if (as_compute) {
-        const Id invocation{LocalInvocation(ctx)};
-        const u32 step{(std::max)(ctx.mesh_threads, 1U)};
-        const u32 words{ctx.mesh_info.payload_words};
         if (ctx.stage == Stage::Mesh && Sirit::ValidId(ctx.mesh_group_index)) {
             // Mesh emulation with a task: find this workgroup's task and its index within the
             // task's mesh workgroups, and copy the task's payload into the input region. Words
@@ -492,14 +514,16 @@ void EmitMeshPrologue(EmitContext& ctx) {
                             ctx.u32_zero_value);
             }
         }
-        if (ctx.stage == Stage::Mesh) {
+    }
+    if (ctx.stage == Stage::Mesh) {
+        const u32 max_vertices{ctx.mesh_info.max_vertices};
+        if (Sirit::ValidId(ctx.mesh_attributes)) {
             // Workgroup memory keeps whatever the previous workgroup left. A primitive that uses
             // a vertex the program never wrote would draw a stray triangle, so every vertex
             // position starts as NaN, which the rasterizer drops.
             const auto& lines{ctx.mesh_info.vertex_lines};
             const u32 num_lines{static_cast<u32>(lines.size())};
             const Id nan{ctx.Const(0x7fc00000U)};
-            const u32 max_vertices{ctx.mesh_info.max_vertices};
             for (u32 line = 0; line < num_lines; ++line) {
                 const auto attribute{static_cast<IR::Attribute>(lines[line])};
                 if (attribute < IR::Attribute::PositionX || attribute > IR::Attribute::PositionW) {
@@ -517,6 +541,33 @@ void EmitMeshPrologue(EmitContext& ctx) {
                         ctx.OpIMul(ctx.U32[1], group, ctx.Const(num_lines * 32)),
                         ctx.OpIAdd(ctx.U32[1], slot, ctx.Const(line * 32)))};
                     ctx.OpStore(SharedWord(ctx, ctx.mesh_attributes, index), nan);
+                }
+            }
+        } else if (!as_compute) {
+            const Id output_vec4{ctx.TypePointer(spv::StorageClass::Output, ctx.F32[4])};
+            if (Sirit::ValidId(ctx.output_position) && max_vertices > 0) {
+                const Id nan_f{ctx.Const(std::bit_cast<f32>(0x7fc00000U))};
+                const Id nan_vec4{ctx.ConstantComposite(ctx.F32[4], nan_f, nan_f, nan_f, nan_f)};
+                for (u32 first = 0; first < max_vertices; first += step) {
+                    const Id vertex{ctx.OpUMin(ctx.U32[1],
+                                               ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first)),
+                                               ctx.Const(max_vertices - 1))};
+                    ctx.OpStore(ctx.OpAccessChain(output_vec4, ctx.output_position, vertex),
+                                nan_vec4);
+                }
+            }
+            if (!ctx.mesh_output_generics.empty()) {
+                const Id default_vec4{ctx.ConstantComposite(ctx.F32[4], ctx.f32_zero_value,
+                                                            ctx.f32_zero_value, ctx.f32_zero_value,
+                                                            ctx.Const(1.0f))};
+                for (const auto& generic : ctx.mesh_output_generics) {
+                    for (u32 first = 0; first < generic.count; first += step) {
+                        const Id elem{ctx.OpUMin(
+                            ctx.U32[1], ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first)),
+                            ctx.Const(generic.count - 1))};
+                        ctx.OpStore(ctx.OpAccessChain(output_vec4, generic.variable, elem),
+                                    default_vec4);
+                    }
                 }
             }
         }

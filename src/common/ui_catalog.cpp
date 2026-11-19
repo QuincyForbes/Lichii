@@ -311,6 +311,9 @@ const Setting kSettings[] = {
                                               "those games' own DLSS network, translated for this GPU "
                                               "(AMD FSR 3.1 still draws while it is checked or fails "
                                               "Lichii's checks). {choice:upscaler.Fsr3}, "
+                                              "{choice:upscaler.Fsr4} (Radeon RX 6000/7000/9000 and "
+                                              "Ryzen RDNA 3+ GPUs; AMD's runtime on Windows, fsr4-vk "
+                                              "on Linux, else {choice:upscaler.Fsr3}), "
                                               "{choice:upscaler.Dlss} (GeForce RTX on Windows, "
                                               "NVIDIA's files from the download button) and "
                                               "{choice:upscaler.MetalFx} (Apple) replace both and draw "
@@ -318,8 +321,8 @@ const Setting kSettings[] = {
                                               "{setting:oot_resolution}, so "
                                               "{choice:oot_resolution.Game} draws at 75% handheld "
                                               "(100% docked) with them, and with "
-                                              "{choice:upscaler.Dlss} the game's Resolution picks the "
-                                              "DLSS mode.\n"
+                                              "{choice:upscaler.Dlss} the game's Resolution or "
+                                              "{setting:nvidia_dlss_quality} picks the DLSS mode.\n"
                                               "Applies the next time a game starts."),
      Desktop | IOS},
     {"nx2_frame_rate_limit",
@@ -339,10 +342,24 @@ const Setting kSettings[] = {
                                               "Also sets the sharpening of the AMD FSR 1 and SGSR "
                                               "window adapting filters."),
      Desktop | IOS},
+    {"nvidia_dlss_quality",
+     QT_TRANSLATE_NOOP("ConfigurationShared", "DLSS Quality"),
+     QT_TRANSLATE_NOOP("ConfigurationShared", "The NVIDIA DLSS Super Resolution mode. "
+                                              "{choice:nvidia_dlss_quality.Auto} follows the game's "
+                                              "render resolution (in Ocarina of Time, its "
+                                              "{setting:oot_resolution}); "
+                                              "{choice:nvidia_dlss_quality.Quality}, "
+                                              "{choice:nvidia_dlss_quality.Balanced}, "
+                                              "{choice:nvidia_dlss_quality.Performance}, "
+                                              "{choice:nvidia_dlss_quality.UltraPerformance} and "
+                                              "{choice:nvidia_dlss_quality.Dlaa} select that DLSS "
+                                              "Super Resolution mode directly."),
+     Desktop,
+     QT_TRANSLATE_NOOP("ConfigurationShared", "NVIDIA DLSS runs on desktop PCs only.")},
     {"nvidia_dlss_preset",
      QT_TRANSLATE_NOOP("ConfigurationShared", "DLSS Preset"),
      QT_TRANSLATE_NOOP("ConfigurationShared", "The DLSS model. K is the tested default; L and M are "
-                                              "NVIDIA's newer models, J the older one. "
+                                              "NVIDIA's newer models, E, F and J the earlier ones. "
                                               "{choice:nvidia_dlss_preset.Default} lets NVIDIA choose "
                                               "per quality mode."),
      Windows,
@@ -608,6 +625,12 @@ const Setting kSettings[] = {
                                               "flow shader, or NVIDIA's optical flow hardware on RTX "
                                               "20 and newer); needs nothing else. It is not AMD FSR "
                                               "3.\n"
+                                              "{choice:frame_gen_type.NvidiaDlssG}: NVIDIA DLSS Frame "
+                                              "Generation (2x on RTX 40, up to 4x Multi Frame "
+                                              "Generation on RTX 50) on Windows with "
+                                              "{choice:upscaler.Dlss} and Hardware-accelerated GPU "
+                                              "scheduling; falls back to {choice:frame_gen_type.Fsr3} "
+                                              "when unavailable.\n"
                                               "{choice:frame_gen_type.Lsfg}: the shaders of "
                                               "Lossless.dll from your own copy of Lossless Scaling "
                                               "(Steam); without the file no frames are generated.\n"
@@ -1701,7 +1724,8 @@ const Choice kChoices[] = {
     CHOICE(FrameGenFlowQuality, Best, QT_TRANSLATE_NOOP("ConfigurationShared", "Best")),
     CHOICE(FrameGenType, Lsfg, QT_TRANSLATE_NOOP("ConfigurationShared", "Lossless Scaling")),
     CHOICE(FrameGenType, Fsr3, QT_TRANSLATE_NOOP("ConfigurationShared", "Optical Flow")),
-    CHOICE(FrameGenType, MetalFx, QT_TRANSLATE_NOOP("ConfigurationShared", "MetalFX")),
+    CHOICE_ON(FrameGenType, NvidiaDlssG, QT_TRANSLATE_NOOP("ConfigurationShared", "NVIDIA DLSS"), Desktop),
+    CHOICE_ON(FrameGenType, MetalFx, QT_TRANSLATE_NOOP("ConfigurationShared", "MetalFX"), Apple),
     CHOICE(ScalingFilter, NearestNeighbor, QT_TRANSLATE_NOOP("ConfigurationShared", "Nearest Neighbor")),
     CHOICE(ScalingFilter, Bilinear, QT_TRANSLATE_NOOP("ConfigurationShared", "Bilinear")),
     CHOICE(ScalingFilter, Bicubic, QT_TRANSLATE_NOOP("ConfigurationShared", "Bicubic")),
@@ -1718,11 +1742,19 @@ const Choice kChoices[] = {
     CHOICE(ScalingFilter, Sgsr, QT_TRANSLATE_NOOP("ConfigurationShared", "Snapdragon GSR")),
     CHOICE(ScalingFilter, SgsrEdge, QT_TRANSLATE_NOOP("ConfigurationShared", "Snapdragon GSR Edge")),
     CHOICE(ScalingFilter, Fsr3, QT_TRANSLATE_NOOP("ConfigurationShared", "AMD FSR 1 Soft")),
-    CHOICE(ScalingFilter, MetalFxSpatial, QT_TRANSLATE_NOOP("ConfigurationShared", "MetalFX Spatial")),
+    CHOICE_ON(ScalingFilter, MetalFxSpatial, QT_TRANSLATE_NOOP("ConfigurationShared", "MetalFX Spatial"), Apple),
     CHOICE(AntiAliasing, None, QT_TRANSLATE_NOOP("ConfigurationShared", "None")),
     CHOICE(AntiAliasing, Fxaa, QT_TRANSLATE_NOOP("ConfigurationShared", "FXAA")),
     CHOICE(AntiAliasing, Smaa, QT_TRANSLATE_NOOP("ConfigurationShared", "SMAA")),
+    CHOICE(DlssQuality, Auto, QT_TRANSLATE_NOOP("ConfigurationShared", "Automatic")),
+    CHOICE(DlssQuality, Quality, QT_TRANSLATE_NOOP("ConfigurationShared", "Quality")),
+    CHOICE(DlssQuality, Balanced, QT_TRANSLATE_NOOP("ConfigurationShared", "Balanced")),
+    CHOICE(DlssQuality, Performance, QT_TRANSLATE_NOOP("ConfigurationShared", "Performance")),
+    CHOICE(DlssQuality, UltraPerformance, QT_TRANSLATE_NOOP("ConfigurationShared", "Ultra Performance")),
+    CHOICE(DlssQuality, Dlaa, QT_TRANSLATE_NOOP("ConfigurationShared", "DLAA")),
     CHOICE(DlssPreset, Default, QT_TRANSLATE_NOOP("ConfigurationShared", "Default")),
+    CHOICE(DlssPreset, E, QT_TRANSLATE_NOOP("ConfigurationShared", "E")),
+    CHOICE(DlssPreset, F, QT_TRANSLATE_NOOP("ConfigurationShared", "F")),
     CHOICE(DlssPreset, J, QT_TRANSLATE_NOOP("ConfigurationShared", "J")),
     CHOICE(DlssPreset, K, QT_TRANSLATE_NOOP("ConfigurationShared", "K")),
     CHOICE(DlssPreset, L, QT_TRANSLATE_NOOP("ConfigurationShared", "L")),
@@ -1753,8 +1785,9 @@ const Choice kChoices[] = {
     CHOICE(Upscaler, Auto, QT_TRANSLATE_NOOP("ConfigurationShared", "Automatic")),
     CHOICE(Upscaler, Game, QT_TRANSLATE_NOOP("ConfigurationShared", "Game's Own")),
     CHOICE(Upscaler, Fsr3, QT_TRANSLATE_NOOP("ConfigurationShared", "AMD FSR 3.1")),
+    CHOICE_ON(Upscaler, Fsr4, QT_TRANSLATE_NOOP("ConfigurationShared", "AMD FSR 4"), Desktop),
     CHOICE_ON(Upscaler, Dlss, QT_TRANSLATE_NOOP("ConfigurationShared", "NVIDIA DLSS"), Desktop),
-    CHOICE(Upscaler, MetalFx, QT_TRANSLATE_NOOP("ConfigurationShared", "MetalFX Temporal")),
+    CHOICE_ON(Upscaler, MetalFx, QT_TRANSLATE_NOOP("ConfigurationShared", "MetalFX Temporal"), Apple),
     CHOICE(OotFrameRate, Fps30, QT_TRANSLATE_NOOP("ConfigurationShared", "30 FPS")),
     CHOICE(OotFrameRate, Fps60, QT_TRANSLATE_NOOP("ConfigurationShared", "60 FPS")),
     CHOICE(OotFrameRate, Unlocked, QT_TRANSLATE_NOOP("ConfigurationShared", "Unlocked")),

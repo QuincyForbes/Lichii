@@ -76,6 +76,9 @@ add_executable(tests
     video_core/descriptor_limits.cpp
     video_core/fire_emblem_upscale.cpp
     video_core/dlss_contract.cpp
+    video_core/dlss_mode.cpp
+    video_core/frame_gen_choice.cpp
+    video_core/fsr4_support.cpp
     video_core/ampere_fast_fusion.cpp
     video_core/ampere_async_copy.cpp
     video_core/ampere_trap_guards.cpp
@@ -127,6 +130,7 @@ add_executable(tests
     video_core/spirv_software_matrix.cpp
     video_core/spirv_builtin_capabilities.cpp
     video_core/spirv_nan_safe_min_max.cpp
+    video_core/spirv_push_constants_and_ops.cpp
     video_core/virtual_range_cache.cpp
     video_core/ocarina_upscale.cpp
     core/nx2_frame_interval.cpp
@@ -293,6 +297,7 @@ if (NOT ANDROID)
         common/first_run_config.cpp
         ../frontend_common/config.cpp
         ../frontend_common/settings_migration.cpp)
+    target_compile_definitions(config_tests PRIVATE LICHII_CONFIG_NO_VULKAN_PROBE)
     target_link_libraries(config_tests PRIVATE common SimpleIni::SimpleIni Catch2::Catch2WithMain
         ${PLATFORM_LIBRARIES})
     add_test(NAME config_tests COMMAND config_tests)

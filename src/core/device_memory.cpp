@@ -53,8 +53,10 @@ DeviceMemory::~DeviceMemory() {
 #if defined(_WIN32) || defined(__APPLE__)
 // Windows can't punch holes in the guest memory section, so pages holding only zeros (games clear
 // their heaps while booting: Ocarina leaves ~7 GB) stay resident until they leave the working set.
-// A pass comes every 5 s while they keep turning up, backing off to once a minute. Apple counts
-// them in the footprint iOS kills the app over, compressed or not.
+// A pass comes every 5 s while they keep turning up, backing off to once every 5 minutes: after
+// boot most passes trim 1-2 MiB for about a second of work. It waits out bulk mapping (loads,
+// spawns), whose map calls stalled 10-14 ms while a pass ran. Apple counts untagged pages in the
+// footprint iOS kills the app over, compressed or not.
 // Passes work in slices of a few MiB with a short sleep after each, on the efficiency cores:
 // whole passes at once took 1.4-4.7 s on Windows and lined up with the 0.6-0.7 s hitches of a
 // game's first minute. On Windows a page leaves only once two passes found it zero. Under host
@@ -252,6 +254,19 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
                 break;
             }
         }
+        // Busy: over 32 MiB mapped, unmapped or protected in the last half second. At most 10
+        // waits (5 s), then the pass runs anyway.
+        if (!urgent && !imminent && (!counts_only || state.free_zero)) {
+            for (int wait = 0; wait < 10; ++wait) {
+                const u64 mapped_before = Common::HostMemory::MappedBytes();
+                if (!sleep(500ms)) {
+                    return;
+                }
+                if (Common::HostMemory::MappedBytes() - mapped_before < (u64{32} << 20)) {
+                    break;
+                }
+            }
+        }
         const auto before = Common::PlatformEvents::QueryProcessMemory();
         const auto start = std::chrono::steady_clock::now();
         const auto [resident, trimmed] = buffer.TrimZeroPages(&state, [&] {
@@ -292,7 +307,7 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
             }
         } else if (trimmed < Busy && pending < Busy) {
             // Nothing to give back: wait longer, with little left as well (up to 30 s then).
-            interval = (std::min)(interval * 2, std::chrono::seconds{tight ? 30 : 60});
+            interval = (std::min)(interval * 2, std::chrono::seconds{tight ? 30 : 300});
             if (!boot && !tight) {
                 continue;
             }

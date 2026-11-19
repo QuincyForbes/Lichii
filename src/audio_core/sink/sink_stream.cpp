@@ -109,11 +109,24 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
     }
 }
 
+/// Blocks a sysmix stream may queue: enough for the host's largest callback plus one block.
+/// A host that asks for more than the queue holds (PipeWire's default 1024 frames against three
+/// 240-frame blocks) gets silence for the rest of every callback. The sample ring must hold the
+/// queued blocks and the one playing, at the device's channel count.
+u32 SinkStream::SysmixQueueLimit() const {
+    constexpr u64 MinimumBlocks = 3;
+    const u64 ring_blocks = SampleRingCapacity / (u64{TargetSampleCount} * device_channels) - 1;
+    const u64 request = largest_request_frames.load(std::memory_order_relaxed);
+    const u64 blocks = (request + TargetSampleCount - 1) / TargetSampleCount + 1;
+    return static_cast<u32>(std::clamp<u64>(blocks, MinimumBlocks, (std::min<u64>)(ring_blocks, 64)));
+}
+
 bool SinkStream::TryAppendOutputBlock(SinkBuffer& buffer, std::span<s16> samples) {
     if (type != StreamType::Sysmix || !IsReady() || buffer.frames != TargetSampleCount ||
         buffer.frames_played != 0 || buffer.consumed || system_channels != 2 ||
         (device_channels != 2 && device_channels != 6) ||
-        samples.size() != TargetSampleCount * system_channels || queued_buffers.load() >= 3) {
+        samples.size() != TargetSampleCount * system_channels ||
+        queued_buffers.load() >= SysmixQueueLimit()) {
         return false;
     }
     AppendBuffer(buffer, samples);
@@ -250,12 +263,7 @@ void SinkStream::ProcessAudioIn(std::span<const s16> input_buffer, std::size_t n
     }
 
     // update sample counts fuer audio-ins
-    {
-        std::scoped_lock lk{sample_count_lock};
-        last_sample_count_update_time = system.CoreTiming().GetGlobalTimeNs();
-        min_played_sample_count = max_played_sample_count;
-        max_played_sample_count += frames_written;
-    }
+    UpdateSampleCount(frames_written);
 }
 
 RenderOutputClock& GetRenderOutputClock() {
@@ -272,6 +280,7 @@ bool RenderOutputClockEnabled() {
     return enabled;
 }
 
+/// Render queued PCM with the stream's underrun policy and optional two-second diagnostics.
 void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::size_t num_frames) {
     if (num_frames == 0) {
         return;
@@ -292,6 +301,13 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
         for (size_t i = 0; i < num_frames; i++)
             std::memset(&output_buffer[i * frame_size], 0, frame_size_bytes);
         return;
+    }
+
+    if (type == StreamType::Sysmix &&
+        num_frames > largest_request_frames.load(std::memory_order_relaxed)) {
+        largest_request_frames.store(num_frames, std::memory_order_relaxed);
+        LOG_INFO(Audio, "sysmix {}: host asks for {} frames per callback, queue limit {} blocks",
+                 name, num_frames, SysmixQueueLimit());
     }
 
     while (frames_written < num_frames) {
@@ -336,19 +352,29 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
             level_peak = std::max<s32>(level_peak, std::abs(static_cast<s32>(output_buffer[i])));
         }
         level_frames += num_frames;
+        const u64 missing = num_frames - actual_frames_written;
+        level_rendered_frames += actual_frames_written;
+        ++level_callbacks;
+        level_underrun_callbacks += missing != 0;
+        level_max_missing_frames = std::max(level_max_missing_frames, missing);
         if (level_frames >= TargetSampleRate * 2) {
             LOG_INFO(Audio, "Audio output peak over {} frames: {} of 32767", level_frames, level_peak);
+            LOG_INFO(Audio,
+                     "Audio sink {}: callbacks={} requested_frames={} rendered_frames={} "
+                     "missing_frames={} underrun_callbacks={} max_missing_frames={}",
+                     name, level_callbacks, level_frames, level_rendered_frames,
+                     level_frames - level_rendered_frames, level_underrun_callbacks,
+                     level_max_missing_frames);
+            level_rendered_frames = 0;
+            level_callbacks = 0;
+            level_underrun_callbacks = 0;
+            level_max_missing_frames = 0;
             level_frames = 0;
             level_peak = 0;
         }
     }
 
-    {
-        std::scoped_lock lk{sample_count_lock};
-        last_sample_count_update_time = system.CoreTiming().GetGlobalTimeNs();
-        min_played_sample_count = max_played_sample_count;
-        max_played_sample_count += actual_frames_written;
-    }
+    UpdateSampleCount(actual_frames_written);
 
     if (RenderOutputClockEnabled() && type == StreamType::Render &&
         name == "ADSP_RenderStream-0") {
@@ -358,14 +384,42 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
     }
 }
 
+void SinkStream::UpdateSampleCount(std::size_t frames_added) {
+    const s64 now_ns = system.CoreTiming().GetGlobalTimeNs().count();
+    const u64 prev_max = max_played_sample_count.load(std::memory_order_relaxed);
+    const u64 next_max = prev_max + frames_added;
+    const u64 seq = sample_count_seq.fetch_add(1, std::memory_order_acq_rel);
+    last_sample_count_update_ns.store(now_ns, std::memory_order_relaxed);
+    min_played_sample_count.store(prev_max, std::memory_order_relaxed);
+    max_played_sample_count.store(next_max, std::memory_order_relaxed);
+    sample_count_seq.store(seq + 2, std::memory_order_release);
+}
+
 u64 SinkStream::GetExpectedPlayedSampleCount() {
-    std::scoped_lock lk{sample_count_lock};
-    auto cur_time{system.CoreTiming().GetGlobalTimeNs()};
-    auto time_delta{cur_time - last_sample_count_update_time};
-    auto exp_played_sample_count{min_played_sample_count + (TargetSampleRate * time_delta) / std::chrono::seconds{1}};
+    u64 min_samples{};
+    u64 max_samples{};
+    s64 last_update_ns{};
+    while (true) {
+        const u64 seq1 = sample_count_seq.load(std::memory_order_acquire);
+        if ((seq1 & 1) != 0) {
+            continue;
+        }
+        last_update_ns = last_sample_count_update_ns.load(std::memory_order_relaxed);
+        min_samples = min_played_sample_count.load(std::memory_order_relaxed);
+        max_samples = max_played_sample_count.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const u64 seq2 = sample_count_seq.load(std::memory_order_relaxed);
+        if (seq1 == seq2) {
+            break;
+        }
+    }
+    const s64 cur_ns = system.CoreTiming().GetGlobalTimeNs().count();
+    const s64 delta_ns = (std::max<s64>)(0, cur_ns - last_update_ns);
+    const u64 exp_played_sample_count =
+        min_samples + (u64{TargetSampleRate} * static_cast<u64>(delta_ns)) / 1'000'000'000ULL;
 
     // Add 25ms of latency in sample reporting to allow for some leeway in scheduler timings
-    return std::min<u64>(exp_played_sample_count, max_played_sample_count) + TargetSampleCount * 5;
+    return std::min<u64>(exp_played_sample_count, max_samples) + TargetSampleCount * 5;
 }
 
 void SinkStream::WaitFreeSpace(std::stop_token stop_token) {

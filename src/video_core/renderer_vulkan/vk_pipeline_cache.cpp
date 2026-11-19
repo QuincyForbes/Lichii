@@ -246,11 +246,12 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     }
     const Shader::Stage stage{program.stage};
     const bool has_geometry{key.unique_hashes[4] != 0 && !programs[4].is_geometry_passthrough};
+    const bool has_tess_eval{key.unique_hashes[3] != 0};
     const bool gl_ndc{key.state.ndc_minus_one_to_one != 0};
     const float point_size{std::bit_cast<float>(key.state.point_size)};
     switch (stage) {
     case Shader::Stage::VertexB:
-        if (!has_geometry) {
+        if (!has_geometry && !has_tess_eval) {
             if (key.state.topology == Maxwell::PrimitiveTopology::Points) {
                 info.fixed_state_point_size = point_size;
             }
@@ -276,6 +277,19 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
         }
         break;
     case Shader::Stage::TessellationEval:
+        if (!has_geometry) {
+            if (key.state.xfb_enabled) {
+                if (device.IsExtTransformFeedbackSupported()) {
+                    auto [varyings, count] =
+                        VideoCommon::MakeTransformFeedbackVaryings(key.state.xfb_state);
+                    info.xfb_varyings = varyings;
+                    info.xfb_count = count;
+                } else {
+                    LOG_WARNING(Render_Vulkan, "XFB requested in pipeline key but device lacks VK_EXT_transform_feedback; ignoring XFB decorations");
+                }
+            }
+            info.convert_depth_mode = gl_ndc;
+        }
         info.tess_clockwise = key.state.tessellation_clockwise != 0;
         info.tess_primitive = [&key] {
             const u32 raw{key.state.tessellation_primitive.Value()};
@@ -324,7 +338,9 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
                 LOG_WARNING(Render_Vulkan, "XFB requested in pipeline key but device lacks VK_EXT_transform_feedback; ignoring XFB decorations");
             }
         }
-        info.convert_depth_mode = gl_ndc;
+        if (!program.is_geometry_passthrough) {
+            info.convert_depth_mode = gl_ndc;
+        }
         break;
     case Shader::Stage::Fragment: {
         info.alpha_test_func = MaxwellToCompareFunction(
@@ -1290,19 +1306,13 @@ void MergeCompatiblePipelineCaches(const std::filesystem::path& base_dir,
                                    const std::filesystem::path& own_cache,
                                    const std::filesystem::path& own_used) {
     constexpr std::array<char, 8> PipelineCacheMagic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
-    constexpr std::array<u32, 2> CompatibleVersions{54, 53};
+    constexpr std::array<u32, 1> CompatibleVersions{CACHE_VERSION};
     struct Candidate {
         std::filesystem::path cache;
         std::filesystem::path used;
         std::optional<u32> version; // nullopt: legacy name, read from the header
     };
     std::vector<Candidate> candidates;
-    for (const u32 version : CompatibleVersions) {
-        candidates.push_back({VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan", version),
-                              VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used",
-                                                                      version),
-                              version});
-    }
     candidates.push_back({base_dir / "vulkan.bin", base_dir / "vulkan_used.bin", std::nullopt});
     candidates.push_back({base_dir / "vulkan_pipelines.bin", {}, std::nullopt});
 
@@ -1854,7 +1864,6 @@ void PipelineCache::BuildCleanWatch(bool patch) {
     watch(regs.conservative_raster_enable);
     watch(regs.line_anti_alias_enable);
     watch(regs.anti_alias_alpha_control);
-    watch(regs.depth_bounds);
     watch(regs.line_stipple_params);
     for (const auto& rt : regs.rt) {
         watch(rt.format);
@@ -4610,7 +4619,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const bool emulated{index == mesh_index || (has_task && index == 1)};
         const auto add = [&](const auto& descriptors, u32* category) {
             const u32 count{Shader::NumDescriptors(descriptors)};
-            output_binding += count;
+            output_binding += static_cast<u32>(descriptors.size());
             if (emulated) {
                 compute_resources += count;
                 if (category) {
@@ -4871,12 +4880,49 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::array<std::optional<Shader::RuntimeInfo>, Maxwell::MaxShaderStage> deferred_runtime_infos;
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
 
-    // A MoltenVK pipeline that failed with descriptor aliasing (RebuildWithoutAliasing) is
-    // emitted with one type per storage buffer.
+    // A MoltenVK pipeline that failed with descriptor aliasing (RebuildWithoutAliasing) or whose
+    // descriptors spill into a Metal argument buffer is emitted with one type per storage buffer.
+    const auto exceeds_metal_direct_slots = [](const Shader::Info& info, u32 extra_buffers) {
+        const u32 buffers = Shader::NumDescriptors(info.constant_buffer_descriptors) +
+                            Shader::NumDescriptors(info.storage_buffers_descriptors) +
+                            extra_buffers;
+        const u32 samplers = Shader::NumDescriptors(info.texture_descriptors);
+        const u32 textures = samplers + Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                             Shader::NumDescriptors(info.image_buffer_descriptors) +
+                             Shader::NumDescriptors(info.image_descriptors);
+        return buffers > 24 || samplers > 16 || textures > 31;
+    };
     std::optional<Shader::Profile> argument_buffer_profile;
     if (device.IsMoltenVK() && profile.support_descriptor_aliasing) {
-        std::scoped_lock lock{no_alias_mutex};
-        if (no_alias_pipelines.contains(key.Hash())) {
+        bool disable_aliasing = false;
+        {
+            std::scoped_lock lock{no_alias_mutex};
+            disable_aliasing = no_alias_pipelines.contains(key.Hash());
+        }
+        if (!disable_aliasing) {
+            const u32 mesh_aux_buffers =
+                mesh_emulation ? (mesh_emulation->has_task ? 4U : 1U) : 0U;
+            for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0;
+                 index < Maxwell::MaxShaderProgram; ++index) {
+                const bool is_emulated_stage =
+                    layer_source_program != nullptr &&
+                    index == static_cast<u32>(Maxwell::ShaderType::Geometry);
+                if (key.unique_hashes[index] == 0 && !is_emulated_stage) {
+                    continue;
+                }
+                const Shader::IR::Program& prog{programs[index]};
+                const u32 extra_buffers =
+                    (mesh_emulation &&
+                     (prog.stage == Shader::Stage::Task || prog.stage == Shader::Stage::Mesh))
+                        ? mesh_aux_buffers
+                        : 0U;
+                if (exceeds_metal_direct_slots(prog.info, extra_buffers)) {
+                    disable_aliasing = true;
+                    break;
+                }
+            }
+        }
+        if (disable_aliasing) {
             argument_buffer_profile = profile;
             argument_buffer_profile->support_descriptor_aliasing = false;
         }
@@ -5535,7 +5581,20 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                     max_shared_memory / 1024);
         program.shared_memory_size = max_shared_memory;
     }
-    std::vector<u32> code{EmitSPIRV(compute_profile, program)};
+    Shader::Profile local_compute_profile = compute_profile;
+    if (device.IsMoltenVK() && local_compute_profile.support_descriptor_aliasing) {
+        const u32 buffers = Shader::NumDescriptors(program.info.constant_buffer_descriptors) +
+                            Shader::NumDescriptors(program.info.storage_buffers_descriptors);
+        const u32 samplers = Shader::NumDescriptors(program.info.texture_descriptors);
+        const u32 textures = samplers +
+                             Shader::NumDescriptors(program.info.texture_buffer_descriptors) +
+                             Shader::NumDescriptors(program.info.image_buffer_descriptors) +
+                             Shader::NumDescriptors(program.info.image_descriptors);
+        if (buffers > 24 || samplers > 16 || textures > 31) {
+            local_compute_profile.support_descriptor_aliasing = false;
+        }
+    }
+    std::vector<u32> code{EmitSPIRV(local_compute_profile, program)};
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 

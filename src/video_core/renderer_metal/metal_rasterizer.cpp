@@ -30,6 +30,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/buffer_cache/cpu_read_stats.h"
+#include "video_core/buffer_cache/deferred_page_caching.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -386,6 +387,11 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
       fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_},
       frame_dump{device_, scheduler_}, flash_watch{device_, scheduler_} {
     pipeline_cache.SetSkipCheck([this] { return DrawMayBeSkipped(); });
+    buffer_cache_runtime.SetWriteHook(
+        [](void* user, BufferHandle buf, u64 offset, u64 size) {
+            static_cast<RasterizerMetal*>(user)->InvalidateConvertedIndices(buf, offset, size);
+        },
+        this);
     Common::PlatformEvents::SetGraphicsMemoryReport([this] { return GraphicsMemoryReport(); });
     // Fence work left pending (EDEN_NX2_FENCE_FLUSH_US) is committed when the split's back goes
     // idle, as Vulkan's deferred flushes; EDEN_NX2_IDLE_GRACE_US and EDEN_NX2_IDLE_HOLD_US work
@@ -425,6 +431,7 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
                     const DAddr page_end =
                         (std::min)(addr + size, Common::AlignDown(page, page_size) + page_size);
                     if (self.buffer_cache.OnCPUWrite(page, page_end - page)) {
+                        Tegra::Nx2NoteDeferredCodeWrite(page, page_end - page);
                         self.gpu.CollectHandoffWrite(page, page_end - page);
                     }
                     page = page_end;
@@ -435,6 +442,7 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
 }
 
 RasterizerMetal::~RasterizerMetal() {
+    buffer_cache_runtime.SetWriteHook(nullptr, nullptr);
     Common::PlatformEvents::SetGraphicsMemoryReport({});
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr, nullptr);
     VideoCommon::GpuSplit::Get().SetIdleBusy(nullptr);
@@ -882,15 +890,22 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         const char* const value = std::getenv("EDEN_NX2_METAL_GPU_INDICES");
         return value != nullptr ? value[0] : 'a';
     }();
-    if (convert && is_indexed && draw_state.inline_index_draw_indexes.empty() &&
-        gpu_indices != '0') {
+    static const bool cache_converted_indices = EnvironmentOn("EDEN_NX2_METAL_INDEX_CACHE");
+    if (convert && is_indexed && draw_state.inline_index_draw_indexes.empty()) {
         const GPUVAddr start = draw_state.index_buffer.StartAddress() +
                                GPUVAddr{draw_state.index_buffer.first} * index_size;
         const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(start);
-        index_rewrite.wanted =
-            gpu_indices == '1' ||
-            (device_addr &&
-             buffer_cache.IsRegionGpuModified(*device_addr, size_t{count} * index_size));
+        const bool gpu_modified =
+            device_addr &&
+            buffer_cache.IsRegionGpuModified(*device_addr, size_t{count} * index_size);
+        if (gpu_indices != '0' && (gpu_indices == '1' || gpu_modified)) {
+            index_rewrite.wanted = true;
+            index_rewrite.only_ahead = false;
+        } else if (!gpu_modified && (cache_converted_indices ||
+                                     (gpu_indices != '0' && count >= 256))) {
+            index_rewrite.wanted = true;
+            index_rewrite.only_ahead = true;
+        }
         index_rewrite.params = {
             .mode = IndexConvert::RewriteMode(DrawTopology(*maxwell3d), provoking_last, restart),
             .index_size = index_size,
@@ -962,11 +977,16 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     };
 
     if (convert) {
-        // 32-bit indices in the stream ring: from the GPU rewrite, or rewritten on the CPU from
-        // the guest's indices (or the vertex range).
-        StagingBufferRef indices = index_rewrite.output;
-        if (indices.buffer != nullptr) {
+        // 32-bit indices: from the converted-index cache, the GPU rewrite, or rewritten on the CPU
+        // from the guest's indices (or the vertex range).
+        BufferHandle draw_index_buffer = index_rewrite.cached_buffer;
+        u64 draw_index_offset = 0;
+        if (draw_index_buffer != nullptr) {
+            converted = index_rewrite.cached_count;
+        } else if (index_rewrite.output.buffer != nullptr) {
             ++indices_rewritten_on_gpu;
+            draw_index_buffer = index_rewrite.output.buffer;
+            draw_index_offset = index_rewrite.output.offset;
         } else {
             std::span<const u8> source;
             if (is_indexed) {
@@ -981,16 +1001,59 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
                     source = converted_source;
                 }
             }
-            indices = staging_pool.Stream(size_t{converted} * sizeof(u32), 4);
-            const std::span<u32> out(reinterpret_cast<u32*>(indices.mapped_span.data()),
-                                     converted);
-            converted = IndexConvert::Convert(DrawTopology(*maxwell3d), source, index_size,
-                                              is_indexed ? 0U : draw_state.vertex_buffer.first,
-                                              count, restart, out, provoking_last);
+            ConvertedIndexEntry* promote_entry = nullptr;
+            if (index_rewrite.wanted && index_rewrite.only_ahead && cache_converted_indices) {
+                const BufferCacheRuntime::IndexState& idx = buffer_cache_runtime.Index();
+                const auto found = converted_index_cache.find(idx.buffer);
+                if (found != converted_index_cache.end()) {
+                    const u64 src_offset = u64{idx.offset} + index_rewrite.params.source_offset;
+                    const u64 src_size = u64{count} * index_size;
+                    for (ConvertedIndexEntry& item : found->second) {
+                        if (!item.buffer && item.hits >= 2 && item.offset == src_offset &&
+                            item.size == src_size && item.mode == index_rewrite.params.mode &&
+                            item.index_size == index_size &&
+                            item.restart == index_rewrite.params.restart &&
+                            converted_index_bytes + u64{converted} * sizeof(u32) <=
+                                (u64{64} << 20)) {
+                            promote_entry = &item;
+                            break;
+                        }
+                    }
+                }
+            }
+            u8* mapped = nullptr;
+            Object promoted_buffer;
+            if (promote_entry != nullptr) {
+                promoted_buffer =
+                    CreateBuffer(device, u64{converted} * sizeof(u32), true, &mapped);
+            }
+            if (promoted_buffer && mapped != nullptr) {
+                const std::span<u32> out(reinterpret_cast<u32*>(mapped), converted);
+                converted = IndexConvert::Convert(DrawTopology(*maxwell3d), source, index_size,
+                                                  is_indexed ? 0U : draw_state.vertex_buffer.first,
+                                                  count, restart, out, provoking_last);
+                if (converted != 0) {
+                    promote_entry->converted = converted;
+                    promote_entry->last_frame = oot_frame;
+                    promote_entry->buffer = std::move(promoted_buffer);
+                    converted_index_bytes += u64{converted} * sizeof(u32);
+                    draw_index_buffer = promote_entry->buffer.Get();
+                }
+            } else {
+                const StagingBufferRef indices =
+                    staging_pool.Stream(size_t{converted} * sizeof(u32), 4);
+                const std::span<u32> out(reinterpret_cast<u32*>(indices.mapped_span.data()),
+                                         converted);
+                converted = IndexConvert::Convert(DrawTopology(*maxwell3d), source, index_size,
+                                                  is_indexed ? 0U : draw_state.vertex_buffer.first,
+                                                  count, restart, out, provoking_last);
+                draw_index_buffer = indices.buffer;
+                draw_index_offset = indices.offset;
+            }
         }
-        if (converted != 0 &&
-            !conditional(*primitive, true, converted, 4, indices.buffer, indices.offset, 0)) {
-            scheduler.DrawIndexed(*primitive, converted, 4, indices.buffer, indices.offset,
+        if (converted != 0 && draw_index_buffer != nullptr &&
+            !conditional(*primitive, true, converted, 4, draw_index_buffer, draw_index_offset, 0)) {
+            scheduler.DrawIndexed(*primitive, converted, 4, draw_index_buffer, draw_index_offset,
                                   instance_count,
                                   is_indexed ? static_cast<s32>(draw_state.base_index) : 0,
                                   draw_state.base_instance);
@@ -1019,6 +1082,9 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
 
 std::vector<TextureHandle> RasterizerMetal::PrepareTexelBuffers(std::span<const Binding> bindings,
                                                                 const Shader::Info& info) {
+    if (info.texture_buffer_descriptors.empty() && info.image_buffer_descriptors.empty()) {
+        return {};
+    }
     // The buffer cache appends a stage's texture buffers, then its image buffers.
     const size_t read_only = Shader::NumDescriptors(info.texture_buffer_descriptors);
     std::vector<TextureHandle> result;
@@ -1064,6 +1130,37 @@ std::vector<TextureHandle> RasterizerMetal::PrepareTexelBuffers(std::span<const 
         result.push_back(view.Get());
     }
     return result;
+}
+
+void RasterizerMetal::InvalidateConvertedIndices(BufferHandle buf, u64 offset, u64 size) {
+    if (converted_index_cache.empty()) {
+        return;
+    }
+    const auto it = converted_index_cache.find(buf);
+    if (it == converted_index_cache.end()) {
+        return;
+    }
+    if (size == ~u64{0}) {
+        for (const ConvertedIndexEntry& entry : it->second) {
+            if (entry.buffer) {
+                converted_index_bytes -= u64{entry.converted} * sizeof(u32);
+            }
+        }
+        converted_index_cache.erase(it);
+        return;
+    }
+    std::erase_if(it->second, [&](const ConvertedIndexEntry& entry) {
+        const bool overlaps = entry.size != 0 && size != 0 &&
+                              (entry.offset < offset ? offset - entry.offset < entry.size
+                                                     : entry.offset - offset < size);
+        if (overlaps && entry.buffer) {
+            converted_index_bytes -= u64{entry.converted} * sizeof(u32);
+        }
+        return overlaps;
+    });
+    if (it->second.empty()) {
+        converted_index_cache.erase(it);
+    }
 }
 
 void RasterizerMetal::RewriteIndices(bool ahead) {
@@ -1672,12 +1769,12 @@ RasterizerMetal::MeshArena& RasterizerMetal::AcquireMeshArena() {
             arenas_empty += words == 0 ? 1 : 0;
             most_words = (std::max)(most_words, u64{words});
             if (arenas_counted % 600 == 0) {
-                LOG_WARNING(Render_Metal,
-                            "Metal: mesh emulation arenas: the last 600 command buffers with task "
-                            "draws asked for at most {:.1f} MiB, {} of them for nothing ({} MiB "
-                            "arenas)",
-                            static_cast<double>(most_words * sizeof(u32)) / (1 << 20),
-                            arenas_empty, mesh_arena_size >> 20);
+                LOG_DEBUG(Render_Metal,
+                          "Metal: mesh emulation arenas: the last 600 command buffers with task "
+                          "draws asked for at most {:.1f} MiB, {} of them for nothing ({} MiB "
+                          "arenas)",
+                          static_cast<double>(most_words * sizeof(u32)) / (1 << 20), arenas_empty,
+                          mesh_arena_size >> 20);
                 arenas_empty = 0;
                 most_words = 0;
             }
@@ -1845,11 +1942,14 @@ bool RasterizerMetal::NeedsReducingVariant(const StageProgram& program,
             if ((bits & 3) == 0) {
                 continue;
             }
-            // An integer view takes a nearest sampler variant (Sampler::HandleFor): no reduction.
-            if (native_reduction && (bits & 4) != 0 && view < views.size() &&
-                !VideoCore::Surface::IsPixelFormatInteger(
-                    texture_cache.GetImageView(views[view].id).format)) {
-                continue;
+            // An integer or stencil view takes a nearest sampler variant (Sampler::HandleFor): no
+            // reduction.
+            if (native_reduction && (bits & 4) != 0 && view < views.size()) {
+                const ImageView& image_view = texture_cache.GetImageView(views[view].id);
+                if (!VideoCore::Surface::IsPixelFormatInteger(image_view.format) &&
+                    image_view.HostClass() != FormatClass::Stencil) {
+                    continue;
+                }
             }
             return true;
         }
@@ -1935,16 +2035,22 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                     break;
                 }
                 if (slot.set == ShaderTranslate::PushConstantSet) {
-                    // Shader::Backend::SPIRV::RescalingLayout (rescaling_words) or
-                    // RenderAreaLayout.
-                    std::array<u32, 8> words = rescaling_words;
-                    if (info.uses_render_area && !info.uses_rescaling_uniform) {
-                        words = {};
-                        words[0] = std::bit_cast<u32>(static_cast<f32>(render_width));
-                        words[1] = std::bit_cast<u32>(static_cast<f32>(render_height));
+                    if (info.uses_render_area) {
+                        std::array<u32, 16> words{};
+                        std::copy(rescaling_words.begin(), rescaling_words.end(), words.begin());
+                        words[12] = std::bit_cast<u32>(static_cast<f32>(render_width));
+                        words[13] = std::bit_cast<u32>(static_cast<f32>(render_height));
+                        scheduler.BindBytes(metal_stage, slot_index, words.data(),
+                                            static_cast<u32>(sizeof(words)));
+                    } else if (Shader::Backend::SPIRV::MeshFirstEnabled()) {
+                        std::array<u32, 12> words{};
+                        std::copy(rescaling_words.begin(), rescaling_words.end(), words.begin());
+                        scheduler.BindBytes(metal_stage, slot_index, words.data(),
+                                            static_cast<u32>(sizeof(words)));
+                    } else {
+                        scheduler.BindBytes(metal_stage, slot_index, rescaling_words.data(),
+                                            static_cast<u32>(sizeof(rescaling_words)));
                     }
-                    scheduler.BindBytes(metal_stage, slot_index, words.data(),
-                                        static_cast<u32>(sizeof(words)));
                     break;
                 }
                 while (next_buffer < pending.size() &&
@@ -1988,23 +2094,68 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     size_t sampler = 0;
     u64 reduction_modes = 0;
     for (const auto& desc : info.texture_descriptors) {
+        VideoCommon::ImageViewId prev_view_id{};
+        VideoCommon::SamplerId prev_sampler_id{};
+        bool have_prev_tex = false;
+        bool have_prev_samp = false;
+        u64 prev_tex_res = 0;
+        u64 prev_samp_res = 0;
         for (u32 element = 0; element < desc.count; ++element) {
-            ImageView& image_view = texture_cache.GetImageView(views[view++].id);
+            const VideoCommon::ImageViewId view_id = views[view++].id;
+            const bool tex_in_array =
+                texture_slot < texture_slots.size() &&
+                (texture_slots[texture_slot] & ArrayEntryFlag) != 0;
+            const bool has_sampler_slot = sampler < sampler_slots.size();
+            const bool samp_in_array =
+                has_sampler_slot && (sampler_slots[sampler] & ArrayEntryFlag) != 0;
+            const VideoCommon::SamplerId samp_id =
+                sampler < samplers.size() ? samplers[sampler] : VideoCommon::SamplerId{};
+            if (tex_in_array && have_prev_tex && view_id == prev_view_id &&
+                (!has_sampler_slot ||
+                 (samp_in_array && have_prev_samp && samp_id == prev_sampler_id))) {
+                const u32 tex_entry = texture_slots[texture_slot] & ~ArrayEntryFlag;
+                if (tex_entry < array_table.size()) {
+                    array_table[tex_entry] = prev_tex_res;
+                }
+                if (samp_in_array) {
+                    const u32 samp_entry = sampler_slots[sampler] & ~ArrayEntryFlag;
+                    if (samp_entry < array_table.size()) {
+                        array_table[samp_entry] = prev_samp_res;
+                    }
+                }
+                ++texture_slot;
+                ++sampler;
+                continue;
+            }
+            ImageView& image_view = texture_cache.GetImageView(view_id);
             if (texture_slot < texture_slots.size()) {
-                bind_texture(texture_slots[texture_slot],
-                             OrPlaceholder(image_view,
-                                           image_view.SampledHandle(desc.type, desc.is_multisample),
-                                           desc.type),
-                             false, false);
+                const TextureHandle tex_handle = OrPlaceholder(
+                    image_view, image_view.SampledHandle(desc.type, desc.is_multisample),
+                    desc.type);
+                if (tex_in_array) {
+                    const u32 entry = texture_slots[texture_slot] & ~ArrayEntryFlag;
+                    prev_tex_res = scheduler.UseTexture(metal_stage, tex_handle, false, false);
+                    prev_view_id = view_id;
+                    have_prev_tex = true;
+                    if (entry < array_table.size()) {
+                        array_table[entry] = prev_tex_res;
+                    }
+                } else {
+                    scheduler.BindTexture(metal_stage, texture_slots[texture_slot], tex_handle,
+                                          false);
+                }
             }
             ++texture_slot;
-            if (sampler < sampler_slots.size()) {
-                void* const handle = texture_cache.GetSampler(samplers[sampler])
-                                         .HandleFor(image_view, desc.is_depth);
-                if ((sampler_slots[sampler] & ArrayEntryFlag) != 0) {
+            if (has_sampler_slot) {
+                void* const handle =
+                    texture_cache.GetSampler(samp_id).HandleFor(image_view, desc.is_depth);
+                if (samp_in_array) {
                     const u32 entry = sampler_slots[sampler] & ~ArrayEntryFlag;
+                    prev_samp_res = Scheduler::SamplerResourceId(handle);
+                    prev_sampler_id = samp_id;
+                    have_prev_samp = true;
                     if (entry < array_table.size()) {
-                        array_table[entry] = Scheduler::SamplerResourceId(handle);
+                        array_table[entry] = prev_samp_res;
                     }
                 } else if ((sampler_slots[sampler] & SpilledSamplerFlag) != 0) {
                     const u32 entry = sampler_slots[sampler] & ~SpilledSamplerFlag;
@@ -2016,8 +2167,8 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                     scheduler.BindSampler(metal_stage, sampler_slots[sampler], handle);
                 }
             }
-            if (sampler < sampler_slots.size() && sampler_slots[sampler] < 16) {
-                reduction_modes |= texture_cache.GetSampler(samplers[sampler]).ReductionBits()
+            if (has_sampler_slot && sampler_slots[sampler] < 16) {
+                reduction_modes |= texture_cache.GetSampler(samp_id).ReductionBits()
                                    << (sampler_slots[sampler] * 4);
             }
             ++sampler;
@@ -2148,6 +2299,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     ScratchList scratch_samplers{draw_scratch.samplers};
     ScratchList scratch_sampler_handles{draw_scratch.sampler_handles};
     ScratchList scratch_binding_kinds{draw_scratch.binding_kinds};
+    ScratchList scratch_batch_handles{draw_scratch.batch_handles};
     std::vector<VideoCommon::ImageViewInOut>& views = scratch_views.value;
     std::vector<VideoCommon::SamplerId>& samplers = scratch_samplers.value;
     std::array<size_t, 5> first_view{};
@@ -2156,8 +2308,42 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     // texture cache's memo.
     const bool use_bind_memo = BindMemo::Enabled();
     std::vector<u32>& sampler_handles = scratch_sampler_handles.value;
-    std::vector<u32>& binding_kinds = scratch_binding_kinds.value;
+    std::vector<u32>& batch_handles = scratch_batch_handles.value;
+    const bool dynamic_stage_kinds = tess != nullptr || geo != nullptr;
+    std::vector<u32>& dynamic_kinds = scratch_binding_kinds.value;
     const bool via_header_index = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
+    struct HandlePage {
+        u64 page{~0ULL};
+        const u8* host{};
+    };
+    std::array<HandlePage, 4> local_pages{};
+    const auto read_handle_word = [&](GPUVAddr addr) -> u32 {
+        constexpr u64 page_mask = 0xfffULL;
+        const u64 page_offset = addr & page_mask;
+        if (page_offset <= 0x1000ULL - sizeof(u32)) {
+            const u64 page = addr >> 12;
+            const size_t page_slot = static_cast<size_t>(page ^ (page >> 4)) & 3U;
+            const u8* host = local_pages[page_slot].host;
+            if (local_pages[page_slot].page != page) {
+                host = gpu_memory->GetPointerForDescriptor(addr & ~page_mask);
+                local_pages[page_slot] = {host != nullptr ? page : ~0ULL, host};
+            }
+            if (host != nullptr) {
+                u32 value;
+                std::memcpy(&value, host + page_offset, sizeof(u32));
+                return value;
+            }
+        }
+        return gpu_memory->ReadHandleWord(addr);
+    };
+    struct HandleWordReader {
+        decltype(read_handle_word)& read_word;
+        u32 ReadHandleWord(GPUVAddr addr) const {
+            return read_word(addr);
+        }
+    } const handle_reader{read_handle_word};
+    const u64 storage_alignment = buffer_cache_runtime.GetStorageBufferAlignment();
+    const GPUVAddr storage_mask = ~(GPUVAddr{(std::max)(storage_alignment, u64{1})} - 1);
     for (size_t index = 0; index < stages.size(); ++index) {
         first_view[index] = views.size();
         first_sampler[index] = samplers.size();
@@ -2190,17 +2376,49 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                                                    indirect_ssbos ? desc.indirect_offset : ~0U);
         }
         const auto& cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
+        std::array<GPUVAddr, Shader::Info::MAX_CBUFS> cbuf_addrs{};
+        std::array<GPUVAddr, Shader::Info::MAX_SSBOS> ssbo_addrs{};
+        const size_t num_ssbos =
+            (std::min)(info.storage_buffers_descriptors.size(), ssbo_addrs.size());
+        bool handle_addrs_ready = false;
+        const auto ensure_handle_addrs = [&] {
+            if (handle_addrs_ready) {
+                return;
+            }
+            handle_addrs_ready = true;
+            for (size_t cbuf = 0; cbuf < cbuf_addrs.size() && cbuf < cbufs.size(); ++cbuf) {
+                cbuf_addrs[cbuf] = cbufs[cbuf].enabled ? cbufs[cbuf].address : GPUVAddr{};
+            }
+            const auto read_u64 = [&](GPUVAddr addr) -> u64 {
+                return u64{read_handle_word(addr)} |
+                       (u64{read_handle_word(addr + sizeof(u32))} << 32);
+            };
+            for (size_t binding = 0; binding < num_ssbos; ++binding) {
+                const auto& storage = info.storage_buffers_descriptors[binding];
+                const GPUVAddr cbuf = storage.cbuf_index < cbuf_addrs.size()
+                                          ? cbuf_addrs[storage.cbuf_index]
+                                          : GPUVAddr{};
+                if (cbuf == 0) {
+                    continue;
+                }
+                GPUVAddr base = read_u64(cbuf + storage.cbuf_offset);
+                if (base != 0 && storage.indirect_offset != ~0U) {
+                    base = read_u64(base + storage.indirect_offset);
+                }
+                ssbo_addrs[binding] = base & storage_mask;
+            }
+        };
         const auto read_handle = [&](const auto& desc, u32 element) {
             if (desc.handle_program != ~0U) {
                 return Tegra::Texture::TexturePair(
                     VideoCommon::EvaluateTextureHandle(
-                        info, desc.handle_program, *gpu_memory,
+                        info, desc.handle_program, handle_reader,
                         [&](u32 cbuf) -> GPUVAddr {
                             return cbuf < cbufs.size() && cbufs[cbuf].enabled
                                        ? cbufs[cbuf].address
                                        : GPUVAddr{};
                         },
-                        buffer_cache_runtime.GetStorageBufferAlignment(), element),
+                        storage_alignment, element),
                     via_header_index);
             }
             const u32 offset = desc.cbuf_offset + (element << desc.size_shift);
@@ -2209,24 +2427,62 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                 if (desc.has_secondary) {
                     const GPUVAddr second = cbufs[desc.secondary_cbuf_index].address +
                                             desc.secondary_cbuf_offset;
-                    const u32 raw = (gpu_memory->Read<u32>(addr) << desc.shift_left) |
-                                    (gpu_memory->Read<u32>(second) << desc.secondary_shift_left);
+                    const u32 raw = (read_handle_word(addr) << desc.shift_left) |
+                                    (read_handle_word(second) << desc.secondary_shift_left);
                     return Tegra::Texture::TexturePair(raw, via_header_index);
                 }
             }
-            return Tegra::Texture::TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
+            return Tegra::Texture::TexturePair(read_handle_word(addr), via_header_index);
+        };
+        const auto add_image_views = [&](const auto& desc, bool blacklist) {
+            if (desc.handle_program != ~0U && desc.count > 1) {
+                ensure_handle_addrs();
+                batch_handles.resize(desc.count);
+                VideoCommon::EvaluateTextureHandles(
+                    info.handle_programs[desc.handle_program], desc.count,
+                    std::span<const GPUVAddr>{cbuf_addrs},
+                    std::span<const GPUVAddr>{ssbo_addrs.data(), num_ssbos}, handle_reader,
+                    std::span<u32>{batch_handles.data(), desc.count});
+                for (u32 element = 0; element < desc.count; ++element) {
+                    const auto handle =
+                        Tegra::Texture::TexturePair(batch_handles[element], via_header_index);
+                    views.push_back({.index = handle.first, .blacklist = blacklist});
+                }
+                return;
+            }
+            for (u32 element = 0; element < desc.count; ++element) {
+                views.push_back(
+                    {.index = read_handle(desc, element).first, .blacklist = blacklist});
+            }
         };
         for (const auto& desc : info.texture_buffer_descriptors) {
-            for (u32 element = 0; element < desc.count; ++element) {
-                views.push_back({.index = read_handle(desc, element).first});
-            }
+            add_image_views(desc, false);
         }
         for (const auto& desc : info.image_buffer_descriptors) {
-            for (u32 element = 0; element < desc.count; ++element) {
-                views.push_back({.index = read_handle(desc, element).first});
-            }
+            add_image_views(desc, false);
         }
         for (const auto& desc : info.texture_descriptors) {
+            if (desc.handle_program != ~0U && desc.count > 1) {
+                ensure_handle_addrs();
+                batch_handles.resize(desc.count);
+                VideoCommon::EvaluateTextureHandles(
+                    info.handle_programs[desc.handle_program], desc.count,
+                    std::span<const GPUVAddr>{cbuf_addrs},
+                    std::span<const GPUVAddr>{ssbo_addrs.data(), num_ssbos}, handle_reader,
+                    std::span<u32>{batch_handles.data(), desc.count});
+                for (u32 element = 0; element < desc.count; ++element) {
+                    const auto handle =
+                        Tegra::Texture::TexturePair(batch_handles[element], via_header_index);
+                    views.push_back({.index = handle.first});
+                    if (use_bind_memo) {
+                        sampler_handles.push_back(handle.second);
+                        samplers.emplace_back();
+                    } else {
+                        samplers.push_back(texture_cache.GetSamplerId(handle.second, false));
+                    }
+                }
+                continue;
+            }
             for (u32 element = 0; element < desc.count; ++element) {
                 const auto handle = read_handle(desc, element);
                 views.push_back({.index = handle.first});
@@ -2239,15 +2495,22 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             }
         }
         for (const auto& desc : info.image_descriptors) {
-            for (u32 element = 0; element < desc.count; ++element) {
-                views.push_back(
-                    {.index = read_handle(desc, element).first, .blacklist = desc.is_written});
-            }
+            add_image_views(desc, desc.is_written);
         }
-        if (use_bind_memo) {
-            BindMemo::AppendKinds(info, 0, binding_kinds);
+        if (use_bind_memo && dynamic_stage_kinds) {
+            if (programs[index]->binding_kinds.empty()) {
+                BindMemo::AppendKinds(info, 0, programs[index]->binding_kinds);
+            }
+            dynamic_kinds.insert(dynamic_kinds.end(), programs[index]->binding_kinds.begin(),
+                                 programs[index]->binding_kinds.end());
         }
     }
+    const std::span<const u32> binding_kinds =
+        !use_bind_memo ? std::span<const u32>{}
+        : dynamic_stage_kinds ? std::span<const u32>{dynamic_kinds}
+        : native != nullptr   ? pipeline.NativeBindingKinds()
+        : mesh != nullptr     ? pipeline.MeshEmulationBindingKinds()
+                              : pipeline.DefaultBindingKinds();
     if (use_bind_memo && binding_kinds.size() == views.size()) {
         BindMemo::Resolve(texture_cache, false, true, binding_kinds, views, sampler_handles,
                           samplers, bind_memo_counts);
@@ -2395,7 +2658,10 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         buffer_cache_runtime.PendingBindings().clear();
         buffer_cache.BindHostStageBuffers(stages[index]);
         stage_bindings[index] = buffer_cache_runtime.PendingBindings();
-        texel_views[index] = PrepareTexelBuffers(stage_bindings[index], programs[index]->info);
+        const Shader::Info& info = programs[index]->info;
+        if (!info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty()) {
+            texel_views[index] = PrepareTexelBuffers(stage_bindings[index], info);
+        }
     }
     // Until the state below is made.
     prepare_refusal = "render pipeline state refused by Metal";
@@ -2548,14 +2814,16 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     // sampler reduction rewrite, unless this draw's samplers need it.
     u32 reducing = 0;
     bool has_variants = false;
-    if (native == nullptr && ReductionVariantsEnabled()) {
+    if (ReductionVariantsEnabled()) {
         for (size_t index = 0; index < programs.size(); ++index) {
             if (absent(index)) {
                 continue;
             }
             StageProgram* const program = programs[index];
-            const bool is_vertex = program == &pipeline.Vertex() && state_desc.expand == 0;
-            const bool is_fragment = program == &pipeline.Fragment();
+            const bool is_vertex =
+                native == nullptr && program == &pipeline.Vertex() && state_desc.expand == 0;
+            const bool is_fragment =
+                program == (native != nullptr ? &native->fragment : &pipeline.Fragment());
             if ((!is_vertex && !is_fragment) || !program->reduction_variants) {
                 continue;
             }
@@ -2608,11 +2876,16 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
 
     const DepthStencilDesc depth_stencil =
         DepthStencilState(regs, targets.has_depth, targets.has_stencil);
-    const u64 depth_stencil_hash = Common::CityHash64(
-        reinterpret_cast<const char*>(&depth_stencil), sizeof(depth_stencil));
-    Object& depth_stencil_state = depth_stencil_states[depth_stencil_hash];
-    if (!depth_stencil_state) {
-        depth_stencil_state = CreateDepthStencilState(device, depth_stencil);
+    const u64 depth_stencil_key = PackDepthStencilKey(depth_stencil);
+    void* depth_stencil_handle = last_depth_stencil_state;
+    if (depth_stencil_key != last_depth_stencil_key || depth_stencil_handle == nullptr) {
+        Object& depth_stencil_state = depth_stencil_states[depth_stencil_key];
+        if (!depth_stencil_state) {
+            depth_stencil_state = CreateDepthStencilState(device, depth_stencil);
+        }
+        depth_stencil_handle = depth_stencil_state.Get();
+        last_depth_stencil_key = depth_stencil_key;
+        last_depth_stencil_state = depth_stencil_handle;
     }
 
     // A kernel goes ahead of the segment (leaving the render pass open) when it reads nothing
@@ -2635,7 +2908,98 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         return false;
     };
     if (index_rewrite.wanted) {
-        RewriteIndices(record_ahead(false));
+        const BufferCacheRuntime::IndexState& idx = buffer_cache_runtime.Index();
+        const IndexConvert::RewriteParams& params = index_rewrite.params;
+        const u64 src_offset = u64{idx.offset} + params.source_offset;
+        const u64 src_size = u64{params.count} * params.index_size;
+        static const bool cache_converted_indices = EnvironmentOn("EDEN_NX2_METAL_INDEX_CACHE");
+        static const char gpu_indices = [] {
+            const char* const value = std::getenv("EDEN_NX2_METAL_GPU_INDICES");
+            return value != nullptr ? value[0] : 'a';
+        }();
+        if (!index_rewrite.only_ahead) {
+            InvalidateConvertedIndices(idx.buffer, src_offset, src_size);
+            RewriteIndices(record_ahead(false));
+        } else if (idx.buffer != nullptr) {
+            ConvertedIndexEntry* matched = nullptr;
+            if (cache_converted_indices) {
+                if (const auto found = converted_index_cache.find(idx.buffer);
+                    found != converted_index_cache.end()) {
+                    for (ConvertedIndexEntry& item : found->second) {
+                        if (item.offset == src_offset && item.size == src_size &&
+                            item.mode == params.mode && item.index_size == params.index_size &&
+                            item.restart == params.restart) {
+                            matched = &item;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (matched != nullptr && matched->buffer) {
+                matched->last_frame = oot_frame;
+                index_rewrite.cached_buffer = matched->buffer.Get();
+                index_rewrite.cached_count = matched->converted;
+            } else if (matched != nullptr) {
+                ++matched->hits;
+                matched->last_frame = oot_frame;
+                if (gpu_indices != '0' && params.count >= 256 && record_ahead(false)) {
+                    EnsureIndexKernels();
+                    Object promoted;
+                    if (index_kernel &&
+                        converted_index_bytes + u64{params.converted} * sizeof(u32) <=
+                            (u64{64} << 20)) {
+                        promoted = CreateBuffer(device, u64{params.converted} * sizeof(u32), false,
+                                                nullptr);
+                    }
+                    if (promoted) {
+                        IndexConvert::RewriteParams gpu_params = params;
+                        gpu_params.source_offset += idx.offset;
+                        const bool strip = gpu_params.mode == IndexConvert::StripRestartMode;
+                        scheduler.BeginCompute(
+                            strip ? index_strip_kernel.Get() : index_kernel.Get(), true);
+                        scheduler.BindBuffer(ShaderStage::Compute, 0, idx.buffer, 0);
+                        scheduler.BindBuffer(ShaderStage::Compute, 1, promoted.Get(), 0);
+                        scheduler.BindBytes(ShaderStage::Compute, 2, &gpu_params,
+                                            static_cast<u32>(sizeof(gpu_params)));
+                        if (strip) {
+                            scheduler.Dispatch({1, 1, 1}, {IndexConvert::StripRestartThreads, 1, 1});
+                        } else {
+                            constexpr u32 GroupSize = 64;
+                            scheduler.Dispatch(
+                                {(gpu_params.converted + GroupSize - 1) / GroupSize, 1, 1},
+                                {GroupSize, 1, 1});
+                        }
+                        matched->converted = params.converted;
+                        matched->buffer = std::move(promoted);
+                        converted_index_bytes += u64{params.converted} * sizeof(u32);
+                        index_rewrite.cached_buffer = matched->buffer.Get();
+                        index_rewrite.cached_count = params.converted;
+                        ++indices_rewritten_on_gpu;
+                    } else {
+                        RewriteIndices(true);
+                    }
+                }
+            } else {
+                if (cache_converted_indices && converted_index_cache.size() < 512) {
+                    auto& entries = converted_index_cache[idx.buffer];
+                    if (entries.size() < 64) {
+                        entries.push_back(ConvertedIndexEntry{
+                            .offset = src_offset,
+                            .size = src_size,
+                            .mode = params.mode,
+                            .index_size = params.index_size,
+                            .restart = params.restart,
+                            .converted = 0,
+                            .hits = 1,
+                            .last_frame = oot_frame,
+                        });
+                    }
+                }
+                if (gpu_indices != '0' && params.count >= 256 && record_ahead(false)) {
+                    RewriteIndices(true);
+                }
+            }
+        }
     }
     if (indirect_plan.wanted && !PrepareIndirect(record_ahead(false))) {
         prepare_refusal = "indirect draw arguments not bound";
@@ -2735,36 +3099,46 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             return value != nullptr && value[0] == '1';
         }();
         const bool mesh_ahead = !(has_task && task_in_order) && record_ahead(true);
-        {
+        if (has_task) {
             // The first draws of each task pipeline: what decides whether its pixels land.
-            static std::mutex logged_mutex;
-            static std::vector<u64> logged_pipelines;
-            const u64 pipeline_hash = pipeline.Key().Hash();
-            std::scoped_lock logged_lock{logged_mutex};
-            if (has_task && logged_pipelines.size() < (DrawTraceEnabled() ? 88U : 24U) &&
-                std::ranges::find(logged_pipelines, pipeline_hash) == logged_pipelines.end()) {
-                logged_pipelines.push_back(pipeline_hash);
-                LOG_WARNING(
-                    Render_Metal,
-                    "Metal: task mesh draw {:016x} (task {:016x}, mesh {:016x}, pixel {:016x}): "
-                    "{} groups, kernels {}; depth test {} func {:#x} write {}, cull {} face {:#x} "
-                    "front {:#x}, rasterize {}, alpha test {} func {:#x}, alpha to coverage {}, "
-                    "blend0 {} mask0 {}{}{}{}, colour formats {:#x} {:#x} {:#x} {:#x}, depth "
-                    "target {}, {}x{}",
-                    pipeline_hash, pipeline.Key().unique_hashes[1],
-                    pipeline.Key().unique_hashes[mesh->mesh_stage + 1],
-                    pipeline.Key().unique_hashes[5], mesh_workgroups,
-                    mesh_ahead ? "ahead" : "in order", regs.depth_test_enable,
-                    static_cast<u32>(regs.depth_test_func), regs.depth_write_enabled,
-                    regs.gl_cull_test_enabled, static_cast<u32>(regs.gl_cull_face),
-                    static_cast<u32>(regs.gl_front_face), regs.rasterize_enable,
-                    regs.alpha_test_enabled, static_cast<u32>(regs.alpha_test_func),
-                    regs.anti_alias_alpha_control.alpha_to_coverage.Value(), regs.blend.enable[0],
-                    regs.color_mask[0].R.Value(), regs.color_mask[0].G.Value(),
-                    regs.color_mask[0].B.Value(), regs.color_mask[0].A.Value(),
-                    static_cast<u32>(regs.rt[0].format), static_cast<u32>(regs.rt[1].format),
-                    static_cast<u32>(regs.rt[2].format), static_cast<u32>(regs.rt[3].format),
-                    targets.has_depth, targets.width, targets.height);
+            static std::atomic_bool logged_full{false};
+            if (!logged_full.load(std::memory_order_relaxed)) {
+                static std::mutex logged_mutex;
+                static std::vector<u64> logged_pipelines;
+                const u64 pipeline_hash = pipeline.Key().Hash();
+                std::scoped_lock logged_lock{logged_mutex};
+                const size_t limit = DrawTraceEnabled() ? 88U : 24U;
+                if (logged_pipelines.size() >= limit) {
+                    logged_full.store(true, std::memory_order_relaxed);
+                } else if (std::ranges::find(logged_pipelines, pipeline_hash) ==
+                           logged_pipelines.end()) {
+                    logged_pipelines.push_back(pipeline_hash);
+                    if (logged_pipelines.size() >= limit) {
+                        logged_full.store(true, std::memory_order_relaxed);
+                    }
+                    LOG_WARNING(
+                        Render_Metal,
+                        "Metal: task mesh draw {:016x} (task {:016x}, mesh {:016x}, pixel "
+                        "{:016x}): {} groups, kernels {}; depth test {} func {:#x} write {}, cull "
+                        "{} face {:#x} front {:#x}, rasterize {}, alpha test {} func {:#x}, alpha "
+                        "to coverage {}, blend0 {} mask0 {}{}{}{}, colour formats {:#x} {:#x} "
+                        "{:#x} {:#x}, depth target {}, {}x{}",
+                        pipeline_hash, pipeline.Key().unique_hashes[1],
+                        pipeline.Key().unique_hashes[mesh->mesh_stage + 1],
+                        pipeline.Key().unique_hashes[5], mesh_workgroups,
+                        mesh_ahead ? "ahead" : "in order", regs.depth_test_enable,
+                        static_cast<u32>(regs.depth_test_func), regs.depth_write_enabled,
+                        regs.gl_cull_test_enabled, static_cast<u32>(regs.gl_cull_face),
+                        static_cast<u32>(regs.gl_front_face), regs.rasterize_enable,
+                        regs.alpha_test_enabled, static_cast<u32>(regs.alpha_test_func),
+                        regs.anti_alias_alpha_control.alpha_to_coverage.Value(),
+                        regs.blend.enable[0], regs.color_mask[0].R.Value(),
+                        regs.color_mask[0].G.Value(), regs.color_mask[0].B.Value(),
+                        regs.color_mask[0].A.Value(), static_cast<u32>(regs.rt[0].format),
+                        static_cast<u32>(regs.rt[1].format), static_cast<u32>(regs.rt[2].format),
+                        static_cast<u32>(regs.rt[3].format), targets.has_depth, targets.width,
+                        targets.height);
+                }
             }
         }
         const auto begin_kernel = [&](size_t index, MeshKernel& kernel, void* kernel_state) {
@@ -3430,6 +3804,272 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         // Committed in the middle of the draw: what the buffer cache noted as used is gone.
         scheduler.BlockAhead();
     }
+    DrawState draw{};
+    draw.pipeline = state;
+    draw.depth_stencil = depth_stencil_handle;
+    for (size_t index = 0; index < state_desc.blend.size(); ++index) {
+        if (state_desc.blend[index].write_mask != 0) {
+            draw.color_written |= static_cast<u8>(1U << index);
+        } else {
+            draw.color_written &= static_cast<u8>(~(1U << index));
+        }
+    }
+    draw.depth_written = depth_stencil.depth_test != 0 && depth_stencil.depth_write != 0;
+    draw.stencil_written =
+        depth_stencil.stencil_test != 0 &&
+        (depth_stencil.front.write_mask != 0 || depth_stencil.back.write_mask != 0);
+    // Viewport i, as Vulkan's GetViewportState makes it (the shader flips y for Metal).
+    const auto make_viewport = [&](size_t index) {
+        Viewport viewport{};
+        const auto& transform = regs.viewport_transform[index];
+        if (regs.viewport_scale_offset_enabled) {
+            viewport.x = transform.translate_x - transform.scale_x;
+            viewport.width = transform.scale_x * 2.0f;
+            viewport.y = transform.translate_y - transform.scale_y;
+            viewport.height = transform.scale_y * 2.0f;
+            if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
+                viewport.y += static_cast<f32>(regs.surface_clip.height);
+                viewport.height = -viewport.height;
+            }
+            // A swizzle the vertex program does (viewport 0's, RasterPatch) includes the y.
+            const bool swizzled_in_program =
+                index == 0 && RasterPatch::ViewportSwizzleEnabled() &&
+                RasterPatch::SwizzleInProgram(transform.swizzle.raw & 0x7777);
+            if (!swizzled_in_program &&
+                transform.swizzle.y == Maxwell::ViewportSwizzle::NegativeY) {
+                viewport.y += viewport.height;
+                viewport.height = -viewport.height;
+            }
+            const f32 reduce_z =
+                regs.depth_mode == Maxwell::DepthMode::MinusOneToOne ? 1.0f : 0.0f;
+            viewport.znear = transform.translate_z - transform.scale_z * reduce_z;
+            viewport.zfar = transform.translate_z + transform.scale_z;
+        } else {
+            const bool use_clip = regs.surface_clip.width != 0 && regs.surface_clip.height != 0;
+            const f32 conv_width = use_clip
+                                       ? static_cast<f32>(regs.surface_clip.width)
+                                       : (std::max)(1.0f, static_cast<f32>(targets.width) /
+                                                              (is_rescaling ? resolution.up_factor : 1.0f));
+            const f32 conv_height = use_clip
+                                        ? static_cast<f32>(regs.surface_clip.height)
+                                        : (std::max)(1.0f, static_cast<f32>(targets.height) /
+                                                               (is_rescaling ? resolution.up_factor : 1.0f));
+            viewport.x = use_clip ? static_cast<f32>(regs.surface_clip.x) : 0.0f;
+            viewport.y = use_clip ? static_cast<f32>(regs.surface_clip.y) : 0.0f;
+            viewport.width = conv_width;
+            viewport.height = conv_height;
+            if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
+                viewport.y = conv_height - viewport.y;
+                viewport.height = -conv_height;
+            }
+        }
+        if (is_rescaling) {
+            // As Vulkan's GetViewportState: the guest's viewport in scaled pixels.
+            const f32 scale = resolution.up_factor;
+            viewport.x *= scale;
+            viewport.y *= scale;
+            viewport.width *= scale;
+            viewport.height *= scale;
+        }
+        // Ocarina's scene draws under EDEN_NX2_DLSS_JITTER (UpdateOcarinaJitter).
+        viewport.x += oot_jitter_applied[0];
+        viewport.y += oot_jitter_applied[1];
+        if (viewport.width == 0.0f) {
+            viewport.width = 1.0f;
+        }
+        if (viewport.height == 0.0f) {
+            viewport.height = 1.0f;
+        }
+        return viewport;
+    };
+    const auto make_scissor = [&](size_t index) -> Scissor {
+        const auto scale = [&](u32 value) {
+            return is_rescaling ? resolution.ScaleUp(value) : value;
+        };
+        if (!regs.viewport_scale_offset_enabled) {
+            if (regs.surface_clip.width == 0 || regs.surface_clip.height == 0) {
+                return {0, 0, targets.width, targets.height};
+            }
+            const u32 x = regs.surface_clip.x;
+            const u32 width = regs.surface_clip.width;
+            const u32 height = regs.surface_clip.height;
+            s32 y = static_cast<s32>(regs.surface_clip.y);
+            if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
+                y = static_cast<s32>(regs.surface_clip.height) -
+                    static_cast<s32>(regs.surface_clip.y) - static_cast<s32>(height);
+            }
+            const u32 clamped_y = static_cast<u32>((std::max)(y, 0));
+            return {scale(x), scale(clamped_y), scale(width), scale(height)};
+        }
+        const auto& scissor = regs.scissor_test[index];
+        if (!scissor.enable) {
+            return {0, 0, targets.width, targets.height};
+        }
+        const bool lower_left = regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft;
+        const s32 clip_height = static_cast<s32>(regs.surface_clip.height);
+        const s32 min_y = (std::max)(lower_left ? clip_height - static_cast<s32>(scissor.max_y)
+                                                : static_cast<s32>(scissor.min_y.Value()),
+                                     0);
+        const s32 max_y = (std::max)(lower_left ? clip_height - static_cast<s32>(scissor.min_y)
+                                                : static_cast<s32>(scissor.max_y.Value()),
+                                     0);
+        const u32 min_x = scale(static_cast<u32>(scissor.min_x.Value()));
+        const u32 max_x = scale(static_cast<u32>(scissor.max_x.Value()));
+        const u32 scaled_min_y = scale(static_cast<u32>(min_y));
+        const u32 scaled_max_y = scale(static_cast<u32>((std::max)(max_y, min_y)));
+        return {min_x, scaled_min_y, max_x > min_x ? max_x - min_x : 0U,
+                scaled_max_y - scaled_min_y};
+    };
+    draw.viewport = make_viewport(0);
+    draw.scissor = make_scissor(0);
+    // A program that picks the viewport gets all 16 with their scissors, as Vulkan sets them
+    // (EDEN_NX2_METAL_VIEWPORTS=0: viewport 0 only, as before).
+    static const bool all_viewports = EnvironmentOn("EDEN_NX2_METAL_VIEWPORTS");
+    const Shader::Info& pre_raster_info =
+        native != nullptr                   ? native->mesh.info
+        : (tess != nullptr && tess->domain) ? tess->domain->evaluate.program.info
+                                            : pipeline.Vertex().info;
+    const bool uses_viewport_index =
+        pre_raster_info.stores[Shader::IR::Attribute::ViewportIndex] ||
+        (geo != nullptr &&
+         std::ranges::find(geo->plan.output_words,
+                           static_cast<u32>(Shader::IR::Attribute::ViewportIndex)) !=
+             geo->plan.output_words.end());
+    if (all_viewports && uses_viewport_index) {
+        draw.viewport_count = static_cast<u8>(Maxwell::NumViewports);
+        for (size_t index = 1; index < Maxwell::NumViewports; ++index) {
+            draw.more_viewports[index - 1] = make_viewport(index);
+            draw.more_scissors[index - 1] = make_scissor(index);
+        }
+    }
+    // Mesh positions are flipped in MSL (FlipMeshPositionY); EDEN_NX2_METAL_MESH_FLIP_Y=1
+    // overrides by flipping the viewport instead.
+    static const bool mesh_flip_y = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_MESH_FLIP_Y");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (mesh_flip_y && native != nullptr) {
+        const auto flip = [](Viewport& viewport) {
+            viewport.y += viewport.height;
+            viewport.height = -viewport.height;
+        };
+        flip(draw.viewport);
+        for (size_t index = 1; index < draw.viewport_count; ++index) {
+            flip(draw.more_viewports[index - 1]);
+        }
+        LOG_ONCE(logged_mesh_flip_y, "Metal: native mesh draws flip the viewport's y "
+                                     "(EDEN_NX2_METAL_MESH_FLIP_Y=0 turns it off)");
+    }
+    const u32 scissor_bound_w = (std::max)(targets.width, 1U);
+    const u32 scissor_bound_h = (std::max)(targets.height, 1U);
+    const auto scissor_empty = [&](const Scissor& s) {
+        return s.width == 0 || s.height == 0 || s.x >= scissor_bound_w || s.y >= scissor_bound_h;
+    };
+    const bool xfb_active =
+        (xfb_draw.wanted && !xfb_draw.expand) || (geo != nullptr && geo->xfb_streams != 0);
+    bool any_scissor_visible = false;
+    for (size_t index = 0; index < draw.viewport_count; ++index) {
+        const Scissor& s = index == 0 ? draw.scissor : draw.more_scissors[index - 1];
+        if (!scissor_empty(s)) {
+            any_scissor_visible = true;
+        }
+    }
+    if (!any_scissor_visible && !xfb_active) {
+        prepare_empty_why = "empty scissor";
+        return false;
+    }
+    if (draw.viewport_count > 1 || !any_scissor_visible) {
+        for (size_t index = 0; index < draw.viewport_count; ++index) {
+            const Scissor& s = index == 0 ? draw.scissor : draw.more_scissors[index - 1];
+            if (scissor_empty(s)) {
+                (index == 0 ? draw.viewport : draw.more_viewports[index - 1]) = {};
+            }
+        }
+    }
+    // Triangles drawn as lines when the faces the draw keeps are (Metal has one fill mode for
+    // both; a point fill mode it has not).
+    const bool front_lines = regs.polygon_mode_front == Maxwell::PolygonMode::Line;
+    const bool back_lines = regs.polygon_mode_back == Maxwell::PolygonMode::Line;
+    const bool culls = regs.gl_cull_test_enabled != 0;
+    static const bool fill_lines = EnvironmentOn("EDEN_NX2_METAL_FILL_LINES");
+    draw.fill_lines =
+        fill_lines &&
+        ((front_lines && back_lines) ||
+         (culls && regs.gl_cull_face == Maxwell::CullFace::Back && front_lines) ||
+         (culls && regs.gl_cull_face == Maxwell::CullFace::Front && back_lines));
+    if (regs.gl_cull_test_enabled != 0) {
+        switch (regs.gl_cull_face) {
+        case Maxwell::CullFace::Front:
+            draw.cull_mode = 1;
+            break;
+        case Maxwell::CullFace::Back:
+            draw.cull_mode = 2;
+            break;
+        case Maxwell::CullFace::FrontAndBack:
+            // Nothing is drawn but points and lines.
+            if (TopologyClass(topology) == 2 && !xfb_active) {
+                prepare_empty_why = "triangles culled front and back";
+                return false;
+            }
+            break;
+        }
+    }
+    bool front_ccw = regs.gl_front_face == Maxwell::FrontFace::CounterClockWise;
+    if (regs.window_origin.flip_y != 0) {
+        front_ccw = !front_ccw;
+    }
+    draw.front_ccw = front_ccw;
+    draw.depth_clamp =
+        regs.viewport_clip_control.geometry_clip !=
+            Maxwell::ViewportClipControl::GeometryClip::Passthrough &&
+        regs.viewport_clip_control.geometry_clip !=
+            Maxwell::ViewportClipControl::GeometryClip::FrustumXYZ &&
+        regs.viewport_clip_control.geometry_clip !=
+            Maxwell::ViewportClipControl::GeometryClip::FrustumZ;
+    u32 offset_mode = TopologyClass(topology);
+    if (native != nullptr) {
+        offset_mode = TopologyClass(static_cast<Maxwell::PrimitiveTopology>(native->topology));
+    } else if (mesh != nullptr) {
+        offset_mode = TopologyClass(static_cast<Maxwell::PrimitiveTopology>(mesh->topology));
+    } else if (geo != nullptr) {
+        offset_mode =
+            geo->plan.output_topology == static_cast<u32>(Shader::OutputTopology::PointList) ? 0U
+            : geo->plan.output_topology == static_cast<u32>(Shader::OutputTopology::LineStrip) ? 1U
+                                                                                               : 2U;
+    } else if (tess != nullptr && tess->domain) {
+        offset_mode = tess->domain->emulation.lines ? 1U : 0U;
+    }
+    if (offset_mode == 2U && draw.fill_lines) {
+        offset_mode = 1U;
+    }
+    const bool polygon_offset_enabled =
+        offset_mode == 0U   ? regs.polygon_offset_point_enable != 0
+        : offset_mode == 1U ? regs.polygon_offset_line_enable != 0
+                            : regs.polygon_offset_fill_enable != 0;
+    if (polygon_offset_enabled) {
+        // The hardware halves the depth bias units (as OpenGL and Vulkan apply it).
+        draw.depth_bias = regs.depth_bias / 2.0f;
+        // Per-pixel slope term: scaled back to guest pixels on a rescaled target, or shadow
+        // maps get self-shadow stripes above 1x (zortos293/Lichii#1925).
+        draw.slope_scale =
+            regs.slope_scale_depth_bias * (is_rescaling ? resolution.up_factor : 1.0f);
+        draw.bias_clamp = regs.depth_bias_clamp;
+    }
+    draw.stencil_front_ref = regs.stencil_front_ref;
+    draw.stencil_back_ref =
+        regs.stencil_two_side_enable != 0 ? regs.stencil_back_ref : regs.stencil_front_ref;
+    draw.blend_color = {regs.blend_color.r, regs.blend_color.g, regs.blend_color.b,
+                        regs.blend_color.a};
+    if (xfb_draw.wanted && xfb_draw.expand && xfb_draw.prim <= RasterExpand::PrimLineLoop) {
+        draw.cull_mode = 0; // A line has no faces
+    }
+    if (regs.depth_bounds_enable != 0 && targets.has_depth &&
+        regs.depth_bounds[0] <= regs.depth_bounds[1]) {
+        // Applied by GPUs that have the test (Scheduler::SetDrawState); Metal wants [0, 1].
+        draw.depth_bounds_min = std::clamp(regs.depth_bounds[0], 0.0f, 1.0f);
+        draw.depth_bounds_max = std::clamp(regs.depth_bounds[1], 0.0f, 1.0f);
+    }
+
     if (flash_watch.WatchesPasses()) {
         FlashWatchPass(framebuffer, {&pipeline.Key().unique_hashes[1], 5});
     }
@@ -3481,191 +4121,6 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     scheduler.BeginRendering(targets);
     if (writes_storage) {
         pass_stores = scheduler.RenderPassSerial();
-    }
-    DrawState draw{};
-    draw.pipeline = state;
-    draw.depth_stencil = depth_stencil_state.Get();
-    for (size_t index = 0; index < state_desc.blend.size(); ++index) {
-        if (state_desc.blend[index].write_mask != 0) {
-            draw.color_written |= static_cast<u8>(1U << index);
-        } else {
-            draw.color_written &= static_cast<u8>(~(1U << index));
-        }
-    }
-    draw.depth_written = depth_stencil.depth_test != 0 && depth_stencil.depth_write != 0;
-    draw.stencil_written =
-        depth_stencil.stencil_test != 0 &&
-        (depth_stencil.front.write_mask != 0 || depth_stencil.back.write_mask != 0);
-    // Viewport i, as Vulkan's GetViewportState makes it (the shader flips y for Metal).
-    const auto make_viewport = [&](size_t index) {
-        Viewport viewport{};
-        const auto& transform = regs.viewport_transform[index];
-        if (regs.viewport_scale_offset_enabled) {
-            viewport.x = transform.translate_x - transform.scale_x;
-            viewport.width = transform.scale_x * 2.0f;
-            viewport.y = transform.translate_y - transform.scale_y;
-            viewport.height = transform.scale_y * 2.0f;
-            if (regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft) {
-                viewport.y += static_cast<f32>(regs.surface_clip.height);
-                viewport.height = -viewport.height;
-            }
-            // A swizzle the vertex program does (viewport 0's, RasterPatch) includes the y.
-            const bool swizzled_in_program =
-                index == 0 && RasterPatch::ViewportSwizzleEnabled() &&
-                RasterPatch::SwizzleInProgram(transform.swizzle.raw & 0x7777);
-            if (!swizzled_in_program &&
-                transform.swizzle.y == Maxwell::ViewportSwizzle::NegativeY) {
-                viewport.y += viewport.height;
-                viewport.height = -viewport.height;
-            }
-            const f32 reduce_z =
-                regs.depth_mode == Maxwell::DepthMode::MinusOneToOne ? 1.0f : 0.0f;
-            viewport.znear = transform.translate_z - transform.scale_z * reduce_z;
-            viewport.zfar = transform.translate_z + transform.scale_z;
-        } else {
-            viewport.x = static_cast<f32>(regs.surface_clip.x);
-            viewport.y = static_cast<f32>(regs.surface_clip.y);
-            viewport.width = static_cast<f32>(regs.surface_clip.width);
-            viewport.height = static_cast<f32>(regs.surface_clip.height);
-        }
-        if (is_rescaling) {
-            // As Vulkan's GetViewportState: the guest's viewport in scaled pixels.
-            const f32 scale = resolution.up_factor;
-            viewport.x *= scale;
-            viewport.y *= scale;
-            viewport.width *= scale;
-            viewport.height *= scale;
-        }
-        // Ocarina's scene draws under EDEN_NX2_DLSS_JITTER (UpdateOcarinaJitter).
-        viewport.x += oot_jitter_applied[0];
-        viewport.y += oot_jitter_applied[1];
-        if (viewport.width == 0.0f) {
-            viewport.width = 1.0f;
-        }
-        if (viewport.height == 0.0f) {
-            viewport.height = 1.0f;
-        }
-        return viewport;
-    };
-    const auto make_scissor = [&](size_t index) -> Scissor {
-        const auto& scissor = regs.scissor_test[index];
-        if (!scissor.enable) {
-            return {0, 0, targets.width, targets.height};
-        }
-        const bool lower_left = regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft;
-        const s32 clip_height = static_cast<s32>(regs.surface_clip.height);
-        const s32 min_y = (std::max)(lower_left ? clip_height - static_cast<s32>(scissor.max_y)
-                                                : static_cast<s32>(scissor.min_y.Value()),
-                                     0);
-        const s32 max_y = (std::max)(lower_left ? clip_height - static_cast<s32>(scissor.min_y)
-                                                : static_cast<s32>(scissor.max_y.Value()),
-                                     0);
-        const auto scale = [&](u32 value) {
-            return is_rescaling ? resolution.ScaleUp(value) : value;
-        };
-        const u32 min_x = scale(static_cast<u32>(scissor.min_x.Value()));
-        const u32 max_x = scale(static_cast<u32>(scissor.max_x.Value()));
-        const u32 scaled_min_y = scale(static_cast<u32>(min_y));
-        const u32 scaled_max_y = scale(static_cast<u32>((std::max)(max_y, min_y)));
-        return {min_x, scaled_min_y, max_x > min_x ? max_x - min_x : 0U,
-                scaled_max_y - scaled_min_y};
-    };
-    draw.viewport = make_viewport(0);
-    draw.scissor = make_scissor(0);
-    // A program that picks the viewport gets all 16 with their scissors, as Vulkan sets them
-    // (EDEN_NX2_METAL_VIEWPORTS=0: viewport 0 only, as before).
-    static const bool all_viewports = EnvironmentOn("EDEN_NX2_METAL_VIEWPORTS");
-    if (all_viewports && pipeline.Vertex().info.stores[Shader::IR::Attribute::ViewportIndex]) {
-        draw.viewport_count = static_cast<u8>(Maxwell::NumViewports);
-        for (size_t index = 1; index < Maxwell::NumViewports; ++index) {
-            draw.more_viewports[index - 1] = make_viewport(index);
-            draw.more_scissors[index - 1] = make_scissor(index);
-        }
-    }
-    // A mesh function's positions reach Metal without the y flip a vertex function's get:
-    // SPIRV-Cross (emit_mesh_outputs) applies Options::flip_vertex_y only to a Position that is a
-    // member of a gl_MeshPerVertexEXT block, and the recompiler declares it as a plain
-    // `vec4[max_vertices]` BuiltIn Position array. Unflipped, every natively drawn task/mesh draw
-    // lands mirrored (and, as its winding flips with it, culled where it should be kept): OoT's
-    // grass blades, leaves and vine glow. Flipping the viewport gives the same window coordinates
-    // (and facing) as the vertex path's flipped positions. EDEN_NX2_METAL_MESH_FLIP_Y=0: as before
-    // (for when the translation flips mesh positions itself).
-    static const bool mesh_flip_y = EnvironmentOn("EDEN_NX2_METAL_MESH_FLIP_Y");
-    if (mesh_flip_y && native != nullptr) {
-        const auto flip = [](Viewport& viewport) {
-            viewport.y += viewport.height;
-            viewport.height = -viewport.height;
-        };
-        flip(draw.viewport);
-        for (size_t index = 1; index < draw.viewport_count; ++index) {
-            flip(draw.more_viewports[index - 1]);
-        }
-        LOG_ONCE(logged_mesh_flip_y, "Metal: native mesh draws flip the viewport's y "
-                                     "(EDEN_NX2_METAL_MESH_FLIP_Y=0 turns it off)");
-    }
-    // Triangles drawn as lines when the faces the draw keeps are (Metal has one fill mode for
-    // both; a point fill mode it has not).
-    const bool front_lines = regs.polygon_mode_front == Maxwell::PolygonMode::Line;
-    const bool back_lines = regs.polygon_mode_back == Maxwell::PolygonMode::Line;
-    const bool culls = regs.gl_cull_test_enabled != 0;
-    static const bool fill_lines = EnvironmentOn("EDEN_NX2_METAL_FILL_LINES");
-    draw.fill_lines =
-        fill_lines &&
-        ((front_lines && back_lines) ||
-         (culls && regs.gl_cull_face == Maxwell::CullFace::Back && front_lines) ||
-         (culls && regs.gl_cull_face == Maxwell::CullFace::Front && back_lines));
-    if (regs.gl_cull_test_enabled != 0) {
-        switch (regs.gl_cull_face) {
-        case Maxwell::CullFace::Front:
-            draw.cull_mode = 1;
-            break;
-        case Maxwell::CullFace::Back:
-            draw.cull_mode = 2;
-            break;
-        case Maxwell::CullFace::FrontAndBack:
-            // Nothing is drawn but points and lines.
-            if (TopologyClass(topology) == 2) {
-                prepare_empty_why = "triangles culled front and back";
-                return false;
-            }
-            break;
-        }
-    }
-    bool front_ccw = regs.gl_front_face == Maxwell::FrontFace::CounterClockWise;
-    if (regs.window_origin.flip_y != 0) {
-        front_ccw = !front_ccw;
-    }
-    draw.front_ccw = front_ccw;
-    draw.depth_clamp =
-        regs.viewport_clip_control.geometry_clip !=
-            Maxwell::ViewportClipControl::GeometryClip::Passthrough &&
-        regs.viewport_clip_control.geometry_clip !=
-            Maxwell::ViewportClipControl::GeometryClip::FrustumXYZ &&
-        regs.viewport_clip_control.geometry_clip !=
-            Maxwell::ViewportClipControl::GeometryClip::FrustumZ;
-    if (regs.polygon_offset_fill_enable != 0 || regs.polygon_offset_line_enable != 0 ||
-        regs.polygon_offset_point_enable != 0) {
-        // The hardware halves the depth bias units (as OpenGL and Vulkan apply it).
-        draw.depth_bias = regs.depth_bias / 2.0f;
-        // Per-pixel slope term: scaled back to guest pixels on a rescaled target, or shadow
-        // maps get self-shadow stripes above 1x (zortos293/Lichii#1925).
-        draw.slope_scale =
-            regs.slope_scale_depth_bias * (is_rescaling ? resolution.up_factor : 1.0f);
-        draw.bias_clamp = regs.depth_bias_clamp;
-    }
-    draw.stencil_front_ref = regs.stencil_front_ref;
-    draw.stencil_back_ref =
-        regs.stencil_two_side_enable != 0 ? regs.stencil_back_ref : regs.stencil_front_ref;
-    draw.blend_color = {regs.blend_color.r, regs.blend_color.g, regs.blend_color.b,
-                        regs.blend_color.a};
-    if (xfb_draw.wanted && xfb_draw.expand && xfb_draw.prim <= RasterExpand::PrimLineLoop) {
-        draw.cull_mode = 0; // A line has no faces
-    }
-    if (regs.depth_bounds_enable != 0 && targets.has_depth &&
-        regs.depth_bounds[0] <= regs.depth_bounds[1]) {
-        // Applied by GPUs that have the test (Scheduler::SetDrawState); Metal wants [0, 1].
-        draw.depth_bounds_min = std::clamp(regs.depth_bounds[0], 0.0f, 1.0f);
-        draw.depth_bounds_max = std::clamp(regs.depth_bounds[1], 0.0f, 1.0f);
     }
     scheduler.SetDrawState(draw);
 
@@ -4100,11 +4555,11 @@ void RasterizerMetal::DrawGeometryIndirect(GraphicsPipeline& pipeline) {
     const bool indexed = params.is_indexed;
     const u32 words = indexed ? 5U : 4U;
     const u64 stride = params.stride != 0 ? params.stride : u64{words} * sizeof(u32);
-    u32 draws = static_cast<u32>(params.max_draw_counts);
+    u32 num_draws = static_cast<u32>(params.max_draw_counts);
     if (params.include_count) {
-        draws = (std::min)(draws, gpu_memory->Read<u32>(params.count_start_address));
+        num_draws = (std::min)(num_draws, gpu_memory->Read<u32>(params.count_start_address));
     }
-    for (u32 draw = 0; draw < draws; ++draw) {
+    for (u32 draw = 0; draw < num_draws; ++draw) {
         const GPUVAddr address = params.indirect_start_address + draw * stride;
         if (const std::optional<DAddr> device_address = gpu_memory->GpuToCpuAddress(address)) {
             FlushRegion(*device_address, words * sizeof(u32), VideoCommon::CacheType::BufferCache);
@@ -5043,18 +5498,16 @@ void RasterizerMetal::Clear(u32 layer_count) {
     if (use_color) {
         const auto format =
             VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[rt].format);
-        const bool is_integer = drawn_clears && VideoCore::Surface::IsPixelFormatInteger(format);
-        const f32 bits =
-            static_cast<f32>(VideoCore::Surface::PixelComponentSizeBitsInteger(format));
+        const bool is_integer = VideoCore::Surface::IsPixelFormatInteger(format);
+        const bool is_signed = is_integer && VideoCore::Surface::IsPixelFormatSignedInteger(format);
         for (size_t component = 0; component < 4; ++component) {
             const f32 value = regs.clear_color[component];
-            // Integer targets: the values Vulkan's Clear writes.
             if (!is_integer) {
                 color_value[component] = value;
-            } else if (!VideoCore::Surface::IsPixelFormatSignedInteger(format)) {
-                color_value[component] = static_cast<u32>(bits * 2.0f * value);
+            } else if (!is_signed) {
+                color_value[component] = static_cast<f64>(std::bit_cast<u32>(value));
             } else {
-                color_value[component] = static_cast<s32>((bits - 1.0f) * 2.0f * (value - 0.5f));
+                color_value[component] = static_cast<f64>(std::bit_cast<s32>(value));
             }
         }
     }
@@ -5296,17 +5749,83 @@ void RasterizerMetal::DispatchCompute() {
 
     const auto& cbufs = qmd.const_buffer_config;
     const bool via_header_index = qmd.linked_tsc != 0;
+    struct HandlePage {
+        u64 page{~0ULL};
+        const u8* host{};
+    };
+    std::array<HandlePage, 4> local_pages{};
+    const auto read_handle_word = [&](GPUVAddr addr) -> u32 {
+        constexpr u64 page_mask = 0xfffULL;
+        const u64 page_offset = addr & page_mask;
+        if (page_offset <= 0x1000ULL - sizeof(u32)) {
+            const u64 page = addr >> 12;
+            const size_t page_slot = static_cast<size_t>(page ^ (page >> 4)) & 3U;
+            const u8* host = local_pages[page_slot].host;
+            if (local_pages[page_slot].page != page) {
+                host = gpu_memory->GetPointerForDescriptor(addr & ~page_mask);
+                local_pages[page_slot] = {host != nullptr ? page : ~0ULL, host};
+            }
+            if (host != nullptr) {
+                u32 value;
+                std::memcpy(&value, host + page_offset, sizeof(u32));
+                return value;
+            }
+        }
+        return gpu_memory->ReadHandleWord(addr);
+    };
+    struct HandleWordReader {
+        decltype(read_handle_word)& read_word;
+        u32 ReadHandleWord(GPUVAddr addr) const {
+            return read_word(addr);
+        }
+    } const handle_reader{read_handle_word};
+    const u64 storage_alignment = buffer_cache_runtime.GetStorageBufferAlignment();
+    const GPUVAddr storage_mask = ~(GPUVAddr{(std::max)(storage_alignment, u64{1})} - 1);
+    std::array<GPUVAddr, Shader::Info::MAX_CBUFS> cbuf_addrs{};
+    std::array<GPUVAddr, Shader::Info::MAX_SSBOS> ssbo_addrs{};
+    const size_t num_ssbos =
+        (std::min)(info.storage_buffers_descriptors.size(), ssbo_addrs.size());
+    bool handle_addrs_ready = false;
+    const auto ensure_handle_addrs = [&] {
+        if (handle_addrs_ready) {
+            return;
+        }
+        handle_addrs_ready = true;
+        for (size_t cbuf = 0; cbuf < cbuf_addrs.size() && cbuf < cbufs.size(); ++cbuf) {
+            cbuf_addrs[cbuf] =
+                ((qmd.const_buffer_enable_mask >> cbuf) & 1) != 0 ? cbufs[cbuf].Address()
+                                                                  : GPUVAddr{};
+        }
+        const auto read_u64 = [&](GPUVAddr addr) -> u64 {
+            return u64{read_handle_word(addr)} |
+                   (u64{read_handle_word(addr + sizeof(u32))} << 32);
+        };
+        for (size_t binding = 0; binding < num_ssbos; ++binding) {
+            const auto& storage = info.storage_buffers_descriptors[binding];
+            const GPUVAddr cbuf = storage.cbuf_index < cbuf_addrs.size()
+                                      ? cbuf_addrs[storage.cbuf_index]
+                                      : GPUVAddr{};
+            if (cbuf == 0) {
+                continue;
+            }
+            GPUVAddr base = read_u64(cbuf + storage.cbuf_offset);
+            if (base != 0 && storage.indirect_offset != ~0U) {
+                base = read_u64(base + storage.indirect_offset);
+            }
+            ssbo_addrs[binding] = base & storage_mask;
+        }
+    };
     const auto read_handle = [&](const auto& desc, u32 element) {
         if (desc.handle_program != ~0U) {
             return Tegra::Texture::TexturePair(
                 VideoCommon::EvaluateTextureHandle(
-                    info, desc.handle_program, *gpu_memory,
+                    info, desc.handle_program, handle_reader,
                     [&](u32 cbuf) -> GPUVAddr {
                         return cbuf < cbufs.size() && ((qmd.const_buffer_enable_mask >> cbuf) & 1)
                                    ? cbufs[cbuf].Address()
                                    : GPUVAddr{};
                     },
-                    buffer_cache_runtime.GetStorageBufferAlignment(), element),
+                    storage_alignment, element),
                 via_header_index);
         }
         const GPUVAddr addr =
@@ -5315,28 +5834,70 @@ void RasterizerMetal::DispatchCompute() {
             if (desc.has_secondary) {
                 const GPUVAddr second =
                     cbufs[desc.secondary_cbuf_index].Address() + desc.secondary_cbuf_offset;
-                const u32 raw = (gpu_memory->Read<u32>(addr) << desc.shift_left) |
-                                (gpu_memory->Read<u32>(second) << desc.secondary_shift_left);
+                const u32 raw = (read_handle_word(addr) << desc.shift_left) |
+                                (read_handle_word(second) << desc.secondary_shift_left);
                 return Tegra::Texture::TexturePair(raw, via_header_index);
             }
         }
-        return Tegra::Texture::TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
+        return Tegra::Texture::TexturePair(read_handle_word(addr), via_header_index);
     };
-    std::vector<VideoCommon::ImageViewInOut> views;
-    std::vector<VideoCommon::SamplerId> samplers;
+    ScratchList scratch_views{compute_scratch.views};
+    ScratchList scratch_samplers{compute_scratch.samplers};
+    ScratchList scratch_sampler_handles{compute_scratch.sampler_handles};
+    ScratchList scratch_batch_handles{compute_scratch.batch_handles};
+    std::vector<VideoCommon::ImageViewInOut>& views = scratch_views.value;
+    std::vector<VideoCommon::SamplerId>& samplers = scratch_samplers.value;
     const bool use_bind_memo = BindMemo::Enabled();
-    std::vector<u32> sampler_handles;
-    for (const auto& desc : info.texture_buffer_descriptors) {
-        for (u32 element = 0; element < desc.count; ++element) {
-            views.push_back({.index = read_handle(desc, element).first});
+    std::vector<u32>& sampler_handles = scratch_sampler_handles.value;
+    std::vector<u32>& batch_handles = scratch_batch_handles.value;
+    const auto add_image_views = [&](const auto& desc, bool blacklist) {
+        if (desc.handle_program != ~0U && desc.count > 1) {
+            ensure_handle_addrs();
+            batch_handles.resize(desc.count);
+            VideoCommon::EvaluateTextureHandles(
+                info.handle_programs[desc.handle_program], desc.count,
+                std::span<const GPUVAddr>{cbuf_addrs},
+                std::span<const GPUVAddr>{ssbo_addrs.data(), num_ssbos}, handle_reader,
+                std::span<u32>{batch_handles.data(), desc.count});
+            for (u32 element = 0; element < desc.count; ++element) {
+                const auto handle =
+                    Tegra::Texture::TexturePair(batch_handles[element], via_header_index);
+                views.push_back({.index = handle.first, .blacklist = blacklist});
+            }
+            return;
         }
+        for (u32 element = 0; element < desc.count; ++element) {
+            views.push_back({.index = read_handle(desc, element).first, .blacklist = blacklist});
+        }
+    };
+    for (const auto& desc : info.texture_buffer_descriptors) {
+        add_image_views(desc, false);
     }
     for (const auto& desc : info.image_buffer_descriptors) {
-        for (u32 element = 0; element < desc.count; ++element) {
-            views.push_back({.index = read_handle(desc, element).first});
-        }
+        add_image_views(desc, false);
     }
     for (const auto& desc : info.texture_descriptors) {
+        if (desc.handle_program != ~0U && desc.count > 1) {
+            ensure_handle_addrs();
+            batch_handles.resize(desc.count);
+            VideoCommon::EvaluateTextureHandles(
+                info.handle_programs[desc.handle_program], desc.count,
+                std::span<const GPUVAddr>{cbuf_addrs},
+                std::span<const GPUVAddr>{ssbo_addrs.data(), num_ssbos}, handle_reader,
+                std::span<u32>{batch_handles.data(), desc.count});
+            for (u32 element = 0; element < desc.count; ++element) {
+                const auto handle =
+                    Tegra::Texture::TexturePair(batch_handles[element], via_header_index);
+                views.push_back({.index = handle.first});
+                if (use_bind_memo) {
+                    sampler_handles.push_back(handle.second);
+                    samplers.emplace_back();
+                } else {
+                    samplers.push_back(texture_cache.GetSamplerId(handle.second, true));
+                }
+            }
+            continue;
+        }
         for (u32 element = 0; element < desc.count; ++element) {
             const auto handle = read_handle(desc, element);
             views.push_back({.index = handle.first});
@@ -5349,17 +5910,16 @@ void RasterizerMetal::DispatchCompute() {
         }
     }
     for (const auto& desc : info.image_descriptors) {
-        for (u32 element = 0; element < desc.count; ++element) {
-            views.push_back(
-                {.index = read_handle(desc, element).first, .blacklist = desc.is_written});
-        }
+        add_image_views(desc, desc.is_written);
     }
     if (use_bind_memo) {
-        std::vector<u32> binding_kinds;
-        BindMemo::AppendKinds(info, TextureCache::BINDING_KIND_COMPUTE, binding_kinds);
-        if (binding_kinds.size() == views.size()) {
-            BindMemo::Resolve(texture_cache, true, true, binding_kinds, views, sampler_handles,
-                              samplers, bind_memo_counts);
+        static_assert(BindMemo::Kind::ComputeBit == TextureCache::BINDING_KIND_COMPUTE);
+        if (program.binding_kinds.empty() && !views.empty()) {
+            BindMemo::AppendKinds(info, BindMemo::Kind::ComputeBit, program.binding_kinds);
+        }
+        if (program.binding_kinds.size() == views.size()) {
+            BindMemo::Resolve(texture_cache, true, true, program.binding_kinds, views,
+                              sampler_handles, samplers, bind_memo_counts);
         } else {
             for (size_t index = 0; index < sampler_handles.size(); ++index) {
                 samplers[index] = texture_cache.GetSamplerId(sampler_handles[index], true);
@@ -5446,8 +6006,14 @@ void RasterizerMetal::DispatchCompute() {
     buffer_cache.UpdateComputeBuffers();
     buffer_cache_runtime.PendingBindings().clear();
     buffer_cache.BindHostComputeBuffers();
-    const std::vector<Binding> bindings = buffer_cache_runtime.PendingBindings();
-    const std::vector<TextureHandle> texel_views = PrepareTexelBuffers(bindings, info);
+    ScratchList scratch_bindings{compute_scratch.bindings};
+    std::vector<Binding>& bindings = scratch_bindings.value;
+    const auto& pending_bindings = buffer_cache_runtime.PendingBindings();
+    bindings.assign(pending_bindings.begin(), pending_bindings.end());
+    std::vector<TextureHandle> texel_views;
+    if (!info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty()) {
+        texel_views = PrepareTexelBuffers(bindings, info);
+    }
 
     rescaling_words = {};
     rescaling_words[6] = std::bit_cast<u32>(1.0f);
@@ -5461,7 +6027,7 @@ void RasterizerMetal::DispatchCompute() {
     if (indirect) {
         const auto [buffer, offset] = buffer_cache.ObtainBuffer(
             *indirect, 12, VideoCommon::ObtainBufferSynchronize::FullSynchronize,
-            VideoCommon::ObtainBufferOperation::DiscardWrite);
+            VideoCommon::ObtainBufferOperation::DoNothing);
         indirect_buffer = buffer->Handle();
         indirect_offset = offset;
     }
@@ -5546,7 +6112,8 @@ void RasterizerMetal::DispatchCompute() {
                                                 .format = Fmt::R32Uint,
                                                 .width = shadow_width,
                                                 .height = shadow_height,
-                                                .shader_write = true});
+                                                .shader_write = true,
+                                                .pixel_format_view = false});
         shadow_bridge = CreateBuffer(device, u64{size.width} * size.height * 2, false, nullptr);
         if (!shadow_texture || !shadow_bridge) {
             throw Shader::RuntimeError("Packed R16 surface shadow not made");
@@ -6100,8 +6667,8 @@ void RasterizerMetal::QueryFallback(GPUVAddr gpu_addr, VideoCommon::QueryType ty
         value = CounterValue(type, subreport).value_or(1U);
     }
     const bool wide = True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
-    std::function<void()> func([this, address = *address, wide, value] {
-        WriteQueryResult(address, wide, value);
+    std::function<void()> func([this, report_addr = *address, wide, value] {
+        WriteQueryResult(report_addr, wide, value);
     });
     if (True(flags & VideoCommon::QueryPropertiesFlags::IsAFence)) {
         // A counter's own fence waits too, but the draw of its byte count reads it on the CPU.
@@ -6346,6 +6913,7 @@ bool RasterizerMetal::OnCPUWrite(DAddr addr, u64 size) {
         {
             std::scoped_lock lock{buffer_cache.mutex};
             if (buffer_cache.OnCPUWrite(addr, size)) {
+                Tegra::Nx2NoteDeferredCodeWrite(addr, size);
                 return true;
             }
         }
@@ -6384,11 +6952,31 @@ bool RasterizerMetal::OnCPUWrite(DAddr addr, u64 size) {
     } else if (!handoff) {
         buffer_cache.mutex.lock();
     }
+    static thread_local VideoCommon::DeferredPageCaching deferred;
+    const bool defer = VideoCommon::ProtectUnlockedEnabled() &&
+                       VideoCommon::t_deferred_page_caching == nullptr &&
+                       !VideoCommon::GpuSplit::OwnsScheduler();
+    bool gpu_modified;
     {
         std::unique_lock lock{buffer_cache.mutex, std::adopt_lock};
-        if (buffer_cache.OnCPUWrite(addr, size)) {
-            return true;
+        if (defer) {
+            VideoCommon::t_deferred_page_caching = &deferred;
         }
+        gpu_modified = buffer_cache.OnCPUWrite(addr, size);
+        if (defer) {
+            VideoCommon::t_deferred_page_caching = nullptr;
+            if (!deferred.Empty()) {
+                device_memory.BeginDeferredCachedUpdates();
+            }
+        }
+    }
+    if (defer && !deferred.Empty()) {
+        deferred.ApplyAll();
+        device_memory.EndDeferredCachedUpdates();
+    }
+    if (gpu_modified) {
+        Tegra::Nx2NoteDeferredCodeWrite(addr, size);
+        return true;
     }
     if (!fast_path || texture_cache.page_filter.Any(addr, size)) {
         std::scoped_lock lock{texture_cache.mutex};
@@ -6465,9 +7053,8 @@ bool RasterizerMetal::TryCacheInvalidation(DAddr addr, u64 size) {
     return true;
 }
 
-bool RasterizerMetal::FencesQuiet(bool, u64& epoch) {
-    // Always strict: this backend's fences are only released by ReleaseFences.
-    return CachePathsEnabled() && fence_manager.FencesQuiet(true, epoch);
+bool RasterizerMetal::FencesQuiet(bool strict, u64& epoch) {
+    return CachePathsEnabled() && fence_manager.FencesQuiet(strict, epoch);
 }
 
 u64 RasterizerMetal::FenceWorkEpoch() const {
@@ -7095,6 +7682,16 @@ void RasterizerMetal::TickFrame() {
     {
         std::scoped_lock lock{buffer_cache.mutex};
         buffer_cache.TickFrame();
+        std::erase_if(converted_index_cache, [this](auto& item) {
+            std::erase_if(item.second, [this](const ConvertedIndexEntry& entry) {
+                const bool stale = oot_frame - entry.last_frame > 120;
+                if (stale && entry.buffer) {
+                    converted_index_bytes -= u64{entry.converted} * sizeof(u32);
+                }
+                return stale;
+            });
+            return item.second.empty();
+        });
     }
     staging_pool.TickFrame();
     pipeline_cache.TickFrame();
@@ -7267,7 +7864,7 @@ void RasterizerMetal::InlineToMemory(GPUVAddr address, size_t copy_size,
     if (!known_clean) {
         std::scoped_lock lock{buffer_cache.mutex};
         // Guest memory has the words now: a command list copy of the page no longer does.
-        buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
+        buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size, memory);
         bool page_clean = false;
         uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory,
                                              per_page_list ? &page_clean : nullptr);

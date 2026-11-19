@@ -43,17 +43,17 @@
 #include <mach/mach_init.h>
 #include <mach/memory_object_types.h>
 #include <mach/vm_statistics.h>
-#if TARGET_OS_IPHONE
 #include <mach/vm_purgable.h>
 #if __has_include(<mach/memory_entry.h>)
 #include <mach/memory_entry.h>
 #endif
 #include <sys/mount.h>
 #include <sys/param.h>
-// iOS forbids POSIX shared memory for third-party apps; the guest is backed by an anonymous Mach
-// memory object and every fastmem view is a vm_map of it.
+// Apple (macOS and iOS): XNU bills untagged shared mappings once per PTE across the backing and
+// fastmem views; iOS also forbids POSIX shared memory. Back guest memory with a ledger-tagged
+// Mach memory object and map every fastmem view with vm_map (falling back to shm_open on macOS if
+// mach_make_memory_entry_64 fails).
 #define LICHII_IOS_MACH_MEMORY 1
-#endif
 #elif defined(__FreeBSD__)
 #include <sys/shm.h>
 #elif defined(__OPENORBIS__)
@@ -129,8 +129,13 @@ constexpr bool FreeZeroPagesDefault = true;
 // Guest memory in a file (outside the footprint). LICHII_IOS_FILE_GUEST=0/1 overrides. On since
 // the device logs of builds 56-59 (iPhone18,2): the footprint stayed at 1.6-1.8 GiB with it, and
 // without it iOS closed Ocarina of Time at 6485 of 6656 MiB entering the forest (build 54).
-// Without 10 GiB of free storage the game runs with guest memory in RAM as before.
+// Without 10 GiB of free storage the game runs with guest memory in RAM as before. Off by default
+// on macOS, where swap is system-managed and ledger tagging eliminates multi-view footprint bloat.
+#if TARGET_OS_IPHONE
 constexpr bool FileGuestDefault = true;
+#else
+constexpr bool FileGuestDefault = false;
+#endif
 
 [[maybe_unused]] bool EnvSwitch(const char* name, bool fallback) {
     const char* const value = std::getenv(name);
@@ -464,6 +469,29 @@ public:
         return host_pointer_it->second + virtual_offset - it->lower();
     }
 
+    struct BackingRun {
+        size_t virtual_offset;
+        size_t length;
+        size_t backing_offset;
+    };
+
+    /// Appends the mapped parts of [virtual_offset, virtual_offset + length) with the backing
+    /// offsets they map, looked up under one lock.
+    void FindBackingRuns(size_t virtual_offset, size_t length, std::vector<BackingRun>& runs) {
+        const size_t virtual_end = virtual_offset + length;
+        std::shared_lock lock{placeholder_mutex};
+        auto [it, end] = placeholders.equal_range({virtual_offset, virtual_end});
+        for (; it != end; ++it) {
+            const auto host_pointer_it = placeholder_host_pointers.find(it->lower());
+            if (host_pointer_it == placeholder_host_pointers.end()) {
+                continue;
+            }
+            const size_t begin = (std::max)(it->lower(), virtual_offset);
+            const size_t run_end = (std::min)(it->upper(), virtual_end);
+            runs.push_back({begin, run_end - begin, host_pointer_it->second + begin - it->lower()});
+        }
+    }
+
     void EnableDirectMappedAddress() {
         // TODO
         UNREACHABLE();
@@ -654,6 +682,7 @@ private:
 #define MAP_NOCORE 0
 #endif
 
+#ifndef LICHII_IOS_MACH_MEMORY
 #if defined(ARCHITECTURE_arm64) && !defined(__APPLE__)
 
 static void* ChooseVirtualBase(size_t virtual_size) {
@@ -705,6 +734,7 @@ static void* ChooseVirtualBase(size_t virtual_size) {
     return mmap(nullptr, virtual_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_NOCORE, -1, 0);
 }
 
+#endif
 #endif
 
 #if defined(__sun__) || defined(__HAIKU__) || defined(__NetBSD__) || defined(__DragonFly__)
@@ -786,6 +816,7 @@ public:
         // Backing memory initialization
 #ifdef LICHII_IOS_MACH_MEMORY
         {
+            g_guest_media_ledger.store(false, std::memory_order_relaxed);
             // XNU charges an untagged object's page to the footprint once per page table entry
             // (arm64 pmap_enter), and the guest memory has two views: the backing (emulator) and
             // the fastmem arena (guest). A ledger-tagged object is billed to its owner once per
@@ -822,19 +853,37 @@ public:
                                                MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE,
                                                &backing_entry, MACH_PORT_NULL);
             }
-            if (kr != KERN_SUCCESS || entry_size < backing_size) {
+            bool shm_fallback = false;
+            if (!chunked && !file && (kr != KERN_SUCCESS || entry_size < backing_size)) {
+                if (backing_entry != MACH_PORT_NULL) {
+                    mach_port_deallocate(mach_task_self(), backing_entry);
+                    backing_entry = MACH_PORT_NULL;
+                }
+                ledger_tagged = false;
+#if TARGET_OS_IPHONE
                 LOG_CRITICAL(HW_Memory, "mach_make_memory_entry_64({:#x}) failed: {}", backing_size,
                              mach_error_string(kr));
-                backing_entry = MACH_PORT_NULL;
                 return false;
+#else
+                LOG_WARNING(HW_Memory,
+                            "mach_make_memory_entry_64({:#x}) failed ({}): falling back to "
+                            "shm_open",
+                            backing_size, mach_error_string(kr));
+                if (!InitShmFallback()) {
+                    return false;
+                }
+                shm_fallback = true;
+#endif
             }
-            LOG_INFO(HW_Memory, "Guest memory: {} MiB, {}", backing_size >> 20,
-                     file ? "in a file (experiment: outside the footprint; iOS writes it to "
-                            "storage when it needs the memory)"
-                     : chunked ? "ledger-tagged in purgeable 2 MiB chunks (each page counted once; "
-                                 "chunks of zeros are given back)"
-                     : ledger_tagged ? "ledger-tagged (each page counted once)"
-                                     : "untagged (counted per mapping; zero trimming on)");
+            if (!shm_fallback) {
+                LOG_INFO(HW_Memory, "Guest memory: {} MiB, {}", backing_size >> 20,
+                         file ? "in a file (experiment: outside the footprint; OS writes it to "
+                                "storage when it needs the memory)"
+                         : chunked ? "ledger-tagged in purgeable 2 MiB chunks (each page counted "
+                                     "once; chunks of zeros are given back)"
+                         : ledger_tagged ? "ledger-tagged (each page counted once)"
+                                         : "untagged (counted per mapping; zero trimming on)");
+            }
             if (file_wanted && !file) {
                 LOG_WARNING(HW_Memory, "Guest memory: the file experiment is on but was refused "
                                        "(reason in the line above): memory as without it");
@@ -852,7 +901,7 @@ public:
             // xnu asks no entitlement and charges phys_footprint the same (vm_memory_entry.c
             // mach_memory_entry_ownership, vm_object.c vm_object_ledger_tag_ledgers).
             // LICHII_IOS_GUEST_MEDIA_LEDGER=0 keeps the default tag.
-            if (ledger_tagged && !chunked && !file) {
+            if (ledger_tagged && !chunked && !file && !shm_fallback) {
                 const char* const media_env = std::getenv("LICHII_IOS_GUEST_MEDIA_LEDGER");
                 if (media_env == nullptr || media_env[0] != '0') {
                     const kern_return_t owner_kr = mach_memory_entry_ownership(
@@ -867,17 +916,33 @@ public:
                 }
             }
 #endif
-            if (!chunked && !file) {
+            if (!chunked && !file && !shm_fallback) {
                 vm_address_t backing_address = 0;
                 kr = vm_map(mach_task_self(), &backing_address, backing_size, 0, VM_FLAGS_ANYWHERE,
                             backing_entry, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
                             VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
                 if (kr != KERN_SUCCESS) {
+#if TARGET_OS_IPHONE
                     LOG_CRITICAL(HW_Memory, "vm_map of the {:#x} byte backing object failed: {}",
                                  backing_size, mach_error_string(kr));
                     return false;
+#else
+                    LOG_WARNING(HW_Memory,
+                                "vm_map of the {:#x} byte backing object failed ({}): falling back "
+                                "to shm_open",
+                                backing_size, mach_error_string(kr));
+                    mach_port_deallocate(mach_task_self(), backing_entry);
+                    backing_entry = MACH_PORT_NULL;
+                    ledger_tagged = false;
+                    g_guest_media_ledger.store(false, std::memory_order_relaxed);
+                    if (!InitShmFallback()) {
+                        return false;
+                    }
+                    shm_fallback = true;
+#endif
+                } else {
+                    backing_base = reinterpret_cast<u8*>(backing_address);
                 }
-                backing_base = reinterpret_cast<u8*>(backing_address);
             }
             // Even with extended-virtual-addressing iOS hands out far less than the 512 GiB a 39-bit
             // guest spans, so take the largest power of two it grants: guest addresses above it
@@ -905,7 +970,7 @@ public:
             virtual_size = guest_space + HugePageSize;
             vm_protect(mach_task_self(), virtual_address, virtual_size, FALSE, VM_PROT_NONE);
             virtual_base = virtual_map_base = reinterpret_cast<u8*>(virtual_address);
-            if (ledger_tagged && !chunked && !file) {
+            if (ledger_tagged && !chunked && !file && !shm_fallback) {
                 free_zero = EnvSwitch("EDEN_NX2_FREE_ZERO", FreeZeroPagesDefault);
                 if (free_zero) {
                     PrepareZeroFreeing();
@@ -1038,7 +1103,7 @@ public:
                 const u32 host_page = static_cast<u32>(host_offset / PageAlignment + i);
                 page_states[first + i] = state | (host_page << PageOffsetShift);
             }
-            UpdateHostPages(virtual_offset, length, true);
+            UpdateHostPages(virtual_offset, length);
             return;
         }
 
@@ -1078,7 +1143,7 @@ public:
             }
             std::scoped_lock lk{page_states_mutex};
             std::fill_n(page_states + StateIndex(virtual_offset), length / PageAlignment, 0u);
-            UpdateHostPages(virtual_offset, length, true);
+            UpdateHostPages(virtual_offset, length);
             return;
         }
 
@@ -1106,11 +1171,7 @@ public:
             const u32 bits = (read ? PageRead : 0u) | (write ? PageWrite : 0u) |
                              (execute ? PageExecute : 0u);
             std::scoped_lock lk{page_states_mutex};
-            u32* const states = page_states + StateIndex(virtual_offset);
-            for (size_t i = 0; i < length / PageAlignment; ++i) {
-                states[i] = (states[i] & ~PagePermissionMask) | bits;
-            }
-            UpdateHostPages(virtual_offset, length, false);
+            ProtectHostPages(virtual_offset, length, bits);
             return;
         }
 
@@ -1327,6 +1388,7 @@ public:
 
     /// The other threads can be stopped for FreeZeroPages: once, while nothing is at stake.
     void PrepareZeroFreeing() {
+#if defined(__arm64__) || defined(__aarch64__)
         stopped.assign(MaxStopped, MACH_PORT_NULL);
         if (!StopWorld()) {
             stopped.clear();
@@ -1336,6 +1398,7 @@ public:
         }
         static_cast<void>(KernelMayWriteGuest());
         ResumeWorld();
+#endif
     }
 
     bool ledger_tagged{}; ///< The guest memory object is billed per page, not per mapping
@@ -1400,13 +1463,54 @@ private:
 
     bool HasBackingObject() const {
 #ifdef LICHII_IOS_MACH_MEMORY
-        return backing_entry != MACH_PORT_NULL || Chunked() || file_backed;
+        return backing_entry != MACH_PORT_NULL || Chunked() || file_backed || fd >= 0;
 #else
         return false;
 #endif
     }
 
 #ifdef LICHII_IOS_MACH_MEMORY
+#if !TARGET_OS_IPHONE
+    bool InitShmFallback() {
+        char shm_name[64];
+        static std::atomic<u32> shm_counter{};
+        std::snprintf(shm_name, sizeof(shm_name), "/eden_mem_%d_%u", static_cast<int>(getpid()),
+                      shm_counter.fetch_add(1, std::memory_order_relaxed));
+        fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) {
+            shm_unlink(shm_name);
+        } else {
+            char template_path[] = "/tmp/eden_mem_XXXXXX";
+            fd = mkstemp(template_path);
+            if (fd >= 0) {
+                unlink(template_path);
+            }
+        }
+        if (fd < 0) {
+            LOG_CRITICAL(HW_Memory, "shm_open fallback failed: {}", strerror(errno));
+            return false;
+        }
+        if (ftruncate(fd, static_cast<off_t>(backing_size)) != 0) {
+            LOG_CRITICAL(HW_Memory, "ftruncate({:#x}) failed: {}", backing_size, strerror(errno));
+            close(fd);
+            fd = -1;
+            return false;
+        }
+        void* const base =
+            mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOCORE, fd, 0);
+        if (base == MAP_FAILED) {
+            LOG_CRITICAL(HW_Memory, "mmap({:#x}) failed: {}", backing_size, strerror(errno));
+            close(fd);
+            fd = -1;
+            return false;
+        }
+        backing_base = static_cast<u8*>(base);
+        LOG_INFO(HW_Memory, "Guest memory: {} MiB, POSIX shared memory fallback",
+                 backing_size >> 20);
+        return true;
+    }
+#endif
+
     static vm_prot_t ToVmProt(int prot) {
         vm_prot_t out = VM_PROT_NONE;
         if (prot & PROT_READ) {
@@ -1419,14 +1523,15 @@ private:
     }
 
     bool MapBackingView(void* address, size_t size, size_t host_offset, int prot) {
-        if (file_backed) {
+        if (file_backed || (backing_entry == MACH_PORT_NULL && !Chunked() && fd >= 0)) {
             // MAP_FIXED replaces the reservation in one step (mmap: VM_FLAGS_OVERWRITE).
             void* const mapped = mmap(address, size, prot & (PROT_READ | PROT_WRITE),
                                       MAP_SHARED | MAP_FIXED, fd, static_cast<off_t>(host_offset));
             if (mapped == MAP_FAILED) {
-                LOG_CRITICAL(HW_Memory, "mmap({}, {:#x}, offset {:#x}) of the guest file failed: {}",
-                             fmt::ptr(address), size, host_offset, strerror(errno));
-            } else if (!std::exchange(file_view_logged, true)) {
+                LOG_CRITICAL(HW_Memory, "mmap({}, {:#x}, offset {:#x}) of the guest {} failed: {}",
+                             fmt::ptr(address), size, host_offset,
+                             file_backed ? "file" : "shm", strerror(errno));
+            } else if (file_backed && !std::exchange(file_view_logged, true)) {
                 LOG_INFO(HW_Memory, "Guest file: first view mapped ({:#x} bytes at {}, file offset "
                                     "{:#x}, protection {})",
                          size, fmt::ptr(address), host_offset, prot);
@@ -1897,22 +2002,20 @@ private:
         return {true, host_offset, ProtectionFlags(permissions)};
     }
 
-    void UpdateHostPages(size_t virtual_offset, size_t length, bool remap) {
+    void UpdateHostPages(size_t virtual_offset, size_t length) {
         const size_t begin = AlignDown(virtual_offset, host_page_size);
         const size_t end = AlignUp(virtual_offset + length, host_page_size);
         const auto apply = [&](size_t run_begin, size_t run_end, const HostPage& page) {
             u8* const address = virtual_base + run_begin;
             const size_t size = run_end - run_begin;
             if (!page.mapped) {
-                if (remap) {
 #ifdef LICHII_IOS_MACH_MEMORY
-                    ASSERT_MSG(ReserveRange(address, size), "vm_allocate failed for {:#x} bytes", size);
+                ASSERT_MSG(ReserveRange(address, size), "vm_allocate failed for {:#x} bytes", size);
 #else
-                    void* ret = mmap(address, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-                    ASSERT_MSG(ret != MAP_FAILED, "mmap: {}", strerror(errno));
+                void* ret = mmap(address, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                ASSERT_MSG(ret != MAP_FAILED, "mmap: {}", strerror(errno));
 #endif
-                }
-            } else if (remap) {
+            } else {
 #ifdef LICHII_IOS_MACH_MEMORY
                 ASSERT_MSG(MapBackingView(address, size, page.host_offset, page.prot),
                            "vm_map failed for {:#x} bytes", size);
@@ -1920,22 +2023,6 @@ private:
                 void* ret = mmap(address, size, page.prot, MAP_SHARED | MAP_FIXED, fd, off_t(page.host_offset));
                 ASSERT_MSG(ret != MAP_FAILED, "mmap: {}", strerror(errno));
 #endif
-            } else {
-                int ret = mprotect(address, size, page.prot);
-#ifdef LICHII_IOS_MACH_MEMORY
-                if (ret != 0) {
-                    const int error = errno;
-                    LOG_CRITICAL(HW_Memory, "mprotect({}, {:#x}, {}) of a guest view failed: {}{}",
-                                 fmt::ptr(address), size, page.prot, strerror(error),
-                                 file_backed ? " (guest memory in a file)" : "");
-                    errno = error;
-                } else if (file_backed && !std::exchange(file_protect_logged, true)) {
-                    LOG_INFO(HW_Memory, "Guest file: first protection change ({:#x} bytes at {}, "
-                                        "protection {})",
-                             size, fmt::ptr(address), page.prot);
-                }
-#endif
-                ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
             }
         };
         size_t run_begin = begin;
@@ -1952,6 +2039,66 @@ private:
             }
         }
         apply(run_begin, end, run);
+    }
+
+    void ProtectHostPages(size_t virtual_offset, size_t length, u32 bits) {
+        const size_t virtual_end = virtual_offset + length;
+        const size_t begin = AlignDown(virtual_offset, host_page_size);
+        const size_t end = AlignUp(virtual_end, host_page_size);
+        const auto apply_protect = [&](size_t run_begin, size_t run_end, int prot) {
+            u8* const address = virtual_base + run_begin;
+            const size_t size = run_end - run_begin;
+            const int ret = mprotect(address, size, prot);
+#ifdef LICHII_IOS_MACH_MEMORY
+            if (ret != 0) {
+                const int error = errno;
+                LOG_CRITICAL(HW_Memory, "mprotect({}, {:#x}, {}) of a guest view failed: {}{}",
+                             fmt::ptr(address), size, prot, strerror(error),
+                             file_backed ? " (guest memory in a file)" : "");
+                errno = error;
+            } else if (file_backed && !std::exchange(file_protect_logged, true)) {
+                LOG_INFO(HW_Memory, "Guest file: first protection change ({:#x} bytes at {}, "
+                                    "protection {})",
+                         size, fmt::ptr(address), prot);
+            }
+#endif
+            ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
+        };
+        bool has_run = false;
+        size_t run_begin = 0;
+        HostPage run{};
+        for (size_t offset = begin; offset < end; offset += host_page_size) {
+            const HostPage before = ResolveHostPage(offset);
+            const size_t sub_begin = (std::max)(virtual_offset, offset);
+            const size_t sub_end = (std::min)(virtual_end, offset + host_page_size);
+            u32* const states = page_states + StateIndex(sub_begin);
+            for (size_t i = 0; i < (sub_end - sub_begin) / PageAlignment; ++i) {
+                states[i] = (states[i] & ~PagePermissionMask) | bits;
+            }
+            const HostPage after = ResolveHostPage(offset);
+            const bool changed =
+                after.mapped && !(before.mapped == after.mapped && before.prot == after.prot);
+            if (!changed) {
+                if (has_run) {
+                    apply_protect(run_begin, offset, run.prot);
+                    has_run = false;
+                }
+                continue;
+            }
+            if (has_run && after.prot == run.prot &&
+                after.host_offset == run.host_offset + (offset - run_begin)) {
+                continue;
+            }
+            if (has_run) {
+                apply_protect(run_begin, offset, run.prot);
+            }
+            has_run = true;
+            run_begin = offset;
+            run = after;
+        }
+        if (has_run) {
+            apply_protect(run_begin, end, run.prot);
+        }
     }
 
     int fd{-1}; // memfd file descriptor, -1 is the error value of memfd_create
@@ -2047,6 +2194,10 @@ HostMemory::HostMemory(HostMemory&&) noexcept = default;
 
 HostMemory& HostMemory::operator=(HostMemory&&) noexcept = default;
 
+namespace {
+std::atomic<u64> g_mapped_bytes{};
+} // namespace
+
 void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms, bool separate_heap) {
 #if !(defined(__OPENORBIS__) || defined(__managarm__))
     ASSERT(virtual_offset % PageAlignment == 0);
@@ -2061,6 +2212,7 @@ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, M
         // Pages the kernel handed out are committed already; this covers any it did not.
         Commit(host_offset, length);
     }
+    g_mapped_bytes.fetch_add(length, std::memory_order_relaxed);
     impl->Map(virtual_offset + virtual_base_offset, host_offset, length, perms);
 #endif
 }
@@ -2073,6 +2225,7 @@ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap)
     if (length == 0 || !virtual_base || !impl) {
         return;
     }
+    g_mapped_bytes.fetch_add(length, std::memory_order_relaxed);
     impl->Unmap(virtual_offset + virtual_base_offset, length);
 #endif
 }
@@ -2088,6 +2241,7 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
     const bool read = True(perm & MemoryPermission::Read);
     const bool write = True(perm & MemoryPermission::Write);
     const bool execute = True(perm & MemoryPermission::Execute);
+    g_mapped_bytes.fetch_add(length, std::memory_order_relaxed);
     impl->Protect(virtual_offset + virtual_base_offset, length, read, write, execute);
 #endif
 }
@@ -2436,6 +2590,10 @@ u64 HostMemory::ZeroFilledBytes() noexcept {
     return g_zero_filled_bytes.load(std::memory_order_relaxed);
 }
 
+u64 HostMemory::MappedBytes() noexcept {
+    return g_mapped_bytes.load(std::memory_order_relaxed);
+}
+
 HostMemory::GuestAccounting HostMemory::ScannedAccounting() noexcept {
 #ifdef LICHII_IOS_MACH_MEMORY
     if (g_guest_media_ledger.load(std::memory_order_relaxed)) {
@@ -2605,21 +2763,46 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
             finished = end_slice();
         }
     }
-    for (size_t i = 0; i < view_pages.size() && finished; ++i) {
-        const uintptr_t page = view_pages[i];
-        const auto offset = impl->BackingOffset(page - view_begin);
-        if (offset && *offset < backing_size) {
-            const uintptr_t backing_page = backing_begin + *offset;
-            if (IsZeroPage(reinterpret_cast<const u8*>(backing_page))) {
-                zero(page);
-            }
-            // Reading it put the backing page in the working set: take it out again.
-            if (!std::binary_search(backing_pages.begin(), backing_pages.end(), backing_page)) {
-                trim.push_back(backing_page);
-            }
+    // The views behind each run of resident view pages (2 MiB at most) are looked up under one
+    // lock, released before the pages are read: guest map, unmap and protect calls wait for one
+    // short lookup at most, and a pass over 5 GB takes the lock a few thousand times instead of
+    // about a million.
+    constexpr size_t MaxRunPages = 512;
+    std::vector<Impl::BackingRun> runs;
+    size_t scanned_view_pages = 0;
+    for (size_t i = 0; i < view_pages.size() && finished;) {
+        size_t j = i + 1;
+        while (j < view_pages.size() && j - i < MaxRunPages &&
+               view_pages[j] == view_pages[j - 1] + PageAlignment) {
+            ++j;
         }
-        if ((i + 1) % SlicePages == 0) {
-            finished = end_slice();
+        runs.clear();
+        if (impl) {
+            impl->FindBackingRuns(view_pages[i] - view_begin,
+                                  view_pages[j - 1] + PageAlignment - view_pages[i], runs);
+        }
+        i = j;
+        for (const auto& run : runs) {
+            for (size_t offset = 0; offset < run.length && finished; offset += PageAlignment) {
+                if (run.backing_offset + offset < backing_size) {
+                    const uintptr_t page = view_begin + run.virtual_offset + offset;
+                    const uintptr_t backing_page = backing_begin + run.backing_offset + offset;
+                    if (IsZeroPage(reinterpret_cast<const u8*>(backing_page))) {
+                        zero(page);
+                    }
+                    // Reading it put the backing page in the working set: take it out again.
+                    if (!std::binary_search(backing_pages.begin(), backing_pages.end(),
+                                            backing_page)) {
+                        trim.push_back(backing_page);
+                    }
+                }
+                if (++scanned_view_pages % SlicePages == 0) {
+                    finished = end_slice();
+                }
+            }
+            if (!finished) {
+                break;
+            }
         }
     }
     if (finished) {
@@ -2751,16 +2934,14 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
             resident += page_size;
             if ((residency[index] & MINCORE_INCORE) == 0) {
                 compressed += page_size;
-            }
-            if (!scan) {
-                continue;
-            }
+            } else if (scan) {
 #ifdef LICHII_IOS_MACH_MEMORY
-            unmap_touched = true;
+                unmap_touched = true;
 #endif
-            zero = is_zero(backing_base + index * page_size);
-            if (!zero) {
-                trimmed_pages[index] = false;
+                zero = is_zero(backing_base + index * page_size);
+                if (!zero) {
+                    trimmed_pages[index] = false;
+                }
             }
         }
         if (!scan) {
@@ -2939,48 +3120,87 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
         return value == nullptr || value[0] != '0';
     }();
 #endif
+    constexpr size_t GranuleSize = size_t{1} << GranuleShift;
     const size_t end = physical_offset + length;
+    const size_t last_index = (end - 1) >> GranuleShift;
     for (size_t offset = physical_offset; offset < end;) {
         const size_t index = offset >> GranuleShift;
-        const size_t granule_begin = index << GranuleShift;
-        const size_t granule_end = granule_begin + (size_t{1} << GranuleShift);
-        const size_t clear_end = (std::min)(granule_end, end);
-        if ((granules[index].load(std::memory_order_acquire) & GranuleDirty) != 0) {
-            const bool whole = offset == granule_begin && clear_end == granule_end;
-            bool cleared = false;
+        if ((granules[index].load(std::memory_order_acquire) & GranuleDirty) == 0) {
+            offset = (std::min)((index + 1) << GranuleShift, end);
+            continue;
+        }
+        // Coalesce adjacent dirty granules into a single [run_begin, run_end) clear span.
+        size_t run_end_index = index + 1;
+        while (run_end_index <= last_index &&
+               (granules[run_end_index].load(std::memory_order_acquire) & GranuleDirty) != 0) {
+            ++run_end_index;
+        }
+        const size_t run_begin = offset;
+        const size_t run_end = (std::min)(run_end_index << GranuleShift, end);
+        const size_t whole_begin = Common::AlignUp(run_begin, GranuleSize);
+        const size_t whole_end = Common::AlignDown(run_end, GranuleSize);
+        bool cleared = false;
 #ifdef __APPLE__
-            const bool released = (granules[index].fetch_and(static_cast<u8>(~GranuleReleased),
-                                                             std::memory_order_acq_rel) &
-                                   GranuleReleased) != 0;
-            cleared = ZeroWithoutFaulting(offset, clear_end - offset);
-            if (!cleared && FileBacked()) {
-                const size_t written = ZeroNonZeroPages(backing_base + offset, clear_end - offset);
-                g_zero_filled_bytes.fetch_add(written, std::memory_order_relaxed);
-                cleared = true;
-                static std::atomic<bool> logged{};
-                if (!logged.exchange(true, std::memory_order_relaxed)) {
-                    LOG_INFO(HW_Memory, "Guest file: first clear ({:#x} bytes at file offset {:#x}, "
-                                        "{:#x} of them held data and were rewritten)",
-                             clear_end - offset, offset, written);
-                }
-            }
-            if (!cleared && released) {
-                madvise(backing_base + granule_begin,
-                        (std::min)(granule_end, backing_size) - granule_begin, MADV_FREE_REUSE);
-            }
-#endif
-#ifdef __linux__
-            cleared = whole && punch && impl && impl->PunchHole(granule_begin, granule_end - granule_begin);
-#endif
-            if (!cleared) {
-                std::memset(backing_base + offset, 0, clear_end - offset);
-                g_zero_filled_bytes.fetch_add(clear_end - offset, std::memory_order_relaxed);
-            }
-            if (whole) {
-                granules[index].fetch_and(static_cast<u8>(~GranuleDirty), std::memory_order_release);
+        cleared = ZeroWithoutFaulting(run_begin, run_end - run_begin);
+        if (!cleared && FileBacked()) {
+            const size_t written = ZeroNonZeroPages(backing_base + run_begin, run_end - run_begin);
+            g_zero_filled_bytes.fetch_add(written, std::memory_order_relaxed);
+            cleared = true;
+            static std::atomic<bool> logged{};
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                LOG_INFO(HW_Memory, "Guest file: first clear ({:#x} bytes at file offset {:#x}, "
+                                    "{:#x} of them held data and were rewritten)",
+                         run_end - run_begin, run_begin, written);
             }
         }
-        offset = clear_end;
+        for (size_t g = index; g < run_end_index;) {
+            const bool released = (granules[g].fetch_and(static_cast<u8>(~GranuleReleased),
+                                                         std::memory_order_acq_rel) &
+                                   GranuleReleased) != 0;
+            if (!cleared && released) {
+                size_t reuse_end = g + 1;
+                while (reuse_end < run_end_index &&
+                       (granules[reuse_end].fetch_and(static_cast<u8>(~GranuleReleased),
+                                                      std::memory_order_acq_rel) &
+                        GranuleReleased) != 0) {
+                    ++reuse_end;
+                }
+                const size_t reuse_begin_off = g << GranuleShift;
+                const size_t reuse_end_off = (std::min)(reuse_end << GranuleShift, backing_size);
+                madvise(backing_base + reuse_begin_off, reuse_end_off - reuse_begin_off,
+                        MADV_FREE_REUSE);
+                g = reuse_end;
+            } else {
+                ++g;
+            }
+        }
+#endif
+#ifdef __linux__
+        if (whole_begin < whole_end && punch && impl &&
+            impl->PunchHole(whole_begin, whole_end - whole_begin)) {
+            if (run_begin < whole_begin) {
+                std::memset(backing_base + run_begin, 0, whole_begin - run_begin);
+            }
+            if (whole_end < run_end) {
+                std::memset(backing_base + whole_end, 0, run_end - whole_end);
+            }
+            g_zero_filled_bytes.fetch_add(
+                (whole_begin - run_begin) + (run_end - whole_end), std::memory_order_relaxed);
+            cleared = true;
+        }
+#endif
+        if (!cleared) {
+            std::memset(backing_base + run_begin, 0, run_end - run_begin);
+            g_zero_filled_bytes.fetch_add(run_end - run_begin, std::memory_order_relaxed);
+        }
+        if (whole_begin < whole_end) {
+            const size_t whole_begin_index = whole_begin >> GranuleShift;
+            const size_t whole_end_index = whole_end >> GranuleShift;
+            for (size_t g = whole_begin_index; g < whole_end_index; ++g) {
+                granules[g].fetch_and(static_cast<u8>(~GranuleDirty), std::memory_order_release);
+            }
+        }
+        offset = run_end;
     }
 }
 

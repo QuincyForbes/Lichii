@@ -105,6 +105,12 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
 
         cmdbuf.EndRenderPass();
     });
+
+    auto tick_layer_it = layers.begin();
+    for (size_t i = 0; i < layer_count; i++) {
+        tick_layer_it->NoteSubmittedTick(image_index);
+        tick_layer_it++;
+    }
 }
 
 VkDescriptorSetLayout WindowAdaptPass::GetDescriptorSetLayout() {

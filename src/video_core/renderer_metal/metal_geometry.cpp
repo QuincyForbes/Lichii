@@ -373,7 +373,11 @@ kernel void geo_records(device const {7}* src [[buffer({1})]], device float* dst
         return;
     }}
     const uint p = n / j.vertices;
-    uint s = (p / j.primitives) * j.count + (p % j.primitives) * j.step + n % j.vertices;
+    uint c = n % j.vertices;
+    if (j.vertices == 3 && j.step == 1 && ((p % j.primitives) & 1u) != 0u && c < 2u) {{
+        c ^= 1u;
+    }}
+    uint s = (p / j.primitives) * j.count + (p % j.primitives) * j.step + c;
     if (j.vertices == 6 && j.step == 2) {{
         // Triangle strips with adjacency: Vulkan's vertex order of primitive i of n.
         const uint i = p % j.primitives, c = n % 6, m = j.primitives;

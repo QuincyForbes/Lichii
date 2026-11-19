@@ -10,6 +10,11 @@
 #include <filesystem>
 #include <span>
 #include <type_traits>
+#ifdef _WIN32
+#include <atomic>
+#include <cstdint>
+#include <mutex>
+#endif
 
 #include "common/concepts.h"
 #include "common/fs/fs_types.h"
@@ -289,6 +294,11 @@ public:
     }
 
     /**
+     * Thread-safe positional byte read that does not disturb the sequential file pointer on POSIX.
+     */
+    [[nodiscard]] size_t ReadBytesAt(std::span<u8> data, u64 offset) const;
+
+    /**
      * Writes a span of T data to a file sequentially.
      * This function writes from the current position of the file pointer and
      * advances it by the (count of T * sizeof(T)) bytes successfully written.
@@ -455,6 +465,10 @@ private:
     FileType file_type{};
 
     std::FILE* file = nullptr;
+#ifdef _WIN32
+    mutable std::atomic<std::intptr_t> pread_handle{0};
+    mutable std::mutex io_mutex;
+#endif
 };
 
 } // namespace Common::FS

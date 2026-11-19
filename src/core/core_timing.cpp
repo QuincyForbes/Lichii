@@ -16,7 +16,11 @@
 #include <optional>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 #include <fmt/format.h>
 #include "common/cpu_features.h"
 #include "common/logging.h"
@@ -58,13 +62,75 @@ constexpr u32 CpuClockTargetMhz(Settings::CpuClock clock) {
 
 namespace {
 
-// The timer thread sleeps in the OS until this long before the next event and waits the rest with
-// Event::WaitFor, which on x86 Windows is a hardware wait that keeps the thread running.
-// EDEN_NX2_TIMING_SPIN_US overrides the tail margin in microseconds (default 0).
-s64 HostWaitMarginNs() {
+void PauseHint() noexcept {
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+    _mm_pause();
+#elif defined(__APPLE__) && defined(__aarch64__)
+    __builtin_arm_isb(0xF);
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
+}
+
+/// How long before a one-shot event the timer thread stops sleeping in the OS and waits the rest
+/// in a hardware wait. OS sleeps end late by the host's timer tick (0.5 ms on Windows) plus
+/// scheduling, so the margin follows the 90th percentile of how late the last Samples sleeps
+/// ended. Hardware waits are paid from a budget of a fifth of the thread's time: with events
+/// denser than the margin, waits fall back to OS sleeps rather than a busy core.
+class HostWaitMargin {
+public:
+    static constexpr size_t Samples = 128;
+    static constexpr size_t UpdateEvery = 16;
+    static constexpr s64 MaxMarginNs = 2'000'000;
+    static constexpr s64 BudgetDivisor = 5;
+    static constexpr s64 BurstNs = 2'000'000;
+
+    s64 Get(s64 now) {
+        if (last_now) {
+            const s64 elapsed = (std::max<s64>)(0, now - *last_now);
+            budget_ns = (std::min)(BurstNs, budget_ns + elapsed / BudgetDivisor);
+        }
+        last_now = now;
+        return std::clamp<s64>(budget_ns, 0, estimate_ns);
+    }
+
+    void OnOversleep(s64 late_ns) {
+        samples[next] = std::clamp<s64>(late_ns, 0, MaxMarginNs);
+        next = (next + 1) % Samples;
+        count = (std::min)(count + 1, Samples);
+        if (++since_update < UpdateEvery) {
+            return;
+        }
+        since_update = 0;
+        std::array<s64, Samples> sorted = samples;
+        const auto p90 = sorted.begin() + count * 9 / 10;
+        std::nth_element(sorted.begin(), p90, sorted.begin() + count);
+        estimate_ns = *p90;
+    }
+
+    void OnPreciseWait(s64 ns) {
+        budget_ns -= ns;
+    }
+
+    s64 Estimate() const {
+        return estimate_ns;
+    }
+
+private:
+    std::array<s64, Samples> samples{};
+    size_t next{};
+    size_t count{};
+    size_t since_update{};
+    s64 estimate_ns{};
+    s64 budget_ns{BurstNs};
+    std::optional<s64> last_now;
+};
+
+// EDEN_NX2_TIMING_SPIN_US overrides the adaptive margin in microseconds when set.
+s64 HostWaitMarginOverrideNs() {
     static const s64 margin_ns = [] {
         const char* v = std::getenv("EDEN_NX2_TIMING_SPIN_US");
-        return v != nullptr ? (std::max<s64>)(0, std::atoll(v) * 1000) : 0;
+        return v != nullptr ? (std::max<s64>)(0, std::atoll(v) * 1000) : -1;
     }();
     return margin_ns;
 }
@@ -76,12 +142,15 @@ struct HostWaitWindow {
     u64 waits{};
     u64 woken{};
     s64 sleep_ns{};
-    s64 wait_for_ns{};
+    s64 precise_ns{};
     std::vector<s64> wake_late;
     std::vector<s64> event_late;
+    std::vector<s64> one_shot_late;
 };
 
 thread_local HostWaitWindow t_host_wait;
+thread_local HostWaitMargin t_host_wait_margin;
+thread_local std::optional<s64> t_next_one_shot_time;
 
 void LogHostWait(s64 now) {
     HostWaitWindow& w = t_host_wait;
@@ -95,24 +164,31 @@ void LogHostWait(s64 now) {
     };
     const auto wake = percentiles(w.wake_late);
     const auto event = percentiles(w.event_late);
+    const auto one_shot = percentiles(w.one_shot_late);
     const f64 seconds = static_cast<f64>(now - w.start) / 1e9;
     const std::optional<u64> cpu = Common::CurrentThreadCpuTimeNs();
+    const s64 override_ns = HostWaitMarginOverrideNs();
+    const s64 reported_margin_us =
+        (override_ns >= 0 ? override_ns : t_host_wait_margin.Estimate()) / 1000;
     LOG_INFO(Core_Timing,
              "HostTiming wait: {} waits, {} woken by new events, OS sleep {:.1f} ms/s, "
-             "WaitFor {:.1f} ms/s; wake late p50/p99/max {}/{}/{} us; {} events late "
-             "p50/p99/max {}/{}/{} us; thread CPU {}",
+             "precise wait {:.1f} ms/s, margin {} us; wake late p50/p99/max {}/{}/{} us; {} events "
+             "late p50/p99/max {}/{}/{} us, {} of them one-shot p50/p99/max {}/{}/{} us; thread "
+             "CPU {}",
              w.waits, w.woken, static_cast<f64>(w.sleep_ns) / 1e6 / seconds,
-             static_cast<f64>(w.wait_for_ns) / 1e6 / seconds, wake[0], wake[1], wake[2],
-             w.event_late.size(), event[0], event[1], event[2],
+             static_cast<f64>(w.precise_ns) / 1e6 / seconds, reported_margin_us, wake[0], wake[1],
+             wake[2], w.event_late.size(), event[0], event[1], event[2], w.one_shot_late.size(),
+             one_shot[0], one_shot[1], one_shot[2],
              cpu && w.cpu_start
                  ? fmt::format("{:.1f}%", static_cast<f64>(*cpu - *w.cpu_start) / 1e7 / seconds)
                  : std::string{"unknown"});
     w.start = now;
     w.cpu_start = cpu;
     w.waits = w.woken = 0;
-    w.sleep_ns = w.wait_for_ns = 0;
+    w.sleep_ns = w.precise_ns = 0;
     w.wake_late.clear();
     w.event_late.clear();
+    w.one_shot_late.clear();
 }
 
 } // Anonymous namespace
@@ -223,69 +299,109 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
 }
 
 void CoreTiming::WaitForEvent(s64 next_time, void* hires_timer) {
+    const std::optional<s64> one_shot_time = std::exchange(t_next_one_shot_time, std::nullopt);
     const s64 start = GetGlobalTimeNs().count();
     if (next_time <= start) {
         return;
     }
-    const s64 margin_ns = HostWaitMarginNs();
-    s64 now = start;
+    const s64 override_ns = HostWaitMarginOverrideNs();
+    const s64 margin_ns = override_ns >= 0 ? override_ns : t_host_wait_margin.Get(start);
+    const bool precise = override_ns >= 0
+                             ? (next_time - margin_ns <= start)
+                             : (one_shot_time && *one_shot_time - margin_ns <= start);
+    const s64 wake = override_ns >= 0
+                         ? (std::max)(start, next_time - margin_ns)
+                         : (one_shot_time ? (std::min)(next_time, *one_shot_time - margin_ns)
+                                          : next_time);
     bool signalled = false;
+    if (precise) {
+#if defined(_WIN32) && defined(ARCHITECTURE_x86_64)
+        if (Common::g_cpu_caps.monitorx || Common::g_cpu_caps.waitpkg) {
+            signalled = event.WaitFor(std::chrono::nanoseconds{next_time - start});
+            if (signalled && wake_handle != nullptr) {
+                ResetEvent(static_cast<HANDLE>(wake_handle));
+            }
+        } else
+#endif
+        {
+            while (true) {
+                if (event.IsSet()) {
+                    event.Reset();
 #ifdef _WIN32
-    // A high resolution waitable timer (~0.5 ms precise on Windows 10 1803+) keeps the guest's
-    // events (vsync among them) on time even where Windows 11 ignores our timer resolution
-    // request, without holding a logical processor in MWAITX for the whole wait.
-    if (hires_timer != nullptr && wake_handle != nullptr && next_time - now > margin_ns) {
-        if (event.IsSet()) {
-            event.Reset();
-            ResetEvent(static_cast<HANDLE>(wake_handle));
-            signalled = true;
-        } else {
-            LARGE_INTEGER due{};
-            due.QuadPart =
-                -(std::max<LONGLONG>)(1, static_cast<LONGLONG>((next_time - margin_ns - now) / 100));
-            if (SetWaitableTimerEx(static_cast<HANDLE>(hires_timer), &due, 0, nullptr, nullptr,
-                                   nullptr, 0)) {
-                const HANDLE handles[2]{static_cast<HANDLE>(wake_handle),
-                                        static_cast<HANDLE>(hires_timer)};
-                const DWORD wait_res = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
-                if (wait_res == WAIT_OBJECT_0) {
-                    event.Reset();
+                    if (wake_handle != nullptr) {
+                        ResetEvent(static_cast<HANDLE>(wake_handle));
+                    }
+#endif
                     signalled = true;
-                } else if (event.IsSet()) {
-                    event.Reset();
-                    ResetEvent(static_cast<HANDLE>(wake_handle));
-                    signalled = true;
+                    break;
                 }
-                now = GetGlobalTimeNs().count();
+                if (GetGlobalTimeNs().count() >= next_time) {
+                    break;
+                }
+                PauseHint();
             }
         }
-    }
+    } else if (wake > start) {
+#ifdef _WIN32
+        // A high resolution waitable timer (~0.5 ms precise on Windows 10 1803+) keeps the guest's
+        // events (vsync among them) on time even where Windows 11 ignores our timer resolution
+        // request, without holding a logical processor in MWAITX for the whole wait.
+        bool waited_hires = false;
+        if (hires_timer != nullptr && wake_handle != nullptr) {
+            if (event.IsSet()) {
+                event.Reset();
+                ResetEvent(static_cast<HANDLE>(wake_handle));
+                signalled = true;
+                waited_hires = true;
+            } else {
+                LARGE_INTEGER due{};
+                due.QuadPart =
+                    -(std::max<LONGLONG>)(1, static_cast<LONGLONG>((wake - start) / 100));
+                if (SetWaitableTimerEx(static_cast<HANDLE>(hires_timer), &due, 0, nullptr, nullptr,
+                                       nullptr, 0)) {
+                    waited_hires = true;
+                    const HANDLE handles[2]{static_cast<HANDLE>(wake_handle),
+                                            static_cast<HANDLE>(hires_timer)};
+                    const DWORD wait_res = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+                    if (wait_res == WAIT_OBJECT_0) {
+                        event.Reset();
+                        signalled = true;
+                    } else if (event.IsSet()) {
+                        event.Reset();
+                        ResetEvent(static_cast<HANDLE>(wake_handle));
+                        signalled = true;
+                    }
+                }
+            }
+        }
+        if (!waited_hires) {
+            signalled = event.SleepFor(std::chrono::nanoseconds{wake - start});
+        }
 #else
-    (void)hires_timer;
-    if (next_time - now > margin_ns) {
-        signalled = event.SleepFor(std::chrono::nanoseconds{next_time - margin_ns - now});
-        now = GetGlobalTimeNs().count();
-    }
+        (void)hires_timer;
+        signalled = event.SleepFor(std::chrono::nanoseconds{wake - start});
 #endif
-    const s64 sleep_ns = now - start;
-    if (!signalled && next_time > now) {
-        signalled = event.WaitFor(std::chrono::nanoseconds{next_time - now});
     }
-    if (!signalled && Common::PerfSched::Enabled()) {
-        Common::PerfSched::g_timer_late.Add(
-            static_cast<u64>((std::max)(s64{0}, GetGlobalTimeNs().count() - next_time)));
+    const s64 end = GetGlobalTimeNs().count();
+    if (override_ns < 0) {
+        if (precise) {
+            t_host_wait_margin.OnPreciseWait(end - start);
+        } else if (!signalled && wake > start) {
+            t_host_wait_margin.OnOversleep(end - wake);
+        }
+    }
+    if (!signalled && (precise || wake == next_time) && Common::PerfSched::Enabled()) {
+        Common::PerfSched::g_timer_late.Add(static_cast<u64>((std::max)(s64{0}, end - next_time)));
     }
     if (!host_wait_stats.load(std::memory_order_relaxed)) {
         return;
     }
-    const s64 end = GetGlobalTimeNs().count();
     HostWaitWindow& w = t_host_wait;
     ++w.waits;
     w.woken += signalled;
-    w.sleep_ns += sleep_ns;
-    w.wait_for_ns += end - start - sleep_ns;
-    if (!signalled) {
-        w.wake_late.push_back(end - next_time);
+    (precise ? w.precise_ns : w.sleep_ns) += end - start;
+    if (!precise && !signalled) {
+        w.wake_late.push_back(end - wake);
     }
     if (w.start == 0) {
         w.start = end;
@@ -517,6 +633,9 @@ std::optional<s64> CoreTiming::Advance() {
             const std::chrono::nanoseconds late{GetGlobalTimeNs().count() - evt_time};
             if (is_multicore && host_wait_stats.load(std::memory_order_relaxed)) {
                 t_host_wait.event_late.push_back(late.count());
+                if (evt.reschedule_time == 0) {
+                    t_host_wait.one_shot_late.push_back(late.count());
+                }
             }
 
             if (evt.reschedule_time == 0) {
@@ -560,9 +679,17 @@ std::optional<s64> CoreTiming::Advance() {
 
     if (!event_queue.empty()) {
         const s64 next = event_queue.front().time;
+        std::optional<s64> one_shot;
+        for (const Event& e : event_queue) {
+            if (e.reschedule_time == 0 && (!one_shot || e.time < *one_shot)) {
+                one_shot = e.time;
+            }
+        }
+        t_next_one_shot_time = one_shot;
         armed_wait_time = next;
         return next;
     } else {
+        t_next_one_shot_time.reset();
         armed_wait_time = (std::numeric_limits<s64>::max)();
         return std::nullopt;
     }

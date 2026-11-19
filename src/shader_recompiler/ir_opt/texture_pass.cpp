@@ -127,6 +127,32 @@ u32 DynamicDescriptorCount(u32 base_offset, u32 size_shift, u32 max_descriptors)
     return std::min(descriptor_limit, available_count);
 }
 
+// The elements a dynamic offset can select below the clamp to the last one: a bit index found by
+// FLO (FindUMsb, or 31 minus it for FLO.SH) takes one of 32. Its -1 for no bit set is past any
+// count, so it takes the last element as it does in a longer array.
+u32 DynamicDescriptorIndexLimit(const IR::U32& dynamic_offset, u32 size_shift) {
+    const IR::Inst* const offset = dynamic_offset.InstRecursive();
+    if (!offset || offset->GetOpcode() != IR::Opcode::ShiftLeftLogical32 ||
+        !offset->Arg(1).IsImmediate() || offset->Arg(1).U32() != size_shift) {
+        return ~0U;
+    }
+    const auto is_bit_index = [](const IR::Value& value) {
+        const IR::Inst* inst = value.IsImmediate() ? nullptr : value.InstRecursive();
+        if (inst && inst->GetOpcode() == IR::Opcode::BitwiseXor32 && inst->Arg(1).IsImmediate() &&
+            inst->Arg(1).U32() == 31) {
+            inst = inst->Arg(0).IsImmediate() ? nullptr : inst->Arg(0).InstRecursive();
+        }
+        return inst && (inst->GetOpcode() == IR::Opcode::FindUMsb32 ||
+                        inst->GetOpcode() == IR::Opcode::FindSMsb32);
+    };
+    const IR::Value index = offset->Arg(0);
+    const IR::Inst* const select = index.IsImmediate() ? nullptr : index.InstRecursive();
+    if (select && select->GetOpcode() == IR::Opcode::SelectU32) {
+        return is_bit_index(select->Arg(1)) && is_bit_index(select->Arg(2)) ? 32U : ~0U;
+    }
+    return is_bit_index(index) ? 32U : ~0U;
+}
+
 u32 SaturatingSub(u32 lhs, u32 rhs) {
     return lhs > rhs ? lhs - rhs : 0;
 }
@@ -385,11 +411,16 @@ static inline bool IsTexturePixelFormatIntegerCached(Environment& env,
 
 
 std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block);
-static inline std::optional<ConstBufferAddr> TrackCached(const IR::Value& v, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block) {
-    if (const IR::Inst* key = v.TryInstRecursive()) {
-        if (auto it = env.track_cache.find(key); it != env.track_cache.end()) return it->second;
+static inline std::optional<ConstBufferAddr> TrackCached(const IR::Value& v, Environment& env,
+                                                         const HostTranslateInfo& host_info,
+                                                         const IR::Block* block) {
+    if (const IR::Inst* inst = v.TryInstRecursive()) {
+        const Environment::TrackCacheKey key{inst, ConditionalHeader(block)};
+        if (auto it = env.track_cache.find(key); it != env.track_cache.end()) {
+            return it->second;
+        }
         auto found = Track(v, env, host_info, block);
-        if (found) env.track_cache.emplace(key, *found);
+        env.track_cache.emplace(key, found);
         return found;
     }
     return Track(v, env, host_info, block);
@@ -413,6 +444,14 @@ bool IsMemoryLoad(IR::Opcode opcode) {
     }
 }
 
+bool IsFloatValue(const IR::Inst& inst) {
+    constexpr IR::Type floats{IR::Type::F16 | IR::Type::F32 | IR::Type::F64 | IR::Type::F16x2 |
+                              IR::Type::F16x3 | IR::Type::F16x4 | IR::Type::F32x2 |
+                              IR::Type::F32x3 | IR::Type::F32x4 | IR::Type::F64x2 |
+                              IR::Type::F64x3 | IR::Type::F64x4};
+    return (inst.Type() & floats) != IR::Type::Void;
+}
+
 std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block) {
     // A value loaded from memory is not a constant buffer word, whatever its address is built
     // from: the search does not look into a load's operands (a handle read from a storage
@@ -432,6 +471,9 @@ std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, c
             return result;
         }
         if (IsMemoryLoad(inst->GetOpcode())) {
+            continue;
+        }
+        if (IsTextureInstruction(*inst) || IsFloatValue(*inst)) {
             continue;
         }
         for (size_t arg = inst->NumArgs(); arg--;) {
@@ -1116,12 +1158,106 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
         .secondary_offset = 0,
         .secondary_shift_left = 0,
         .dynamic_offset = dynamic_offset,
-        .count = DynamicDescriptorCount(base_offset, size_shift, (std::min)({DESCRIPTOR_MAX_COUNT, sampled_limit, resource_limit})),
+        .count = (std::min)(DynamicDescriptorCount(base_offset, size_shift,
+                                                   (std::min)({DESCRIPTOR_MAX_COUNT, sampled_limit,
+                                                               resource_limit})),
+                            DynamicDescriptorIndexLimit(dynamic_offset, size_shift)),
         .has_secondary = false,
     };
 }
 
-TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const HostTranslateInfo& host_info) {
+struct BuiltHandleProgram {
+    bool built{};
+    u32 program_index{~0U};
+    IR::Value index{};
+    IR::Opcode failure{IR::Opcode::Void};
+    int budget{};
+};
+
+struct HandleMemoKey {
+    const IR::Inst* inst;
+    const IR::Block* conditional_header;
+    bool allow_table;
+    constexpr bool operator==(const HandleMemoKey&) const noexcept = default;
+};
+
+struct HandleMemoKeyHash {
+    size_t operator()(const HandleMemoKey& k) const noexcept {
+        const size_t h1{std::hash<const IR::Inst*>{}(k.inst)};
+        const size_t h2{std::hash<const IR::Block*>{}(k.conditional_header)};
+        return (h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2))) ^
+               (k.allow_table ? 1ULL : 0ULL);
+    }
+};
+
+using HandleMemoMap =
+    ::Common::unordered_map<HandleMemoKey, BuiltHandleProgram, HandleMemoKeyHash>;
+
+BuiltHandleProgram BuildOrMemoizeHandleProgram(const IR::Value& handle_val, const IR::Block* block,
+                                               bool allow_table, HandleMemoMap& memo) {
+    const auto intern_code = [](std::vector<u32>& code) -> u32 {
+        TrimTrailingTees(code);
+        auto& programs{*g_handle_programs};
+        auto it{std::ranges::find(programs, code)};
+        if (it == programs.end()) {
+            programs.push_back(std::move(code));
+            it = programs.end() - 1;
+        }
+        return static_cast<u32>(it - programs.begin());
+    };
+    const auto build_once = [&](bool table) -> BuiltHandleProgram {
+        std::vector<u32> code;
+        int budget = 4096;
+        g_handle_failure = IR::Opcode::Void;
+        IR::Value index{};
+        bool built{};
+        if (!table) {
+            built = BuildHandleProgram(handle_val, code, budget, block);
+        } else {
+            g_handle_index = IR::Value{};
+            g_handle_index_allowed = true;
+            g_handle_table_build = true;
+            built = BuildHandleProgram(handle_val, code, budget, block);
+            g_handle_index_allowed = false;
+            g_handle_table_build = false;
+            index = built ? g_handle_index : IR::Value{};
+            g_handle_index = IR::Value{};
+        }
+        return BuiltHandleProgram{
+            .built = built,
+            .program_index = built ? intern_code(code) : ~0U,
+            .index = index,
+            .failure = g_handle_failure,
+            .budget = budget,
+        };
+    };
+    const IR::Inst* const handle_inst{handle_val.TryInstRecursive()};
+    if (!handle_inst) {
+        BuiltHandleProgram res{build_once(false)};
+        if (!res.built && allow_table) {
+            res = build_once(true);
+        }
+        return res;
+    }
+    const IR::Block* const cond_header{ConditionalHeader(block)};
+    const HandleMemoKey direct_key{handle_inst, cond_header, false};
+    auto direct_it{memo.find(direct_key)};
+    if (direct_it == memo.end()) {
+        direct_it = memo.emplace(direct_key, build_once(false)).first;
+    }
+    if (direct_it->second.built || !allow_table) {
+        return direct_it->second;
+    }
+    const HandleMemoKey table_key{handle_inst, cond_header, true};
+    auto table_it{memo.find(table_key)};
+    if (table_it == memo.end()) {
+        table_it = memo.emplace(table_key, build_once(true)).first;
+    }
+    return table_it->second;
+}
+
+TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst,
+                     const HostTranslateInfo& host_info, HandleMemoMap& handle_memo) {
     ConstBufferAddr addr;
     if (IsBindless(inst)) {
         const std::optional<ConstBufferAddr> track_addr{TrackCached(inst.Arg(0), env, host_info, block)};
@@ -1129,31 +1265,22 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
         if (track_addr) {
             addr = *track_addr;
         } else {
-            // Read from a storage buffer (a handle table): computed for each draw.
-            std::vector<u32> code;
-            int budget = 4096;
-            g_handle_failure = IR::Opcode::Void;
-            bool built{g_handle_programs && BuildHandleProgram(inst.Arg(0), code, budget, block)};
-            IR::Value index{};
             // Only sampled textures: an array of storage images would have every element taken
             // as written.
             const bool sampled{!IsStorageImageOpcode(IndexedInstruction(inst)) &&
                                inst.Flags<IR::TextureInstInfo>().type != TextureType::Buffer};
-            if (!built && g_handle_programs && sampled && host_info.handle_table_size > 1) {
-                // Read from a table at an index each invocation reads for itself (Ocarina's
-                // clustered light shadow maps, in every lit world shader): a descriptor array of
-                // the table's first entries, which the shader indexes with that index.
-                code.clear();
-                budget = 4096;
-                g_handle_index = IR::Value{};
-                g_handle_index_allowed = true;
-                g_handle_table_build = true;
-                built = BuildHandleProgram(inst.Arg(0), code, budget, block);
-                g_handle_index_allowed = false;
-                g_handle_table_build = false;
-                index = built ? g_handle_index : IR::Value{};
-                g_handle_index = IR::Value{};
+            const bool allow_table{sampled && host_info.handle_table_size > 1};
+            BuiltHandleProgram built_entry{.built = false,
+                                           .failure = IR::Opcode::Void,
+                                           .budget = 4096};
+            if (g_handle_programs) {
+                built_entry =
+                    BuildOrMemoizeHandleProgram(inst.Arg(0), block, allow_table, handle_memo);
             }
+            const bool built{built_entry.built};
+            const IR::Value index{built_entry.index};
+            const int budget{built_entry.budget};
+            g_handle_failure = built_entry.failure;
             if (!built) {
                 // Not computable for a whole draw (a handle that changes in a loop): keep the
                 // earlier search through loads, which at least gives the shader a texture.
@@ -1200,13 +1327,6 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
                 }
                 return TextureInst{.cbuf = *legacy, .inst = &inst, .block = block};
             }
-            TrimTrailingTees(code);
-            auto& programs{*g_handle_programs};
-            auto it{std::ranges::find(programs, code)};
-            if (it == programs.end()) {
-                programs.push_back(std::move(code));
-                it = programs.end() - 1;
-            }
             // The shader indexes the array with the index word, which must be defined wherever
             // the texture instruction runs; where it isn't, every invocation takes the first
             // element.
@@ -1234,7 +1354,7 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
                 .dynamic_offset = count > 1 ? IR::U32{index} : IR::U32{},
                 .count = count,
                 .has_secondary = false,
-                .handle_program = static_cast<u32>(it - programs.begin()),
+                .handle_program = built_entry.program_index,
             };
         }
     } else {
@@ -1446,13 +1566,13 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
         g_program = nullptr;
         g_dominance.reset();
     };
+    HandleMemoMap handle_memo;
     for (IR::Block* const block : program.post_order_blocks) {
-        env.track_cache.clear();
         for (IR::Inst& inst : block->Instructions()) {
             if (!IsTextureInstruction(inst)) {
                 continue;
             }
-            to_replace.push_back(MakeInst(env, block, inst, host_info));
+            to_replace.push_back(MakeInst(env, block, inst, host_info, handle_memo));
         }
     }
     if (g_handle_table_arrays != 0) {

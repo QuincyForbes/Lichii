@@ -134,9 +134,11 @@ TEST_CASE("Desktop profile follows the GPU when it is known", "[device_profile]"
     device.dlss_capable = false;
     device.gpu_integrated = true;
     device.vram_mib = 2048;
+    device.recommended_vulkan_device = 1;
     profile = Profile::Recommend(device);
     CHECK(Value(profile, "texture_quality") == "Half");
     CHECK(Value(profile, "oot_resolution") == "Percent75");
+    CHECK(Value(profile, "vulkan_device") == "1");
 }
 
 TEST_CASE("Applying the profile sets the global values and reports changes", "[device_profile]") {
@@ -270,6 +272,8 @@ TEST_CASE("Ocarina's resolution sets its scale; other games keep resolution_setu
     // A temporal upscaler needs 1x.
     values.upscaler.SetValue(Settings::Upscaler::Dlss);
     CHECK(Settings::EffectiveResolutionSetup() == ResolutionSetup::Res1X);
+    values.upscaler.SetValue(Settings::Upscaler::Fsr4);
+    CHECK(Settings::EffectiveResolutionSetup() == ResolutionSetup::Res1X);
 }
 
 TEST_CASE("Ocarina of Time's dynamic resolution is fixed under a temporal upscaler",
@@ -283,6 +287,10 @@ TEST_CASE("Ocarina of Time's dynamic resolution is fixed under a temporal upscal
           OotResolution::Full);
     CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::Fsr3, false) ==
           OotResolution::Percent75);
+    CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::Fsr4, false) ==
+          OotResolution::Percent75);
+    CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::Fsr4, true) ==
+          OotResolution::Full);
     CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::Auto, false) ==
           OotResolution::Game);
     CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::Game, true) ==
@@ -305,11 +313,40 @@ TEST_CASE("UiCatalog covers every core setting and resolves cross-references", "
                               static_cast<u32>(Settings::ScalingFilter::Fsr3));
     REQUIRE(fsr_filter != nullptr);
     CHECK(std::string_view{fsr_filter->label} == "AMD FSR 1 Soft");
+    const auto* fsr4_upscaler =
+        UiCatalog::FindChoice(Settings::EnumMetadata<Settings::Upscaler>::Index(),
+                              static_cast<u32>(Settings::Upscaler::Fsr4));
+    REQUIRE(fsr4_upscaler != nullptr);
+    CHECK(std::string_view{fsr4_upscaler->label} == "AMD FSR 4");
     const auto* optical_flow =
         UiCatalog::FindChoice(Settings::EnumMetadata<Settings::FrameGenType>::Index(),
                               static_cast<u32>(Settings::FrameGenType::Fsr3));
     REQUIRE(optical_flow != nullptr);
     CHECK(std::string_view{optical_flow->label} == "Optical Flow");
+    const auto* dlss_fg =
+        UiCatalog::FindChoice(Settings::EnumMetadata<Settings::FrameGenType>::Index(),
+                              static_cast<u32>(Settings::FrameGenType::NvidiaDlssG));
+    REQUIRE(dlss_fg != nullptr);
+    CHECK(std::string_view{dlss_fg->label} == "NVIDIA DLSS");
+    CHECK(static_cast<u32>(Settings::FrameGenType::NvidiaDlssG) == 3);
+    for (const auto& [name, preset] :
+         Settings::EnumMetadata<Settings::DlssPreset>::Canonicalizations()) {
+        INFO(name);
+        CHECK(UiCatalog::FindChoice(Settings::EnumMetadata<Settings::DlssPreset>::Index(),
+                                    static_cast<u32>(preset)) != nullptr);
+    }
+    CHECK(static_cast<u32>(Settings::DlssPreset::M) == 4);
+    CHECK(static_cast<u32>(Settings::DlssPreset::E) == 5);
+    CHECK(static_cast<u32>(Settings::DlssPreset::F) == 6);
+    const auto* dlss_quality_setting = UiCatalog::FindSetting("nvidia_dlss_quality");
+    REQUIRE(dlss_quality_setting != nullptr);
+    CHECK(std::string_view{dlss_quality_setting->label} == "DLSS Quality");
+    for (const auto& [name, quality] :
+         Settings::EnumMetadata<Settings::DlssQuality>::Canonicalizations()) {
+        INFO(name);
+        CHECK(UiCatalog::FindChoice(Settings::EnumMetadata<Settings::DlssQuality>::Index(),
+                                    static_cast<u32>(quality)) != nullptr);
+    }
     CHECK(std::string_view{UiCatalog::GetText("page.experiments")} == "Memory & Experiments");
     const auto* file_guest = UiCatalog::FindExperiment("file_guest");
     REQUIRE(file_guest != nullptr);

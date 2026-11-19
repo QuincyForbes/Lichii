@@ -11,9 +11,11 @@
 #include <array>
 #include <optional>
 #include <random>
+#include <span>
 #include <utility>
-#include <vector>
 
+#include <boost/container/small_vector.hpp>
+#include <boost/container/static_vector.hpp>
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "dynarmic/mcl/is_instance_of_template.hpp"
@@ -141,7 +143,7 @@ private:
 };
 
 struct HostLocInfo final {
-    std::vector<const IR::Inst*> values;
+    boost::container::small_vector<const IR::Inst*, 2> values;
     std::size_t locked = 0;
     bool realized = false;
     std::size_t uses_this_inst = 0;
@@ -161,11 +163,11 @@ class RegAlloc final {
 public:
     using ArgumentInfo = std::array<Argument, IR::max_arg_count>;
 
-    explicit RegAlloc(oaknut::CodeGenerator& code, FpsrManager& fpsr_manager, std::vector<int> gpr_order, std::vector<int> fpr_order) noexcept
-        : code{code}
-        , fpsr_manager{fpsr_manager}
-        , gpr_order{gpr_order}
-        , fpr_order{fpr_order}
+    explicit RegAlloc(oaknut::CodeGenerator& code_, FpsrManager& fpsr_manager_, std::span<const int> gpr_order_, std::span<const int> fpr_order_) noexcept
+        : code{code_}
+        , fpsr_manager{fpsr_manager_}
+        , gpr_order{gpr_order_}
+        , fpr_order{fpr_order_}
     {}
 
     ArgumentInfo GetArgumentInfo(IR::Inst* inst);
@@ -314,7 +316,7 @@ private:
     template<HostLoc::Kind kind> int RealizeWriteImpl(const IR::Inst* value);
     template<HostLoc::Kind kind> int RealizeReadWriteImpl(const IR::Value& read_value, const IR::Inst* write_value);
 
-    int AllocateRegister(const std::array<HostLocInfo, 32>& regs, const std::vector<int>& order) const;
+    int AllocateRegister(const std::array<HostLocInfo, 32>& regs, std::span<const int> order) const;
     void SpillGpr(int index);
     void SpillFpr(int index);
     int FindFreeSpill() const;
@@ -328,8 +330,8 @@ private:
 
     oaknut::CodeGenerator& code;
     FpsrManager& fpsr_manager;
-    std::vector<int> gpr_order;
-    std::vector<int> fpr_order;
+    std::span<const int> gpr_order;
+    std::span<const int> fpr_order;
 
     std::array<HostLocInfo, 32> gprs;
     std::array<HostLocInfo, 32> fprs;
@@ -341,8 +343,8 @@ private:
 };
 
 template<typename T>
-RAReg<T>::RAReg(RegAlloc& reg_alloc, RWType rw, const IR::Value& read_value, const IR::Inst* write_value)
-        : reg_alloc{reg_alloc}, rw{rw}, read_value{read_value}, write_value{write_value} {
+RAReg<T>::RAReg(RegAlloc& reg_alloc_, RWType rw_, const IR::Value& read_value_, const IR::Inst* write_value_)
+        : reg_alloc{reg_alloc_}, rw{rw_}, read_value{read_value_}, write_value{write_value_} {
     if (rw != RWType::Write && !read_value.IsImmediate()) {
         reg_alloc.ValueInfo(read_value.GetInst()).locked++;
     }

@@ -26,6 +26,9 @@ public:
     /// Whether this GPU and OS run MetalFX frame interpolation (iOS 26, macOS 26).
     [[nodiscard]] static bool IsSupported(const Device& device);
 
+    bool Prepare(const Device& device, TextureHandle color, TextureHandle destination,
+                 std::array<u32, 2> size);
+
     /// Writes the frame halfway between `previous` and `current` (`size`, the same format) into
     /// `destination`. `motion` (RG16F at `motion_size`) holds per current pixel the offset in
     /// motion texels to where it was in the previous frame. False when it can't (logged once);

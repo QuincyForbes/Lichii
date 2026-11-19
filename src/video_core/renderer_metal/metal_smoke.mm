@@ -4150,19 +4150,23 @@ int RunGeometryAdjacencyStrip() {
         std::printf("metal-smoke: FAIL adjacency strip kernel: %s\n%s\n", error.c_str(), source.c_str());
         return 1;
     }
-    const auto order = [&](uint32_t count) {
-        const uint32_t primitives = plan.Primitives(count);
+    const auto order = [&](uint32_t count, uint32_t vertices_per_prim = 6, uint32_t step = 2) {
+        Metal::Geometry::Plan custom = plan;
+        custom.input_vertices = vertices_per_prim;
+        custom.input_step = step;
+        const uint32_t primitives = custom.Primitives(count);
         uint8_t* src = nullptr;
         uint8_t* dst = nullptr;
         const Metal::Object vertices = Metal::CreateBuffer(device, count * 16, true, &src);
-        const Metal::Object records =
-            Metal::CreateBuffer(device, std::max<uint32_t>(primitives * 6 * 4, 16), true, &dst);
+        const Metal::Object records = Metal::CreateBuffer(
+            device, std::max<uint32_t>(primitives * vertices_per_prim * 4, 16), true, &dst);
         std::memset(src, 0, count * 16);
         for (uint32_t i = 0; i < count; ++i) {
             const float x = static_cast<float>(i);
             std::memcpy(src + i * 16, &x, sizeof(x));
         }
-        const Metal::Geometry::RecordsParams params{primitives * 6, 6, 2, count, primitives};
+        const Metal::Geometry::RecordsParams params{primitives * vertices_per_prim,
+                                                    vertices_per_prim, step, count, primitives};
         scheduler.BeginCompute(kernel.Get());
         scheduler.BindBuffer(Metal::ShaderStage::Compute, Metal::Geometry::RecordsSourceSlot,
                              vertices.Get(), 0);
@@ -4173,7 +4177,7 @@ int RunGeometryAdjacencyStrip() {
         scheduler.Dispatch({(params.records + 63) / 64, 1, 1}, {64, 1, 1});
         scheduler.Finish();
         std::vector<int> result;
-        for (uint32_t i = 0; i < primitives * 6; ++i) {
+        for (uint32_t i = 0; i < primitives * vertices_per_prim; ++i) {
             float value;
             std::memcpy(&value, dst + i * 4, sizeof(value));
             result.push_back(static_cast<int>(value));
@@ -4184,10 +4188,13 @@ int RunGeometryAdjacencyStrip() {
                                       2, 5, 6, 8, 4, 0,   // i = 1, odd, middle
                                       4, 2, 6, 9, 8, 7};  // i = 2, even, last
     const std::vector<int> expected6{0, 1, 2, 5, 4, 3};
+    const std::vector<int> expected_strip{0, 1, 2, 2, 1, 3, 2, 3, 4};
     const std::vector<int> got10 = order(10);
     const std::vector<int> got6 = order(6);
-    const bool passed = got10 == expected10 && got6 == expected6 && plan.Primitives(10) == 3 &&
-                        plan.Primitives(6) == 1 && plan.Primitives(5) == 0;
+    const std::vector<int> got_strip = order(5, 3, 1);
+    const bool passed = got10 == expected10 && got6 == expected6 && got_strip == expected_strip &&
+                        plan.Primitives(10) == 3 && plan.Primitives(6) == 1 &&
+                        plan.Primitives(5) == 0;
     std::printf("metal-smoke: geometry triangle strip with adjacency vertex order (10 vertices: 3 "
                 "primitives, 6 vertices: 1, against Vulkan's table): %s\n",
                 passed ? "PASS" : "FAIL");

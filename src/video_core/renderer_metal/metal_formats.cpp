@@ -304,6 +304,7 @@ FormatClass ClassOf(u32 mtl_format) {
     case Fmt::Depth32Float:
         return FormatClass::Depth;
     case Fmt::Stencil8:
+    case Fmt::X32_Stencil8:
         return FormatClass::Stencil;
     case Fmt::Depth32Float_Stencil8:
         return FormatClass::DepthStencil;

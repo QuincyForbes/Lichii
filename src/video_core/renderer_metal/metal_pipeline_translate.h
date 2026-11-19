@@ -132,6 +132,8 @@ struct StageProgram {
     /// Buffer slot of the table of spilled texture and sampler arrays, ~0 without; its entries.
     u32 array_spill_slot{~0U};
     u32 array_spill_entries{};
+    /// Precomputed Metal::BindMemo kinds for this stage's descriptors.
+    std::vector<u32> binding_kinds;
     /// The MTLLibrary and MTLFunction, made on first use (BuildFunctions).
     Object library;
     Object function;
@@ -201,11 +203,11 @@ struct NativeMesh {
     bool failed{};
 };
 
-/// EDEN_NX2_METAL_MESH_NATIVE (default off; 1: task/mesh pipelines as Metal 3 mesh pipelines).
+/// EDEN_NX2_METAL_MESH_NATIVE / EDEN_NX2_METAL_NATIVE_MESH (default on; 0: emulated).
 [[nodiscard]] bool NativeMeshEnabled();
 
-/// EDEN_NX2_METAL_MESH_PER_PRIMITIVE=1: a mesh program that writes per-primitive generics is built
-/// natively too (default: emulated, as Vulkan on MoltenVK does since IPA 150).
+/// EDEN_NX2_METAL_MESH_PER_PRIMITIVE (default on; 0: mesh programs with per-primitive generics
+/// fall back to compute emulation).
 [[nodiscard]] bool NativeMeshPerPrimitive();
 
 /// Metal's limits for mesh pipelines on Apple GPUs, as the native path checks them.

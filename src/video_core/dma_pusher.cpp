@@ -370,24 +370,32 @@ bool DmaPusher::Step() {
     // The current list's entries before this one ran already and are never parsed again, and an
     // entry the acquire suspended inside reads its remaining words from memory anyway
     // (CanUseSubmittedCommands): neither is copied (zortos293/Lichii#805).
-    if (ResnapshotEnabled() && !TrustSubmitted() &&
-        suspensions.load(std::memory_order_relaxed) != suspensions_before) {
-        const u64 now = suspensions.load(std::memory_order_acquire);
-        // The copy takes the front a while: what it sent before goes to the back first
-        // (zortos293/Lichii#1520; EDEN_NX2_RESUME_PUBLISH=0: after the copy, as before).
-        static const bool publish_first = [] {
-            const char* value = std::getenv("EDEN_NX2_RESUME_PUBLISH");
-            return value == nullptr || value[0] != '0';
-        }();
-        if (auto& split = VideoCommon::GpuSplit::Get(); publish_first && split.Active()) {
-            split.Publish();
-        }
+    if (suspensions.load(std::memory_order_relaxed) != suspensions_before) {
         size_t first_entry = dma_pushbuffer_subindex + (command_resume_offset != 0 ? 1 : 0);
-        for (CommandList& list : dma_pushbuffer) {
-            if (!list.submitted_offsets.empty()) {
-                RefreshSnapshot(list, now, first_entry);
+        if (ResnapshotEnabled() && !TrustSubmitted()) {
+            const u64 now = suspensions.load(std::memory_order_acquire);
+            // The copy takes the front a while: what it sent before goes to the back first
+            // (zortos293/Lichii#1520; EDEN_NX2_RESUME_PUBLISH=0: after the copy, as before).
+            static const bool publish_first = [] {
+                const char* value = std::getenv("EDEN_NX2_RESUME_PUBLISH");
+                return value == nullptr || value[0] != '0';
+            }();
+            if (auto& split = VideoCommon::GpuSplit::Get(); publish_first && split.Active()) {
+                split.Publish();
             }
-            first_entry = 0;
+            for (CommandList& list : dma_pushbuffer) {
+                if (!list.submitted_offsets.empty()) {
+                    RefreshSnapshot(list, now, first_entry);
+                }
+                first_entry = 0;
+            }
+        } else {
+            for (CommandList& list : dma_pushbuffer) {
+                if (!list.submitted_offsets.empty() && !list.deferred_entries.empty()) {
+                    RefreshDeferredEntries(list, first_entry);
+                }
+                first_entry = 0;
+            }
         }
     }
 
@@ -397,6 +405,7 @@ bool DmaPusher::Step() {
     const size_t command_list_size = command_list.command_lists.size();
 
     if (prefetch_size == 0 && command_list_size == 0) {
+        dirty_flushed_pages.clear();
         dma_pushbuffer.pop_front();
         dma_pushbuffer_subindex = 0;
         return true;
@@ -410,6 +419,7 @@ bool DmaPusher::Step() {
             return false;
         }
         command_resume_offset = 0;
+        dirty_flushed_pages.clear();
         dma_pushbuffer.pop_front();
         return true;
     }
@@ -517,19 +527,12 @@ bool DmaPusher::Step() {
                                           command_list.snapshot_suspensions ==
                                               suspensions.load(std::memory_order_acquire))) &&
                                VideoCommon::CanUseSubmittedCommands(
-            command_resume_offset != 0,
-            dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
-                !std::ranges::binary_search(command_list.deferred_entries,
-                                            static_cast<u32>(dma_pushbuffer_subindex)),
+            !trust && command_resume_offset != 0,
+            has_copy,
             gpu_written,
             !trust && use_safe &&
                 memory_manager.IsMemoryDirty(dma_state.dma_get, header.size * sizeof(u32)));
-        if (released && !has_copy) {
-            NoteReleasedEntry(ReleasedUse::ParseSkipped, command_list, dma_pushbuffer_subindex);
-            // A method left open would take the next entry's words as its data.
-            dma_state.method_count = 0;
-        } else if (released && (!submitted || command_resume_offset != 0)) {
-            NoteReleasedEntry(ReleasedUse::ParseUsedCopy, command_list, dma_pushbuffer_subindex);
+        const auto run_submitted_copy = [&] {
             std::span<const CommandHeader> commands{
                 command_list.submitted_words.data() +
                     command_list.submitted_offsets[dma_pushbuffer_subindex],
@@ -544,18 +547,16 @@ bool DmaPusher::Step() {
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Submitted);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+        };
+        if (released && !has_copy) {
+            NoteReleasedEntry(ReleasedUse::ParseSkipped, command_list, dma_pushbuffer_subindex);
+            // A method left open would take the next entry's words as its data.
+            ResetOpenMethod();
+        } else if (released && (!submitted || command_resume_offset != 0)) {
+            NoteReleasedEntry(ReleasedUse::ParseUsedCopy, command_list, dma_pushbuffer_subindex);
+            run_submitted_copy();
         } else if (submitted) {
-            const std::span<const CommandHeader> commands = CheckEntryWords(
-                header,
-                {command_list.submitted_words.data() +
-                     command_list.submitted_offsets[dma_pushbuffer_subindex],
-                 header.size},
-                command_list,
-                command_list.refreshes != 0 ? EntrySource::SubmittedRefreshed
-                                            : EntrySource::Submitted);
-            RecordParsedEntry(header, commands);
-            Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Submitted);
-            command_resume_offset += ProcessCommands(commands, 0);
+            run_submitted_copy();
         } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
@@ -602,34 +603,72 @@ bool DmaPusher::Step() {
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
             command_resume_offset += ProcessCommands(commands, 0);
-        } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
-            std::span<const CommandHeader> commands{command_headers.data(), header.size};
-            if (command_resume_offset == 0) {
-                commands = CheckEntryWords(header, commands, command_list,
-                                           EntrySource::GpuWrittenCopy);
+        } else if (bool any_copied = false;
+                   ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size),
+                                          &any_copied)) {
+            const bool recycled_page =
+                !any_copied &&
+                !HasDirtyFlushedPage(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+            const bool entry_released = IsReleasedEntry(command_list, dma_pushbuffer_subindex);
+            if (recycled_page && entry_released && !has_copy) {
+                NoteReleasedEntry(ReleasedUse::ParseSkipped, command_list,
+                                  dma_pushbuffer_subindex);
+                ResetOpenMethod();
+            } else if (recycled_page && has_copy && (trust || entry_released)) {
+                if (entry_released) {
+                    NoteReleasedEntry(ReleasedUse::ParseUsedCopy, command_list,
+                                      dma_pushbuffer_subindex);
+                }
+                run_submitted_copy();
+            } else {
+                std::span<const CommandHeader> commands{command_headers.data(), header.size};
+                if (command_resume_offset == 0) {
+                    commands = CheckEntryWords(header, commands, command_list,
+                                               EntrySource::GpuWrittenCopy);
+                }
+                if (ListChangeTrace* const trace = ListChangeTrace::Get()) [[unlikely]] {
+                    const u32 sub = dma_state.subchannel;
+                    trace->Note(dma_state.dma_get, commands, dma_state.method, sub,
+                                dma_state.method_count,
+                                sub < subchannel_type.size() ? static_cast<u32>(subchannel_type[sub])
+                                                             : ~0U);
+                }
+                RecordParsedEntry(header, commands);
+                Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
+                command_resume_offset +=
+                    ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
             }
-            if (ListChangeTrace* const trace = ListChangeTrace::Get()) [[unlikely]] {
-                const u32 sub = dma_state.subchannel;
-                trace->Note(dma_state.dma_get, commands, dma_state.method, sub,
-                            dma_state.method_count,
-                            sub < subchannel_type.size() ? static_cast<u32>(subchannel_type[sub])
-                                                         : ~0U);
-            }
-            RecordParsedEntry(header, commands);
-            Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
-            command_resume_offset +=
-                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
-            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
-            Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
-            std::span<const CommandHeader> commands{headers.data(), headers.size()};
-            if (command_resume_offset == 0) {
-                commands = CheckEntryWords(header, commands, command_list, EntrySource::Memory);
+            bool had_gpu_writes = false;
+            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32),
+                                    &had_gpu_writes);
+            const bool no_gpu_data =
+                !had_gpu_writes &&
+                !HasDirtyFlushedPage(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+            const bool entry_released = IsReleasedEntry(command_list, dma_pushbuffer_subindex);
+            if (no_gpu_data && entry_released && !has_copy) {
+                NoteReleasedEntry(ReleasedUse::ParseSkipped, command_list,
+                                  dma_pushbuffer_subindex);
+                ResetOpenMethod();
+            } else if (no_gpu_data && has_copy && (trust || entry_released)) {
+                if (entry_released) {
+                    NoteReleasedEntry(ReleasedUse::ParseUsedCopy, command_list,
+                                      dma_pushbuffer_subindex);
+                }
+                run_submitted_copy();
+            } else {
+                Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader,
+                                              Tegra::Memory::GuestMemoryFlags::UnsafeRead>
+                    headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
+                std::span<const CommandHeader> commands{headers.data(), headers.size()};
+                if (command_resume_offset == 0) {
+                    commands = CheckEntryWords(header, commands, command_list, EntrySource::Memory);
+                }
+                RecordParsedEntry(header, commands);
+                Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Slow);
+                command_resume_offset +=
+                    ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
             }
-            RecordParsedEntry(header, commands);
-            Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Slow);
-            command_resume_offset +=
-                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         }
         if (puller.HasPendingAcquire()) {
             return false;
@@ -654,6 +693,7 @@ bool DmaPusher::Step() {
             }
         }
         parked_methods.clear();
+        dirty_flushed_pages.clear();
         dma_pushbuffer.pop_front();
         dma_pushbuffer_subindex = 0;
     } else {
@@ -924,6 +964,15 @@ void DmaPusher::SetState(const CommandHeader& command_header) {
     dma_state.method = command_header.method;
     dma_state.subchannel = command_header.subchannel;
     dma_state.method_count = command_header.method_count;
+}
+
+void DmaPusher::ResetOpenMethod() {
+    if (dma_state.subchannel < subchannels.size() && subchannels[dma_state.subchannel] != nullptr &&
+        subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D) {
+        static_cast<Engines::Maxwell3D*>(subchannels[dma_state.subchannel])->ClearPendingMacro();
+    }
+    dma_state.method_count = 0;
+    dma_increment_once = false;
 }
 
 
@@ -1318,6 +1367,35 @@ std::span<const CommandHeader> DmaPusher::CheckEntryWords(const CommandListHeade
     } else if (submitted_valid) {
         result = submitted;
         used = "the submit-time copy";
+    } else if (carry != 0) {
+        bool reset_carry = false;
+        if (PlausibleCommandWords(result, 0)) {
+            reset_carry = true;
+            used = "the same words with carry reset to 0";
+        } else if (!submitted.empty() && PlausibleCommandWords(submitted, 0)) {
+            result = submitted;
+            reset_carry = true;
+            used = "the submit-time copy with carry reset to 0";
+        } else if (memory_differs && !IsReleasedEntry(list, dma_pushbuffer_subindex) &&
+                   PlausibleCommandWords(memory, 0)) {
+            result = memory;
+            reset_carry = true;
+            used = "memory read after the drain with carry reset to 0";
+        }
+        if (reset_carry) {
+            const u32 old_method = dma_state.method;
+            const u32 old_subchannel = dma_state.subchannel;
+            ResetOpenMethod();
+            static std::atomic<u32> carry_logged{};
+            if (carry_logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+                LOG_WARNING(HW_GPU,
+                            "List validate: entry {:#x}+{:#x} (ch {}, {} of {}) failed with "
+                            "carry {} (method {:#x} on sub {}), parses cleanly from word 0: "
+                            "resetting open method/macro state",
+                            u64{address}, u64{size}, channel_state.bind_id, index,
+                            list.command_lists.size(), carry, old_method, old_subchannel);
+            }
+        }
     }
     static constexpr std::array source_names{"submit-time copy", "submit copy refreshed from memory",
                                              "GPU-written list copy", "guest memory"};
@@ -1356,11 +1434,11 @@ bool DmaPusher::TrustSubmitted() {
     return Settings::GetCurrentProgramID() == OcarinaOfTimeId;
 }
 
-void DmaPusher::RefreshDeferredEntries(CommandList& list) {
+void DmaPusher::RefreshDeferredEntries(CommandList& list, size_t first_entry) {
     UpdateReleasedEntries(list);
     for (const u32 i : list.deferred_entries) {
-        if (i >= list.command_lists.size() || i >= list.submitted_offsets.size() ||
-            IsReleasedEntry(list, i)) {
+        if (i < first_entry || i >= list.command_lists.size() ||
+            i >= list.submitted_offsets.size() || IsReleasedEntry(list, i)) {
             continue;
         }
         const CommandListHeader& entry = list.command_lists[i];
@@ -1496,7 +1574,7 @@ bool DmaPusher::DrawFromGpuArguments(const CommandListHeader& header) {
     return true;
 }
 
-bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
+bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* any_copied) {
     // The pages are marked as command list pages: from the next write on, the buffer cache copies
     // them to host memory right after the dispatch or copy that writes them and submits. The
     // front then waits only for the back to run that work and for the GPU to finish the copy, not
@@ -1504,6 +1582,9 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
     // second in a Mario Kart World race, during which the back had nothing to do). Pages
     // FlushGpuWrittenCommands flushed whole and no GPU work wrote since are read from guest
     // memory.
+    if (any_copied != nullptr) {
+        *any_copied = false;
+    }
     if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || count == 0 ||
         rasterizer == nullptr) {
         return false;
@@ -1529,6 +1610,7 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
         }
     }
     bool past_sync = !split.Active();
+    bool copied = false;
     using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;
     command_headers.resize_destructive(count);
     u8* const out = reinterpret_cast<u8*>(command_headers.data());
@@ -1562,9 +1644,9 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
                     diag.reads_synced.fetch_add(1, std::memory_order_relaxed);
                     if (split.Active() && Nx2CmdPageDiag::IsDrawPage(page)) {
                         // The back, at this list's place: did work sent before it write the page?
-                        split.Defer([page, begin = static_cast<u32>(*device - page),
-                                     end = static_cast<u32>(*device - page + part.size())] {
-                            Nx2CmdPageDiag::CheckMissedWrite(page, begin, end);
+                        split.Defer([page, range_begin = static_cast<u32>(*device - page),
+                                     range_end = static_cast<u32>(*device - page + part.size())] {
+                            Nx2CmdPageDiag::CheckMissedWrite(page, range_begin, range_end);
                         });
                     }
                 } else {
@@ -1578,15 +1660,39 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
         if (where == GpuWrittenList::Unknown) {
             return false;
         }
+        if (where == GpuWrittenList::Copied) {
+            copied = true;
+        }
         if (where == GpuWrittenList::Synced) {
             memory_manager.ReadBlockUnsafe(chunk, part.data(), part.size());
         }
         chunk = chunk_end;
     }
+    if (any_copied != nullptr) {
+        *any_copied = copied;
+    }
     return true;
 }
 
-bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
+bool DmaPusher::HasDirtyFlushedPage(GPUVAddr address, size_t size) const {
+    if (dirty_flushed_pages.empty() || size == 0) {
+        return false;
+    }
+    const GPUVAddr end = address + size;
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < end; page += 0x1000) {
+        if (const auto device = memory_manager.GpuToCpuAddress(page);
+            device && std::ranges::find(dirty_flushed_pages, *device & ~u64{0xfff}) !=
+                          dirty_flushed_pages.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size, bool* had_gpu_writes) {
+    if (had_gpu_writes != nullptr) {
+        *had_gpu_writes = false;
+    }
     if (!g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
         return false;
     }
@@ -1609,6 +1715,20 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
     const bool dirty = memory_manager.IsMemoryDirty(first_page, end_page - first_page,
                                                     VideoCommon::CacheType::BufferCache);
+    if (had_gpu_writes != nullptr) {
+        *had_gpu_writes = dirty;
+    }
+    if (dirty) {
+        for (GPUVAddr page = first_page; page < end_page; page += 0x1000) {
+            if (const auto device = memory_manager.GpuToCpuAddress(page)) {
+                const u64 device_page = *device & ~u64{0xfff};
+                if (std::ranges::find(dirty_flushed_pages, device_page) ==
+                    dirty_flushed_pages.end()) {
+                    dirty_flushed_pages.push_back(device_page);
+                }
+            }
+        }
+    }
     // The other pages draws wrote since their last flush go along in the same GPU round trip:
     // their next lists then read guest memory instead of draining and flushing again.
     // EDEN_NX2_CMDPAGE_BATCH=0 flushes this entry's pages only, as before.
@@ -1624,14 +1744,14 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
             }
         }
         VideoCommon::GpuSplit::Get().Run(
-            [rasterizer = rasterizer, pages = &pages] {
-                rasterizer->FlushGpuWrittenCommandListPages(*pages);
+            [rasterizer_ptr = rasterizer, pages_ptr = &pages] {
+                rasterizer_ptr->FlushGpuWrittenCommandListPages(*pages_ptr);
             },
             VideoCommon::DrainSite::ListFlush);
     } else if (dirty) {
         VideoCommon::GpuSplit::Get().Run(
-            [memory = &memory_manager, first_page, size = end_page - first_page] {
-                memory->FlushRegion(first_page, size, VideoCommon::CacheType::BufferCache);
+            [memory = &memory_manager, first_page, flush_size = end_page - first_page] {
+                memory->FlushRegion(first_page, flush_size, VideoCommon::CacheType::BufferCache);
             },
             VideoCommon::DrainSite::ListFlush);
     }

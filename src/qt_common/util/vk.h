@@ -79,7 +79,8 @@ public:
     explicit Record(std::string_view name, const std::vector<VkPresentModeKHR>& vsync_modes,
                     bool has_broken_compute, VkDriverId driver_id, bool dlss_capable,
                     std::string_view driver_version = {}, bool integrated = false,
-                    u64 vram_mib = 0, Capabilities capabilities = {});
+                    u64 vram_mib = 0, Capabilities capabilities = {},
+                    bool fsr4_capable = false);
     ~Record();
 
     const std::string name;
@@ -89,12 +90,16 @@ public:
     /// NVIDIA's proprietary driver on a GPU with tensor cores (GeForce/Quadro RTX), which DLSS
     /// needs. Streamline makes the final call when a game starts.
     const bool dlss_capable;
+    /// AMD Radeon RX 6000/7000/9000 or Ryzen RDNA 3+ GPU on AMD's Windows driver, or Mesa RADV
+    /// on Linux with fsr4-vk.
+    const bool fsr4_capable;
     /// The driver's own version text (e.g. "581.57"), for support logs.
     const std::string driver_version;
     /// Shares the CPU's memory (VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU).
     const bool integrated;
     /// The largest device-local memory heap.
     const u64 vram_mib;
+    const u32 vendor_id;
     const Capabilities capabilities;
 };
 

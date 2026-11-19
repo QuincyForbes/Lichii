@@ -9,6 +9,7 @@
 
 #include <array>
 #include <span>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -97,16 +98,9 @@ public:
     }
 
     /// Callers outside the GPU thread (the list reads of BufferCache's Nx2 paths, with the GPU
-    /// split in two threads) wait for a committed tick through the scheduler's completion
-    /// signal: Scheduler::Wait commits and walks the command buffers in flight, which only the
-    /// recording thread may. A tick not committed yet can only be the recording thread's own.
-    void WaitSubmittedTick(u64 tick, u64 writer = 0) {
-        if (scheduler.IsSubmitted(tick)) {
-            scheduler.WaitSubmitted(tick);
-        } else {
-            scheduler.Wait(tick);
-        }
-    }
+    /// split in two threads) wait without flushing or walking the command buffers in flight on
+    /// the wrong thread.
+    void WaitSubmittedTick(u64 tick, u64 writer = 0);
 
     void Finish() {
         scheduler.Finish();
@@ -154,6 +148,22 @@ public:
     void CopyBuffer(BufferHandle dst_buffer, BufferHandle src_buffer,
                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
                     bool can_reorder_upload = false);
+    void CopyBuffer(Buffer& dst_buffer, BufferHandle src_buffer,
+                    std::span<const VideoCommon::BufferCopy> copies, bool barrier,
+                    bool can_reorder_upload = false);
+    void CopyBuffer(BufferHandle dst_buffer, Buffer& src_buffer,
+                    std::span<const VideoCommon::BufferCopy> copies, bool barrier,
+                    bool can_reorder_upload = false);
+    void CopyBuffer(Buffer& dst_buffer, Buffer& src_buffer,
+                    std::span<const VideoCommon::BufferCopy> copies, bool barrier,
+                    bool can_reorder_upload = false);
+
+    /// Notifies a listener when a buffer range is written or the buffer is destroyed (size = ~0ULL).
+    using WriteHook = void (*)(void* user, BufferHandle buffer, u64 offset, u64 size);
+    void SetWriteHook(WriteHook hook, void* user) noexcept {
+        write_hook = hook;
+        write_hook_user = user;
+    }
 
     void PostCopyBarrier() {}
 
@@ -174,8 +184,22 @@ public:
 
     void BindTransformFeedbackBuffers(VideoCommon::HostBindings<Buffer>& bindings);
 
+    struct StreamUniformRef {
+        BufferHandle buffer{};
+        u32 offset{};
+    };
+    static_assert(std::is_trivially_copyable_v<StreamUniformRef>);
+
     /// A stream slice of exactly `size` bytes, bound next.
     std::span<u8> BindMappedUniformBuffer(size_t stage, u32 binding_index, u32 size);
+
+    [[nodiscard]] StreamUniformRef LastStreamUniformRef() const noexcept {
+        return last_stream_uniform;
+    }
+
+    void RebindStreamUniform(const StreamUniformRef& ref, u32 size) {
+        bindings.push_back({Binding::Kind::Buffer, ref.buffer, ref.offset, size, {}});
+    }
 
     void BindUniformBuffer(const Buffer& buffer, u32 offset, u32 size) {
         bindings.push_back({Binding::Kind::Buffer, buffer.Handle(), offset, size, {}});
@@ -283,9 +307,10 @@ private:
     std::array<VertexState, VideoCommon::NUM_TRANSFORM_FEEDBACK_BUFFERS> feedback_states{};
 
     Object nx2_mesh_mirror;
-    Object clear_pattern;
-    u64 clear_pattern_size{};
     u64 allocated_bytes{};
+    StreamUniformRef last_stream_uniform{};
+    WriteHook write_hook{};
+    void* write_hook_user{};
 };
 
 struct BufferCacheParams {

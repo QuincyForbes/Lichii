@@ -23,6 +23,7 @@
 #include <map>
 #include <span>
 #include "common/container/unordered_map.h"
+#include "common/container/unordered_set.h"
 #include <variant>
 #include <vector>
 
@@ -508,10 +509,10 @@ void VisitBlock(Pass& pass, IR::Block* block) {
 }
 
 IR::Type GetConcreteType(IR::Inst* inst) {
-    std::deque<IR::Inst*> queue;
-    queue.push_back(inst);
+    std::deque<IR::Inst*> queue{inst};
+    ::Common::unordered_set<IR::Inst*> visited{inst};
     while (!queue.empty()) {
-        IR::Inst* current = queue.front();
+        IR::Inst* const current = queue.front();
         queue.pop_front();
         const size_t num_args{current->NumArgs()};
         for (size_t i = 0; i < num_args; ++i) {
@@ -520,11 +521,43 @@ IR::Type GetConcreteType(IR::Inst* inst) {
                 return set_type;
             }
             if (!current->Arg(i).IsImmediate()) {
-                queue.push_back(current->Arg(i).Inst());
+                IR::Inst* const arg_inst = current->Arg(i).Inst();
+                if (visited.insert(arg_inst).second) {
+                    queue.push_back(arg_inst);
+                }
             }
         }
     }
     return IR::Type::Opaque;
+}
+bool IsPrePassTextureInstruction(const IR::Inst& inst) noexcept {
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::BindlessImageSampleImplicitLod:
+    case IR::Opcode::BindlessImageSampleExplicitLod:
+    case IR::Opcode::BindlessImageSampleDrefImplicitLod:
+    case IR::Opcode::BindlessImageSampleDrefExplicitLod:
+    case IR::Opcode::BindlessImageGather:
+    case IR::Opcode::BindlessImageGatherDref:
+    case IR::Opcode::BindlessImageFetch:
+    case IR::Opcode::BindlessImageQueryDimensions:
+    case IR::Opcode::BindlessImageQueryLod:
+    case IR::Opcode::BindlessImageGradient:
+    case IR::Opcode::BindlessImageRead:
+    case IR::Opcode::BoundImageSampleImplicitLod:
+    case IR::Opcode::BoundImageSampleExplicitLod:
+    case IR::Opcode::BoundImageSampleDrefImplicitLod:
+    case IR::Opcode::BoundImageSampleDrefExplicitLod:
+    case IR::Opcode::BoundImageGather:
+    case IR::Opcode::BoundImageGatherDref:
+    case IR::Opcode::BoundImageFetch:
+    case IR::Opcode::BoundImageQueryDimensions:
+    case IR::Opcode::BoundImageQueryLod:
+    case IR::Opcode::BoundImageGradient:
+    case IR::Opcode::BoundImageRead:
+        return true;
+    default:
+        return false;
+    }
 }
 } // Anonymous namespace
 
@@ -544,15 +577,15 @@ void SsaRewritePass(IR::Program& program) {
             }
         }
     }
-    // Trivial phis and replaced reads stay in their blocks as Identity instructions, often more
-    // of them than real instructions. Those without uses cannot gain any now that the definition
-    // tables are gone: drop them here, as dead code elimination would later (same order), instead
-    // of letting every pass until then walk them.
+    // Prune dead side-effect-free instructions (including SetRegister, SetPred, SetGotoVariable,
+    // Set*Flag, and Identity instructions from trivial phis and replaced reads) before the
+    // remaining IR passes walk the program. Keep pre-pass texture ops until DeadCodeEliminationPass
+    // so TexturePass still sees standalone texture snippets without outputs.
     for (IR::Block* const block : program.post_order_blocks) {
         auto it{block->end()};
         while (it != block->begin()) {
             --it;
-            if (it->GetOpcode() == IR::Opcode::Identity && !it->HasUses()) {
+            if (!it->HasUses() && !it->MayHaveSideEffects() && !IsPrePassTextureInstruction(*it)) {
                 it->Invalidate();
                 it = block->Instructions().erase(it);
             }

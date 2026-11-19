@@ -122,6 +122,7 @@ struct EmittedBlockInfo {
     std::vector<Relocation> relocations;
     boost::container::flat_map<IR::LocationDescriptor, std::vector<BlockRelocation>> block_relocations;
     boost::container::flat_map<std::ptrdiff_t, FastmemPatchInfo> fastmem_patch_info;
+    const void* nzcv_live_pos = nullptr;
 };
 
 struct EmitConfig {
@@ -169,6 +170,9 @@ struct EmitConfig {
 
     // Timing & control flow
     bool wall_clock_cntpct;
+    bool inline_cntpct = false;
+    u64 cntpct_scale_lo = 0;
+    u64 cntpct_scale_hi = 0;
     bool enable_cycle_counting;
     bool halt_check_on_back_edges;
     bool use_state_rsb;

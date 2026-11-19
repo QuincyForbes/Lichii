@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <QComboBox>
 #include <QFrame>
 #include <QGroupBox>
 #include <QGuiApplication>
@@ -508,7 +509,18 @@ void ConfigureDialog::OnSearchChanged(const QString& text) {
                     continue;
                 }
                 const QString key = QString::fromStdString(widget->GetSetting().GetLabel());
-                if (!matches(widget->Label()) && !matches(key)) {
+                const bool direct_match = matches(widget->Label()) || matches(key);
+                QString matched_choice;
+                if (!direct_match && widget->combobox != nullptr) {
+                    for (int item_idx = 0; item_idx < widget->combobox->count(); ++item_idx) {
+                        const QString choice_text = widget->combobox->itemText(item_idx);
+                        if (matches(choice_text)) {
+                            matched_choice = choice_text;
+                            break;
+                        }
+                    }
+                }
+                if (!direct_match && matched_choice.isEmpty()) {
                     continue;
                 }
                 // Where it is: the page, then the group it sits in (a section or a group box).
@@ -531,8 +543,12 @@ void ConfigureDialog::OnSearchChanged(const QString& text) {
                 if (!widget->isVisibleTo(content)) {
                     place += QStringLiteral(" (%1)").arg(UiText::Text("search.hidden_now"));
                 }
+                const QString title_line =
+                    matched_choice.isEmpty()
+                        ? widget->Label()
+                        : QStringLiteral("%1 (%2)").arg(widget->Label(), matched_choice);
                 auto* const item = new QListWidgetItem(LichiiStyle::Icon(page.icon),
-                                                       widget->Label() + QLatin1Char('\n') + place);
+                                                       title_line + QLatin1Char('\n') + place);
                 item->setData(Qt::UserRole, static_cast<int>(i));
                 item->setData(Qt::UserRole + 1, QVariant::fromValue(static_cast<QObject*>(widget)));
                 item->setToolTip(widget->toolTip());

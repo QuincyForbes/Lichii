@@ -989,7 +989,8 @@ void CopyBufferToImage(vk::CommandBuffer cmdbuf, VkBuffer src_buffer, VkImage im
     const VkImageMemoryBarrier read_barrier{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
-            .srcAccessMask = WRITE_ACCESS_FLAGS,
+            .srcAccessMask = static_cast<VkAccessFlags>(is_initialized ? WRITE_ACCESS_FLAGS
+                                                                       : VK_ACCESS_NONE),
             .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
             .oldLayout = is_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
             .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -1012,18 +1013,15 @@ void CopyBufferToImage(vk::CommandBuffer cmdbuf, VkBuffer src_buffer, VkImage im
             .subresourceRange = subresource_range,
     };
 
-    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                           read_barrier);
+    cmdbuf.PipelineBarrier(is_initialized
+                               ? vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER
+                               : VkPipelineStageFlags{VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT},
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, read_barrier);
     cmdbuf.CopyBufferToImage(src_buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copies);
     // TODO: Move this to another API
-    cmdbuf.PipelineBarrier(
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            0, nullptr, nullptr, write_barrier);
+    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, nullptr, nullptr,
+                           write_barrier);
 }
 
 [[nodiscard]] VkImageBlit MakeImageBlit(const Region2D& dst_region, const Region2D& src_region,
@@ -1873,6 +1871,9 @@ bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
         return true;
     }
 #endif
+    if (Settings::AmdFsr4Chosen() && !fsr4_unsupported) {
+        return true;
+    }
     return !fsr3_unsupported;
 }
 
@@ -1918,15 +1919,35 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
 #ifdef EGLANTINE_STREAMLINE
     if (UpscaleWithDlss(dst_framebuffer, input_color, motion_vectors, depth, render_size, jitter,
                         motion_scale, reset)) {
+        fsr4_evaluated_last = false;
         return true;
     }
 #endif
 #ifdef LICHII_METALFX
     if (UpscaleWithMetalFx(dst_framebuffer, input_color, motion_vectors, depth, render_size,
                            jitter, motion_scale, reset)) {
+        fsr4_evaluated_last = false;
         return true;
     }
 #endif
+    // FSR's own RCAS, set by the sharpness slider: FSR takes 0-1 for 2 to 0 stops, and the slider
+    // stores stops x 100, so this is the percentage the slider shows; 0% (stored 200) is off.
+    // EDEN_NX2_TEMPORAL_SHARPEN=<stops>|off overrides the slider.
+    static const char* const sharpen_override = std::getenv("EDEN_NX2_TEMPORAL_SHARPEN");
+    const int slider = Settings::values.fsr_sharpening_slider.GetValue();
+    bool sharpen = slider < 200;
+    f32 stops = static_cast<f32>(slider) / 100.0f;
+    if (sharpen_override) {
+        sharpen = std::string_view{sharpen_override} != "off";
+        stops = static_cast<f32>(std::strtod(sharpen_override, nullptr));
+    }
+    const f32 sharpness = std::clamp(1.0f - stops / 2.0f, 0.0f, 1.0f);
+    if (UpscaleWithFsr4(dst_framebuffer, input_color, motion_vectors, depth, render_size, jitter,
+                        motion_scale, frame_time_ms, reset, sharpen, sharpness)) {
+        fsr4_evaluated_last = true;
+        return true;
+    }
+    const bool fsr3_reset = reset || std::exchange(fsr4_evaluated_last, false);
     if (fsr3_unsupported) {
         return false;
     }
@@ -1948,17 +1969,6 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
             return false;
         }
     }
-    // FSR's own RCAS, set by the sharpness slider: FSR takes 0-1 for 2 to 0 stops, and the slider
-    // stores stops x 100, so this is the percentage the slider shows; 0% (stored 200) is off.
-    // EDEN_NX2_TEMPORAL_SHARPEN=<stops>|off overrides the slider.
-    static const char* const sharpen_override = std::getenv("EDEN_NX2_TEMPORAL_SHARPEN");
-    const int slider = Settings::values.fsr_sharpening_slider.GetValue();
-    bool sharpen = slider < 200;
-    f32 stops = static_cast<f32>(slider) / 100.0f;
-    if (sharpen_override) {
-        sharpen = std::string_view{sharpen_override} != "off";
-        stops = static_cast<f32>(std::strtod(sharpen_override, nullptr));
-    }
     try {
         fsr3_upscaler->Upscale({
             .color = input_color.Handle(Shader::TextureType::Color2D),
@@ -1970,9 +1980,9 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
             .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
                                     motion_scale[1] * static_cast<f32>(render_size[1])},
             .frame_time_ms = frame_time_ms,
-            .reset = reset,
+            .reset = fsr3_reset,
             .sharpen = sharpen,
-            .sharpness = 1.0f - stops / 2.0f,
+            .sharpness = sharpness,
         });
     } catch (const vk::Exception& exception) {
         LOG_ERROR(Render_Vulkan, "FSR 3.1 evaluation unavailable ({}); using the temporal stand-in",
@@ -1986,6 +1996,86 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
     if (!logged) {
         logged = true;
         LOG_INFO(Render_Vulkan, "DLSS replaced by FSR 3.1: {}x{} -> {}x{}", render_size[0],
+                 render_size[1], extent.width, extent.height);
+    }
+    return true;
+}
+
+bool TextureCacheRuntime::UpscaleWithFsr4(Framebuffer* dst_framebuffer, ImageView& input_color,
+                                          ImageView& motion_vectors, ImageView& depth,
+                                          std::array<u32, 2> render_size,
+                                          std::array<f32, 2> jitter,
+                                          std::array<f32, 2> motion_scale, f32 frame_time_ms,
+                                          bool reset, bool sharpen, f32 sharpness) {
+    if (!Settings::AmdFsr4Chosen() || fsr4_unsupported) {
+        return false;
+    }
+    if (!fsr4_upscaler) {
+        if (!Fsr4Upscaler::IsWanted(device)) {
+            fsr4_unsupported = true;
+            return false;
+        }
+        try {
+            fsr4_upscaler = std::make_unique<Fsr4Upscaler>(
+                device, scheduler, memory_allocator, Fsr4Upscaler::Profile::HdrReversedDepth);
+        } catch (const vk::Exception& exception) {
+            LOG_WARNING(Render_Vulkan, "AMD FSR 4 unavailable ({}); using FSR 3.1",
+                        exception.what());
+            fsr4_unsupported = true;
+            return false;
+        }
+    }
+    if (fsr4_upscaler->Failed()) {
+        fsr4_unsupported = true;
+        return false;
+    }
+    const auto image = [&](ImageView& view, VkImageAspectFlags aspect) {
+        return Fsr4Upscaler::Image{
+            .image = view.ImageHandle(),
+            .format = MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, view.format)
+                          .format,
+            .range{
+                .aspectMask = aspect,
+                .baseMipLevel = static_cast<u32>(view.range.base.level),
+                .levelCount = 1,
+                .baseArrayLayer = static_cast<u32>(view.range.base.layer),
+                .layerCount = 1,
+            },
+            .barrier_aspect = ImageAspectMask(view.format),
+            .extent = {view.size.width, view.size.height},
+        };
+    };
+    const VkExtent2D extent = dst_framebuffer->RenderArea();
+    bool upscaled = false;
+    try {
+        upscaled = fsr4_upscaler->Upscale({
+            .color = image(input_color, VK_IMAGE_ASPECT_COLOR_BIT),
+            .depth = image(depth, VK_IMAGE_ASPECT_DEPTH_BIT),
+            .motion_vectors = image(motion_vectors, VK_IMAGE_ASPECT_COLOR_BIT),
+            .render_size = {render_size[0], render_size[1]},
+            .upscale_size = extent,
+            .frame_time_ms = frame_time_ms,
+            .reset = reset,
+            .sharpen = sharpen,
+            .sharpness = sharpness,
+            .jitter = jitter,
+            .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
+                                    motion_scale[1] * static_cast<f32>(render_size[1])},
+        });
+    } catch (const vk::Exception& exception) {
+        LOG_WARNING(Render_Vulkan, "AMD FSR 4 evaluation unavailable ({}); using FSR 3.1",
+                    exception.what());
+    }
+    if (!upscaled || fsr4_upscaler->Failed()) {
+        fsr4_unsupported = true;
+        return false;
+    }
+    DrawUpscaledOutput(dst_framebuffer, fsr4_upscaler->OutputView(), fsr4_upscaler->OutputImage(),
+                       fsr4_upscaler->PointSampler());
+    static bool logged{};
+    if (!logged) {
+        logged = true;
+        LOG_INFO(Render_Vulkan, "DLSS replaced by AMD FSR 4: {}x{} -> {}x{}", render_size[0],
                  render_size[1], extent.width, extent.height);
     }
     return true;
@@ -2087,7 +2177,10 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
     const auto image = [&](ImageView& view, VkImageView handle, VkImageAspectFlags aspect) {
         return DlssImage(device, view, handle, aspect);
     };
-    const VkExtent2D extent = dst_framebuffer->RenderArea();
+    const bool native_resolution =
+        Settings::values.nvidia_dlss_quality.GetValue() == Settings::DlssQuality::Dlaa;
+    const VkExtent2D extent = native_resolution ? VkExtent2D{render_size[0], render_size[1]}
+                                                : dst_framebuffer->RenderArea();
     bool upscaled{};
     try {
         upscaled = dlss_upscaler->Upscale({
@@ -2113,7 +2206,8 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
         return false;
     }
     DrawUpscaledOutput(dst_framebuffer, dlss_upscaler->OutputView(), dlss_upscaler->OutputImage(),
-                       dlss_upscaler->PointSampler());
+                       native_resolution ? dlss_upscaler->LinearSampler()
+                                         : dlss_upscaler->PointSampler());
     static bool logged{};
     if (!logged) {
         logged = true;
@@ -2573,6 +2667,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                 .pNext = nullptr,
                 .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT |
+                                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
                                  VK_ACCESS_TRANSFER_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
@@ -2593,6 +2688,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                 .pNext = nullptr,
                 .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT |
+                                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
                                  VK_ACCESS_TRANSFER_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -2615,6 +2711,8 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
             .pNext = nullptr,
             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                             VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
                              VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -2644,8 +2742,8 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                 src_image, VK_IMAGE_LAYOUT_GENERAL, dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 MakeImageBlit(dst_region, src_region, dst_layers, src_layers), vk_filter);
         }
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
-                       0, write_barrier);
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, write_barrier);
     });
 }
 
@@ -2877,18 +2975,13 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
                 .subresourceRange = dst_range.SubresourceRange(aspect_mask),
             },
         };
-        cmdbuf.PipelineBarrier(
-                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, nullptr, nullptr, pre_barriers);
+        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, nullptr, nullptr, pre_barriers);
         cmdbuf.CopyImage(src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst_image,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk_copies);
-        cmdbuf.PipelineBarrier(
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, nullptr, nullptr, post_barriers);
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, nullptr, nullptr,
+                               post_barriers);
     });
 }
 
@@ -4983,10 +5076,13 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
         supports_minmax_filter = (properties3.optimalTilingFeatures &
                                   VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT) != 0;
     } else {
-        supports_depth_comparison = true;
+        const VkFormatFeatureFlags format_features =
+            device->GetPhysical().GetFormatProperties(format_info.format).optimalTilingFeatures;
+        supports_depth_comparison =
+            (aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 &&
+            (format_features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
         supports_minmax_filter =
-            (device->GetPhysical().GetFormatProperties(format_info.format).optimalTilingFeatures &
-             VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT) != 0;
+            (format_features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT) != 0;
     }
     if (VideoCommon::RenderTrace::Enabled() &&
         (aspect_mask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0) {
@@ -5917,6 +6013,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .initialized = false,
             .level_view = [&pending](s32 level) { return *pending.views[level]; },
             .wait = !one_submit,
+            .compute_only = true,
         },
         map, swizzles);
 
@@ -5925,6 +6022,9 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                      Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
     const u64 block_bytes = bc3 ? 16 : 8;
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
+    boost::container::small_vector<BcEncoderPass::LevelEncode, 16> encodes;
+    copies.reserve(levels);
+    encodes.reserve(levels);
     u64 total = 0;
     for (u32 level = 0; level < levels; ++level) {
         const u32 level_width = (std::max)(width >> level, 1U);
@@ -5945,24 +6045,17 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .image_offset{0, 0, 0},
             .image_extent{level_width, level_height, 1},
         });
+        encodes.push_back({
+            .source = *pending.views[level],
+            .width = level_width,
+            .height = level_height,
+            .out_offset = total,
+        });
         total += size;
     }
     const auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal);
-    for (u32 level = 0; level < levels; ++level) {
-        bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
-                                copies[level].image_extent.height, layers, bc3, output.buffer,
-                                output.offset, total, copies[level].buffer_offset);
-    }
-    scheduler.Record([](vk::CommandBuffer cmdbuf) {
-        const VkMemoryBarrier barrier{
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-        };
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                               0, barrier);
-    });
+    bc_encoder_pass->EncodeLevels(std::span{encodes.data(), encodes.size()}, layers, bc3,
+                                  output.buffer, output.offset, total, true);
     image.UploadMemory(output.buffer, output.offset, copies);
     pending.tick = scheduler.CurrentTick();
     pending.last_use = ++transcode_use_counter;

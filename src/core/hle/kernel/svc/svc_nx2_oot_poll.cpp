@@ -5,13 +5,12 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <mutex>
 
-#ifdef __APPLE__
-#include <TargetConditionals.h>
-#endif
-
 #include "common/logging.h"
+#include "common/swap.h"
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
@@ -70,8 +69,8 @@ constexpr u64 kAllDoneOffset = 0x110;   // w: bit 0 = every entry was ready
 constexpr u64 kWalkCountOffset = 0x128; // w: entries this walk visits (snapshot at 0x130E0)
 
 constexpr s64 kMinSleepNs = 500'000;
-constexpr s64 kDefaultMaxSleepNs = 4'000'000;
 constexpr s64 kLimitMaxSleepNs = 16'000'000; // the game's own idle sleep in this loop
+constexpr s64 kDefaultMaxSleepNs = kLimitMaxSleepNs;
 constexpr s64 kWalkFactor = 4;
 // A gap longer than this since the last return from the SVC is not one walk (the thread idled in
 // the 16 ms sleep or was preempted for long); such a walk gets the minimum sleep.
@@ -80,16 +79,11 @@ constexpr s64 kLogIntervalNs = 10'000'000'000;
 
 // EDEN_NX2_OOT_POLL_BACKOFF: "0" leaves main unpatched (patch_manager.cpp), and then this SVC never
 // runs. A number above 1 is the longest sleep in us (at most 16000); "500" is wave 3's fixed sleep.
-// Anything else: 4000 us, and 16000 us on phones: an iPhone walks for ~4.1 ms, so a 4 ms cap kept
-// the poll walking half of the time (101 walks a second, 40% of a core); 4x a 4 ms walk fits.
+// Anything else: 16000 us, so 4x a ~4 ms walk sleeps ~15-16 ms (~28 walks/s instead of ~130/s).
 s64 MaxSleepNs() {
     static const s64 ns = [] {
         const char* value = std::getenv("EDEN_NX2_OOT_POLL_BACKOFF");
-#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
-        s64 us = kLimitMaxSleepNs / 1000;
-#else
         s64 us = kDefaultMaxSleepNs / 1000;
-#endif
         if (value != nullptr && value[0] != 0) {
             const long long parsed = std::strtoll(value, nullptr, 10);
             if (parsed > 1) {
@@ -102,15 +96,14 @@ s64 MaxSleepNs() {
 }
 
 // EDEN_NX2_OOT_POLL_SLICE=0: one sleep of the whole length (as before). Otherwise the sleep is
-// cut into slices of this many us (default 500, at least 100) and ends early once the request
+// cut into slices of this many us (default 4000, at least 100) and ends early once the request
 // ring moves (head or count) or the manager leaves state 3: what would have made the walk return
-// at once had it happened during the walk. The CPU saved stays the same, while a request added or
-// completed mid-sleep is picked up within one slice instead of up to 4 ms later.
+// at once had it happened during the walk.
 s64 SliceNs() {
     static const s64 ns = [] {
         const char* value = std::getenv("EDEN_NX2_OOT_POLL_SLICE");
         if (value == nullptr || value[0] == 0) {
-            return s64{500'000};
+            return s64{4'000'000};
         }
         const long long parsed = std::strtoll(value, nullptr, 10);
         if (parsed <= 0) {
@@ -148,6 +141,39 @@ bool Valid(Core::Memory::Memory& memory, u64 address, u64 size) {
     return address != 0 && memory.IsValidVirtualAddressRange(address, size);
 }
 
+struct ManagerFields {
+    u32 state{};
+    u32 head{};
+    u32 count{};
+};
+
+u32 LoadU32Le(const u8* ptr) {
+    u32_le val{};
+    std::memcpy(&val, ptr, sizeof(val));
+    return val;
+}
+
+bool ReadManagerFields(Core::Memory::Memory& memory, u64 manager, ManagerFields& out) {
+    if (manager == 0 || manager > (std::numeric_limits<u64>::max)() - (kCountOffset + 4)) {
+        return false;
+    }
+    if ((manager ^ (manager + kCountOffset + 3)) < 0x1000) {
+        if (const u8* const base = memory.GetPointerSilent(manager)) {
+            out.state = LoadU32Le(base + kStateOffset);
+            out.head = LoadU32Le(base + kHeadOffset);
+            out.count = LoadU32Le(base + kCountOffset);
+            return true;
+        }
+    }
+    if (!Valid(memory, manager, kCountOffset + 4)) {
+        return false;
+    }
+    out.state = memory.Read32(manager + kStateOffset);
+    out.head = memory.Read32(manager + kHeadOffset);
+    out.count = memory.Read32(manager + kCountOffset);
+    return true;
+}
+
 bool ExitPending(Core::Memory::Memory& memory, u64 main_base) {
     const u64 got = main_base + kExitGotOffset;
     if (!Valid(memory, got, 8)) {
@@ -183,20 +209,41 @@ WalkView ReadWalk(Core::Memory::Memory& memory, const ThreadContext& ctx) {
     }
     const u64 manager = ctx.r[19];
     const u64 sp = ctx.sp;
-    if (!Valid(memory, manager, kCountOffset + 4) || !Valid(memory, sp + kIssuedOffset, 0x24)) {
+    ManagerFields fields{};
+    if (!ReadManagerFields(memory, manager, fields)) {
         return view;
     }
-    if ((memory.Read32(sp + kAllDoneOffset) & 1) != 0) {
+    u32 issued{};
+    u32 all_done{};
+    u32 walk_count{};
+    const u64 stack_base = sp + kIssuedOffset;
+    if (sp != 0 && sp <= (std::numeric_limits<u64>::max)() - (kIssuedOffset + 0x24) &&
+        (stack_base ^ (stack_base + 0x23)) < 0x1000) {
+        if (const u8* const ptr = memory.GetPointerSilent(stack_base)) {
+            issued = LoadU32Le(ptr);
+            all_done = LoadU32Le(ptr + (kAllDoneOffset - kIssuedOffset));
+            walk_count = LoadU32Le(ptr + (kWalkCountOffset - kIssuedOffset));
+        } else {
+            return view;
+        }
+    } else if (Valid(memory, stack_base, 0x24)) {
+        issued = memory.Read32(sp + kIssuedOffset);
+        all_done = memory.Read32(sp + kAllDoneOffset);
+        walk_count = memory.Read32(sp + kWalkCountOffset);
+    } else {
+        return view;
+    }
+    if ((all_done & 1) != 0) {
         return view;
     }
     view.manager = manager;
-    view.head = memory.Read32(manager + kHeadOffset);
-    view.count = memory.Read32(manager + kCountOffset);
-    if (memory.Read32(manager + kStateOffset) != kStateWalking) {
+    view.head = fields.head;
+    view.count = fields.count;
+    if (fields.state != kStateWalking) {
         view.outcome = Outcome::State;
-    } else if (memory.Read32(sp + kIssuedOffset) != 0) {
+    } else if (issued != 0) {
         view.outcome = Outcome::Progress;
-    } else if (view.count != memory.Read32(sp + kWalkCountOffset)) {
+    } else if (view.count != walk_count) {
         view.outcome = Outcome::ListChanged;
     } else if (ExitPending(memory, main_base)) {
         view.outcome = Outcome::Exit;
@@ -347,13 +394,13 @@ bool CallNx2OotPollBackoff(Core::System& system, u32 imm) {
             bool early = false;
             for (s64 left = sleep_ns; left > 0; left = until - NowNs()) {
                 SleepThread(system, (std::min)(left, slice));
+                ManagerFields fields{};
                 if (GetCurrentThread(kernel).IsTerminationRequested() ||
-                    !Valid(memory, view.manager, kCountOffset + 4)) {
+                    !ReadManagerFields(memory, view.manager, fields)) {
                     break;
                 }
-                if (memory.Read32(view.manager + kHeadOffset) != view.head ||
-                    memory.Read32(view.manager + kCountOffset) != view.count ||
-                    memory.Read32(view.manager + kStateOffset) != kStateWalking) {
+                if (fields.head != view.head || fields.count != view.count ||
+                    fields.state != kStateWalking) {
                     early = until - NowNs() > 0;
                     break;
                 }
@@ -364,8 +411,10 @@ bool CallNx2OotPollBackoff(Core::System& system, u32 imm) {
             }
         }
         // The next walk starts now: remember when, and the ring it starts from.
-        const u32 head = memory.Read32(view.manager + kHeadOffset);
-        const u32 count = memory.Read32(view.manager + kCountOffset);
+        ManagerFields after{};
+        const bool ok = ReadManagerFields(memory, view.manager, after);
+        const u32 head = ok ? after.head : view.head;
+        const u32 count = ok ? after.count : view.count;
         const s64 resume = NowNs();
         std::scoped_lock lock{g_mutex};
         Slot& slot = FindSlot(view.manager);

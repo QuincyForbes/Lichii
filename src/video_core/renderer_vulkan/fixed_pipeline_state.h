@@ -250,6 +250,8 @@ struct FixedPipelineState {
     };
 
     DynamicState dynamic_state;
+    u32 line_stipple_factor;
+    u32 line_stipple_pattern;
     std::array<BlendingAttachment, Maxwell::NumRenderTargets> attachments;
     std::array<VertexAttribute, Maxwell::NumVertexAttributes> attributes;
     std::array<u32, Maxwell::NumVertexArrays> binding_divisors;
@@ -260,9 +262,6 @@ struct FixedPipelineState {
 
     u32 depth_bounds_min;
     u32 depth_bounds_max;
-
-    u32 line_stipple_factor;
-    u32 line_stipple_pattern;
 
     void Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features);
 

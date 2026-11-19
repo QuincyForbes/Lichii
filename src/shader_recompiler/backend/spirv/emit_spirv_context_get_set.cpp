@@ -312,7 +312,9 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, Id vertex) {
     if (IR::IsGeneric(attr)) {
         const u32 index{IR::GenericAttributeIndex(attr)};
         const auto& generic{ctx.input_generics.at(index)};
-        if (!ValidId(generic.id)) {
+        if (!ValidId(generic.id) ||
+            (ctx.stage == Stage::Fragment &&
+             !ctx.runtime_info.previous_stage_stores.Generic(index, element))) {
             // Attribute is disabled or varying component is not written
             return ctx.Const(element == 3 ? 1.0f : 0.0f);
         }

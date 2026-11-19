@@ -36,6 +36,10 @@ public:
 
     [[nodiscard]] size_t GeneratedFrameCount() const;
 
+    [[nodiscard]] u64 TotalGeneratedFrames() const noexcept {
+        return total_generated_frames.load(std::memory_order_relaxed);
+    }
+
     /// The semaphore the next graphics submission must wait on (hardware optical flow), or a
     /// null handle.
     [[nodiscard]] VkSemaphore TakeFlowWait() {
@@ -81,9 +85,11 @@ private:
     u64 frame_count{};
     u64 last_count{};
     size_t last_generations{};
+    std::atomic<u64> total_generated_frames{};
     u32 warm_streak{};
     bool generated{};
     bool unavailable{};
+    bool logged_dlssg_state{};
     bool dumped{};
     u32 interpolation_dumps{};
 };

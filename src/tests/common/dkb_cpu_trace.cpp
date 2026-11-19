@@ -32,7 +32,7 @@ TEST_CASE("Thread CPU clocks report monotonic execution counters", "[common][dkb
     Common::ThreadCpuClock disabled{false};
     REQUIRE_FALSE(disabled.Read());
     const auto start = Common::CurrentThreadCpuTimeNs();
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
     REQUIRE(start);
     Common::ThreadCpuClock captured;
     const auto captured_time = captured.Read();
@@ -116,7 +116,7 @@ TEST_CASE("Thread CPU snapshots read the registered thread not the caller", "[co
     const auto owner_after = ended.get_future().get();
     REQUIRE(after.wall_time >= before.wall_time);
     REQUIRE_FALSE(ReadSnapshot().threads[index].active);
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
     if (Common::DkbFrameTrace::Enabled()) {
         const auto delta = CpuTimeDelta(before.threads[index], after.threads[index]);
         REQUIRE(busy);
@@ -154,7 +154,7 @@ TEST_CASE("Thread CPU snapshots serialize against unregister", "[common][dkb_cpu
     }
     reader.request_stop();
     reader.join();
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
     REQUIRE(unavailable.load() == 0);
 #endif
     REQUIRE_FALSE(ReadSnapshot().threads[static_cast<size_t>(Role::GpuBack)].active);

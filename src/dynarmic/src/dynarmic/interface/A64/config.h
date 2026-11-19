@@ -396,6 +396,9 @@ struct UserConfig {
     /// This tells the translator a wall clock will be used, thus allowing it
     /// to avoid writting certain unnecessary code only needed for cycle timers.
     bool wall_clock_cntpct = false;
+    bool inline_cntpct = false;
+    std::uint64_t cntpct_scale_lo = 0;
+    std::uint64_t cntpct_scale_hi = 0;
     std::uint64_t inline_cntpct_tsc_base = 0;
     std::uint64_t inline_cntpct_tsc_factor = 0;
     std::uint64_t* inline_cntpct_last_ticks = nullptr;

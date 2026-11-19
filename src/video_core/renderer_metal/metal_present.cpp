@@ -296,7 +296,8 @@ TextureHandle PresentPasses::Make(Target& target, std::array<u32, 2> size, u32 f
                                                 .format = format,
                                                 .width = size[0],
                                                 .height = size[1],
-                                                .render_target = true});
+                                                .render_target = true,
+                                                .pixel_format_view = false});
         target.size = size;
         target.format = format;
     }
@@ -395,11 +396,13 @@ bool PresentPasses::PrepareSmaaTextures() {
     smaa_area = CreateTexture(device, {.kind = TextureKind::e2D,
                                        .format = Fmt::RG8Unorm,
                                        .width = AREATEX_WIDTH,
-                                       .height = AREATEX_HEIGHT});
+                                       .height = AREATEX_HEIGHT,
+                                       .pixel_format_view = false});
     smaa_search = CreateTexture(device, {.kind = TextureKind::e2D,
                                          .format = Fmt::R8Unorm,
                                          .width = SEARCHTEX_WIDTH,
-                                         .height = SEARCHTEX_HEIGHT});
+                                         .height = SEARCHTEX_HEIGHT,
+                                         .pixel_format_view = false});
     u8* area_bytes = nullptr;
     u8* search_bytes = nullptr;
     const Object area_upload = CreateBuffer(device, AREATEX_SIZE, true, &area_bytes);
@@ -624,7 +627,8 @@ bool PresentPasses::TemporalFilter(const TemporalInputs& inputs) {
                                            .format = Fmt::RGBA16Float,
                                            .width = inputs.size[0],
                                            .height = inputs.size[1],
-                                           .shader_write = true});
+                                           .shader_write = true,
+                                           .pixel_format_view = false});
         }
         if (!history[0] || !history[1]) {
             history = {};

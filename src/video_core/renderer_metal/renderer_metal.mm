@@ -5,12 +5,15 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <dlfcn.h>
@@ -86,6 +89,34 @@ namespace {
     }();
     return enabled;
 }
+
+[[nodiscard]] bool AsyncPresentEnabled() {
+    static const bool allowed = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_ASYNC_PRESENT");
+        return value == nullptr || value[0] != '0';
+    }();
+    return allowed && Settings::values.async_presentation.GetValue();
+}
+
+constexpr const char* PresentCopySource = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct PresentOut {
+    float4 position [[position]];
+    float2 uv;
+};
+vertex PresentOut present_vertex(uint id [[vertex_id]]) {
+    const float2 corner = float2(float((id << 1) & 2), float(id & 2));
+    PresentOut out;
+    out.position = float4(corner.x * 2.0 - 1.0, 1.0 - corner.y * 2.0, 0.0, 1.0);
+    out.uv = corner;
+    return out;
+}
+fragment float4 present_fragment(PresentOut in [[stage_in]], texture2d<float> src [[texture(0)]],
+                                 sampler smp [[sampler(0)]]) {
+    return src.sample(smp, in.uv);
+}
+)";
 
 /// MetalFX spatial upscaling of the first layer (the MetalFxSpatial scaling filter), on the
 /// renderer's own textures and command buffer.
@@ -319,6 +350,10 @@ struct RendererMetal::Impl {
           swapchain{device, emu_window.GetWindowInfo().render_surface},
           rasterizer{gpu, device_memory_, device, scheduler} {}
 
+    ~Impl() {
+        StopAsyncPresent();
+    }
+
     /// First: the device and swapchain are created under it.
     AbortTrace abort_trace;
 
@@ -403,12 +438,52 @@ struct RendererMetal::Impl {
 #endif
 
     std::chrono::steady_clock::time_point report_start = std::chrono::steady_clock::now();
-    u64 presented{};
-    u64 skipped{};
-    u64 drawable_wait_ns{};     ///< Composite's nextDrawable waits since the last report
-    u64 drawable_wait_max_ns{};
+    std::atomic<u64> presented{0};
+    std::atomic<u64> skipped{0};
+    std::atomic<u64> drawable_wait_ns{0}; ///< nextDrawable waits since the last report
+    std::atomic<u64> drawable_wait_max_ns{0};
     u64 from_cache{};
     u64 from_memory{};
+
+    static constexpr size_t AsyncPresentSlots = 3;
+    struct AsyncSlot {
+        Object texture;
+        u32 width{};
+        u32 height{};
+        u64 render_tick{};
+    };
+    struct PresentJob {
+        size_t slot_index{};
+        TextureHandle texture{};
+        u32 width{};
+        u32 height{};
+        u64 ready_tick{};
+        bool drawn{};
+    };
+    struct AsyncPresentSync {
+        std::mutex mutex;
+        std::condition_variable work_cv;
+        std::condition_variable free_cv;
+        std::deque<PresentJob> jobs;
+        std::array<bool, AsyncPresentSlots> slot_busy{};
+        bool worker_busy{};
+        bool stop{};
+    };
+    std::shared_ptr<AsyncPresentSync> async_sync = std::make_shared<AsyncPresentSync>();
+    std::array<AsyncSlot, AsyncPresentSlots> async_slots{};
+    size_t next_async_slot{};
+    std::thread async_present_thread;
+    id<MTLCommandQueue> async_present_queue = nil;
+    id<MTLRenderPipelineState> async_present_pipeline = nil;
+    id<MTLSamplerState> async_present_sampler = nil;
+    bool async_present_failed{};
+
+    bool EnsureAsyncPresenter();
+    void RunAsyncPresentWorker();
+    bool SubmitAsyncPresent(std::span<const Tegra::FramebufferConfig> framebuffers,
+                            const Layout::FramebufferLayout& layout);
+    void DrainAsyncPresent();
+    void StopAsyncPresent();
 };
 
 std::optional<DisplayTexture> RendererMetal::Impl::PrepareLayer(
@@ -433,6 +508,7 @@ std::optional<DisplayTexture> RendererMetal::Impl::PrepareLayer(
                                                       FramebufferFormat(framebuffer.pixel_format)),
                                                   .width = framebuffer.width,
                                                   .height = framebuffer.height,
+                                                  .pixel_format_view = false,
                                               });
         state.width = framebuffer.width;
         state.height = framebuffer.height;
@@ -629,12 +705,12 @@ void RendererMetal::Impl::PresentTexture(TextureHandle texture, id<CAMetalDrawab
         .keep_dst = false,
     });
     const id<MTLCommandBuffer> command_buffer =
-        (__bridge id<MTLCommandBuffer>)scheduler.CommandBuffer();
+        (__bridge id<MTLCommandBuffer>)scheduler.CommandBuffer(true);
     swapchain.PresentHeld(command_buffer, drawable, hold_seconds);
     scheduler.NotePresent(guest);
     // Each present on a command buffer of its own: the hold counts from the one before.
     scheduler.Flush(CommitReason::Present);
-    ++presented;
+    presented.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool RendererMetal::Impl::CompositeGenerated(std::span<const Tegra::FramebufferConfig> framebuffers,
@@ -647,7 +723,8 @@ bool RendererMetal::Impl::CompositeGenerated(std::span<const Tegra::FramebufferC
                                          .format = DrawableFormat(),
                                          .width = size[0],
                                          .height = size[1],
-                                         .render_target = true});
+                                         .render_target = true,
+                                         .pixel_format_view = false});
         compose_size = size;
     }
     if (!compose) {
@@ -709,11 +786,240 @@ bool RendererMetal::Impl::CompositeGenerated(std::span<const Tegra::FramebufferC
     if (next != nil) {
         PresentTexture(compose.Get(), next, layout, hold, drawn);
     } else {
-        ++skipped;
+        skipped.fetch_add(1, std::memory_order_relaxed);
     }
     return drawn;
 }
 #endif
+
+bool RendererMetal::Impl::EnsureAsyncPresenter() {
+    if (async_present_thread.joinable()) {
+        return true;
+    }
+    if (async_present_failed) {
+        return false;
+    }
+    const id<MTLDevice> mtl = device.GetDevice();
+    async_present_queue = [mtl newCommandQueueWithMaxCommandBufferCount:16];
+    if (async_present_queue != nil) {
+        async_present_queue.label = @"LichiiPresent";
+    }
+    NSError* error = nil;
+    const id<MTLLibrary> lib = [mtl newLibraryWithSource:@(PresentCopySource)
+                                                 options:nil
+                                                   error:&error];
+    if (lib != nil) {
+        MTLRenderPipelineDescriptor* desc = [MTLRenderPipelineDescriptor new];
+        desc.label = @"Async Present";
+        desc.vertexFunction = [lib newFunctionWithName:@"present_vertex"];
+        desc.fragmentFunction = [lib newFunctionWithName:@"present_fragment"];
+        desc.colorAttachments[0].pixelFormat = swapchain.PixelFormat();
+        async_present_pipeline = [mtl newRenderPipelineStateWithDescriptor:desc error:&error];
+    }
+    MTLSamplerDescriptor* sdesc = [MTLSamplerDescriptor new];
+    sdesc.minFilter = MTLSamplerMinMagFilterNearest;
+    sdesc.magFilter = MTLSamplerMinMagFilterNearest;
+    sdesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    sdesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    async_present_sampler = [mtl newSamplerStateWithDescriptor:sdesc];
+    if (async_present_queue == nil || async_present_pipeline == nil ||
+        async_present_sampler == nil) {
+        LOG_WARNING(Render_Metal, "Metal: async present worker unavailable ({}); presenting inline",
+                    error != nil ? error.localizedDescription.UTF8String : "resource init failed");
+        async_present_failed = true;
+        return false;
+    }
+    async_present_thread = std::thread([this] { RunAsyncPresentWorker(); });
+    return true;
+}
+
+void RendererMetal::Impl::RunAsyncPresentWorker() {
+    pthread_setname_np("MetalPresent");
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    const id<MTLSharedEvent> shared_event = (__bridge id<MTLSharedEvent>)scheduler.SharedEvent();
+    for (;;) {
+        PresentJob job{};
+        {
+            std::unique_lock lock{async_sync->mutex};
+            async_sync->work_cv.wait(lock, [this] {
+                return async_sync->stop || !async_sync->jobs.empty();
+            });
+            if (async_sync->jobs.empty()) {
+                return;
+            }
+            job = async_sync->jobs.front();
+            async_sync->jobs.pop_front();
+            async_sync->worker_busy = true;
+        }
+        @autoreleasepool {
+            const auto drawable_start = std::chrono::steady_clock::now();
+            const id<CAMetalDrawable> drawable = swapchain.NextDrawable(job.width, job.height);
+            const u64 waited = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - drawable_start)
+                    .count());
+            drawable_wait_ns.fetch_add(waited, std::memory_order_relaxed);
+            u64 prev_max = drawable_wait_max_ns.load(std::memory_order_relaxed);
+            while (waited > prev_max &&
+                   !drawable_wait_max_ns.compare_exchange_weak(prev_max, waited,
+                                                               std::memory_order_relaxed)) {
+            }
+            bool submitted_cb = false;
+            if (drawable != nil) {
+                const id<MTLCommandBuffer> cb = [async_present_queue commandBuffer];
+                if (cb != nil) {
+                    cb.label = @"Lichii present";
+                    if (shared_event != nil && job.ready_tick != 0) {
+                        [cb encodeWaitForEvent:shared_event value:job.ready_tick];
+                    }
+                    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+                    pass.colorAttachments[0].texture = drawable.texture;
+                    pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+                    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    pass.renderTargetWidth = job.width;
+                    pass.renderTargetHeight = job.height;
+                    const id<MTLRenderCommandEncoder> enc =
+                        [cb renderCommandEncoderWithDescriptor:pass];
+                    if (enc != nil) {
+                        enc.label = @"Present Blit";
+                        [enc setRenderPipelineState:async_present_pipeline];
+                        [enc setViewport:MTLViewport{0.0, 0.0, static_cast<f64>(job.width),
+                                                     static_cast<f64>(job.height), 0.0, 1.0}];
+                        [enc setScissorRect:MTLScissorRect{0, 0, job.width, job.height}];
+                        [enc setFragmentTexture:AsTexture(job.texture) atIndex:0];
+                        [enc setFragmentSamplerState:async_present_sampler atIndex:0];
+                        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                        [enc endEncoding];
+                    }
+                    swapchain.Present(cb, drawable, job.drawn);
+                    std::shared_ptr<AsyncPresentSync> sync_ref = async_sync;
+                    const size_t slot_idx = job.slot_index;
+                    [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+                        {
+                            std::scoped_lock lock{sync_ref->mutex};
+                            sync_ref->slot_busy[slot_idx] = false;
+                        }
+                        sync_ref->free_cv.notify_all();
+                    }];
+                    [cb commit];
+                    submitted_cb = true;
+                    presented.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (!submitted_cb) {
+                skipped.fetch_add(1, std::memory_order_relaxed);
+                {
+                    std::scoped_lock lock{async_sync->mutex};
+                    async_sync->slot_busy[job.slot_index] = false;
+                }
+                async_sync->free_cv.notify_all();
+            }
+        }
+        {
+            std::scoped_lock lock{async_sync->mutex};
+            async_sync->worker_busy = false;
+        }
+        async_sync->free_cv.notify_all();
+    }
+}
+
+bool RendererMetal::Impl::SubmitAsyncPresent(
+    std::span<const Tegra::FramebufferConfig> framebuffers,
+    const Layout::FramebufferLayout& layout) {
+    if (!EnsureAsyncPresenter()) {
+        return false;
+    }
+    if (layout.width == 0 || layout.height == 0) {
+        skipped.fetch_add(1, std::memory_order_relaxed);
+        scheduler.Flush(CommitReason::Present);
+        return true;
+    }
+    const size_t slot_idx = next_async_slot;
+    next_async_slot = (next_async_slot + 1) % AsyncPresentSlots;
+    {
+        const auto wait_start = std::chrono::steady_clock::now();
+        std::unique_lock lock{async_sync->mutex};
+        if (async_sync->slot_busy[slot_idx]) {
+            async_sync->free_cv.wait(lock, [&] { return !async_sync->slot_busy[slot_idx]; });
+            const u64 waited = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_start)
+                    .count());
+            VideoCommon::SplitStats::AddPresentBlock(waited);
+        }
+    }
+    AsyncSlot& slot = async_slots[slot_idx];
+    if (!slot.texture || slot.width != layout.width || slot.height != layout.height) {
+        if (slot.render_tick != 0 && !scheduler.IsFree(slot.render_tick)) {
+            scheduler.Wait(slot.render_tick);
+        }
+        slot.texture = CreateTexture(device, {.kind = TextureKind::e2D,
+                                              .format = DrawableFormat(),
+                                              .width = layout.width,
+                                              .height = layout.height,
+                                              .render_target = true,
+                                              .pixel_format_view = false});
+        slot.width = layout.width;
+        slot.height = layout.height;
+    }
+    if (!slot.texture) {
+        return false;
+    }
+    const Attachment target{.texture = slot.texture.Get()};
+    const bool drawn = DrawLayers(framebuffers, target, DrawableFormat(), layout, true);
+    if (!drawn) {
+        ClearPass clear{};
+        clear.color[0] = target;
+        clear.clear_color[0] = true;
+        clear.color_value[0] = {0.06, 0.09, 0.22, 1.0};
+        clear.width = layout.width;
+        clear.height = layout.height;
+        scheduler.Clear(clear);
+    }
+    scheduler.NotePresent(drawn);
+    const u64 ready_tick = scheduler.Flush(CommitReason::Present);
+    slot.render_tick = ready_tick;
+    {
+        std::scoped_lock lock{async_sync->mutex};
+        async_sync->slot_busy[slot_idx] = true;
+        async_sync->jobs.push_back(PresentJob{
+            .slot_index = slot_idx,
+            .texture = slot.texture.Get(),
+            .width = layout.width,
+            .height = layout.height,
+            .ready_tick = ready_tick,
+            .drawn = drawn,
+        });
+    }
+    async_sync->work_cv.notify_one();
+    return true;
+}
+
+void RendererMetal::Impl::DrainAsyncPresent() {
+    if (!async_present_thread.joinable()) {
+        return;
+    }
+    std::unique_lock lock{async_sync->mutex};
+    async_sync->free_cv.wait(lock, [this] {
+        return async_sync->jobs.empty() && !async_sync->worker_busy &&
+               std::ranges::none_of(async_sync->slot_busy, [](bool b) { return b; });
+    });
+}
+
+void RendererMetal::Impl::StopAsyncPresent() {
+    if (async_present_thread.joinable()) {
+        {
+            std::scoped_lock lock{async_sync->mutex};
+            async_sync->stop = true;
+        }
+        async_sync->work_cv.notify_all();
+        async_present_thread.join();
+    }
+    std::unique_lock lock{async_sync->mutex};
+    async_sync->free_cv.wait(lock, [this] {
+        return std::ranges::none_of(async_sync->slot_busy, [](bool b) { return b; });
+    });
+}
 
 void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
     SCOPE_EXIT {
@@ -744,51 +1050,67 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
             VideoCore::Probe::StoreFrameExtents(game_width, game_height, layout.width,
                                                 layout.height);
         }
-        // nextDrawable blocks the compositing thread (the GPU back) while every drawable is
-        // queued for display (display sync on, game faster than the display): timed for the
-        // nx2:vi2 critical path line and the report below.
-        const auto drawable_start = std::chrono::steady_clock::now();
-        const id<CAMetalDrawable> drawable =
-            impl->swapchain.NextDrawable(layout.width, layout.height);
-        {
-            const u64 waited = static_cast<u64>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - drawable_start)
-                    .count());
-            VideoCommon::SplitStats::AddPresentBlock(waited);
-            impl->drawable_wait_ns += waited;
-            impl->drawable_wait_max_ns = (std::max)(impl->drawable_wait_max_ns, waited);
-        }
-        if (drawable != nil) {
+        const bool want_frame_gen =
 #ifdef HAS_LSFG
-            if (FrameGen::Wanted()) {
-                impl->CompositeGenerated(framebuffers, drawable, layout);
-            } else
+            FrameGen::Wanted();
+#else
+            false;
 #endif
-            {
-            const Attachment target{.texture = (__bridge void*)drawable.texture};
-            const bool drawn =
-                impl->DrawLayers(framebuffers, target, DrawableFormat(), layout, true);
-            if (!drawn) {
-                // Dark blue: the renderer runs, the guest has no framebuffer to show.
-                ClearPass clear{};
-                clear.color[0] = target;
-                clear.clear_color[0] = true;
-                clear.color_value[0] = {0.06, 0.09, 0.22, 1.0};
-                clear.width = layout.width;
-                clear.height = layout.height;
-                impl->scheduler.Clear(clear);
-            }
-            const id<MTLCommandBuffer> command_buffer =
-                (__bridge id<MTLCommandBuffer>)impl->scheduler.CommandBuffer();
-            impl->swapchain.Present(command_buffer, drawable, drawn);
-            impl->scheduler.NotePresent(drawn);
-            impl->scheduler.Flush(CommitReason::Present);
-            ++impl->presented;
-            }
+        if (!want_frame_gen && AsyncPresentEnabled() &&
+            impl->SubmitAsyncPresent(framebuffers, layout)) {
+            // Composite rendered into the handoff ring; MetalPresent handles nextDrawable/present.
         } else {
-            ++impl->skipped;
-            impl->scheduler.Flush(CommitReason::Present);
+            impl->DrainAsyncPresent();
+            // nextDrawable blocks the compositing thread (the GPU back) while every drawable is
+            // queued for display (display sync on, game faster than the display): timed for the
+            // nx2:vi2 critical path line and the report below.
+            const auto drawable_start = std::chrono::steady_clock::now();
+            const id<CAMetalDrawable> drawable =
+                impl->swapchain.NextDrawable(layout.width, layout.height);
+            {
+                const u64 waited = static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - drawable_start)
+                        .count());
+                VideoCommon::SplitStats::AddPresentBlock(waited);
+                impl->drawable_wait_ns.fetch_add(waited, std::memory_order_relaxed);
+                u64 prev_max = impl->drawable_wait_max_ns.load(std::memory_order_relaxed);
+                while (waited > prev_max &&
+                       !impl->drawable_wait_max_ns.compare_exchange_weak(
+                           prev_max, waited, std::memory_order_relaxed)) {
+                }
+            }
+            if (drawable != nil) {
+#ifdef HAS_LSFG
+                if (want_frame_gen) {
+                    impl->CompositeGenerated(framebuffers, drawable, layout);
+                } else
+#endif
+                {
+                    const Attachment target{.texture = (__bridge void*)drawable.texture};
+                    const bool drawn =
+                        impl->DrawLayers(framebuffers, target, DrawableFormat(), layout, true);
+                    if (!drawn) {
+                        // Dark blue: the renderer runs, the guest has no framebuffer to show.
+                        ClearPass clear{};
+                        clear.color[0] = target;
+                        clear.clear_color[0] = true;
+                        clear.color_value[0] = {0.06, 0.09, 0.22, 1.0};
+                        clear.width = layout.width;
+                        clear.height = layout.height;
+                        impl->scheduler.Clear(clear);
+                    }
+                    const id<MTLCommandBuffer> command_buffer =
+                        (__bridge id<MTLCommandBuffer>)impl->scheduler.CommandBuffer(true);
+                    impl->swapchain.Present(command_buffer, drawable, drawn);
+                    impl->scheduler.NotePresent(drawn);
+                    impl->scheduler.Flush(CommitReason::Present);
+                    impl->presented.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else {
+                impl->skipped.fetch_add(1, std::memory_order_relaxed);
+                impl->scheduler.Flush(CommitReason::Present);
+            }
         }
     }
     ++m_current_frame;
@@ -803,6 +1125,8 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
             impl->scheduler.TakeCounts();
         const auto [graphics_made, compute_made, refused] =
             impl->rasterizer.Pipelines().TakeCounts();
+        const u64 presented_count = impl->presented.exchange(0, std::memory_order_relaxed);
+        const u64 skipped_count = impl->skipped.exchange(0, std::memory_order_relaxed);
         LOG_INFO(Render_Metal,
                  "Metal: {} frames presented ({} from the texture cache, {} from guest memory), "
                  "{} without a drawable; {} draws ({} with a built pipeline, {} drawn, {} with "
@@ -814,8 +1138,8 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                  "starting with a clear), {} blit commands; state and bindings {} set, {} left as "
                  "they were; {} copies and {} kernels ahead of their segment, {} segments split "
                  "off; {} fences without a command buffer; staging {} MiB ({} early commits, {} "
-                 "waited for, {} buffers freed); textures {} MiB, buffers {} MiB",
-                 impl->presented, impl->from_cache, impl->from_memory, impl->skipped, work.draws,
+                 "waited for, {} buffers freed); textures {} MiB (+{} MiB pooled), buffers {} MiB",
+                 presented_count, impl->from_cache, impl->from_memory, skipped_count, work.draws,
                  work.draws_with_pipeline, work.draws_encoded, work.draws_converted,
                  work.indices_rewritten_on_gpu, work.dispatches, work.dispatches_with_pipeline,
                  work.clears, work.texel_copies, work.occlusion_queries, work.mesh_draws,
@@ -826,13 +1150,18 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                  work.staging_bytes >> 20, work.staging_flushes, work.staging_waits,
                  work.staging_freed,
                  impl->rasterizer.TextureRuntime().allocated_bytes >> 20,
+                 impl->rasterizer.TextureRuntime().PooledImageBytes() >> 20,
                  impl->rasterizer.BufferRuntime().GetDeviceMemoryUsage() >> 20);
         LOG_INFO(Render_Metal,
-                 "Metal present: the GPU back waited {:.1f} ms for drawables in {} frames "
+                 "Metal present ({}): waited {:.1f} ms for drawables in {} frames "
                  "(longest {:.2f} ms)",
-                 static_cast<double>(std::exchange(impl->drawable_wait_ns, u64{0})) / 1e6,
-                 impl->presented + impl->skipped,
-                 static_cast<double>(std::exchange(impl->drawable_wait_max_ns, u64{0})) / 1e6);
+                 impl->async_present_thread.joinable() ? "async worker" : "inline",
+                 static_cast<double>(impl->drawable_wait_ns.exchange(0, std::memory_order_relaxed)) /
+                     1e6,
+                 presented_count + skipped_count,
+                 static_cast<double>(
+                     impl->drawable_wait_max_ns.exchange(0, std::memory_order_relaxed)) /
+                     1e6);
         if (const std::string coverage = Coverage::TakeLine(); !coverage.empty()) {
             LOG_INFO(Render_Metal, "Perf Metal coverage: {}", coverage);
         }
@@ -887,11 +1216,11 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
         }
         // Per frame, to set against MoltenVK's Perf: and Perf passes: lines.
         const f64 seconds = std::chrono::duration<f64>(now - impl->report_start).count();
-        const f64 frames = static_cast<f64>((std::max)(impl->presented, u64{1}));
+        const f64 frames = static_cast<f64>((std::max)(presented_count, u64{1}));
         LOG_INFO(Render_Metal,
                  "Metal perf: {:.1f} fps, GPU {:.2f} ms/frame, {:.1f} command buffers, {:.1f} "
                  "encoders and {:.1f} render passes per frame, {:.0f} draws per frame",
-                 static_cast<f64>(impl->presented) / seconds,
+                 static_cast<f64>(presented_count) / seconds,
                  static_cast<f64>(impl->scheduler.TakeGpuNanoseconds()) / 1e6 / frames,
                  static_cast<f64>(command_buffers) / frames, static_cast<f64>(encoders) / frames,
                  static_cast<f64>(passes) / frames, static_cast<f64>(work.draws_encoded) / frames);
@@ -927,8 +1256,6 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                      deferred, idle_commits);
         }
         impl->report_start = now;
-        impl->presented = 0;
-        impl->skipped = 0;
         impl->from_cache = 0;
         impl->from_memory = 0;
     }
@@ -968,7 +1295,8 @@ void RendererMetal::Impl::RenderAppletCapture(
                                                 .format = Fmt::RGBA8Unorm,
                                                 .width = LinearWidth,
                                                 .height = LinearHeight,
-                                                .render_target = true});
+                                                .render_target = true,
+                                                .pixel_format_view = false});
     }
     if (!applet_capture) {
         return;
@@ -1019,7 +1347,8 @@ void RendererMetal::RenderScreenshot(std::span<const Tegra::FramebufferConfig> f
                                                                    .format = Fmt::BGRA8Unorm,
                                                                    .width = layout.width,
                                                                    .height = layout.height,
-                                                                   .render_target = true});
+                                                                   .render_target = true,
+                                                                   .pixel_format_view = false});
             impl->screenshot_width = layout.width;
             impl->screenshot_height = layout.height;
         }

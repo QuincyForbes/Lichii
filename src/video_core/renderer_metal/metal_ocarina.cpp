@@ -280,7 +280,8 @@ bool CameraMotionPass::Record(TextureHandle depth, std::array<u32, 2> extent,
                                         .format = Fmt::RG16Float,
                                         .width = extent[0],
                                         .height = extent[1],
-                                        .shader_write = true});
+                                        .shader_write = true,
+                                        .pixel_format_view = false});
         size = extent;
         if (!motion) {
             return false;
@@ -495,7 +496,8 @@ bool OcarinaTemporal::Resize(std::array<u32, 2> extent) {
                                       .width = extent[0],
                                       .height = extent[1],
                                       .render_target = render_target,
-                                      .shader_write = true});
+                                      .shader_write = true,
+                                      .pixel_format_view = false});
     };
     // The actor overlay draws into the motion.
     motion = make(Fmt::RG16Float, true);
@@ -700,7 +702,8 @@ void OcarinaTemporal::SaveEffectsBase(TextureHandle scene, std::array<u32, 2> ex
                                           .format = format,
                                           .width = extent[0],
                                           .height = extent[1],
-                                          .shader_write = true});
+                                          .shader_write = true,
+                                          .pixel_format_view = false});
         };
         effects = {};
         effects.extent = extent;

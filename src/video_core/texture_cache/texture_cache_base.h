@@ -72,6 +72,7 @@ struct ImageViewInOut {
     u32 index{};
     bool blacklist{};
     ImageViewId id{};
+    bool skip_cross_frame_guard = false;
 };
 
 /// The current draw's render targets as the asynchronous shaders' skip rule sees them
@@ -206,6 +207,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 native_critical_memory{};
     u64 native_expected_memory{};
     u64 budget_check_frames{};
+    u64 retention_limit{};
+    u64 retention_budget{}; ///< The lowest driver budget read lately (RetentionBudget)
     u64 logged_critical_memory{}; ///< The critical threshold of the last thresholds line logged
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
     u32 seen_host_pressure{};     ///< Common::PlatformEvents memory pressure already answered
@@ -523,9 +526,15 @@ public:
     /// descriptor with nothing to prepare; nullptr otherwise. Touches the image in the LRU once
     /// per frame, as preparing the view would.
     [[nodiscard]] BindingMemo* FindBinding(const BindingLookup& lookup, u32 tic_handle,
-                                           u32 tsc_index, u32 kind);
+                                           u32 tsc_index, u32 kind,
+                                           bool skip_cross_frame_guard = false);
     [[nodiscard]] BindingMemo* FindBinding(const BindingLookup& lookup, u32 tic_handle,
-                                           u32 tsc_index, u32 kind, const BindingProbe& probe);
+                                           u32 tsc_index, u32 kind, const BindingProbe& probe,
+                                           bool skip_cross_frame_guard = false);
+
+    /// True when a memo hit from before FillImageViews(subset) still holds after BindingClock()
+    /// changed during that partial resolve.
+    [[nodiscard]] bool MemoStillValid(const BindingMemo& memo) const noexcept;
 
     /// Changes with every event that can make a binding memo stale.
     [[nodiscard]] u64 BindingClock() const noexcept {
@@ -660,7 +669,8 @@ public:
     void CreateChannel(Tegra::Control::ChannelState& channel) final override;
 
     /// Prepare an image to be used
-    void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
+    void PrepareImage(ImageId image_id, bool is_modification, bool invalidate,
+                      bool skip_cross_frame_guard = false);
 
     Common::SpinRecursiveMutex mutex;
 
@@ -702,7 +712,7 @@ private:
     void RunGarbageCollector(bool out_of_memory, bool host_pressure = false);
 
     /// Find or create an image view in the guest descriptor table
-    ImageViewId VisitImageView(u32 index, bool compute);
+    ImageViewId VisitImageView(u32 index, bool compute, bool skip_cross_frame_guard = false);
 
     /// Find or create a framebuffer with the given render target parameters
     FramebufferId GetFramebufferId(const RenderTargets& key);
@@ -819,9 +829,15 @@ private:
         bool candidate_logged{};
         bool relocated_logged{};
         u32 same_frame_refused{}; ///< Since the last report (render-frame clock line)
+        std::array<u64, 3> last_guard_frame{};
     };
+    struct RelocationGuardedAddr {
+        u8 guard{};
+        std::array<u64, 3> last_guard_frame{};
+    };
+    static constexpr u64 RelocationGuardDecayFrames = 600;
     ::Common::unordered_map<u64, RelocationShape> relocation_shapes;
-    ::Common::unordered_map<GPUVAddr, u8> relocation_guarded_addresses;
+    ::Common::unordered_map<GPUVAddr, RelocationGuardedAddr> relocation_guarded_addresses;
     /// Since the last report (TickFrame, every 600 frames once a candidate was seen).
     u64 relocation_candidates{};
     u64 relocation_guarded{};
@@ -936,9 +952,11 @@ private:
     void RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr cpu_addr);
     void DropOverlapLinks(ImageId image_id);
     void NoteRelocationGuard(ImageBase& image, RelocationGuard reason);
-    void CheckCrossFrameUse(ImageBase& image, bool is_modification, bool invalidate) {
-        if (image.last_write_frame == ~u64{0} || RenderFrame() <= image.last_write_frame + 1 ||
-            invalidate) {
+    void DecayRelocationGuards();
+    void CheckCrossFrameUse(ImageBase& image, bool is_modification, bool invalidate,
+                            bool skip_guard = false) {
+        if (skip_guard || image.last_write_frame == ~u64{0} ||
+            RenderFrame() <= image.last_write_frame + 1 || invalidate) {
             return;
         }
         const RelocationGuard reason = is_modification ? GuardLoaded : GuardSampled;
@@ -958,7 +976,8 @@ private:
     [[nodiscard]] bool IsActiveRenderTarget(ImageId image_id) const noexcept;
 
     /// Prepare an image view to be used
-    void PrepareImageView(ImageViewId image_view_id, bool is_modification, bool invalidate);
+    void PrepareImageView(ImageViewId image_view_id, bool is_modification, bool invalidate,
+                          bool skip_cross_frame_guard = false);
 
     /// Execute copies from one image to the other, even if they are incompatible
     void CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies);
@@ -1044,6 +1063,7 @@ private:
     std::vector<u64> image_binding_serials;
     u64 binding_clock = 1;
     u64 binding_memo_epoch = 1; ///< every memo: an image rescaled
+    void EnsureBindingSerialSlot(ImageId image_id);
     void BumpBindingSerial(ImageId image_id);
     void BumpBindingEpoch() noexcept {
         binding_memo_epoch = ++binding_clock;
@@ -1080,7 +1100,11 @@ private:
     void MarkStale(const ImageBase& image);
     void ClearStale(DAddr addr, size_t size);
     void ClearStaleImage(const ImageBase& image);
+    Tegra::MemoryManager* WriteBackMemory(const ImageBase& image);
+    bool WriteBackImage(const ImageBase& image, std::span<const BufferImageCopy> copies,
+                        std::span<const u8> data);
     /// Clears every device range [gpu_addr, gpu_addr + size) maps to.
+    void ClearStaleGpu(Tegra::MemoryManager& memory, GPUVAddr gpu_addr, size_t size);
     void ClearStaleGpu(GPUVAddr gpu_addr, size_t size);
     [[nodiscard]] bool IsAllStale(DAddr addr, size_t size) const;
     void UpdateStaleTracking(u64 run_begin, u64 run_pages, s32 delta);
@@ -1200,8 +1224,20 @@ private:
     struct FeedbackShadow {
         ImageId id;
         u64 last_frame;
+        ImageId last_src_id{};
+        u64 last_src_mod_tick{};
+        SubresourceRange copied_range{};
     };
     std::vector<FeedbackShadow> feedback_shadows;
+    void InvalidateFeedbackShadowSource(ImageId src_id) noexcept {
+        for (FeedbackShadow& shadow : feedback_shadows) {
+            if (shadow.last_src_id == src_id) {
+                shadow.last_src_id = ImageId{};
+                shadow.last_src_mod_tick = 0;
+                shadow.copied_range = {};
+            }
+        }
+    }
 
     // Join caching
     boost::container::small_vector<ImageId, 4> join_overlap_ids;

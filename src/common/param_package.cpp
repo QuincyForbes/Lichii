@@ -5,7 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
-#include <stdexcept>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -93,12 +95,15 @@ int ParamPackage::Get(const std::string& key, int default_value) const {
         return default_value;
     }
 
-    try {
-        return std::stoi(pair->second);
-    } catch (const std::logic_error&) {
+    const char* begin = pair->second.c_str();
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(begin, &end, 10);
+    if (end == begin || errno == ERANGE || parsed < INT_MIN || parsed > INT_MAX) {
         LOG_ERROR(Common, "failed to convert {} to int", pair->second);
         return default_value;
     }
+    return static_cast<int>(parsed);
 }
 
 float ParamPackage::Get(const std::string& key, float default_value) const {
@@ -108,12 +113,15 @@ float ParamPackage::Get(const std::string& key, float default_value) const {
         return default_value;
     }
 
-    try {
-        return std::stof(pair->second);
-    } catch (const std::logic_error&) {
+    const char* begin = pair->second.c_str();
+    char* end = nullptr;
+    errno = 0;
+    const float parsed = std::strtof(begin, &end);
+    if (end == begin || errno == ERANGE) {
         LOG_ERROR(Common, "failed to convert {} to float", pair->second);
         return default_value;
     }
+    return parsed;
 }
 
 void ParamPackage::Set(const std::string& key, std::string value) {

@@ -107,6 +107,9 @@ public:
     std::shared_ptr<const GplLibrary> GetOrCreate(GplPart part, const std::string& key,
                                                   const Builder& build, u64 name);
 
+    /// True when `key` has already finished building in the cache.
+    [[nodiscard]] bool IsReady(const std::string& key);
+
     /// While set on a thread, libraries it builds are not kept in the cache (the graphics
     /// precache: only the driver's disk cache keeps them, 60,000 kept libraries would not fit).
     static void SetNoRetainOnThisThread(bool no_retain) noexcept;

@@ -4,11 +4,17 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <span>
 #include <utility>
 
 #include "common/common_types.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/memory_manager.h"
+
+namespace Shader {
+using HandleProgram = std::vector<u32>;
+} // namespace Shader
 
 namespace VideoCommon {
 
@@ -53,6 +59,71 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_mem
                },
                element)
         .value_or(0U);
+}
+
+/// Evaluates elements 0..count-1 of a handle program into `out`, caching constant buffer words and
+/// up to 64 SSBO base pointers across all elements of the array.
+template <typename MemoryReader>
+void EvaluateTextureHandles(std::span<const u32> program, u32 count,
+                            std::span<const GPUVAddr> cbuf_addrs,
+                            std::span<const GPUVAddr> ssbo_addrs, MemoryReader& memory,
+                            std::span<u32> out) {
+    const auto read_word = [&](GPUVAddr addr) -> u32 {
+        if constexpr (requires(GPUVAddr a) { memory.ReadHandleWord(a); }) {
+            return memory.ReadHandleWord(addr);
+        } else {
+            return memory.template Read<u32>(addr);
+        }
+    };
+    struct CbufWord {
+        u32 index;
+        u32 offset;
+        u32 value;
+    };
+    std::array<CbufWord, 16> words{};
+    size_t num_words = 0;
+    std::array<GPUVAddr, Shader::Info::MAX_SSBOS> bases{};
+    static_assert(Shader::Info::MAX_SSBOS <= 64);
+    u64 known_bases = 0;
+    const auto read_cbuf = [&](u32 index, u32 offset) -> u32 {
+        for (size_t i = 0; i < num_words; ++i) {
+            if (words[i].index == index && words[i].offset == offset) {
+                return words[i].value;
+            }
+        }
+        const GPUVAddr base = index < cbuf_addrs.size() ? cbuf_addrs[index] : GPUVAddr{};
+        const u32 value = base != 0 ? read_word(base + offset) : 0U;
+        if (num_words < words.size()) {
+            words[num_words++] = {index, offset, value};
+        }
+        return value;
+    };
+    const auto read_storage = [&](u32 binding, u32 offset) -> u32 {
+        if (binding >= bases.size()) {
+            return 0U;
+        }
+        const u64 bit = u64{1} << binding;
+        if ((known_bases & bit) == 0) {
+            bases[binding] = binding < ssbo_addrs.size() ? ssbo_addrs[binding] : GPUVAddr{};
+            known_bases |= bit;
+        }
+        const GPUVAddr base = bases[binding];
+        return base != 0 ? read_word(base + offset) : 0U;
+    };
+    const u32 n = static_cast<u32>((std::min<size_t>)(count, out.size()));
+    for (u32 element = 0; element < n; ++element) {
+        out[element] =
+            Shader::EvaluateHandleProgram(program, read_cbuf, read_storage, element).value_or(0U);
+    }
+}
+
+template <typename MemoryReader>
+void EvaluateTextureHandles(const Shader::HandleProgram& program, u32 count,
+                            std::span<const GPUVAddr> cbuf_addrs,
+                            std::span<const GPUVAddr> ssbo_addrs, MemoryReader& memory,
+                            std::span<u32> out) {
+    EvaluateTextureHandles(std::span<const u32>{program}, count, cbuf_addrs, ssbo_addrs, memory,
+                           out);
 }
 
 /// Whether texture descriptor `desc`'s handle word (element `index`) is where a storage buffer of

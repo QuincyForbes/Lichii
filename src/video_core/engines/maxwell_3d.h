@@ -3240,6 +3240,9 @@ public:
     /// Write the value to the register identified by method.
     void CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) override;
 
+    /// Drops a macro call left half-open by a truncated command entry.
+    void ClearPendingMacro();
+
     /// Split front: `words` GPU-written words at `arguments` are all the parameters of the macro
     /// that starts at `method`. When the macro only draws with them (FrontGpuArgumentDraw), its
     /// draw runs on the back from the words in GPU memory, without reading them here. False
@@ -3357,11 +3360,49 @@ private:
 
     void ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call);
 
-    u32 ProcessShadowRam(u32 method, u32 argument);
+    u32 ProcessShadowRam(u32 method, u32 argument) {
+        const auto control = shadow_state.shadow_ram_control;
+        if (control == Regs::ShadowRamControl::Track ||
+            control == Regs::ShadowRamControl::TrackWithFilter) {
+            return shadow_state.reg_array[method] = argument;
+        }
+        if (control == Regs::ShadowRamControl::Replay) {
+            return shadow_state.reg_array[method];
+        }
+        return argument;
+    }
 
-    void SetDirtyFlags(u32 method) noexcept;
+    void SetDirtyFlags(u32 method) noexcept {
+        const u8 f0 = dirty.tables[0][method];
+        const u8 f1 = dirty.tables[1][method];
+        if (f0 != 0) {
+            dirty.flags[f0] = true;
+        }
+        if (f1 != 0) {
+            dirty.flags[f1] = true;
+        }
+    }
 
-    void ProcessDirtyRegisters(u32 method, u32 argument);
+    void ProcessDirtyRegisters(u32 method, u32 argument) {
+        // The instances after the first are drawn together once their loop ends, and they must see
+        // the state they were begun with: NVN's draw macros reset the base instance (and its copy
+        // in c[0][0x644]) right after the loop, before the macro returns.
+        if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) {
+            draw_manager.DrawDeferred(*this, true);
+        }
+        if (super_macro_enabled && !execution_mask[method] && regs.reg_array[method] == argument) {
+            return;
+        }
+        regs.reg_array[method] = argument;
+        SetDirtyFlags(method);
+    }
+
+    void WriteStateRegister(u32 method, u32 method_argument) {
+        const u32 argument = ProcessShadowRam(method, method_argument);
+        if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
+            ProcessDirtyRegisters(method, argument);
+        }
+    }
 
     void ConsumeSinkImpl(Core::System& system) final;
 
@@ -3493,7 +3534,7 @@ private:
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                       u32 count);
     bool FrontRunOotMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
-                          u32 method, OotMacros::Id id);
+                          u32 method, OotMacros::Id id, std::span<const u32>& borrowed);
     struct OotContext;
     /// Tells the split a report just sent releases a known payload (GpuSplit::NoteRelease).
     void FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontState& fs, u32 query) const;
@@ -3524,6 +3565,7 @@ private:
     // EDEN_NX2_SKIP_SAME and EDEN_NX2_PERF_VERIFY, read in the constructor (after the switch
     // files are loaded): every method checks them, so no static guard on the hot path.
     bool skip_same_value_writes{true};
+    bool super_macro_enabled{true};
     bool perf_verify{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,
     // mode before, path), printed when the sides disagree.

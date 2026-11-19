@@ -268,7 +268,47 @@ namespace {
                            u64{256} << 20);
 }
 
+[[nodiscard]] bool TexturePoolEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_TEXTURE_POOL");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool IsPoolableDesc(const TextureDesc& d) noexcept {
+    return (d.kind == TextureKind::e2D || d.kind == TextureKind::e2DArray) && d.samples == 1 &&
+           d.depth == 1 && d.width > 0 && d.height > 0 && d.format != 0;
+}
+
+constexpr u64 MaxTexturePoolBytes = u64{256} << 20;
+constexpr u64 MaxTexturePoolIdleFrames = 120;
+
 } // Anonymous namespace
+
+size_t TextureCacheRuntime::TextureDescHash::operator()(const TextureDesc& d) const noexcept {
+    u64 h = 14695981039346656037ULL;
+    const auto mix = [&h](u64 v) {
+        h ^= v;
+        h *= 1099511628211ULL;
+    };
+    mix((u64{static_cast<u8>(d.kind)} << 32) | d.format);
+    mix((u64{d.width} << 32) | d.height);
+    mix((u64{d.depth} << 32) | d.levels);
+    mix((u64{d.layers} << 32) | d.samples);
+    mix((d.render_target ? 1U : 0U) | (d.shader_write ? 2U : 0U) |
+        (d.pixel_format_view ? 4U : 0U));
+    return static_cast<size_t>(h);
+}
+
+bool TextureCacheRuntime::TextureDescEqual::operator()(const TextureDesc& a,
+                                                       const TextureDesc& b) const noexcept {
+    return a.kind == b.kind && a.format == b.format && a.width == b.width &&
+           a.height == b.height && a.depth == b.depth && a.levels == b.levels &&
+           a.layers == b.layers && a.samples == b.samples &&
+           a.render_target == b.render_target && a.shader_write == b.shader_write &&
+           a.pixel_format_view == b.pixel_format_view;
+}
 
 TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
                                          StagingBufferPool& staging_buffer_pool_)
@@ -281,8 +321,99 @@ void TextureCacheRuntime::Finish() {
     scheduler.Finish();
 }
 
+void TextureCacheRuntime::TickFrame() {
+    ++pool_frame;
+    if (!TexturePoolEnabled()) {
+        TrimTexturePool(0);
+        return;
+    }
+    const u64 budget = GetDeviceLocalMemory();
+    const u64 used = DeviceAllocatedSize(device);
+    if (budget != 0 && (used >= budget || budget - used < (u64{256} << 20))) {
+        TrimTexturePool(0);
+        return;
+    }
+    while (!texture_pool_lru.empty() &&
+           pool_frame - texture_pool_lru.front().frame > MaxTexturePoolIdleFrames) {
+        auto it = texture_pool_lru.begin();
+        if (const auto idx = texture_pool_index.find(it->desc); idx != texture_pool_index.end()) {
+            std::erase(idx->second, it);
+            if (idx->second.empty()) {
+                texture_pool_index.erase(idx);
+            }
+        }
+        pooled_texture_bytes -= (std::min)(pooled_texture_bytes, it->bytes);
+        texture_pool_lru.pop_front();
+        ++pool_evicted;
+    }
+}
+
+std::pair<Object, u64> TextureCacheRuntime::AcquireTexture(const TextureDesc& tex_desc,
+                                                           bool* out_from_pool) {
+    if (out_from_pool != nullptr) {
+        *out_from_pool = false;
+    }
+    if (TexturePoolEnabled() && IsPoolableDesc(tex_desc)) {
+        if (const auto idx = texture_pool_index.find(tex_desc);
+            idx != texture_pool_index.end() && !idx->second.empty()) {
+            const auto lru_it = idx->second.back();
+            idx->second.pop_back();
+            if (idx->second.empty()) {
+                texture_pool_index.erase(idx);
+            }
+            Object tex = std::move(lru_it->texture);
+            const u64 tex_bytes = lru_it->bytes;
+            pooled_texture_bytes -= (std::min)(pooled_texture_bytes, tex_bytes);
+            texture_pool_lru.erase(lru_it);
+            ++pool_hits;
+            if (out_from_pool != nullptr) {
+                *out_from_pool = true;
+            }
+            return {std::move(tex), tex_bytes};
+        }
+        ++pool_misses;
+    }
+    Object tex = CreateTexture(device, tex_desc);
+    const u64 tex_bytes = tex ? AllocatedSize(tex.Get()) : 0;
+    return {std::move(tex), tex_bytes};
+}
+
+void TextureCacheRuntime::ReleaseTexture(const TextureDesc& tex_desc, Object&& tex,
+                                         u64 tex_bytes) {
+    if (!TexturePoolEnabled() || !tex || !IsPoolableDesc(tex_desc) || tex_bytes == 0 ||
+        tex_bytes > MaxTexturePoolBytes) {
+        return;
+    }
+    TrimTexturePool(MaxTexturePoolBytes - tex_bytes);
+    texture_pool_lru.push_back(PooledTexture{
+        .desc = tex_desc,
+        .texture = std::move(tex),
+        .bytes = tex_bytes,
+        .frame = pool_frame,
+    });
+    const auto lru_it = std::prev(texture_pool_lru.end());
+    texture_pool_index[tex_desc].push_back(lru_it);
+    pooled_texture_bytes += tex_bytes;
+    ++pool_recycled;
+}
+
+void TextureCacheRuntime::TrimTexturePool(u64 max_bytes) {
+    while (!texture_pool_lru.empty() && pooled_texture_bytes > max_bytes) {
+        auto it = texture_pool_lru.begin();
+        if (const auto idx = texture_pool_index.find(it->desc); idx != texture_pool_index.end()) {
+            std::erase(idx->second, it);
+            if (idx->second.empty()) {
+                texture_pool_index.erase(idx);
+            }
+        }
+        pooled_texture_bytes -= (std::min)(pooled_texture_bytes, it->bytes);
+        texture_pool_lru.pop_front();
+        ++pool_evicted;
+    }
+}
+
 StagingBufferRef TextureCacheRuntime::UploadStagingBuffer(size_t size, bool deferred) {
-    return staging_buffer_pool.Request(size, deferred);
+    return staging_buffer_pool.Request(size, deferred, true);
 }
 
 StagingBufferRef TextureCacheRuntime::DownloadStagingBuffer(size_t size, bool deferred) {
@@ -298,13 +429,14 @@ u64 TextureCacheRuntime::GetDeviceLocalMemory() const {
 }
 
 u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
-    return allocated_bytes + staging_buffer_pool.HeldBytes();
+    return allocated_bytes + pooled_texture_bytes + staging_buffer_pool.HeldBytes();
 }
 
 bool TextureCacheRuntime::ShouldReinterpret(Image& dst, Image& src) const noexcept {
     // Two formats of one Metal format keep their guest bits apart when one of them is swapped.
     return dst.HostFormat().format != src.HostFormat().format ||
-           dst.PackedShift() != src.PackedShift() || dst.Pack16() != src.Pack16();
+           dst.PackedShift() != src.PackedShift() || dst.Pack16() != src.Pack16() ||
+           dst.DepthBytesLayout() != src.DepthBytesLayout();
 }
 
 void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
@@ -1071,6 +1203,8 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         .shader_write = (host_format.storage ||
                          (FormatsExpanded() && LinearTwin(host_format.format) != 0)) &&
                         samples == 1,
+        .pixel_format_view = samples == 1 && host_format.format != Fmt::Depth32Float &&
+                             host_format.format != Fmt::Depth16Unorm,
     };
     if (UsesSparseTiles(runtime->device, info, host_format, converted, gpu_addr_)) {
         if (std::optional<SparseTexture> made = CreateSparseTexture(
@@ -1103,13 +1237,13 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
             return;
         }
     }
-    texture = CreateTexture(runtime->device, desc);
+    std::tie(texture, base_texture_bytes) = runtime->AcquireTexture(desc, &from_pool);
     if (!texture) {
         LOG_ERROR(Render_Metal, "Metal: texture {}x{}x{} format {} levels {} layers {} failed",
                   desc.width, desc.height, desc.depth, info.format, desc.levels, desc.layers);
         return;
     }
-    bytes = AllocatedSize(texture.Get());
+    bytes = base_texture_bytes;
     // Q27: a multisampled colour image gets a single-sampled shadow its passes resolve into, which
     // BlitImage's resolves consume (EDEN_NX2_METAL_MSAA_SHADOW=0: none).
     static const bool shadows_enabled = [] {
@@ -1124,7 +1258,8 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                                                     .width = desc.width,
                                                                     .height = desc.height,
                                                                     .layers = desc.layers,
-                                                                    .render_target = true});
+                                                                    .render_target = true,
+                                                                    .pixel_format_view = false});
         if (resolve_shadow) {
             bytes += AllocatedSize(resolve_shadow.Get());
             runtime->scheduler.SetResolveShadow(texture.Get(), resolve_shadow.Get());
@@ -1134,6 +1269,39 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
 }
 
 Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBase{params} {}
+
+void Image::ReleaseToPool() {
+    if (runtime == nullptr || !texture || sparse.tile_width != 0 ||
+        True(flags & (ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked))) {
+        return;
+    }
+    if (!IsPoolableDesc(desc) && (!scaled_texture || !IsPoolableDesc(scaled_desc))) {
+        return;
+    }
+    if (resolve_shadow) {
+        runtime->scheduler.SetResolveShadow(texture.Get(), nullptr);
+        resolve_shadow.Reset();
+    }
+    runtime->allocated_bytes -= bytes + scaled_bytes;
+    const u64 orig_base_bytes = base_texture_bytes;
+    const u64 orig_scaled_bytes = scaled_bytes;
+    bytes = 0;
+    base_texture_bytes = 0;
+    scaled_bytes = 0;
+    sample_grid.Reset();
+    if (IsPoolableDesc(desc)) {
+        runtime->ReleaseTexture(desc, std::move(texture), orig_base_bytes);
+    } else {
+        texture.Reset();
+    }
+    if (scaled_texture) {
+        if (IsPoolableDesc(scaled_desc)) {
+            runtime->ReleaseTexture(scaled_desc, std::move(scaled_texture), orig_scaled_bytes);
+        } else {
+            scaled_texture.Reset();
+        }
+    }
+}
 
 Image::~Image() {
     if (resolve_shadow && runtime != nullptr) {
@@ -1168,18 +1336,17 @@ bool Image::ScaleUp(bool ignore) {
         return false;
     }
     if (!scaled_texture) {
-        TextureDesc scaled = desc;
-        scaled.width = resolution.ScaleUp(desc.width);
+        scaled_desc = desc;
+        scaled_desc.width = resolution.ScaleUp(desc.width);
         if (info.type == ImageType::e2D) {
-            scaled.height = resolution.ScaleUp(desc.height);
+            scaled_desc.height = resolution.ScaleUp(desc.height);
         }
-        scaled_texture = CreateTexture(runtime->device, scaled);
+        std::tie(scaled_texture, scaled_bytes) = runtime->AcquireTexture(scaled_desc);
         if (!scaled_texture) {
             LOG_ONCE(warned_scaled, "Metal: a scaled {}x{} texture failed; images stay native",
-                     scaled.width, scaled.height);
+                     scaled_desc.width, scaled_desc.height);
             return false;
         }
-        scaled_bytes = AllocatedSize(scaled_texture.Get());
         runtime->allocated_bytes += scaled_bytes;
         has_scaled = true;
         ignore = false;
@@ -1319,6 +1486,8 @@ TextureHandle Image::SampleGrid() {
         grid.samples = 1;
         grid.render_target = true;
         grid.shader_write = false;
+        grid.pixel_format_view =
+            host_format.format != Fmt::Depth32Float && host_format.format != Fmt::Depth16Unorm;
         sample_grid = CreateTexture(runtime->device, grid);
         if (sample_grid) {
             bytes += AllocatedSize(sample_grid.Get());
@@ -1399,6 +1568,7 @@ std::optional<DepthLayout> Image::DepthBytesLayout() const {
     switch (info.format) {
     case PixelFormat::X8_D24_UNORM:
     case PixelFormat::D24_UNORM_S8_UINT:
+        return DepthLayout::Packed8_24;
     case PixelFormat::S8_UINT_D24_UNORM:
         return DepthLayout::Packed24_8;
     case PixelFormat::D32_FLOAT_S8_UINT:
@@ -1473,7 +1643,7 @@ bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
 }
 
 void Image::UploadMemory(BufferHandle buffer, size_t offset,
-                         std::span<const VideoCommon::BufferImageCopy> copies) {
+                         std::span<const VideoCommon::BufferImageCopy> copies, bool ahead) {
     if (!CanCopyWithBuffers()) {
         return;
     }
@@ -1523,7 +1693,7 @@ void Image::UploadMemory(BufferHandle buffer, size_t offset,
                 is_3d ? bytes_per_image : 0U, target,
                 static_cast<u32>(copy.image_subresource.base_level),
                 is_3d ? 0U : static_cast<u32>(copy.image_subresource.base_layer + layer),
-                ToOffset(copy.image_offset), extent);
+                ToOffset(copy.image_offset), extent, ahead && !multisampled && !rescaled);
         }
     }
     if (multisampled) {
@@ -1572,7 +1742,10 @@ void Image::UploadMemory(const StagingBufferRef& map,
             }
         });
     }
-    UploadMemory(map.buffer, map.offset, copies);
+    const bool ahead = runtime != nullptr && !rescaled && desc.samples == 1 &&
+                       !DepthBytesLayout() && (pack16 == 0 || info.type == ImageType::e3D) &&
+                       runtime->scheduler.CanUploadTextureAhead(texture.Get());
+    UploadMemory(map.buffer, map.offset, copies, ahead);
 }
 
 void Image::DownloadMemory(BufferHandle buffer, size_t offset,
@@ -1674,12 +1847,39 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const ImageViewInfo& info, Im
     is_render_target = info.IsRenderTarget();
     is_3d_slice = True(flags & ImageViewFlagBits::Slice);
     if (!is_render_target) {
-        swizzle = {HostSwizzle(info.x_source, host.swizzle), HostSwizzle(info.y_source, host.swizzle),
-                   HostSwizzle(info.z_source, host.swizzle), HostSwizzle(info.w_source, host.swizzle)};
+        using Tegra::Texture::SwizzleSource;
+        using VideoCore::Surface::SurfaceType;
+        const SurfaceType surface_type = VideoCore::Surface::GetFormatType(format);
+        std::array<u8, 4> view_swizzle{info.x_source, info.y_source, info.z_source, info.w_source};
+        const bool any_r = std::ranges::any_of(view_swizzle, [](u8 s) {
+            return static_cast<SwizzleSource>(s) == SwizzleSource::R;
+        });
+        const bool stencil_aspect =
+            format == PixelFormat::S8_UINT ||
+            ((format == PixelFormat::D24_UNORM_S8_UINT ||
+              format == PixelFormat::D32_FLOAT_S8_UINT) &&
+             !any_r) ||
+            (format == PixelFormat::S8_UINT_D24_UNORM && any_r);
+        if (stencil_aspect && image.HostFormat().format == Fmt::Depth32Float_Stencil8 &&
+            samples == 1) {
+            host_format = Fmt::X32_Stencil8;
+        }
+        if (surface_type == SurfaceType::Depth || surface_type == SurfaceType::Stencil ||
+            surface_type == SurfaceType::DepthStencil) {
+            for (u8& source : view_swizzle) {
+                if (static_cast<SwizzleSource>(source) == SwizzleSource::G) {
+                    source = static_cast<u8>(SwizzleSource::R);
+                }
+            }
+        }
+        swizzle = {HostSwizzle(view_swizzle[0], host.swizzle),
+                   HostSwizzle(view_swizzle[1], host.swizzle),
+                   HostSwizzle(view_swizzle[2], host.swizzle),
+                   HostSwizzle(view_swizzle[3], host.swizzle)};
     }
     // A render target in another format than its image draws through a view of that format.
-    if (image_texture != nullptr && host_format != image.HostFormat().format && !is_3d_slice &&
-        image_kind != TextureKind::e3D) {
+    if (image_texture != nullptr && host_format != image.HostFormat().format &&
+        host_format != Fmt::X32_Stencil8 && !is_3d_slice && image_kind != TextureKind::e3D) {
         render_view = CreateTextureView(image_texture, host_format, image_kind, 0,
                                         static_cast<u32>(image.info.resources.levels), 0,
                                         static_cast<u32>(image.info.resources.layers),
@@ -1952,7 +2152,9 @@ void* Sampler::HandleFor(const ImageView& view, bool is_depth) {
     if (has_added_anisotropy && !view.SupportsAnisotropy()) {
         key |= ReduceAnisotropy;
     }
-    if (has_linear_filtering && VideoCore::Surface::IsPixelFormatInteger(view.format)) {
+    if (has_linear_filtering &&
+        (VideoCore::Surface::IsPixelFormatInteger(view.format) ||
+         view.HostClass() == FormatClass::Stencil)) {
         key |= ForceNearest;
     }
     // A compare sampler read by a plain sample: Maxwell ignores the comparison.

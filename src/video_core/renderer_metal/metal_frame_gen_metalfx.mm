@@ -160,6 +160,31 @@ bool FrameInterpolator::IsSupported([[maybe_unused]] const Device& device) {
     return false;
 }
 
+bool FrameInterpolator::Prepare([[maybe_unused]] const Device& device,
+                                [[maybe_unused]] TextureHandle color,
+                                [[maybe_unused]] TextureHandle destination,
+                                [[maybe_unused]] std::array<u32, 2> size) {
+#ifdef LICHII_METALFX_FRAME_INTERPOLATOR
+    Impl& state = *impl;
+    if (state.failed) {
+        return false;
+    }
+    if (@available(iOS 26.0, macOS 26.0, *)) {
+        @autoreleasepool {
+            id<MTLTexture> color_texture = AsTexture(color);
+            id<MTLTexture> destination_texture = AsTexture(destination);
+            if (color_texture == nil || destination_texture == nil ||
+                !state.Prepare(device.GetDevice(), color_texture, destination_texture, size)) {
+                state.failed = true;
+                return false;
+            }
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
 bool FrameInterpolator::Generate([[maybe_unused]] const Device& device,
                                  [[maybe_unused]] Scheduler& scheduler,
                                  [[maybe_unused]] TextureHandle previous,

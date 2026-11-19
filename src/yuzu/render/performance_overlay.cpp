@@ -18,6 +18,9 @@
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
+#if defined(_WIN32) || defined(__linux__)
+#include "video_core/vulkan_common/ffx_runtime.h"
+#endif
 
 #include "main_window.h"
 
@@ -70,8 +73,15 @@ bool LosslessMissing() {
 #endif
 }
 
-QString FrameGenMethodLabel() {
-    return UiText::ChoiceNames<Settings::FrameGenType>()[Settings::values.frame_gen_type.GetValue()];
+QString FrameGenMethodLabel(bool nvidia_fg_active, bool generating) {
+    auto fg_type = Settings::values.frame_gen_type.GetValue();
+    if (nvidia_fg_active) {
+        fg_type = Settings::FrameGenType::NvidiaDlssG;
+    } else if (fg_type == Settings::FrameGenType::NvidiaDlssG && generating) {
+        fg_type = Settings::FrameGenType::Fsr3;
+    }
+    return UiText::ChoiceLabel(Settings::EnumMetadata<Settings::FrameGenType>::Index(),
+                               static_cast<u32>(fg_type));
 }
 
 bool QueryProcessRam(double& used_gb, double& free_gb) {
@@ -225,24 +235,56 @@ const QColor BuildingColor{255, 214, 10};
 // What draws the picture, by the names Settings gives it.
 QString UpscalerLabel() {
     if (Settings::values.upscaler.GetValue() == Settings::Upscaler::MetalFx) {
-        return UiText::ChoiceNames<Settings::Upscaler>()[Settings::Upscaler::MetalFx];
+        return UiText::ChoiceLabel(Settings::EnumMetadata<Settings::Upscaler>::Index(),
+                                   static_cast<u32>(Settings::Upscaler::MetalFx));
     }
     if (Settings::GameDlssNetworkChosen()) {
         return UiText::Text("overlay.game_dlss");
     }
     if (Settings::NvidiaDlssChosen()) {
-        const QString dlss_name = UiText::ChoiceNames<Settings::Upscaler>()[Settings::Upscaler::Dlss];
+        const QString dlss_name =
+            UiText::ChoiceLabel(Settings::EnumMetadata<Settings::Upscaler>::Index(),
+                                static_cast<u32>(Settings::Upscaler::Dlss));
 #ifdef EGLANTINE_STREAMLINE
         // What NVIDIA DLSS does in this game, not just the setting.
         const auto dlss = Vulkan::Streamline::GetSessionStatus();
-        return dlss.available && dlss.frames > 0 ? dlss_name
-               : dlss.available                  ? UiText::Text("overlay.dlss_idle").arg(dlss_name)
-                                                 : UiText::Text("overlay.dlss_off").arg(dlss_name);
+        if (dlss.available && dlss.frames > 0) {
+            QString label = dlss_name;
+            if (!dlss.mode_name.empty()) {
+                label += QLatin1Char(' ') + QString::fromStdString(dlss.mode_name);
+            }
+            if (!dlss.preset_name.empty()) {
+                label += QLatin1Char(' ') + QString::fromStdString(dlss.preset_name);
+            }
+            return label;
+        }
+        return dlss.available ? UiText::Text("overlay.dlss_idle").arg(dlss_name)
+                              : UiText::Text("overlay.dlss_off").arg(dlss_name);
 #else
         return dlss_name;
 #endif
     }
-    return UiText::ChoiceNames<Settings::ScalingFilter>()[Settings::values.scaling_filter.GetValue()];
+    if (Settings::AmdFsr4Chosen()) {
+        const QString fsr4_name =
+            UiText::ChoiceLabel(Settings::EnumMetadata<Settings::Upscaler>::Index(),
+                                static_cast<u32>(Settings::Upscaler::Fsr4));
+#if defined(_WIN32) || defined(__linux__)
+        const auto fsr4 = Vulkan::FfxRuntime::GetSessionStatus();
+        if (fsr4.available && fsr4.frames > 0) {
+            return fsr4_name;
+        }
+        return fsr4.available ? UiText::Text("overlay.dlss_idle").arg(fsr4_name)
+                              : UiText::Text("overlay.dlss_off").arg(fsr4_name);
+#else
+        return fsr4_name;
+#endif
+    }
+    if (Settings::values.upscaler.GetValue() == Settings::Upscaler::Fsr3) {
+        return UiText::ChoiceLabel(Settings::EnumMetadata<Settings::Upscaler>::Index(),
+                                   static_cast<u32>(Settings::Upscaler::Fsr3));
+    }
+    return UiText::ChoiceLabel(Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
+                               static_cast<u32>(Settings::values.scaling_filter.GetValue()));
 }
 
 } // namespace
@@ -451,15 +493,16 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
     }
 
     // What draws the frames.
+    const bool nvidia_fg_active = m_mainWindow != nullptr && m_mainWindow->IsNvidiaFrameGenActive();
     QString frame_gen = UiText::Text("value.off");
-    if (Settings::values.frame_gen.GetValue()) {
-        if (LosslessMissing()) {
-            frame_gen = UiText::Text("overlay.lossless_missing").arg(FrameGenMethodLabel());
+    if (Settings::values.frame_gen.GetValue() || nvidia_fg_active) {
+        const QString method = FrameGenMethodLabel(nvidia_fg_active, generating);
+        if (!nvidia_fg_active && LosslessMissing()) {
+            frame_gen = UiText::Text("overlay.lossless_missing").arg(method);
         } else if (generating) {
-            frame_gen =
-                UiText::Text("overlay.frame_gen_rate").arg(FrameGenMethodLabel()).arg(total_fps / fps, 0, 'f', 1);
+            frame_gen = UiText::Text("overlay.frame_gen_rate").arg(method).arg(total_fps / fps, 0, 'f', 1);
         } else {
-            frame_gen = UiText::Text("overlay.warming_up").arg(FrameGenMethodLabel());
+            frame_gen = UiText::Text("overlay.warming_up").arg(method);
         }
     }
     setLine(m_frameGen, UiText::Text("overlay.frame_gen").arg(frame_gen));

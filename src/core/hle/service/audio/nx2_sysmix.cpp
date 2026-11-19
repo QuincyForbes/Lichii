@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -20,8 +21,12 @@
 #include "common/logging.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/hle/ipc.h"
 #include "core/hle/kernel/k_event.h"
+#include "core/hle/kernel/k_light_lock.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/kernel.h"
 #include "core/hle/service/audio/errors.h"
 #include "core/hle/service/audio/nx2_sysmix.h"
 #include "core/hle/service/kernel_helpers.h"
@@ -37,6 +42,115 @@ constexpr u32 BlockFrames = 240;
 u64 AlignUp(u64 value, u64 alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
+
+bool IsVirtualOutputLoopbackName(std::string_view stream_name) {
+    constexpr std::string_view VirtualOutput = "AudioVirtualOutput0";
+    constexpr std::string_view Suffix = "<=AudioVirtualOutput0";
+    return stream_name == VirtualOutput || stream_name.ends_with(Suffix);
+}
+
+bool IsVirtualOutputLoopbackIpc(Kernel::KernelCore& kernel, Kernel::KProcess& process,
+                                u32 match_cmd_id, u64 stream_buffer, u64 stream_size,
+                                u32 stream_flags, u32 stream_id) {
+    if (Kernel::GetCurrentThreadPointer(kernel) == nullptr) {
+        return false;
+    }
+    auto& memory = process.GetMemory();
+    Kernel::KScopedLightLock lk{process.GetListLock()};
+    for (const auto& thread : process.GetThreadList()) {
+        const u64 tls = GetInteger(thread.GetTlsAddress());
+        if (tls == 0) {
+            continue;
+        }
+        std::array<u32, IPC::COMMAND_BUFFER_LENGTH> cmd_buf{};
+        if (!memory.ReadBlock(tls, cmd_buf.data(), sizeof(cmd_buf))) {
+            continue;
+        }
+        IPC::CommandHeader header{};
+        std::memcpy(&header, cmd_buf.data(), sizeof(header));
+        if (header.IsCloseCommand() || header.IsTipc() ||
+            (header.type != IPC::CommandType::Request &&
+             header.type != IPC::CommandType::RequestWithContext)) {
+            continue;
+        }
+        std::size_t idx = 2;
+        if (header.enable_handle_descriptor) {
+            if (idx >= cmd_buf.size()) {
+                continue;
+            }
+            IPC::HandleDescriptorHeader hd{};
+            std::memcpy(&hd, &cmd_buf[idx++], sizeof(hd));
+            idx +=
+                (hd.send_current_pid ? 2u : 0u) + hd.num_handles_to_copy + hd.num_handles_to_move;
+        }
+        const u32 num_x = header.num_buf_x_descriptors;
+        const u32 num_a = header.num_buf_a_descriptors;
+        const u32 num_b = header.num_buf_b_descriptors;
+        const u32 num_w = header.num_buf_w_descriptors;
+        if (idx + 2u * num_x + 3u * (num_a + num_b + num_w) > cmd_buf.size()) {
+            continue;
+        }
+        VAddr name_addr = 0;
+        u64 name_size = 0;
+        if (num_x > 0) {
+            IPC::BufferDescriptorX desc_x{};
+            std::memcpy(&desc_x, &cmd_buf[idx], sizeof(desc_x));
+            name_addr = desc_x.Address();
+            name_size = desc_x.Size();
+        }
+        idx += 2u * num_x;
+        if (num_a > 0) {
+            IPC::BufferDescriptorABW desc_a{};
+            std::memcpy(&desc_a, &cmd_buf[idx], sizeof(desc_a));
+            if (desc_a.Size() != 0) {
+                name_addr = desc_a.Address();
+                name_size = desc_a.Size();
+            }
+        }
+        idx += 3u * (num_a + num_b + num_w);
+        idx = (idx + 3u) & ~std::size_t{3};
+        constexpr u32 SfciMagic = Common::MakeMagic('S', 'F', 'C', 'I');
+        if (idx < cmd_buf.size() && cmd_buf[idx] != SfciMagic && idx + 4u < cmd_buf.size() &&
+            cmd_buf[idx + 4u] == SfciMagic) {
+            idx += 4u;
+        }
+        if (idx + 6u > cmd_buf.size() || cmd_buf[idx] != SfciMagic ||
+            cmd_buf[idx + 2u] != match_cmd_id) {
+            continue;
+        }
+        if (match_cmd_id == 1u) {
+            if (idx + 12u > cmd_buf.size()) {
+                continue;
+            }
+            const u32 req_device = cmd_buf[idx + 4u];
+            const u32 req_flags = cmd_buf[idx + 5u];
+            const u64 req_buffer = u64{cmd_buf[idx + 8u]} | (u64{cmd_buf[idx + 9u]} << 32);
+            const u64 req_size = u64{cmd_buf[idx + 10u]} | (u64{cmd_buf[idx + 11u]} << 32);
+            if (req_device != 2u || req_flags != stream_flags || req_buffer != stream_buffer ||
+                req_size != stream_size) {
+                continue;
+            }
+        } else if (match_cmd_id == 700u) {
+            if (cmd_buf[idx + 4u] != stream_id || cmd_buf[idx + 5u] != 2u) {
+                continue;
+            }
+        }
+        if (name_addr == 0 || name_size == 0) {
+            return false;
+        }
+        std::array<char, 0x100> raw_name{};
+        const std::size_t to_read =
+            static_cast<std::size_t>(std::min<u64>(name_size, raw_name.size() - 1));
+        if (!memory.ReadBlock(name_addr, raw_name.data(), to_read)) {
+            return false;
+        }
+        const char* const nul = std::char_traits<char>::find(raw_name.data(), to_read, '\0');
+        const std::string_view stream_name{
+            raw_name.data(), nul ? static_cast<std::size_t>(nul - raw_name.data()) : to_read};
+        return IsVirtualOutputLoopbackName(stream_name);
+    }
+    return false;
+}
 } // namespace
 
 struct SysmixOutput::Impl {
@@ -44,7 +158,10 @@ struct SysmixOutput::Impl {
          u64 buffer_, u64 size_, u32 creation_flags_, bool input_)
         : system{system_}, process{system.Kernel(), &process_}, sink{sink_},
           context{system, "sysmix"}, id{id_}, buffer{buffer_}, size{size_},
-          creation_flags{creation_flags_}, input_stream{input_} {
+          creation_flags{creation_flags_}, input_stream{input_},
+          loopback_input{input_ && IsVirtualOutputLoopbackIpc(system_.Kernel(), process_, 1u,
+                                                              buffer_, size_, creation_flags_,
+                                                              id_)} {
         state_event = context.CreateEvent("sysmix state");
         data_event = context.CreateEvent("sysmix data");
     }
@@ -75,10 +192,15 @@ struct SysmixOutput::Impl {
         host = nullptr;
     }
 
-    /// Replace a host microphone that failed to open or start with silence the guest can capture.
-    void UseSilentInput(u32 guest_channels) {
-        LOG_WARNING(Service_Audio,
-                    "sysmix stream {}: host microphone unavailable, capturing silence", id);
+    /// Stand in with synthesized 48 kHz silence for virtual-output loopback or missing microphones.
+    void UseSilentInput(u32 guest_channels, bool warn = true) {
+        if (warn) {
+            LOG_WARNING(Service_Audio,
+                        "sysmix stream {}: host microphone unavailable, capturing silence", id);
+        } else {
+            LOG_INFO(Service_Audio,
+                     "sysmix stream {}: virtual output loopback, capturing silence", id);
+        }
         ReleaseHost();
         silent_input = std::make_unique<AudioCore::Sink::SilentInputStream>(system, guest_channels);
         host = silent_input.get();
@@ -150,6 +272,7 @@ struct SysmixOutput::Impl {
     u64 size;
     u32 creation_flags;
     bool input_stream;
+    bool loopback_input;
     u32 channels{2};
     AudioCore::SampleFormat format{};
     u32 frame_bytes{};
@@ -230,21 +353,25 @@ Result SysmixOutput::Open(u32 sample_type, u32 channels, u32 rate, u32 frames, u
                  memory.Read32Acquire(p.buffer + WriteOffset, write) && read < slots &&
                  write < slots,
              ResultInvalidAddressInfo);
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-    if (p.input_stream) {
-        p.UseSilentInput(channels);
+    if (p.input_stream && p.loopback_input) {
+        p.UseSilentInput(channels, false);
     } else {
-        p.host = p.sink.AcquireSinkStream(p.system, channels, "sysmix-" + std::to_string(p.id),
-                                          AudioCore::Sink::StreamType::Sysmix);
-    }
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        if (p.input_stream) {
+            p.UseSilentInput(channels);
+        } else {
+            p.host = p.sink.AcquireSinkStream(p.system, channels, "sysmix-" + std::to_string(p.id),
+                                              AudioCore::Sink::StreamType::Sysmix);
+        }
 #else
-    p.host = p.sink.AcquireSinkStream(p.system, channels, "sysmix-" + std::to_string(p.id),
-                                      p.input_stream ? AudioCore::Sink::StreamType::In
-                                                     : AudioCore::Sink::StreamType::Sysmix);
-    if (p.input_stream && (!p.host || !p.host->IsReady())) {
-        p.UseSilentInput(channels);
-    }
+        p.host = p.sink.AcquireSinkStream(p.system, channels, "sysmix-" + std::to_string(p.id),
+                                          p.input_stream ? AudioCore::Sink::StreamType::In
+                                                         : AudioCore::Sink::StreamType::Sysmix);
+        if (p.input_stream && (!p.host || !p.host->IsReady())) {
+            p.UseSilentInput(channels);
+        }
 #endif
+    }
     if (!p.host || !p.host->IsReady()) {
         p.ReleaseHost();
         R_RETURN(ResultOperationFailed);
@@ -280,6 +407,12 @@ Result SysmixOutput::SetEngaged(bool engaged) {
         R_SUCCEED();
     }
     if (engaged) {
+        if (p.input_stream && !p.loopback_input &&
+            IsVirtualOutputLoopbackIpc(p.system.Kernel(), *p.process, 700u, p.buffer, p.size,
+                                       p.creation_flags, p.id)) {
+            p.loopback_input = true;
+            p.UseSilentInput(p.channels, false);
+        }
         p.host->Start();
         if (p.input_stream && (!p.host->IsReady() || p.host->IsPaused())) {
             p.UseSilentInput(p.channels);
@@ -358,7 +491,7 @@ u32 SysmixOutput::GetState() const {
     return impl->open && !impl->faulted ? (impl->engaged ? 2 : 1) : 0;
 }
 
-/// Transfer a bounded PCM block between host audio and the guest ring, preserving cursor ownership.
+/// Transfer bounded PCM between host audio and the guest ring, preserving cursor ownership.
 void SysmixOutput::Pump() {
     auto& p = *impl;
     std::unique_lock lock{p.mutex, std::try_to_lock};
@@ -437,91 +570,115 @@ void SysmixOutput::Pump() {
         }
         return;
     }
-    const u32 taken = std::min(filled, BlockFrames);
-    // A short block is padded with silence. That is right for a real underrun, but while the host
-    // still has audio to play the guest is only a little behind this tick, and padding would cut a
-    // gap into continuous audio. Wait for a whole block until the host drains, so a guest that
-    // waits on fewer than BlockFrames frames (a high notification threshold) still makes progress.
-    // The queue size alone is not enough: it is zero while the last block is still playing.
-    if (taken < BlockFrames && p.host->HasPendingAudio()) {
-        ++p.counters.deferred;
-        p.Notify(filled);
-        return;
-    }
-    const u32 first = std::min(taken, p.slots - read);
-    const u32 second = taken - first;
-    auto& memory = p.process->GetMemory();
-    if ((first && !memory.ReadBlock(p.buffer + PayloadOffset + u64{read} * p.frame_bytes,
-                                    p.input.data(), first * p.frame_bytes)) ||
-        (second &&
-         !memory.ReadBlock(p.buffer + PayloadOffset, p.input.data() + first * p.frame_bytes,
-                           second * p.frame_bytes))) {
-        p.Fault();
-        return;
-    }
-    p.counters.copied_frames += taken;
-    p.output.fill(0);
-    u32 nonzero{};
-    for (u32 frame = 0; frame < taken; ++frame) {
-        bool audible{};
-        for (u32 channel = 0; channel < 2; ++channel) {
-            const u32 index = frame * 2 + channel;
-            f32 value;
-            if (p.format == AudioCore::SampleFormat::PcmInt16) {
-                s16 sample;
-                std::memcpy(&sample, p.input.data() + index * sizeof(sample), sizeof(sample));
-                value = static_cast<f32>(sample) / 32768.0f;
-            } else {
-                std::memcpy(&value, p.input.data() + index * sizeof(value), sizeof(value));
-            }
-            if (std::isfinite(value)) {
-                const auto sample =
-                    static_cast<s32>(std::clamp(value * p.gain, -1.0f, 1.0f) * 32768.0f);
-                p.output[index] = static_cast<s16>(std::clamp(sample, -32768, 32767));
-                audible |= p.output[index] != 0;
-            }
-        }
-        nonzero += audible;
-    }
-    AudioCore::Sink::SinkBuffer block{BlockFrames, 0, p.counters.admitted_blocks, false};
-    if (!p.host->TryAppendOutputBlock(block, p.output)) {
-        if (!p.host->IsReady()) {
-            p.Fault(ResultOperationFailed);
-            return;
-        }
+    // Host callbacks need several guest blocks at once (for example 1024 versus 240 frames).
+    // Once the host has requested frames, refill the bounded host queue from available whole
+    // blocks so submillisecond timer jitter cannot insert silence while PCM is waiting in the
+    // guest ring. Before a host callback runs (including discard sinks with no callback), admit
+    // one block per tick to preserve guest PCM pacing.
+    const bool refill_headroom = p.host->HasHostCallback();
+    const u32 queue_limit = refill_headroom ? p.host->SysmixQueueLimit() : 1U;
+    const u32 queued = refill_headroom ? p.host->GetQueueSize() : 0U;
+    if (refill_headroom && queued >= queue_limit) {
         ++p.counters.backpressure;
-        p.counters.retried_frames += taken;
-        if (p.counters.backpressure <= 3) {
-            LOG_INFO(Service_Audio, "sysmix stream {} host full: accepted={} blocks={}", p.id,
-                     p.counters.accepted_frames, p.counters.admitted_blocks);
-        }
         if (p.counters.ticks % 400 == 0) {
             p.LogStatus(filled);
         }
         return;
     }
-    ++p.counters.admitted_blocks;
-    if (taken < BlockFrames) {
-        p.counters.padded_frames += BlockFrames - taken;
+    bool log_status = p.counters.admitted_blocks < 3 || p.counters.ticks % 400 == 0;
+    for (u32 block_index = queued; block_index < queue_limit; ++block_index) {
+        const u32 taken = std::min(filled, BlockFrames);
+        // A short block is padded with silence. That is right for a real underrun, but while the
+        // host still has audio to play the guest is only a little behind this tick, and padding
+        // would cut a gap into continuous audio. Wait for a whole block until the host drains, so a
+        // guest that waits on fewer than BlockFrames frames (a high notification threshold) still
+        // makes progress. The queue size alone is not enough: it is zero while the last block is
+        // still playing.
+        if (taken < BlockFrames && p.host->HasPendingAudio()) {
+            ++p.counters.deferred;
+            p.Notify(filled);
+            return;
+        }
+        const u32 first = std::min(taken, p.slots - read);
+        const u32 second = taken - first;
+        auto& memory = p.process->GetMemory();
+        if ((first && !memory.ReadBlock(p.buffer + PayloadOffset + u64{read} * p.frame_bytes,
+                                        p.input.data(), first * p.frame_bytes)) ||
+            (second &&
+             !memory.ReadBlock(p.buffer + PayloadOffset, p.input.data() + first * p.frame_bytes,
+                               second * p.frame_bytes))) {
+            p.Fault();
+            return;
+        }
+        p.counters.copied_frames += taken;
+        p.output.fill(0);
+        u32 nonzero{};
+        for (u32 frame = 0; frame < taken; ++frame) {
+            bool audible{};
+            for (u32 channel = 0; channel < 2; ++channel) {
+                const u32 index = frame * 2 + channel;
+                f32 value;
+                if (p.format == AudioCore::SampleFormat::PcmInt16) {
+                    s16 sample;
+                    std::memcpy(&sample, p.input.data() + index * sizeof(sample), sizeof(sample));
+                    value = static_cast<f32>(sample) / 32768.0f;
+                } else {
+                    std::memcpy(&value, p.input.data() + index * sizeof(value), sizeof(value));
+                }
+                if (std::isfinite(value)) {
+                    const auto sample =
+                        static_cast<s32>(std::clamp(value * p.gain, -1.0f, 1.0f) * 32768.0f);
+                    p.output[index] = static_cast<s16>(std::clamp(sample, -32768, 32767));
+                    audible |= p.output[index] != 0;
+                }
+            }
+            nonzero += audible;
+        }
+        AudioCore::Sink::SinkBuffer block{BlockFrames, 0, p.counters.admitted_blocks, false};
+        if (!p.host->TryAppendOutputBlock(block, p.output)) {
+            if (!p.host->IsReady()) {
+                p.Fault(ResultOperationFailed);
+                return;
+            }
+            ++p.counters.backpressure;
+            p.counters.retried_frames += taken;
+            if (p.counters.backpressure <= 3) {
+                LOG_INFO(Service_Audio, "sysmix stream {} host full: accepted={} blocks={}", p.id,
+                         p.counters.accepted_frames, p.counters.admitted_blocks);
+            }
+            if (p.counters.ticks % 400 == 0) {
+                p.LogStatus(filled);
+            }
+            return;
+        }
+        ++p.counters.admitted_blocks;
+        if (taken < BlockFrames) {
+            p.counters.padded_frames += BlockFrames - taken;
+        }
+        const u32 next = (read + taken) % p.slots;
+        u32 checked{};
+        if (!memory.Read32Acquire(p.buffer + ReadOffset, checked) || checked != read ||
+            !memory.WriteExclusive32(p.buffer + ReadOffset, next, read) ||
+            !memory.Read32Acquire(p.buffer + ReadOffset, checked) || checked != next) {
+            p.Fault();
+            return;
+        }
+        p.consumer = next;
+        p.counters.accepted_frames += taken;
+        p.counters.nonzero_frames += nonzero;
+        if (!p.ReadOccupancy(read, write, filled)) {
+            p.Fault();
+            return;
+        }
+        p.Notify(filled);
+        log_status |= nonzero && p.counters.nonzero_frames == nonzero;
+        // Never pad another block merely to fill host headroom. Leave a short guest tail for the
+        // next tick; the existing empty-host path above can still pad a genuine underrun.
+        if (filled < BlockFrames) {
+            break;
+        }
     }
-    const u32 next = (read + taken) % p.slots;
-    u32 checked{};
-    if (!memory.Read32Acquire(p.buffer + ReadOffset, checked) || checked != read ||
-        !memory.WriteExclusive32(p.buffer + ReadOffset, next, read) ||
-        !memory.Read32Acquire(p.buffer + ReadOffset, checked) || checked != next) {
-        p.Fault();
-        return;
-    }
-    p.consumer = next;
-    p.counters.accepted_frames += taken;
-    p.counters.nonzero_frames += nonzero;
-    if (!p.ReadOccupancy(read, write, filled)) {
-        p.Fault();
-        return;
-    }
-    p.Notify(filled);
-    if (p.counters.admitted_blocks <= 3 || p.counters.ticks % 400 == 0 ||
-        (nonzero && p.counters.nonzero_frames == nonzero)) {
+    if (log_status) {
         p.LogStatus(filled);
     }
 }

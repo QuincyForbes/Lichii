@@ -24,6 +24,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_host_import.h"
+#include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -136,7 +137,11 @@ public:
         return (vertex_repack_mask & (1U << binding)) != 0;
     }
 
-    u64 CurrentTick();
+    /// Scheduler::CurrentTick, inline: the stream uniform reuse asks for it on every small
+    /// uniform buffer bind.
+    u64 CurrentTick() const noexcept {
+        return master_semaphore.CurrentTick();
+    }
 
     bool IsFree(u64 tick);
 
@@ -293,16 +298,10 @@ public:
         return allocation_size != size ? ref.mapped_span.first(size) : ref.mapped_span;
     }
 
-    /// Whether EDEN_NX2_HOST_IMPORT is on when it is not set: the NVIDIA proprietary driver on
-    /// Linux, where importing the guest memory was measured (RADV refuses the memfd backing,
-    /// and Windows and macOS are not verified). The emulator copies instead if an import fails.
+    /// Off unless explicitly enabled via EDEN_NX2_HOST_IMPORT=1: imported guest pages lack
+    /// COW/trap holds against concurrent guest CPU writes while GPU command buffers are in flight.
     [[nodiscard]] bool HostImportByDefault() const noexcept {
-#if defined(__linux__) && !defined(__ANDROID__)
-        return device.IsExtExternalMemoryHost() &&
-               device.GetDriverID() == VK_DRIVER_ID_NVIDIA_PROPRIETARY;
-#else
         return false;
-#endif
     }
 
     /// Binds the guest's own memory at `host_ptr` as a uniform buffer, with no copy (the host GPU
@@ -310,11 +309,14 @@ public:
     /// meet the uniform buffer alignment; the caller then copies as usual.
     bool TryBindImportedUniformBuffer(const u8* host_ptr, u32 size) {
         const u64 alignment = device.GetUniformBufferAlignment();
-        if (alignment > 1 && (reinterpret_cast<uintptr_t>(host_ptr) & 0xfff) % alignment != 0) {
+        if (alignment > 1 && (reinterpret_cast<uintptr_t>(host_ptr) % alignment) != 0) {
             return false;
         }
         HostImporter::Ref ref;
         if (!host_importer.Get(host_ptr, size, ref)) {
+            return false;
+        }
+        if (alignment > 1 && (ref.offset % alignment) != 0) {
             return false;
         }
         guest_descriptor_queue.AddBuffer(ref.buffer, ref.address, ref.offset, size);
@@ -420,6 +422,7 @@ private:
     const Device& device;
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
+    const MasterSemaphore& master_semaphore; ///< The scheduler's, for CurrentTick
     StagingBufferPool& staging_pool;
     HostImporter host_importer{device};
     GuestDescriptorQueue& guest_descriptor_queue;

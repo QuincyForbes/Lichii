@@ -5,10 +5,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <memory>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -30,6 +31,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/renderer_metal/metal_bind_memo.h"
 #include "video_core/renderer_metal/metal_draw_desc.h"
 #include "video_core/renderer_metal/metal_pipeline_cache.h"
 #include "video_core/renderer_metal/metal_resources.h"
@@ -96,7 +98,9 @@ Object SharedLibrary(const Device& device, const std::string& source, std::strin
     };
     static std::mutex cache_mutex;
     static std::unordered_map<u64, std::shared_ptr<Entry>> cache;
-    const u64 key = Common::CityHash64(source.data(), source.size()) ^ (u64{source.size()} << 40);
+    const u64 device_bits = static_cast<u64>(reinterpret_cast<std::uintptr_t>(DeviceHandle(device)));
+    const u64 key = Common::CityHash64(source.data(), source.size()) ^ (u64{source.size()} << 40) ^
+                    (device_bits * 0x9E3779B97F4A7C15ULL);
     std::shared_ptr<Entry> entry;
     bool owner = false;
     {
@@ -227,12 +231,71 @@ GraphicsPipeline::GraphicsPipeline(const GraphicsPipelineKey& key_, StageProgram
     : key{key_}, vertex{std::move(vertex_)}, fragment{std::move(fragment_)},
       mesh{std::move(mesh_)}, tessellation{std::move(tessellation_)},
       native_mesh{std::move(native_mesh_)}, xfb{std::move(xfb_)}, geometry{std::move(geometry_)} {
-    if (!fragment.entry_point.empty()) {
-        for (size_t index = 0; index < fragment.info.interpolation.size(); ++index) {
+    const StageProgram& frag =
+        !fragment.entry_point.empty()
+            ? fragment
+            : (native_mesh && !native_mesh->fragment.entry_point.empty() ? native_mesh->fragment
+                                                                         : fragment);
+    const Shader::Info* const pre_info =
+        native_mesh                              ? &native_mesh->mesh.info
+        : (tessellation && tessellation->domain) ? &tessellation->domain->evaluate.program.info
+        : !vertex.entry_point.empty()            ? &vertex.info
+                                                 : nullptr;
+    if (!frag.entry_point.empty()) {
+        for (size_t index = 0; index < frag.info.interpolation.size(); ++index) {
             flat_inputs = flat_inputs ||
-                          (fragment.info.loads.Generic(index) &&
-                           fragment.info.interpolation[index] == Shader::Interpolation::Flat);
+                          (frag.info.loads.Generic(index) &&
+                           frag.info.interpolation[index] == Shader::Interpolation::Flat &&
+                           (pre_info == nullptr || pre_info->stores.Generic(index)));
         }
+    }
+
+    const auto build_stage_kinds = [](StageProgram& stage) {
+        stage.binding_kinds.clear();
+        if (!stage.entry_point.empty()) {
+            BindMemo::AppendKinds(stage.info, 0, stage.binding_kinds);
+        }
+    };
+    const auto append_stage_kinds = [](const StageProgram& stage, std::vector<u32>& out) {
+        if (!stage.entry_point.empty()) {
+            out.insert(out.end(), stage.binding_kinds.begin(), stage.binding_kinds.end());
+        }
+    };
+    build_stage_kinds(vertex);
+    build_stage_kinds(fragment);
+    append_stage_kinds(vertex, default_binding_kinds);
+    append_stage_kinds(fragment, default_binding_kinds);
+    if (native_mesh) {
+        build_stage_kinds(native_mesh->object);
+        build_stage_kinds(native_mesh->mesh);
+        build_stage_kinds(native_mesh->fragment);
+        append_stage_kinds(native_mesh->object, native_binding_kinds);
+        append_stage_kinds(native_mesh->mesh, native_binding_kinds);
+        append_stage_kinds(native_mesh->fragment, native_binding_kinds);
+    }
+    if (mesh) {
+        build_stage_kinds(mesh->first.program);
+        build_stage_kinds(mesh->mesh.program);
+        append_stage_kinds(mesh->first.program, mesh_emulation_binding_kinds);
+        if (mesh->has_task) {
+            append_stage_kinds(mesh->mesh.program, mesh_emulation_binding_kinds);
+        }
+        append_stage_kinds(fragment, mesh_emulation_binding_kinds);
+    }
+    if (tessellation) {
+        for (StageProgram& v : tessellation->vertex) {
+            build_stage_kinds(v);
+        }
+        build_stage_kinds(tessellation->control.program);
+        if (tessellation->domain) {
+            build_stage_kinds(tessellation->domain->evaluate.program);
+        }
+    }
+    if (geometry) {
+        for (StageProgram& c : geometry->capture) {
+            build_stage_kinds(c);
+        }
+        build_stage_kinds(geometry->kernel.program);
     }
 }
 
@@ -463,10 +526,11 @@ bool GraphicsPipeline::BuildNativeFunctions(const Device& device) {
             continue;
         }
         std::string error;
-        BuildProgramLibrary(device, *stage, error);
+        BuildProgramLibrary(device, *stage, error, stage == &native_mesh->fragment);
         stage->function = stage->library ? CreateFunction(stage->library.Get(), stage->entry_point)
                                          : Object{};
         if (!stage->function) {
+            stage->reduction_variants = false;
             FailNative(fmt::format("{} function not built: {}",
                                    stage == &native_mesh->object ? "object"
                                    : stage == &native_mesh->mesh ? "mesh"
@@ -521,14 +585,18 @@ bool GraphicsPipeline::BuildFunctions(const Device& device) {
     return true;
 }
 
-std::optional<MeshFunctions> GraphicsPipeline::NativeFunctions() const noexcept {
+std::optional<MeshFunctions> GraphicsPipeline::NativeFunctions(u32 reducing) const noexcept {
     if (!native_mesh || native_mesh->failed) {
         return std::nullopt;
     }
+    const StageProgram& frag = native_mesh->fragment;
+    const void* const fragment_function =
+        (reducing & ReducingFragment) != 0 && frag.reducing_function ? frag.reducing_function.Get()
+                                                                     : frag.function.Get();
     return MeshFunctions{
         .object_function = native_mesh->object.function.Get(),
         .mesh_function = native_mesh->mesh.function.Get(),
-        .fragment_function = native_mesh->fragment.function.Get(),
+        .fragment_function = fragment_function,
         .payload_bytes = native_mesh->payload_bytes,
         .object_threads = native_mesh->object_threads,
         .mesh_threads = native_mesh->mesh_threads,
@@ -536,7 +604,7 @@ std::optional<MeshFunctions> GraphicsPipeline::NativeFunctions() const noexcept 
 }
 
 u64 GraphicsPipeline::StateHash(RenderPipelineDesc& desc, u32 reducing) const noexcept {
-    if (const std::optional<MeshFunctions> native = NativeFunctions()) {
+    if (const std::optional<MeshFunctions> native = NativeFunctions(reducing)) {
         desc.vertex_function = native->mesh_function;
         desc.fragment_function = native->fragment_function;
     } else {
@@ -567,7 +635,7 @@ void* GraphicsPipeline::RenderState(const Device& device, RenderPipelineDesc& de
     if (const std::optional<void*> found = FindState(hash)) {
         return *found;
     }
-    const std::optional<MeshFunctions> native = NativeFunctions();
+    const std::optional<MeshFunctions> native = NativeFunctions(reducing);
     std::string error;
     if (native) {
         Object state = CreateMeshRenderPipelineState(device, desc, *native, error, archive);
@@ -613,7 +681,9 @@ void* GraphicsPipeline::AdoptState(u64 hash, const RenderPipelineDesc& desc, Obj
 }
 
 ComputePipeline::ComputePipeline(const ComputePipelineKey& key_, StageProgram program_)
-    : key{key_}, program{std::move(program_)} {}
+    : key{key_}, program{std::move(program_)} {
+    BindMemo::AppendKinds(program.info, BindMemo::Kind::ComputeBit, program.binding_kinds);
+}
 
 void* ComputePipeline::State(const Device& device) {
     if (state || failed) {
@@ -686,9 +756,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory,
     if (const u32 threads = AsyncPipelineThreads(); threads != 0) {
         // Background QoS: a draw that waits for a build runs it itself or lends it its own.
         const u32 apple_family = DeviceAppleFamily(device);
+        const bool supports_mesh_shaders = DeviceSupportsMeshShaders(device);
         builders = std::make_unique<Common::StatefulThreadWorker<PipelineTranslator>>(
             threads, "MetalPipelineBuilder",
-            [apple_family] { return PipelineTranslator{TranslateForIos, apple_family}; },
+            [apple_family, supports_mesh_shaders] {
+                return PipelineTranslator{TranslateForIos, apple_family, supports_mesh_shaders};
+            },
             Common::ThreadPlacement::Background);
         LOG_INFO(Render_Metal, "Metal: pipelines first seen in a run are built on {} threads "
                                "(EDEN_NX2_METAL_ASYNC_PIPELINES)",
@@ -1333,7 +1406,7 @@ void* PipelineCache::RenderState(GraphicsPipeline& pipeline, RenderPipelineDesc&
         }
         auto build = std::make_shared<StateBuild>();
         build->desc = desc;
-        build->native = pipeline.NativeFunctions();
+        build->native = pipeline.NativeFunctions(reducing);
         StateBuild* const raw = build.get();
         build->job = std::make_shared<PipelineBuildJob>([this, raw](PipelineTranslator&) {
             InAutoreleasePool([&] {

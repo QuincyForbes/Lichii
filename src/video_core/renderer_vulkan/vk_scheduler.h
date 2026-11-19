@@ -16,7 +16,9 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <queue>
 #include <source_location>
@@ -112,6 +114,10 @@ public:
     /// Waits for the worker thread to finish executing everything. After this function returns it's
     /// safe to touch worker resources.
     void WaitWorker();
+
+    [[nodiscard]] std::unique_lock<std::mutex> PauseWorker() {
+        return std::unique_lock{execution_mutex};
+    }
 
     /// The next submission without a wait semaphore of its own waits for this binary semaphore
     /// (MetalFX work submitted outside the scheduler, see present/metalfx_context.h).
@@ -253,6 +259,10 @@ public:
         render_pass_depth_written = true;
     }
 
+    void MarkRenderPassUsedXfb() noexcept {
+        render_pass_used_xfb = true;
+    }
+
     /// Whether the active render pass may have written its depth/stencil attachment (a clear
     /// when it began, or a draw or clear since).
     [[nodiscard]] bool RenderPassWroteDepthStencil() const {
@@ -300,7 +310,12 @@ public:
         }
         state.descriptor_buffer_bound = true;
         state.descriptor_buffer_chunk = descriptor_chunk;
+        ++state.descriptor_buffer_bind_serial;
         return true;
+    }
+
+    [[nodiscard]] u64 DescriptorBufferBindSerial() const noexcept {
+        return state.descriptor_buffer_bind_serial;
     }
 
     /// Marks the descriptor buffer as unbound (e.g. after vkCmdBindDescriptorSets on any bind
@@ -577,12 +592,22 @@ private:
 
     class CommandChunk final {
     public:
+        ~CommandChunk() {
+            auto* command = first;
+            while (command != nullptr) {
+                auto* next = command->GetNext();
+                command->~Command();
+                command = next;
+            }
+        }
+
         /// By reference: a command may start a new command buffer (SplitBeforePass).
         void ExecuteAll(const vk::CommandBuffer& cmdbuf, const vk::CommandBuffer& upload_cmdbuf);
 
         template <typename T>
         bool Record(T& command) {
             using FuncType = TypedCommand<T>;
+            static_assert(std::is_nothrow_destructible_v<std::decay_t<T>>);
             static_assert(sizeof(FuncType) < sizeof(data), "Lambda is too large");
 
             command_offset = Common::AlignUp(command_offset, alignof(FuncType));
@@ -638,6 +663,7 @@ private:
         bool needs_state_enable_refresh = false;
         u32 descriptor_buffer_chunk = 0;
         bool descriptor_buffer_bound = false;
+        u64 descriptor_buffer_bind_serial = 1;
         /// Known only inside one render pass: commands recorded between passes (compute
         /// dispatches, compute passes) push at the same offsets without InvalidateState.
         PushedConstants<24> pushed_rescaling_words;
@@ -714,6 +740,7 @@ private:
     FragmentBarrierState fragment_barrier;
     bool render_pass_has_stores{};
     bool render_pass_depth_written{};
+    bool render_pass_used_xfb{};
     bool compute_writes_pending{};
     bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;

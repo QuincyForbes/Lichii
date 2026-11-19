@@ -51,6 +51,8 @@ SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
 SWITCHABLE(Upscaler, false);
+SWITCHABLE(DlssQuality, false);
+SWITCHABLE(DlssPreset, false);
 SWITCHABLE(OotMovieUpscale, false);
 SWITCHABLE(TextureQuality, false);
 SWITCHABLE(OotResolution, false);
@@ -565,6 +567,7 @@ OotResolution OcarinaUpscaledResolution(OotResolution resolution, Upscaler upsca
     }
     switch (upscaler) {
     case Upscaler::Fsr3:
+    case Upscaler::Fsr4:
     case Upscaler::Dlss:
     case Upscaler::MetalFx:
         return docked ? OotResolution::Full : OotResolution::Percent75;
@@ -590,6 +593,7 @@ ResolutionSetup EffectiveResolutionSetup() {
     }
     switch (values.upscaler.GetValue()) {
     case Upscaler::Fsr3:
+    case Upscaler::Fsr4:
     case Upscaler::Dlss:
     case Upscaler::MetalFx:
         return ResolutionSetup::Res1X;
@@ -612,6 +616,10 @@ bool NvidiaDlssChosen() {
     return values.upscaler.GetValue() == Upscaler::Dlss;
 }
 
+bool AmdFsr4Chosen() {
+    return values.upscaler.GetValue() == Upscaler::Fsr4;
+}
+
 bool MetalFxTemporalChosen() {
     return values.upscaler.GetValue() == Upscaler::MetalFx;
 }
@@ -621,7 +629,8 @@ bool GameDlssNetworkChosen() {
 }
 
 bool OcarinaFsrChosen() {
-    return values.upscaler.GetValue() == Upscaler::Fsr3;
+    const auto upscaler = values.upscaler.GetValue();
+    return upscaler == Upscaler::Fsr3 || upscaler == Upscaler::Fsr4;
 }
 
 void SetSpeedMode(const SpeedMode& mode) {

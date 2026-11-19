@@ -655,6 +655,8 @@ private:
     u64 conditions_on_cpu{};
     u64 draws_under_condition{};
     ::Common::unordered_map<u64, Object> depth_stencil_states;
+    u64 last_depth_stencil_key{~u64{0}};
+    void* last_depth_stencil_state{};
     /// What an attribute of a vertex stream without a buffer reads, made on first use.
     Object zero_vertices;
 
@@ -683,8 +685,16 @@ private:
         std::vector<VideoCommon::SamplerId> samplers;
         std::vector<u32> sampler_handles;
         std::vector<u32> binding_kinds;
+        std::vector<u32> batch_handles;
         std::array<std::vector<Binding>, 5> stage_bindings;
     } draw_scratch;
+    struct ComputeScratch {
+        std::vector<VideoCommon::ImageViewInOut> views;
+        std::vector<VideoCommon::SamplerId> samplers;
+        std::vector<u32> sampler_handles;
+        std::vector<u32> batch_handles;
+        std::vector<Binding> bindings;
+    } compute_scratch;
     /// EDEN_NX2_METAL_BIND_SCRATCH: BindStageResources' slot lists and tables, their storage
     /// kept between calls.
     struct BindScratch {
@@ -727,9 +737,26 @@ private:
     /// The GPU index rewrite of the draw being prepared.
     struct IndexRewrite {
         bool wanted{};
+        bool only_ahead{};
         IndexConvert::RewriteParams params{};
         StagingBufferRef output;
+        BufferHandle cached_buffer{};
+        u32 cached_count{};
     } index_rewrite;
+    struct ConvertedIndexEntry {
+        u64 offset{};
+        u64 size{};
+        u32 mode{};
+        u32 index_size{};
+        u32 restart{};
+        u32 converted{};
+        u32 hits{};
+        u64 last_frame{};
+        Object buffer;
+    };
+    std::unordered_map<BufferHandle, std::vector<ConvertedIndexEntry>> converted_index_cache;
+    u64 converted_index_bytes{};
+    void InvalidateConvertedIndices(BufferHandle buffer, u64 offset, u64 size);
     Object index_kernel_library;
     Object index_kernel;
     Object index_strip_kernel;
@@ -878,7 +905,7 @@ private:
     u64 native_mesh_indirect{};
     u64 emulated_mesh_draws{};
     size_t mesh_arena_current{~size_t{}};
-    u64 mesh_arena_size{u64{32} << 20};
+    u64 mesh_arena_size{u64{8} << 20};
     /// Guest index data read for draws whose indices are rewritten.
     std::vector<u8> converted_source;
     u64 dispatches{};

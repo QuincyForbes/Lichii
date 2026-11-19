@@ -262,6 +262,7 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
         if (!Settings::values.cpuopt_ignore_memory_aborts) {
             config.check_halt_on_memory_access = true;
         }
+        config.optimizations &= ~Dynarmic::OptimizationFlag::DisableVerification;
         break;
     // Unsafe optimizations
     case Settings::CpuAccuracy::Unsafe:
@@ -306,6 +307,10 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
     if (!Settings::IsFastmemEnabled()) {
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
+    }
+    if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Debugging &&
+        Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
+        config.optimizations |= Dynarmic::OptimizationFlag::DisableVerification;
     }
     m_jit.emplace(config);
 }

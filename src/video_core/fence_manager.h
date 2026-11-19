@@ -633,9 +633,16 @@ private:
         {
             std::scoped_lock lock{buffer_cache.mutex};
             if (buffer_cache.HasUncommittedFlushes()) {
-                buffer_cache.CommitAsyncFlushes();
-                flushes.should_flush = true;
-                flushes.committed |= BufferFlushes;
+                if constexpr (requires { buffer_cache.TryCommitAsyncFlushes(); }) {
+                    if (buffer_cache.TryCommitAsyncFlushes()) {
+                        flushes.should_flush = true;
+                        flushes.committed |= BufferFlushes;
+                    }
+                } else {
+                    buffer_cache.CommitAsyncFlushes();
+                    flushes.should_flush = true;
+                    flushes.committed |= BufferFlushes;
+                }
             }
         }
         return flushes;

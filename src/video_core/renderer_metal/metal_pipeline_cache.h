@@ -201,7 +201,19 @@ public:
                      std::string_view error, bool mesh_state);
 
     /// Native()'s functions for a mesh pipeline state, none without Native().
-    [[nodiscard]] std::optional<MeshFunctions> NativeFunctions() const noexcept;
+    [[nodiscard]] std::optional<MeshFunctions> NativeFunctions(u32 reducing = 0) const noexcept;
+
+    [[nodiscard]] std::span<const u32> DefaultBindingKinds() const noexcept {
+        return default_binding_kinds;
+    }
+
+    [[nodiscard]] std::span<const u32> NativeBindingKinds() const noexcept {
+        return native_binding_kinds;
+    }
+
+    [[nodiscard]] std::span<const u32> MeshEmulationBindingKinds() const noexcept {
+        return mesh_emulation_binding_kinds;
+    }
 
 private:
     bool BuildNativeFunctions(const Device& device);
@@ -214,6 +226,9 @@ private:
     std::optional<NativeMesh> native_mesh;
     std::optional<XfbCapture> xfb;
     std::optional<GeometryCompute> geometry;
+    std::vector<u32> default_binding_kinds;
+    std::vector<u32> native_binding_kinds;
+    std::vector<u32> mesh_emulation_binding_kinds;
     PipelineArchive* archive{};
     PipelineFiles* recorder{};
     bool used{};

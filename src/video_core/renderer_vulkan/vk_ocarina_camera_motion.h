@@ -47,6 +47,7 @@ public:
     ~OcarinaUpscaler();
 
     [[nodiscard]] bool EvaluationFailed() const;
+    [[nodiscard]] bool UsedFsr4() const;
     /// Save the 1440p upscaled copy before the game adds its HUD.
     void SaveSceneReference(VkImageView color);
     /// Composite the HUD from the guest image over the matching 4K scene.

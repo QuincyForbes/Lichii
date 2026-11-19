@@ -79,7 +79,7 @@ inline void Reset() {
     g_steady.store(false, std::memory_order_relaxed);
 }
 
-inline void NotePresent() {
+inline void NotePresent(u32 swap_interval = 0) {
     using Clock = std::chrono::steady_clock;
     using Detail::Window;
     std::scoped_lock lock{Detail::g_pacing_mutex};
@@ -96,31 +96,41 @@ inline void NotePresent() {
     const double median = sorted[Window / 2];
     const auto in_band = std::count_if(intervals.begin(), intervals.end(),
                                        [median](double v) { return std::abs(v - median) <= 4.0; });
-    // Paced to every 2nd or 3rd vblank (30 or 20 fps), there is room for the hold; at 60 frame
-    // times can't tell how much, and a scene running slow at 25-30 ms has none.
+    // Paced to every 2nd or 3rd vblank (swap_interval >= 2: 30 or 20 fps), there is room for the
+    // hold; a 60 fps title (swap_interval == 1) running near 33 ms is bottlenecked, not sleeping
+    // on vblank. An unknown interval (0) only qualifies when forced with EDEN_NX2_GPU_LATENCY=1.
+    static const int latency_env = [] {
+        const char* const value = std::getenv("EDEN_NX2_GPU_LATENCY");
+        return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
+    }();
+    const bool interval_allows_hold =
+        latency_env != 0 && (swap_interval >= 2 || (swap_interval == 0 && latency_env == 1));
     constexpr double Vblank = 16.683;
     const bool slow_cap =
-        std::abs(median - 2 * Vblank) <= 1.5 || std::abs(median - 3 * Vblank) <= 1.5;
+        interval_allows_hold &&
+        (std::abs(median - 2 * Vblank) <= 1.5 || std::abs(median - 3 * Vblank) <= 1.5);
     const bool on = g_steady.load(std::memory_order_relaxed);
     if (!on && slow_cap && in_band >= 54 && since_off >= need) {
         g_steady.store(true, std::memory_order_relaxed);
         on_since = now;
         if (drops < 32) {
-            LOG_INFO(HW_GPU, "nx2 gpu latency: on ({} of {} frames near {:.1f} ms)", in_band,
-                     Window, median);
+            LOG_INFO(HW_GPU,
+                     "nx2 gpu latency: on ({} of {} frames near {:.1f} ms, swap_interval={})",
+                     in_band, Window, median, swap_interval);
         }
     } else if (on && (in_band < 45 || !slow_cap)) {
         g_steady.store(false, std::memory_order_relaxed);
         since_off = 0;
         const bool stall = std::any_of(intervals.begin(), intervals.end(),
                                        [](double v) { return v > 100.0; });
-        if (!stall) {
+        if (!stall && interval_allows_hold) {
             need = (std::min)(need * 2, 1920u);
         }
         if (++drops <= 32) {
-            LOG_INFO(HW_GPU, "nx2 gpu latency: off ({} of {} frames near {:.1f} ms{}), next try "
-                             "after {} frames", in_band, Window, median,
-                     stall ? ", loading" : "", need);
+            LOG_INFO(HW_GPU,
+                     "nx2 gpu latency: off ({} of {} frames near {:.1f} ms, swap_interval={}{}), "
+                     "next try after {} frames",
+                     in_band, Window, median, swap_interval, stall ? ", loading" : "", need);
         }
     } else if (on && need > 60 && now - on_since > std::chrono::seconds{30}) {
         need /= 2;

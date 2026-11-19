@@ -112,6 +112,16 @@ std::shared_ptr<const GplLibrary> GraphicsPipelineLibraryCache::GetOrCreate(
     return library;
 }
 
+bool GraphicsPipelineLibraryCache::IsReady(const std::string& key) {
+    std::scoped_lock lock{mutex};
+    const auto it = entries.find(key);
+    if (it == entries.end()) {
+        return false;
+    }
+    std::scoped_lock entry_lock{it->second->mutex};
+    return it->second->done;
+}
+
 void GraphicsPipelineLibraryCache::RecordLink(bool optimized, std::chrono::nanoseconds time) {
     const size_t index = optimized ? 1 : 0;
     const u64 ns = static_cast<u64>(time.count());

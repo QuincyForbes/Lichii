@@ -24,9 +24,11 @@ constexpr size_t MaxCauses = 48;
 constexpr std::array<std::string_view, NumWork> WorkNames{"draw", "dispatch", "clear"};
 constexpr std::array<std::string_view, NumWork> WorkPlurals{"draws", "dispatches", "clears"};
 constexpr std::array<std::string_view, NumPaths> PathNames{
-    "native",        "mesh as compute", "tessellation kernels", "rewritten indices",
-    "indirect loop", "replaced",        "clear as a draw",      "empty",
+    "native",          "mesh as compute",   "tessellation kernels",
+    "geometry kernels", "rewritten indices", "indirect loop",
+    "replaced",        "clear as a draw",   "empty",
 };
+static_assert(!PathNames.back().empty());
 
 struct State {
     std::array<std::array<std::atomic<u64>, NumPaths>, NumWork> paths{};

@@ -159,8 +159,9 @@ ENUM(OotAntiAliasing, Game, NoSharpening);
 // What takes the place of a game's own upscaler (Settings upscaler): Auto keeps Ocarina of Time's
 // own pass and gives games that call DLSS AMD FSR 3.1; Game runs each game's own (translated DLSS
 // network included); the others replace both.
-ENUM(Upscaler, Auto, Game, Fsr3, Dlss, MetalFx);
-ENUM(DlssPreset, Default, J, K, L, M);
+ENUM(Upscaler, Auto, Game, Fsr3, Dlss, MetalFx, Fsr4);
+ENUM(DlssPreset, Default, J, K, L, M, E, F);
+ENUM(DlssQuality, Auto, Quality, Balanced, Performance, UltraPerformance, Dlaa);
 ENUM(OcarinaDlssMode, Quality, Balanced, Performance, UltraPerformance);
 // Ocarina of Time's movies: the game's own upscaler, or a bilinear copy (Settings oot_movie_upscale).
 ENUM(OotMovieUpscale, Automatic, Bilinear, Game);
@@ -196,7 +197,7 @@ ENUM(ExtendedDynamicState, Disabled, EDS1, EDS2, EDS3);
 ENUM(GpuLogLevel, Off, Errors, Standard, Verbose, All)
 ENUM(GameListMode, TreeView, GridView, CarouselView);
 ENUM(SpeedMode, Standard, Turbo, Slow);
-ENUM(FrameGenType, Lsfg, Fsr3, MetalFx);
+ENUM(FrameGenType, Lsfg, Fsr3, MetalFx, NvidiaDlssG);
 ENUM(FrameGenMotion, Auto, Shader);
 ENUM(FrameGenFlowQuality, Fast, Medium, Best);
 ENUM(ColdHintMode, Off, WhenRamIsLow, Always);

@@ -58,13 +58,23 @@ constexpr const char* INTERPOSER_ENTRY = "bin/x64/sl.interposer.dll";
 constexpr const char* MODEL_ENTRY = "bin/x64/nvngx_dlss.dll";
 constexpr const char* STREAMLINE_LICENSE_ENTRY = "license.txt";
 constexpr const char* DLSS_LICENSE_ENTRY = "bin/x64/nvngx_dlss.license.txt";
+constexpr const char* REFLEX_LICENSE_ENTRY = "bin/x64/reflex.license.txt";
+constexpr const char* BIN_DIR = "bin/x64/";
+
+std::string FileName(const std::string& entry) {
+    return Common::FS::PathToUTF8String(std::filesystem::path{entry}.filename());
+}
 
 QString Tr(const char* text) {
     return QCoreApplication::translate("NvidiaDlssPanel", text);
 }
 
 QString DlssName() {
-    return UiText::ChoiceNames<Settings::Upscaler>()[Settings::Upscaler::Dlss];
+    return UiText::ChoiceLabel("upscaler", "Dlss");
+}
+
+QString Fsr3Name() {
+    return UiText::ChoiceLabel("upscaler", "Fsr3");
 }
 
 u16 U16(const std::string& data, size_t at) {
@@ -383,8 +393,25 @@ void NvidiaDlssPanel::hideEvent(QHideEvent* event) {
     QWidget::hideEvent(event);
 }
 
-void NvidiaDlssPanel::SetDevice(const QString& name) {
+void NvidiaDlssPanel::SetDevice(const QString& name, bool capable) {
     device_name = name;
+    device_capable = capable;
+    Refresh();
+}
+
+void NvidiaDlssPanel::SetFrameGenWanted(bool wanted) {
+    if (frame_gen_wanted == wanted) {
+        return;
+    }
+    frame_gen_wanted = wanted;
+    Refresh();
+}
+
+void NvidiaDlssPanel::SetUpscalerSelected(bool selected) {
+    if (upscaler_selected == selected) {
+        return;
+    }
+    upscaler_selected = selected;
     Refresh();
 }
 
@@ -393,7 +420,10 @@ void NvidiaDlssPanel::Refresh() {
     const bool has_loader = !files.interposer.empty();
     const bool has_model = !files.model.empty() || !files.app_model.empty();
     const bool has_plugins = files.missing_plugins.empty();
-    const bool ready = has_loader && has_model && has_plugins;
+    const bool sr_ready = has_loader && has_model && has_plugins;
+    const bool has_frame_gen =
+        !frame_gen_wanted || (files.frame_gen_missing.empty() && !files.streamline_mixed);
+    const bool ready = sr_ready && has_frame_gen;
     const QString dlss = !files.model.empty()
                              ? Named(QStringLiteral("DLSS"), files.model_version)
                              : Tr("%1 from the NVIDIA app")
@@ -403,9 +433,15 @@ void NvidiaDlssPanel::Refresh() {
     if (!device_name.isEmpty()) {
         lines << Tr("GPU: %1").arg(device_name.toHtmlEscaped());
     }
-    if (ready) {
+    if (!device_capable) {
+        lines << Tr("<b>GPU not supported:</b> %1 requires an NVIDIA GeForce RTX GPU on Vulkan "
+                    "(%2 runs instead).")
+                     .arg(DlssName().toHtmlEscaped(), Fsr3Name().toHtmlEscaped());
+    }
+    if (sr_ready) {
         lines << Tr("<b>Files ready:</b> %1 and %2.")
-                     .arg(Named(QStringLiteral("NVIDIA Streamline"), files.interposer_version), dlss);
+                     .arg(Named(QStringLiteral("NVIDIA Streamline"), files.interposer_version),
+                          dlss);
     } else {
         QStringList missing;
         if (!has_loader) {
@@ -417,61 +453,131 @@ void NvidiaDlssPanel::Refresh() {
         if (!has_model) {
             missing << QStringLiteral("nvngx_dlss.dll");
         }
-        lines << Tr("<b>NVIDIA's files needed:</b> %1. Until then games use AMD FSR 3.1.")
-                     .arg(missing.join(QStringLiteral(", ")));
+        lines << Tr("<b>NVIDIA's files needed:</b> %1. Until then games use %2.")
+                     .arg(missing.join(QStringLiteral(", ")), Fsr3Name().toHtmlEscaped());
+    }
+    if (frame_gen_wanted) {
+        QStringList fg_missing;
+        for (const std::string& name : files.frame_gen_missing) {
+            fg_missing << QString::fromStdString(name);
+        }
+        if (!fg_missing.isEmpty()) {
+            lines << Tr("<b>DLSS Frame Generation needed:</b> %1.")
+                         .arg(fg_missing.join(QStringLiteral(", ")));
+        } else if (files.streamline_mixed) {
+            lines << Tr("<b>DLSS Frame Generation:</b> NVIDIA's Streamline files (sl.*) in the "
+                        "folder come from different releases; download a matching set.");
+        } else {
+            lines << Tr("<b>DLSS Frame Generation:</b> files ready.");
+        }
     }
     status_label->setText(lines.join(QStringLiteral("<br>")));
     status_label->setToolTip(Tr("Folder: %1").arg(PathText(files.folder)));
 
-    // What DLSS did in the running (or last) game.
+    // What DLSS and DLSS Frame Generation did in the running (or last) game.
     const Streamline::SessionStatus session = Streamline::GetSessionStatus();
     const QString version = Named(QStringLiteral("DLSS"), session.version);
+    QString mode_detail;
+    if (!session.mode_name.empty() && !session.preset_name.empty()) {
+        mode_detail = QStringLiteral(" (%1, %2)")
+                          .arg(QString::fromStdString(session.mode_name).toHtmlEscaped(),
+                               Tr("preset %1").arg(
+                                   QString::fromStdString(session.preset_name).toHtmlEscaped()));
+    } else if (!session.mode_name.empty()) {
+        mode_detail = QStringLiteral(" (%1)").arg(
+            QString::fromStdString(session.mode_name).toHtmlEscaped());
+    }
     const QString covered =
         Tr("Games it covers: The Legend of Zelda: Ocarina of Time (at 1x resolution scale) and "
            "Fire Emblem: Fortune's Weave. Other games keep their own upscaling.");
-    QString state;
+    QStringList session_lines;
     bool active = false;
     if (session.available && session.frames > 0) {
         active = true;
-        state = Tr("<b>Active:</b> %1 has upscaled %2 frames in this game.")
-                    .arg(version)
-                    .arg(session.frames);
+        session_lines << Tr("<b>Active:</b> %1%2 has upscaled %3 frames in this game.")
+                             .arg(version, mode_detail)
+                             .arg(session.frames);
     } else if (session.available) {
-        state = Tr("<b>Running</b>, but this game hasn't drawn a pass DLSS can replace. %1")
-                    .arg(covered);
+        session_lines << Tr("<b>Running</b>, but this game hasn't drawn a pass DLSS can replace. "
+                            "%1")
+                             .arg(covered);
     } else if (!session.problem.empty()) {
-        state = Tr("<b>Not used in the last game:</b> %1")
-                    .arg(QString::fromStdString(session.problem).toHtmlEscaped());
+        session_lines << Tr("<b>Not used in the last game:</b> %1")
+                             .arg(QString::fromStdString(session.problem).toHtmlEscaped());
     } else if (session.frames > 0) {
-        state = Tr("Last game: %1 upscaled %2 frames. %3")
-                    .arg(version)
-                    .arg(session.frames)
-                    .arg(covered);
+        session_lines << Tr("Last game: %1%2 upscaled %3 frames. %4")
+                             .arg(version, mode_detail)
+                             .arg(session.frames)
+                             .arg(covered);
+    } else if (!upscaler_selected) {
+        session_lines << Tr("Select <b>%1</b> in %2 above to enable it for the next game. %3")
+                             .arg(DlssName().toHtmlEscaped(),
+                                  UiText::SettingLabel("upscaler").toHtmlEscaped(), covered);
     } else {
-        state = Tr("Starts with the next game. %1").arg(covered);
+        session_lines << Tr("Starts with the next game. %1").arg(covered);
     }
-    session_label->setText(state);
 
-    const bool problem = !ready || (!session.available && !session.problem.empty());
+    if (session.frame_gen_active && session.generated_frames > 0) {
+        active = true;
+        session_lines << Tr("<b>Frame Generation active:</b> +%1 generated frames.")
+                             .arg(session.generated_frames);
+    } else if (session.frame_gen_active) {
+        session_lines << Tr("<b>Frame Generation ready</b> (pauses on menus and static scenes).");
+    } else if (frame_gen_wanted && !session.frame_gen_problem.empty()) {
+        session_lines << Tr("<b>Frame Generation not used:</b> %1")
+                             .arg(QString::fromStdString(session.frame_gen_problem).toHtmlEscaped());
+    }
+    session_label->setText(session_lines.join(QStringLiteral("<br>")));
+
+    const bool problem = !device_capable || !ready ||
+                         (!session.available && !session.problem.empty()) ||
+                         (frame_gen_wanted && !session.frame_gen_active &&
+                          !session.frame_gen_problem.empty());
     icon_label->setText(
         problem ? QStringLiteral("<span style=\"color:#d29922\">&#9888;</span>")
         : active ? QStringLiteral("<span style=\"color:#2ea043\">&#9679;</span>")
                  : QStringLiteral("<span style=\"color:#2ea043\">&#10004;</span>"));
-    download_button->setVisible(!ready);
+    download_button->setText(sr_ready && !has_frame_gen
+                                 ? Tr("Download Frame Generation files from NVIDIA...")
+                                 : Tr("Download from NVIDIA..."));
+    download_button->setVisible(!ready && device_capable);
 }
 
 void NvidiaDlssPanel::Download() {
     const Streamline::DlssFiles files = Streamline::FindDlssFiles();
     std::vector<std::string> wanted;
-    if (files.interposer.empty()) {
-        wanted.emplace_back(INTERPOSER_ENTRY);
+    // Frame generation's files come as one set with the loader, all from this release: Streamline
+    // loads a module only with the sl.common.dll and loader of its own release.
+    std::vector<std::string> frame_gen_set;
+    if (frame_gen_wanted && (!files.frame_gen_missing.empty() || files.streamline_mixed)) {
+        frame_gen_set.emplace_back(INTERPOSER_ENTRY);
+        for (const char* const name : Streamline::FrameGenFiles()) {
+            frame_gen_set.push_back(BIN_DIR + std::string{name});
+        }
+    }
+    const auto in_frame_gen_set = [&frame_gen_set](const std::string& entry) {
+        return std::ranges::find(frame_gen_set, entry) != frame_gen_set.end();
+    };
+    const auto add_unique = [&wanted](std::string entry) {
+        if (std::ranges::find(wanted, entry) == wanted.end()) {
+            wanted.push_back(std::move(entry));
+        }
+    };
+    if (files.interposer.empty() && !in_frame_gen_set(INTERPOSER_ENTRY)) {
+        add_unique(INTERPOSER_ENTRY);
     }
     for (const std::filesystem::path& plugin : files.missing_plugins) {
-        wanted.emplace_back(fmt::format("bin/x64/{}",
-                                        Common::FS::PathToUTF8String(plugin.filename())));
+        const std::string entry =
+            fmt::format("{}{}", BIN_DIR, Common::FS::PathToUTF8String(plugin.filename()));
+        if (!in_frame_gen_set(entry)) {
+            add_unique(entry);
+        }
     }
     if (files.model.empty() && files.app_model.empty()) {
-        wanted.emplace_back(MODEL_ENTRY);
+        add_unique(MODEL_ENTRY);
+    }
+    for (const std::string& entry : frame_gen_set) {
+        add_unique(entry);
     }
     if (wanted.empty()) {
         return;
@@ -499,22 +605,47 @@ void NvidiaDlssPanel::Download() {
             fail(zip.error);
             return;
         }
+        const auto wants = [&wanted](const std::string& name) {
+            return std::ranges::find(wanted, BIN_DIR + name) != wanted.end();
+        };
         std::vector<std::pair<QString, const char*>> texts{
             {Tr("NVIDIA Streamline"), STREAMLINE_LICENSE_ENTRY}};
-        if (std::ranges::find(wanted, MODEL_ENTRY) != wanted.end()) {
+        if (std::ranges::find(wanted, MODEL_ENTRY) != wanted.end() || wants("nvngx_dlssg.dll")) {
             texts.emplace_back(DlssName(), DLSS_LICENSE_ENTRY);
+        }
+        if (wants("sl.reflex.dll") || wants("NvLowLatencyVk.dll")) {
+            texts.emplace_back(Tr("NVIDIA Reflex"), REFLEX_LICENSE_ENTRY);
         }
         for (const auto& [title, entry_name] : texts) {
             const ZipEntry* const entry = zip.Find(entry_name);
             const std::optional<std::string> text = entry ? zip.Read(*entry) : std::nullopt;
+            if ((!text || text->empty()) && entry_name == REFLEX_LICENSE_ENTRY) {
+                LOG_WARNING(Frontend, "NVIDIA's release has no {}", entry_name);
+                continue;
+            }
             if (!text || text->empty()) {
                 busy.close();
                 fail("could not retrieve NVIDIA's licence text");
                 return;
             }
-            licences += fmt::format("==== {} ====\n\n{}\n\n", title.toStdString(),
-                                    *text);
+            licences += fmt::format("==== {} ====\n\n{}\n\n", title.toStdString(), *text);
         }
+    }
+
+    // Without every file of the frame generation set in the release, none of it is taken.
+    if (const auto missing = std::ranges::find_if(
+            frame_gen_set, [&zip](const std::string& name) { return !zip.Find(name); });
+        missing != frame_gen_set.end()) {
+        LOG_WARNING(Frontend,
+                    "NVIDIA's Streamline {} release has no {}; skipping DLSS Frame Generation's "
+                    "files",
+                    RELEASE_VERSION, *missing);
+        std::erase_if(wanted, in_frame_gen_set);
+        frame_gen_set.clear();
+    }
+    if (wanted.empty()) {
+        fail("the release has none of the missing files");
+        return;
     }
 
     u64 total = 0;
@@ -528,11 +659,10 @@ void NvidiaDlssPanel::Download() {
         }
         entries.push_back(entry);
         total += entry->compressed;
-        names << QString::fromStdString(
-            Common::FS::PathToUTF8String(std::filesystem::path{name}.filename()));
+        names << QString::fromStdString(FileName(name));
     }
     QDialog dialog(this);
-    dialog.setWindowTitle(Tr("Download NVIDIA DLSS"));
+    dialog.setWindowTitle(Tr("Download %1").arg(DlssName()));
     QVBoxLayout* layout = new QVBoxLayout(&dialog);
     QLabel* intro = new QLabel(
         Tr("Lichii will download %1 (%2 MB) from NVIDIA's Streamline %3 release on GitHub into "
@@ -574,17 +704,28 @@ void NvidiaDlssPanel::Download() {
     std::error_code ec;
     std::filesystem::create_directories(folder, ec);
     u64 done = 0;
+    // Every file is checked before any is replaced; frame generation's set is saved whole or not
+    // at all, so the loader's folder never mixes releases.
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> verified;
+    const auto discard = [&verified, &ec] {
+        for (const auto& [partial, target] : verified) {
+            std::filesystem::remove(partial, ec);
+        }
+    };
+    QStringList skipped;
     for (size_t i = 0; i < wanted.size(); ++i) {
         progress.setLabelText(Tr("Downloading %1 (%2 of %3) from NVIDIA...")
                                   .arg(names[static_cast<qsizetype>(i)])
                                   .arg(i + 1)
                                   .arg(wanted.size()));
         const std::optional<std::string> contents = zip.Read(*entries[i], [&](u64 received) {
-            progress.setValue(static_cast<int>((done + received) * 1000 / std::max<u64>(total, 1)));
+            progress.setValue(
+                static_cast<int>((done + received) * 1000 / std::max<u64>(total, 1)));
             QApplication::processEvents();
             return !progress.wasCanceled();
         });
         if (!contents) {
+            discard();
             progress.close();
             if (!zip.canceled) {
                 fail(zip.error);
@@ -599,30 +740,80 @@ void NvidiaDlssPanel::Download() {
             std::ofstream file(partial, std::ios::binary | std::ios::trunc);
             file.write(contents->data(), static_cast<std::streamsize>(contents->size()));
             if (!file) {
+                discard();
                 progress.close();
                 fail("could not write " + Common::FS::PathToUTF8String(partial));
                 return;
             }
         }
-        // The loader must carry Streamline's own signature (Load checks it again), DLSS
-        // NVIDIA's Authenticode signature; the plugins either.
-        const bool signed_ok =
-            wanted[i] == MODEL_ENTRY        ? Streamline::IsSignedByNvidia(partial)
-            : wanted[i] == INTERPOSER_ENTRY ? Streamline::IsStreamlineModule(partial)
-                                            : Streamline::IsStreamlineModule(partial) ||
-                                                  Streamline::IsSignedByNvidia(partial);
+        // Streamline's own modules (sl.*) carry Streamline's signature; NVIDIA's other DLLs an
+        // Authenticode one.
+        const bool streamline_module = FileName(wanted[i]).starts_with("sl.");
+        const bool signed_ok = streamline_module ? Streamline::IsStreamlineModule(partial)
+                                                 : Streamline::IsSignedByNvidia(partial);
+        if (!signed_ok && in_frame_gen_set(wanted[i])) {
+            std::filesystem::remove(partial, ec);
+            LOG_WARNING(Frontend, "{} from NVIDIA's release is not signed by NVIDIA; skipping it",
+                        FileName(wanted[i]));
+            skipped << QString::fromStdString(FileName(wanted[i]));
+            continue;
+        }
         if (!signed_ok) {
             std::filesystem::remove(partial, ec);
+            discard();
             progress.close();
             fail(Common::FS::PathToUTF8String(target.filename()) + " is not signed by NVIDIA");
             return;
         }
-        std::filesystem::rename(partial, target, ec);
-        if (ec) {
-            std::filesystem::remove(partial, ec);
+        verified.emplace_back(partial, target);
+    }
+    if (!skipped.isEmpty()) {
+        std::erase_if(verified, [&](const auto& file) {
+            if (!in_frame_gen_set(BIN_DIR + Common::FS::PathToUTF8String(file.second.filename()))) {
+                return false;
+            }
+            std::filesystem::remove(file.first, ec);
+            return true;
+        });
+    }
+    // The old files move aside first, so a failed save puts every one of them back.
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> replaced;
+    const auto restore = [&replaced, &ec] {
+        for (const auto& [backup, target] : replaced) {
+            std::filesystem::remove(target, ec);
+            if (!backup.empty()) {
+                std::filesystem::rename(backup, target, ec);
+            }
+        }
+    };
+    for (const auto& [partial, target] : verified) {
+        std::filesystem::path backup;
+        if (std::filesystem::exists(target, ec)) {
+            backup = target;
+            backup += L".old";
+            std::filesystem::remove(backup, ec);
+            std::filesystem::rename(target, backup, ec);
+        }
+        bool failed = static_cast<bool>(ec);
+        if (!failed) {
+            std::filesystem::rename(partial, target, ec);
+            failed = static_cast<bool>(ec);
+            if (failed && !backup.empty()) {
+                std::filesystem::rename(backup, target, ec);
+            }
+        }
+        if (failed) {
+            restore();
+            discard();
             progress.close();
             fail("could not save " + Common::FS::PathToUTF8String(target));
             return;
+        }
+        replaced.emplace_back(backup, target);
+    }
+    for (const auto& [backup, target] : replaced) {
+        if (!backup.empty()) {
+            std::filesystem::remove(backup, ec);
         }
         LOG_INFO(Frontend, "Downloaded {} from NVIDIA's Streamline {} release",
                  Common::FS::PathToUTF8String(target), RELEASE_VERSION);
@@ -630,8 +821,16 @@ void NvidiaDlssPanel::Download() {
     progress.setValue(1000);
     progress.close();
     Refresh();
-    QMessageBox::information(this, DlssName(),
-                             Tr("%1 is ready. It is used the next time a game starts.").arg(DlssName()));
+    if (!skipped.isEmpty()) {
+        QMessageBox::warning(this, DlssName(),
+                             Tr("These files failed NVIDIA's signature check, so none of DLSS "
+                                "Frame Generation's files were saved and it stays off: %1")
+                                 .arg(skipped.join(QStringLiteral(", "))));
+        return;
+    }
+    QMessageBox::information(
+        this, DlssName(),
+        Tr("%1 is ready. It is used the next time a game starts.").arg(DlssName()));
 }
 
 #endif

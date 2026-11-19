@@ -89,7 +89,7 @@ void TurboMode::Run(std::stop_token stop_token) {
         .pBindings = &layout_binding,
     });
 
-    // Actually create the descriptor set.
+    // Actually create the descriptor set and write it once at setup.
     auto descriptor_set = descriptor_pool.Allocate(VkDescriptorSetAllocateInfo{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .pNext = nullptr,
@@ -97,6 +97,24 @@ void TurboMode::Run(std::stop_token stop_token) {
         .descriptorSetCount = 1,
         .pSetLayouts = descriptor_set_layout.address(),
     });
+    const VkDescriptorBufferInfo buffer_info{
+        .buffer = *buffer,
+        .offset = 0,
+        .range = VK_WHOLE_SIZE,
+    };
+    const VkWriteDescriptorSet buffer_write{
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .pNext = nullptr,
+        .dstSet = descriptor_set[0],
+        .dstBinding = 0,
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pImageInfo = nullptr,
+        .pBufferInfo = &buffer_info,
+        .pTexelBufferView = nullptr,
+    };
+    dld.UpdateDescriptorSets(std::array{buffer_write}, {});
 
     // Create the shader.
     auto shader = BuildShader(m_device, VULKAN_TURBO_MODE_COMP_SPV);
@@ -163,28 +181,6 @@ void TurboMode::Run(std::stop_token stop_token) {
         // Reset the fence.
         fence.Reset();
 
-        // Update descriptor set.
-        const VkDescriptorBufferInfo buffer_info{
-            .buffer = *buffer,
-            .offset = 0,
-            .range = VK_WHOLE_SIZE,
-        };
-
-        const VkWriteDescriptorSet buffer_write{
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .pNext = nullptr,
-            .dstSet = descriptor_set[0],
-            .dstBinding = 0,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .pImageInfo = nullptr,
-            .pBufferInfo = &buffer_info,
-            .pTexelBufferView = nullptr,
-        };
-
-        dld.UpdateDescriptorSets(std::array{buffer_write}, {});
-
         // Set up the command buffer.
         cmdbuf.Begin(VkCommandBufferBeginInfo{
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -193,8 +189,16 @@ void TurboMode::Run(std::stop_token stop_token) {
             .pInheritanceInfo = nullptr,
         });
 
-        // Clear the buffer.
+        // Clear the buffer and make the transfer write visible to compute.
         cmdbuf.FillBuffer(*buffer, 0, VK_WHOLE_SIZE, 0);
+        static constexpr VkMemoryBarrier fill_barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, fill_barrier);
 
         // Bind descriptor set.
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0,
@@ -226,12 +230,22 @@ void TurboMode::Run(std::stop_token stop_token) {
         // Wait for completion.
         fence.Wait();
 #endif
-        // Wait for the next graphics queue submission if necessary.
-        std::unique_lock lk{m_submission_lock};
-        m_submission_cv.wait(lk, stop_token, [this] {
-            return (std::chrono::steady_clock::now() - m_submission_time) <=
-                   std::chrono::milliseconds{100};
-        });
+        // Pace active submissions by 1ms; sleep until the next queue submission once idle (>100ms).
+        bool is_active = false;
+        {
+            std::unique_lock lk{m_submission_lock};
+            is_active = (std::chrono::steady_clock::now() - m_submission_time) <=
+                        std::chrono::milliseconds{100};
+            if (!is_active) {
+                m_submission_cv.wait(lk, stop_token, [this] {
+                    return (std::chrono::steady_clock::now() - m_submission_time) <=
+                           std::chrono::milliseconds{100};
+                });
+            }
+        }
+        if (is_active) {
+            Common::StoppableTimedWait(stop_token, std::chrono::milliseconds{1});
+        }
     }
 #if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
     adrenotools_set_turbo(false);

@@ -423,6 +423,18 @@ void SetupDenormControl(const Profile& profile, const IR::Program& program, Emit
             LOG_DEBUG(Shader_SPIRV, "Fp32 denorm preserve used in shader without host support");
         }
     }
+    if (ctx.native_half_rounding) {
+        // The software matrix functions convert to fp16 natively (emit_spirv_tensor.cpp).
+        ctx.AddCapability(spv::Capability::DenormPreserve);
+        ctx.AddCapability(spv::Capability::RoundingModeRTE);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 16U);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::RoundingModeRTE, 16U);
+        if (!profile.support_separate_denorm_behavior || !profile.support_separate_rounding_mode) {
+            ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 64U);
+            ctx.AddExecutionMode(main_func, spv::ExecutionMode::RoundingModeRTE, 64U);
+        }
+        return;
+    }
     if (!profile.support_separate_denorm_behavior || profile.has_broken_fp16_float_controls) {
         // No separate denorm behavior
         return;
@@ -593,9 +605,12 @@ void PatchPhiNodes(IR::Program& program, EmitContext& ctx) {
             });
         }
 
-void RewriteOpcodes(std::vector<u32>& code, std::span<const std::pair<u32, spv::Op>> rewrites) {
+void RewriteOpcodes(std::vector<u32>& code, std::span<std::pair<u32, spv::Op>> rewrites) {
     if (rewrites.empty()) {
         return;
+    }
+    if (rewrites.size() > 1) {
+        std::ranges::sort(rewrites, {}, &std::pair<u32, spv::Op>::first);
     }
     size_t offset = 5;
     while (offset + 2 < code.size()) {
@@ -607,9 +622,10 @@ void RewriteOpcodes(std::vector<u32>& code, std::span<const std::pair<u32, spv::
         if (opcode == spv::Op::OpGroupNonUniformShuffleXor ||
             opcode == spv::Op::OpGroupNonUniformQuadBroadcast ||
             opcode == spv::Op::OpAtomicIAdd) {
-            const auto it{std::ranges::find(rewrites, code[offset + 2],
-                                            &std::pair<u32, spv::Op>::first)};
-            if (it != rewrites.end()) {
+            const u32 result_id{code[offset + 2]};
+            const auto it{std::ranges::lower_bound(rewrites, result_id, {},
+                                                   &std::pair<u32, spv::Op>::first)};
+            if (it != rewrites.end() && it->first == result_id) {
                 code[offset] = (code[offset] & 0xFFFF0000u) | static_cast<u32>(it->second);
             }
         }
@@ -665,7 +681,9 @@ void PatchMeshInstructions(std::vector<u32>& code, const EmitContext& ctx) {
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings) {
     const std::optional<u32> tensor_scratch_word{ReserveCooperativeHmmaScratch(profile, program)};
-    EmitContext ctx{profile, runtime_info, program, bindings};
+    const bool cooperative_hmma{tensor_scratch_word.has_value() ||
+                                UsesCooperativeHmma(profile, program)};
+    EmitContext ctx{profile, runtime_info, program, bindings, cooperative_hmma};
     ctx.tensor_scratch_word = tensor_scratch_word;
     DefineSoftwareMatrixFunctions(ctx, program);
     const Id main{DefineMain(ctx, program)};

@@ -37,7 +37,8 @@ public:
     StagingBufferPool& operator=(const StagingBufferPool&) = delete;
 
     /// A deferred buffer stays taken until FreeDeferred, whatever the GPU does.
-    [[nodiscard]] StagingBufferRef Request(size_t size, bool deferred = false);
+    [[nodiscard]] StagingBufferRef Request(size_t size, bool deferred = false,
+                                           bool host_to_device = false);
 
     void FreeDeferred(StagingBufferRef& ref);
 

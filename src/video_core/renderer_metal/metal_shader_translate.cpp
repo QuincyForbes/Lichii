@@ -36,13 +36,16 @@ constexpr u32 SamplerSpillBase = 2000;
 /// Spilled texture and sampler arrays: MSL indices from ArraySpillBase + their first table entry.
 [[nodiscard]] bool SpillArrays(std::string& source, const std::string& entry_point, u32 table_slot);
 constexpr u32 ArraySpillBase = 100000;
-/// Metal's texture slots per stage (0-127).
-constexpr u32 MetalTextureSlots = 128;
+/// Metal's texture slots per stage on Apple GPUs (0-95).
+constexpr u32 MetalTextureSlots = 96;
 /// Metal's sampler slots per stage (0-15).
 constexpr u32 MetalSamplerSlots = 16;
 
 [[nodiscard]] u32 RewriteSamplerReduction(std::string& source, const std::string& entry_point,
                                           bool fragment, u32 buffer_slot);
+void InlinePreciseHelpers(std::string& source);
+void GuardObjectGridDispatch(std::string& source, const std::string& entry_point);
+void FlipMeshPositionY(std::string& source);
 
 /// EDEN_NX2_METAL_OPTNONE_HELPERS=1: keeps SPIRV-Cross's [[clang::optnone]] spvFAdd/spvFSub/
 /// spvFMul (A/B against InlinePreciseHelpers).
@@ -54,11 +57,21 @@ constexpr u32 MetalSamplerSlots = 16;
     return kept;
 }
 
-/// EDEN_NX2_METAL_INVARIANT_POSITION=0: vertex, mesh and evaluation stages get the inlined
-/// helpers and no invariant_float_math, as the other stages.
+/// EDEN_NX2_METAL_INVARIANT_POSITION=1: vertex, mesh and evaluation stages get SPIRV-Cross's
+/// invariant_float_math and [[clang::optnone]] helpers.
 [[nodiscard]] bool InvariantPositionEnabled() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_METAL_INVARIANT_POSITION");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+/// EDEN_NX2_METAL_SPILL_ARRAYS=0: read-only sampled texture and sampler arrays stay in direct
+/// [[texture(n)]] / [[sampler(n)]] slots unless the stage exceeds Metal's slot limits.
+[[nodiscard]] bool SpillSampledArraysEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_SPILL_ARRAYS");
         return value == nullptr || value[0] != '0';
     }();
     return enabled;
@@ -71,43 +84,6 @@ constexpr u32 MetalSamplerSlots = 16;
         return value == nullptr || value[0] != '0';
     }();
     return enabled;
-}
-
-/// The recompiler marks every guest FADD/FMUL/FFMA NoContraction, and SPIRV-Cross writes each
-/// such operation as a call to a [[clang::optnone]] helper (fma(l, r, 0), fma(1, l, r)). An
-/// optnone function is also noinline: the AIR kept one real call per arithmetic operation, with
-/// the arguments stored to and reloaded from private memory, and nothing (constant folding,
-/// CSE, vectorization, scheduling) crossed them. The helpers become inline plain operations in
-/// a scope where clang may neither contract nor reassociate (#pragma clang fp): the AIR then
-/// carries fmul/fadd without the `contract` and `reassoc` flags, which keeps each operation
-/// separately rounded as NoContraction asks, and everything around it is optimized normally.
-void InlinePreciseHelpers(std::string& source) {
-    if (OptnoneHelpersKept() || source.find("[[clang::optnone]]") == std::string::npos) {
-        return;
-    }
-    const auto replace = [&](std::string_view from, std::string_view to) {
-        for (size_t at = source.find(from); at != std::string::npos;
-             at = source.find(from, at + to.size())) {
-            source.replace(at, from.size(), to);
-        }
-    };
-    constexpr std::string_view Pragma = "#pragma clang fp contract(off) reassociate(off)\n";
-    replace("[[clang::optnone]] T spvFAdd(T l, T r)\n{\n    return fma(T(1), l, r);\n}",
-            std::string("inline T spvFAdd(T l, T r)\n{\n") + std::string(Pragma) +
-                "    return l + r;\n}");
-    replace("[[clang::optnone]] T spvFSub(T l, T r)\n{\n    return fma(T(-1), r, l);\n}",
-            std::string("inline T spvFSub(T l, T r)\n{\n") + std::string(Pragma) +
-                "    return l - r;\n}");
-    replace("[[clang::optnone]] T spvFMul(T l, T r)\n{\n    return fma(l, r, T(0));\n}",
-            std::string("inline T spvFMul(T l, T r)\n{\n") + std::string(Pragma) +
-                "    return l * r;\n}");
-    // The matrix forms are written with explicit fma (exact whatever the optimizer does).
-    replace("[[clang::optnone]] vec<T, Cols> spvFMulVectorMatrix",
-            "inline vec<T, Cols> spvFMulVectorMatrix");
-    replace("[[clang::optnone]] vec<T, Rows> spvFMulMatrixVector",
-            "inline vec<T, Rows> spvFMulMatrixVector");
-    replace("[[clang::optnone]] matrix<T, RCols, LRows> spvFMulMatrixMatrix",
-            "inline matrix<T, RCols, LRows> spvFMulMatrixMatrix");
 }
 
 [[nodiscard]] spv::ExecutionModel Model(Stage stage) {
@@ -270,6 +246,7 @@ struct Declared {
     u32 set;
     u32 binding;
     bool combined; ///< Takes a texture and a sampler
+    bool spillable_single; ///< Read-only sampled/separate texture (not storage or buffer)
     ResourceKind kind;
     u32 count; ///< Array elements, each a slot
 };
@@ -374,16 +351,13 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
         msl.capture_output_to_buffer = tess_vertex || tess_control;
         msl.multi_patch_workgroup = tess_vertex || tess_control || tess_evaluation;
         msl.raw_buffer_tese_input = tess_evaluation;
-        // Stages whose arithmetic makes a position keep every float add, subtract and multiply
-        // exact and unfused (SPIRV-Cross's [[clang::optnone]] fma helpers, as MoltenVK runs
-        // them; InlinePreciseHelpers is skipped for them): a depth pre-pass and the colour pass
-        // that tests EQUAL against it are different programs, and Ocarina's grass and vine glow
-        // vanished when Metal's compiler fused or reordered their positions differently
-        // (EDEN_NX2_METAL_INVARIANT_POSITION=0: as before).
+        // Position-computing stages use Profile::fp_no_contraction_as_fma instead of
+        // SPIRV-Cross's [[clang::optnone]] helpers unless explicitly requested
+        // (Options::invariant_float_math or EDEN_NX2_METAL_INVARIANT_POSITION=1).
         const bool invariant_position =
-            InvariantPositionEnabled() &&
-            (options.invariant_float_math || stage == Stage::Vertex || stage == Stage::Mesh ||
-             tess_vertex || tess_evaluation);
+            options.invariant_float_math ||
+            (InvariantPositionEnabled() &&
+             (stage == Stage::Vertex || stage == Stage::Mesh || tess_vertex || tess_evaluation));
         msl.invariant_float_math = msl.invariant_float_math || invariant_position;
         switch (options.vertex_index_size) {
         case 2:
@@ -445,23 +419,25 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
         const spv::ExecutionModel model = Model(stage);
         const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
         std::vector<Declared> declared;
-        const auto add = [&](const auto& list, bool combined, ResourceKind kind) {
+        const auto add = [&](const auto& list, bool combined, bool sampled, ResourceKind kind) {
             for (const spirv_cross::Resource& resource : list) {
+                const spirv_cross::SPIRType& type = compiler.get_type(resource.base_type_id);
                 declared.push_back(Declared{
                     .set = compiler.get_decoration(resource.id, spv::DecorationDescriptorSet),
                     .binding = compiler.get_decoration(resource.id, spv::DecorationBinding),
                     .combined = combined,
+                    .spillable_single = sampled && type.image.dim != spv::DimBuffer,
                     .kind = kind,
                     .count = ArrayCount(compiler, resource),
                 });
             }
         };
-        add(resources.uniform_buffers, false, ResourceKind::Buffer);
-        add(resources.storage_buffers, false, ResourceKind::Buffer);
-        add(resources.sampled_images, true, ResourceKind::Texture);
-        add(resources.separate_images, false, ResourceKind::Texture);
-        add(resources.storage_images, false, ResourceKind::Texture);
-        add(resources.separate_samplers, false, ResourceKind::Sampler);
+        add(resources.uniform_buffers, false, false, ResourceKind::Buffer);
+        add(resources.storage_buffers, false, false, ResourceKind::Buffer);
+        add(resources.sampled_images, true, true, ResourceKind::Texture);
+        add(resources.separate_images, false, true, ResourceKind::Texture);
+        add(resources.storage_images, false, false, ResourceKind::Texture);
+        add(resources.separate_samplers, false, false, ResourceKind::Sampler);
         std::ranges::sort(declared, [](const Declared& lhs, const Declared& rhs) {
             return lhs.set != rhs.set ? lhs.set < rhs.set : lhs.binding < rhs.binding;
         });
@@ -492,13 +468,36 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
             total_samplers += takes_sampler ? resource.count : 0;
         }
         u32 total_textures = 0;
+        u32 single_textures = 0;
+        u32 unspillable_single_textures = 0;
         for (const Declared& resource : declared) {
-            total_textures += resource.kind == ResourceKind::Texture ? resource.count : 0;
+            if (resource.kind != ResourceKind::Texture) {
+                continue;
+            }
+            total_textures += resource.count;
+            if (resource.count == 1) {
+                ++single_textures;
+                if (!resource.spillable_single) {
+                    ++unspillable_single_textures;
+                }
+            }
         }
-        // Arrays (bindless tables, Ocarina's volume lookup reads 1020 3D textures) go to a table
-        // of resource IDs when the program has more than Metal's slots of their kind.
+        // Read-only sampled texture and sampler arrays go to a table of resource IDs
+        // (spvArrayTable) so dynamic array lookups load one 8-byte constant instead of spilling
+        // Metal's by-value array<texture..., N> parameter to per-pixel stack memory; any array
+        // also spills once the stage exceeds Metal's slot limits, and extra read-only single
+        // textures spill if single textures alone exceed MetalTextureSlots.
+        const bool spill_all_sampled_arrays = SpillSampledArraysEnabled();
         const bool spill_texture_arrays = total_textures > MetalTextureSlots;
-        const bool spill_sampler_arrays = total_samplers > MetalSamplerSlots;
+        const u32 direct_spillable_limit =
+            spill_texture_arrays && single_textures > MetalTextureSlots
+                ? (MetalTextureSlots > unspillable_single_textures
+                       ? MetalTextureSlots - unspillable_single_textures
+                       : 0U)
+                : ~0U;
+        u32 direct_spillable_used = 0;
+        const bool spill_sampler_arrays =
+            spill_all_sampled_arrays || total_samplers > MetalSamplerSlots;
         u32 array_entries = 0;
         const auto spill_array = [&](const Declared& resource, ResourceKind kind) {
             const u32 first = array_entries;
@@ -553,9 +552,16 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                 buffers += resource.count;
                 break;
             case ResourceKind::Texture:
-                if (spill_texture_arrays && resource.count > 1) {
+                if (((spill_texture_arrays ||
+                      (spill_all_sampled_arrays && resource.spillable_single)) &&
+                     resource.count > 1) ||
+                    (resource.count == 1 && resource.spillable_single &&
+                     direct_spillable_used >= direct_spillable_limit)) {
                     binding.msl_texture = spill_array(resource, ResourceKind::Texture);
                 } else {
+                    if (resource.count == 1 && resource.spillable_single) {
+                        ++direct_spillable_used;
+                    }
                     binding.msl_texture = textures;
                     result.slots.push_back(
                         {resource.set, resource.binding, resource.kind, textures, resource.count});
@@ -624,6 +630,11 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
         }
 
         result.source = compiler.compile();
+        const auto entry_points = compiler.get_entry_points_and_stages();
+        const std::string cleansed_entry =
+            entry_points.empty()
+                ? std::string{}
+                : compiler.get_cleansed_entry_point_name(entry_points.front().name, model);
         if (!invariant_position) {
             InlinePreciseHelpers(result.source);
         }
@@ -643,35 +654,33 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                 replace_all("    main0_out out = {};\n", "");
                 replace_all("return out;", "return;");
             }
+            if (!cleansed_entry.empty()) {
+                GuardObjectGridDispatch(result.source, cleansed_entry);
+            }
+        }
+        if (stage == Stage::Mesh && options.flip_vertex_y) {
+            FlipMeshPositionY(result.source);
         }
         if (spilled != 0) {
-            const auto points = compiler.get_entry_points_and_stages();
-            if (points.empty() ||
-                !SpillBuffers(result.source,
-                              compiler.get_cleansed_entry_point_name(points.front().name, model),
-                              spilled, result.spill_slot)) {
+            if (cleansed_entry.empty() ||
+                !SpillBuffers(result.source, cleansed_entry, spilled, result.spill_slot)) {
                 result.source.clear();
                 result.error = "buffers spilled to a table not understood";
                 return result;
             }
         }
         if (array_entries != 0) {
-            const auto points = compiler.get_entry_points_and_stages();
-            if (points.empty() ||
-                !SpillArrays(result.source,
-                             compiler.get_cleansed_entry_point_name(points.front().name, model),
-                             result.array_spill_slot)) {
+            if (cleansed_entry.empty() ||
+                !SpillArrays(result.source, cleansed_entry, result.array_spill_slot)) {
                 result.source.clear();
                 result.error = "texture or sampler arrays spilled to a table not understood";
                 return result;
             }
         }
         if (spilled_samplers != 0) {
-            const auto points = compiler.get_entry_points_and_stages();
-            if (points.empty() ||
-                !SpillSamplers(result.source,
-                               compiler.get_cleansed_entry_point_name(points.front().name, model),
-                               spilled_samplers, result.sampler_spill_slot)) {
+            if (cleansed_entry.empty() ||
+                !SpillSamplers(result.source, cleansed_entry, spilled_samplers,
+                               result.sampler_spill_slot)) {
                 result.source.clear();
                 result.error = "samplers spilled to a table not understood";
                 return result;
@@ -683,12 +692,10 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
         if (reducible && options.sampler_reduction && !resources.sampled_images.empty() &&
             spilled_samplers == 0 && array_entries == 0 &&
             !(stage == Stage::Vertex && buffers + 1 > options.first_vertex_buffer_slot)) {
-            const auto points = compiler.get_entry_points_and_stages();
-            if (!points.empty()) {
+            if (!cleansed_entry.empty()) {
                 std::string plain = result.source;
                 result.reduction_slot = RewriteSamplerReduction(
-                    result.source, compiler.get_cleansed_entry_point_name(points.front().name, model),
-                    stage == Stage::Fragment, buffers);
+                    result.source, cleansed_entry, stage == Stage::Fragment, buffers);
                 if (result.reduction_slot != ~0U) {
                     result.source_without_reduction = std::move(plain);
                 }
@@ -697,11 +704,7 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
         if (tess_vertex || tess_control || tess_evaluation) {
             result.outputs = StageOutputs(compiler, resources);
         }
-        const auto entry_points = compiler.get_entry_points_and_stages();
-        if (!entry_points.empty()) {
-            result.entry_point =
-                compiler.get_cleansed_entry_point_name(entry_points.front().name, model);
-        }
+        result.entry_point = cleansed_entry;
     } catch (const std::exception& exception) {
         result.source.clear();
         result.slots.clear();
@@ -1203,6 +1206,193 @@ struct EntryParameter {
     return parameter;
 }
 
+[[nodiscard]] bool IsZeroFloatLiteral(std::string_view text) {
+    return text == "0.0" || text == "0.0f" || text == "float2(0.0)" || text == "float2(0.0f)" ||
+           text == "float3(0.0)" || text == "float3(0.0f)" || text == "float4(0.0)" ||
+           text == "float4(0.0f)";
+}
+
+[[nodiscard]] bool IsOneFloatLiteral(std::string_view text) {
+    return text == "1.0" || text == "1.0f" || text == "float2(1.0)" || text == "float2(1.0f)" ||
+           text == "float3(1.0)" || text == "float3(1.0f)" || text == "float4(1.0)" ||
+           text == "float4(1.0f)";
+}
+
+/// Replaces SPIRV-Cross's [[clang::optnone]] arithmetic helpers with inline non-contracting
+/// operations and lowers unit-range precise::clamp / precise::min(precise::max(x, 0), 1) to
+/// saturate(x) (NaN -> 0 in MSL, matching Maxwell .SAT, so AGX emits hardware .sat).
+void InlinePreciseHelpers(std::string& source) {
+    if (!OptnoneHelpersKept() && source.find("[[clang::optnone]]") != std::string::npos) {
+        const auto replace = [&](std::string_view from, std::string_view to) {
+            for (size_t at = source.find(from); at != std::string::npos;
+                 at = source.find(from, at + to.size())) {
+                source.replace(at, from.size(), to);
+            }
+        };
+        constexpr std::string_view Pragma = "#pragma clang fp contract(off) reassociate(off)\n";
+        replace("[[clang::optnone]] T spvFAdd(T l, T r)\n{\n    return fma(T(1), l, r);\n}",
+                std::string("inline T spvFAdd(T l, T r)\n{\n") + std::string(Pragma) +
+                    "    return l + r;\n}");
+        replace("[[clang::optnone]] T spvFSub(T l, T r)\n{\n    return fma(T(-1), r, l);\n}",
+                std::string("inline T spvFSub(T l, T r)\n{\n") + std::string(Pragma) +
+                    "    return l - r;\n}");
+        replace("[[clang::optnone]] T spvFMul(T l, T r)\n{\n    return fma(l, r, T(0));\n}",
+                std::string("inline T spvFMul(T l, T r)\n{\n") + std::string(Pragma) +
+                    "    return l * r;\n}");
+        // The matrix forms are written with explicit fma (exact whatever the optimizer does).
+        replace("[[clang::optnone]] vec<T, Cols> spvFMulVectorMatrix",
+                "inline vec<T, Cols> spvFMulVectorMatrix");
+        replace("[[clang::optnone]] vec<T, Rows> spvFMulMatrixVector",
+                "inline vec<T, Rows> spvFMulMatrixVector");
+        replace("[[clang::optnone]] matrix<T, RCols, LRows> spvFMulMatrixMatrix",
+                "inline matrix<T, RCols, LRows> spvFMulMatrixMatrix");
+    }
+
+    constexpr std::string_view ClampCall = "precise::clamp(";
+    for (size_t at = source.find(ClampCall); at != std::string::npos;) {
+        const size_t open = at + ClampCall.size() - 1;
+        if (at != 0 && IsIdentifier(source[at - 1])) {
+            at = source.find(ClampCall, open + 1);
+            continue;
+        }
+        const size_t close = MatchingBracket(source, open);
+        if (close != std::string_view::npos) {
+            const std::vector<std::string_view> args =
+                SplitParameters(std::string_view(source).substr(open + 1, close - open - 1));
+            if (args.size() == 3 && IsZeroFloatLiteral(args[1]) && IsOneFloatLiteral(args[2])) {
+                const std::string replacement = "saturate(" + std::string(args[0]) + ")";
+                source.replace(at, close + 1 - at, replacement);
+                at = source.find(ClampCall, at + 9);
+                continue;
+            }
+        }
+        at = source.find(ClampCall, open + 1);
+    }
+
+    constexpr std::string_view MinCall = "precise::min(";
+    constexpr std::string_view MaxCall = "precise::max(";
+    for (size_t at = source.find(MinCall); at != std::string::npos;) {
+        const size_t open = at + MinCall.size() - 1;
+        if (at != 0 && IsIdentifier(source[at - 1])) {
+            at = source.find(MinCall, open + 1);
+            continue;
+        }
+        const size_t close = MatchingBracket(source, open);
+        if (close != std::string_view::npos) {
+            const std::vector<std::string_view> outer_args =
+                SplitParameters(std::string_view(source).substr(open + 1, close - open - 1));
+            if (outer_args.size() == 2 && IsOneFloatLiteral(outer_args[1]) &&
+                outer_args[0].starts_with(MaxCall) && outer_args[0].ends_with(")") &&
+                MatchingBracket(outer_args[0], MaxCall.size() - 1) == outer_args[0].size() - 1) {
+                const std::vector<std::string_view> inner_args = SplitParameters(
+                    outer_args[0].substr(MaxCall.size(), outer_args[0].size() - MaxCall.size() - 1));
+                if (inner_args.size() == 2 && IsZeroFloatLiteral(inner_args[1])) {
+                    const std::string replacement = "saturate(" + std::string(inner_args[0]) + ")";
+                    source.replace(at, close + 1 - at, replacement);
+                    at = source.find(MinCall, at + 9);
+                    continue;
+                }
+            }
+        }
+        at = source.find(MinCall, open + 1);
+    }
+}
+
+/// Guards SPIRV-Cross's EmitMeshTasksEXT -> spvMgp.set_threadgroups_per_grid(...) so only thread 0
+/// of the object threadgroup writes the mesh grid size.
+void GuardObjectGridDispatch(std::string& source, const std::string& entry_point) {
+    constexpr std::string_view Call = "spvMgp.set_threadgroups_per_grid(";
+    if (source.find(Call) == std::string::npos) {
+        return;
+    }
+    const size_t object_at = source.find("[[object]]");
+    const std::string needle = " " + entry_point + "(";
+    const size_t entry_at =
+        object_at == std::string::npos ? std::string::npos : source.find(needle, object_at);
+    if (entry_at == std::string::npos) {
+        return;
+    }
+    const size_t open = entry_at + needle.size() - 1;
+    const size_t close = MatchingBracket(source, open);
+    if (close == std::string_view::npos) {
+        return;
+    }
+    std::string lane_name;
+    const std::string_view params_text =
+        std::string_view(source).substr(open + 1, close - open - 1);
+    for (const std::string_view part : SplitParameters(params_text)) {
+        if (const auto param = ParseParameter(part);
+            param && param->attribute == "thread_index_in_threadgroup") {
+            lane_name = param->name;
+            break;
+        }
+    }
+    size_t body_start = close + 1;
+    if (lane_name.empty()) {
+        lane_name = "gl_LocalInvocationIndex";
+        const std::string added =
+            (Trim(params_text).empty() ? "" : ", ") +
+            std::string("uint gl_LocalInvocationIndex [[thread_index_in_threadgroup]]");
+        source.insert(close, added);
+        body_start += added.size();
+    }
+    for (size_t at = source.find(Call, body_start); at != std::string::npos;) {
+        const size_t window_begin = at > body_start + 128 ? at - 128 : body_start;
+        const std::string_view before =
+            std::string_view(source).substr(window_begin, at - window_begin);
+        if (before.find(lane_name + " == 0") != std::string_view::npos) {
+            at = source.find(Call, at + Call.size());
+            continue;
+        }
+        const std::string guard = "if (" + lane_name + " == 0) ";
+        source.insert(at, guard);
+        at = source.find(Call, at + guard.size() + Call.size());
+    }
+}
+
+/// SPIRV-Cross flips BuiltInPosition.y in mesh shaders only when Position is inside a struct
+/// (gl_MeshPerVertexEXT); our recompiler emits a plain BuiltIn::Position vec4 array, leaving Y
+/// unflipped unless negated here.
+void FlipMeshPositionY(std::string& source) {
+    if (source.find("// Invert Y-axis for Metal") != std::string::npos) {
+        return;
+    }
+    const size_t per_vertex = source.find("struct spvPerVertex\n{");
+    const size_t per_vertex_end =
+        per_vertex == std::string::npos ? std::string::npos : source.find("};", per_vertex);
+    if (per_vertex_end == std::string::npos) {
+        return;
+    }
+    const size_t pos_attr = source.find("[[position]]", per_vertex);
+    if (pos_attr == std::string::npos || pos_attr > per_vertex_end) {
+        return;
+    }
+    size_t name_end = pos_attr;
+    while (name_end > per_vertex &&
+           std::isspace(static_cast<unsigned char>(source[name_end - 1])) != 0) {
+        --name_end;
+    }
+    size_t name_begin = name_end;
+    while (name_begin > per_vertex && IsIdentifier(source[name_begin - 1])) {
+        --name_begin;
+    }
+    if (name_begin == name_end) {
+        return;
+    }
+    const std::string member = source.substr(name_begin, name_end - name_begin);
+    const std::string assign = "spvV." + member + " = ";
+    const size_t assign_at = source.find(assign, per_vertex_end);
+    const size_t semi =
+        assign_at == std::string::npos ? std::string::npos : source.find(";\n", assign_at);
+    if (semi == std::string::npos) {
+        return;
+    }
+    const size_t line_begin = source.rfind('\n', assign_at) + 1;
+    const std::string indent = source.substr(line_begin, assign_at - line_begin);
+    source.insert(semi + 2, indent + "spvV." + member + ".y = -(spvV." + member +
+                                ".y); // Invert Y-axis for Metal\n");
+}
+
 struct MslMember {
     std::string type;
     std::string name;
@@ -1386,15 +1576,18 @@ bool SpillArrays(std::string& source, const std::string& entry_point, u32 table_
             const u32 index = static_cast<u32>(
                 std::atoi(parameter->attribute.c_str() + (texture ? 8 : 8)));
             if (index >= ArraySpillBase) {
-                if (!parameter->type.starts_with("array<")) {
+                const bool is_array = parameter->type.starts_with("array<");
+                if (!is_array && !parameter->type.starts_with("texture") &&
+                    !parameter->type.starts_with("depth")) {
                     return false;
                 }
                 // In the table (Metal 3: the resource IDs written by the CPU), and a reference
-                // to it under the parameter's name.
+                // or local handle to it under the parameter's name.
                 members += "    " + parameter->type + " " + parameter->name + " [[id(" +
                            std::to_string(index - ArraySpillBase) + ")]];\n";
-                declarations += "    constant " + parameter->type + "& " + parameter->name +
-                                " = spvArrayTable." + parameter->name + ";\n";
+                declarations += (is_array ? "    constant " + parameter->type + "& "
+                                          : "    " + parameter->type + " ") +
+                                parameter->name + " = spvArrayTable." + parameter->name + ";\n";
                 continue;
             }
         }

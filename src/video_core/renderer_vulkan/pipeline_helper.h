@@ -17,8 +17,9 @@
 #include <cstdlib>
 #include <optional>
 #include <span>
-#include <vector>
 #include <string>
+#include <type_traits>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 
@@ -26,6 +27,7 @@
 #include "common/logging.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
@@ -356,9 +358,12 @@ public:
     }
 
     VkPushConstantRange PushConstantRange() const {
+        using Shader::Backend::SPIRV::RENDERAREA_LAYOUT_OFFSET;
         using Shader::Backend::SPIRV::RenderAreaLayout;
         using Shader::Backend::SPIRV::RescalingLayout;
-        const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
+        const u32 size =
+            is_compute ? static_cast<u32>(sizeof(RescalingLayout))
+                       : static_cast<u32>(RENDERAREA_LAYOUT_OFFSET + sizeof(RenderAreaLayout));
         return VkPushConstantRange{
             .stageFlags = static_cast<VkShaderStageFlags>(
                 is_compute ? VK_SHADER_STAGE_COMPUTE_BIT
@@ -368,8 +373,7 @@ public:
                                        VK_SHADER_STAGE_MESH_BIT_EXT
                                  : VK_SHADER_STAGE_ALL_GRAPHICS)),
             .offset = 0,
-            .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
-                    static_cast<u32>(sizeof(RenderAreaLayout)),
+            .size = size,
         };
     }
 
@@ -424,6 +428,23 @@ public:
             .pushConstantRangeCount = 1,
             .pPushConstantRanges = &range,
         });
+    }
+
+    /// The set and pipeline layouts from the cache, made on the first pipeline with these
+    /// bindings, set flags and push constant range.
+    const PipelineLayoutCache::Entry& GetLayouts(PipelineLayoutCache& cache,
+                                                 bool use_push_descriptor,
+                                                 bool use_descriptor_buffer = false) const {
+        return cache.Get(PipelineLayoutCache::MakeKey(use_push_descriptor, use_descriptor_buffer,
+                                                      is_compute, uses_mesh, mesh_emulation,
+                                                      std::span(bindings.data(), bindings.size())),
+                         [&] {
+                             PipelineLayoutCache::Entry entry;
+                             entry.set = CreateDescriptorSetLayout(use_push_descriptor,
+                                                                   use_descriptor_buffer);
+                             entry.pipeline = CreatePipelineLayout(*entry.set);
+                             return entry;
+                         });
     }
 
     /// Mesh emulation: a graphics pipeline layout whose mesh program runs as a compute shader
@@ -523,6 +544,9 @@ public:
     explicit RescalingPushConstant() noexcept {}
 
     void PushTexture(bool is_rescaled) noexcept {
+        if (texture_ptr >= words.data() + Shader::Backend::SPIRV::NUM_TEXTURE_SCALING_WORDS) {
+            return;
+        }
         *texture_ptr |= is_rescaled ? texture_bit : 0u;
         texture_bit <<= 1u;
         if (texture_bit == 0u) {
@@ -532,6 +556,9 @@ public:
     }
 
     void PushImage(bool is_rescaled) noexcept {
+        if (image_ptr >= words.data() + NUM_TEXTURE_AND_IMAGE_SCALING_WORDS) {
+            return;
+        }
         *image_ptr |= is_rescaled ? image_bit : 0u;
         image_bit <<= 1u;
         if (image_bit == 0u) {
@@ -597,7 +624,8 @@ inline void AppendBindingKinds(const Shader::Info& info, bool compute, std::vect
     }
     for (const auto& desc : info.texture_descriptors) {
         const u32 kind = base | BindingKind::Texture | (static_cast<u32>(desc.type) << 3) |
-                         (desc.is_depth ? 1U << 7 : 0U);
+                         (desc.is_depth ? 1U << 7 : 0U) |
+                         (desc.handle_program != ~0U ? 1U << 14 : 0U);
         kinds.insert(kinds.end(), desc.count, kind);
     }
     for (const auto& desc : info.image_descriptors) {
@@ -680,6 +708,7 @@ inline void FindImageBindings(TextureCache& texture_cache,
 /// Resolves the bindings FindImageBindings missed, as GetSamplerId and FillImageViews do.
 inline void ResolveMissedBindings(TextureCache& texture_cache,
                                   const TextureCache::BindingLookup& lookup,
+                                  std::span<const u32> kinds,
                                   std::span<VideoCommon::ImageViewInOut> views,
                                   std::span<const u32> sampler_handles,
                                   std::span<VideoCommon::SamplerId> samplers,
@@ -695,7 +724,7 @@ inline void ResolveMissedBindings(TextureCache& texture_cache,
         return value == nullptr || value[0] != '0';
     }();
     const bool all_missed = misses.size() == views.size();
-    if (!all_missed && !aliased_hit && partial_enabled) {
+    if (!all_missed && partial_enabled) {
         for (const BindingMiss& miss : misses) {
             if (miss.sampler != ~0U) {
                 samplers[miss.sampler] =
@@ -708,11 +737,61 @@ inline void ResolveMissedBindings(TextureCache& texture_cache,
             subset.push_back(views[miss.view]);
         }
         texture_cache.FillImageViews(std::span(subset.data(), subset.size()), compute, blacklist);
-        if (texture_cache.BindingClock() == lookup.clock) {
-            for (size_t index = 0; index < misses.size(); ++index) {
-                views[misses[index].view].id = subset[index].id;
-            }
+        for (size_t index = 0; index < misses.size(); ++index) {
+            views[misses[index].view].id = subset[index].id;
+        }
+        if (texture_cache.BindingClock() == lookup.clock && !aliased_hit) {
             return;
+        }
+        BindingMisses stale_hits;
+        u32 sampler_index = 0;
+        for (size_t index = 0; index < views.size(); ++index) {
+            const bool is_texture = index < kinds.size() &&
+                                    (kinds[index] & BindingKind::ClassMask) == BindingKind::Texture;
+            if (auto* const memo = memos[index]) {
+                if (!texture_cache.MemoStillValid(*memo)) {
+                    memos[index] = nullptr;
+                    stale_hits.push_back(
+                        {static_cast<u32>(index), is_texture ? sampler_index : ~0U});
+                }
+            }
+            if (is_texture) {
+                ++sampler_index;
+            }
+        }
+        if (stale_hits.empty()) {
+            return;
+        }
+        if (stale_hits.size() + misses.size() < views.size()) {
+            const u64 retry_clock = texture_cache.BindingClock();
+            for (const BindingMiss& stale : stale_hits) {
+                if (stale.sampler != ~0U) {
+                    samplers[stale.sampler] =
+                        texture_cache.GetSamplerId(sampler_handles[stale.sampler], compute);
+                }
+            }
+            subset.clear();
+            subset.reserve(stale_hits.size());
+            for (const BindingMiss& stale : stale_hits) {
+                subset.push_back(views[stale.view]);
+            }
+            texture_cache.FillImageViews(std::span(subset.data(), subset.size()), compute,
+                                         blacklist);
+            for (size_t index = 0; index < stale_hits.size(); ++index) {
+                views[stale_hits[index].view].id = subset[index].id;
+            }
+            bool all_remaining_valid = true;
+            if (texture_cache.BindingClock() != retry_clock || aliased_hit) {
+                for (size_t index = 0; index < views.size(); ++index) {
+                    if (memos[index] != nullptr && !texture_cache.MemoStillValid(*memos[index])) {
+                        all_remaining_valid = false;
+                        break;
+                    }
+                }
+            }
+            if (all_remaining_valid) {
+                return;
+            }
         }
     }
     for (size_t index = 0; index < sampler_handles.size(); ++index) {
@@ -725,7 +804,7 @@ inline void ResolveMissedBindings(TextureCache& texture_cache,
 /// What PushImageDescriptors takes from the memo and where it leaves the descriptor and
 /// rescaling bit of each binding it resolves, by view index, for RecordImageBindings.
 struct ImageBindingRecord {
-    const VideoCommon::ImageViewInOut* views_begin;
+    VideoCommon::ImageViewInOut* views_begin;
     TextureCache::BindingMemo* const* memos; ///< per view: the memo to push, or nullptr
     DescriptorUpdateEntry* descriptors;      ///< per view; nullptr: nothing is resolved
     u8* rescaled;
@@ -774,11 +853,12 @@ inline void RecordImageBindings(TextureCache& texture_cache,
     }
 }
 
+template <typename ViewPtr>
 inline void PushImageDescriptors(TextureCache& texture_cache,
                                  GuestDescriptorQueue& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
-                                 const VideoCommon::ImageViewInOut*& views,
+                                 ViewPtr& views,
                                  const ImageBindingRecord* record = nullptr) {
     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
@@ -788,7 +868,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
     for (const auto& desc : info.texture_descriptors) {
         bool is_rescaled{};
         for (u32 index = 0; index < desc.count; ++index) {
-            const VideoCommon::ImageViewInOut* const view{views++};
+            const ViewPtr view{views++};
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
             size_t view_index = 0;
             if (record) {
@@ -809,6 +889,12 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                     VideoCore::Surface::GetFormatType(candidate.format) ==
                         VideoCore::Surface::SurfaceType::ColorTexture) {
                     image_view_id = VideoCommon::NULL_IMAGE_VIEW_ID;
+                    if constexpr (!std::is_const_v<std::remove_pointer_t<ViewPtr>>) {
+                        view->id = VideoCommon::NULL_IMAGE_VIEW_ID;
+                    }
+                    if (record && record->views_begin) {
+                        record->views_begin[view_index].id = VideoCommon::NULL_IMAGE_VIEW_ID;
+                    }
                 }
             }
             ImageView& image_view{texture_cache.GetImageView(image_view_id)};

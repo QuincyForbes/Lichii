@@ -22,6 +22,7 @@ namespace Metal {
 struct PipelineArchive::Impl {
     id<MTLBinaryArchive> archive = nil;
     NSURL* url = nil;
+    NSData* mapped_data = nil;
     std::string path;
 
     std::mutex add_mutex;
@@ -59,8 +60,9 @@ void PipelineArchive::DeferAdd(std::function<bool()> add) {
                 for (;;) {
                     std::function<bool()> next;
                     {
-                        std::unique_lock lock{impl->add_mutex};
-                        impl->add_cv.wait(lock, [this] { return impl->stop || !impl->adds.empty(); });
+                        std::unique_lock thread_lock{impl->add_mutex};
+                        impl->add_cv.wait(thread_lock,
+                                          [this] { return impl->stop || !impl->adds.empty(); });
                         if (impl->adds.empty()) {
                             return;
                         }
@@ -104,11 +106,20 @@ bool PipelineArchive::Open(const Device& device, const std::filesystem::path& pa
         const auto start = std::chrono::steady_clock::now();
         NSError* error = nil;
         id<MTLBinaryArchive> archive = nil;
+        impl->mapped_data = nil;
         if (exists) {
-            MTLBinaryArchiveDescriptor* descriptor = [MTLBinaryArchiveDescriptor new];
-            descriptor.url = impl->url;
-            archive = [device.GetDevice() newBinaryArchiveWithDescriptor:descriptor error:&error];
+            NSData* const mapped = [NSData dataWithContentsOfURL:impl->url
+                                                         options:NSDataReadingMappedAlways
+                                                           error:&error];
+            if (mapped != nil && mapped.length > 0) {
+                impl->mapped_data = mapped;
+                MTLBinaryArchiveDescriptor* descriptor = [MTLBinaryArchiveDescriptor new];
+                descriptor.url = impl->url;
+                archive =
+                    [device.GetDevice() newBinaryArchiveWithDescriptor:descriptor error:&error];
+            }
             if (archive == nil) {
+                impl->mapped_data = nil;
                 // Another OS or GPU, or a damaged file: start again.
                 LOG_WARNING(Render_Metal, "Metal: pipeline archive {} not loaded ({}); a new one "
                                           "is made",
@@ -158,11 +169,15 @@ void PipelineArchive::Save() {
         std::filesystem::create_directories(std::filesystem::path{impl->path}.parent_path(), ec);
         NSError* error = nil;
         std::unique_lock build_lock{build_mutex};
+        impl->mapped_data = nil;
         if (![impl->archive serializeToURL:impl->url error:&error]) {
             LOG_WARNING(Render_Metal, "Metal: pipeline archive {} not written: {}", impl->path,
                         error != nil ? error.localizedDescription.UTF8String : "no reason");
             return;
         }
+        impl->mapped_data = [NSData dataWithContentsOfURL:impl->url
+                                                  options:NSDataReadingMappedAlways
+                                                    error:nil];
         dirty = false;
         LOG_INFO(Render_Metal, "Metal: pipeline archive {} written with {} new pipelines ({:.1f} "
                                "ms)",

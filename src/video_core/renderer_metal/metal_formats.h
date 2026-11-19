@@ -119,7 +119,8 @@ namespace Metal {
     X(Depth16Unorm, 250)                                                                           \
     X(Depth32Float, 252)                                                                           \
     X(Stencil8, 253)                                                                               \
-    X(Depth32Float_Stencil8, 260)
+    X(Depth32Float_Stencil8, 260)                                                                  \
+    X(X32_Stencil8, 261)
 
 /// MTLPixelFormat values, named as Metal names them.
 namespace Fmt {

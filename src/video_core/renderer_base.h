@@ -51,6 +51,16 @@ public:
 
     [[nodiscard]] virtual std::string GetDeviceVendor() const = 0;
 
+    /// Total frames generated so far in the current session.
+    [[nodiscard]] virtual u64 GeneratedFrames() const {
+        return 0;
+    }
+
+    /// Whether NVIDIA DLSS Frame Generation (DLSS-G) is active in this session.
+    [[nodiscard]] virtual bool IsNvidiaFrameGenActive() const {
+        return false;
+    }
+
     // Getter/setter functions:
     // ------------------------
 

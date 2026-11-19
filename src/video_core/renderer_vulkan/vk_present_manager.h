@@ -19,6 +19,9 @@
 #include "video_core/renderer_vulkan/vk_host_pacer.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline_frame_gen.h"
+#endif
 
 namespace Core::Frontend {
 class EmuWindow;
@@ -51,6 +54,12 @@ struct Frame {
     /// signals, so the graphics queue never waits for it.
     bool generated_async{};
     vk::Fence generated_ready;
+#ifdef EGLANTINE_STREAMLINE
+    // DLSS Frame Generation: the guest frame presented and where the guest image is in the frame.
+    bool frame_gen{};
+    Streamline::FrameGenFrame frame_gen_frame{};
+    VkRect2D guest_rect{};
+#endif
 };
 
 class PresentManager {

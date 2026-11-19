@@ -29,7 +29,26 @@ public:
         u32 offset{}; ///< Of the asked range inside the window's buffer
     };
 
-    explicit HostImporter(const Device& device_) : device{device_} {}
+    explicit HostImporter(const Device& device_) : device{device_} {
+        if (device.IsExtExternalMemoryHost()) {
+            VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_props{
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
+                .pNext = nullptr,
+                .minImportedHostPointerAlignment = 0,
+            };
+            VkPhysicalDeviceProperties2 props2{
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                .pNext = &host_props,
+                .properties{},
+            };
+            device.GetPhysical().GetProperties2(props2);
+            if (host_props.minImportedHostPointerAlignment > 0) {
+                alignment = (std::max)(
+                    uintptr_t{4096},
+                    static_cast<uintptr_t>(std::bit_ceil(host_props.minImportedHostPointerAlignment)));
+            }
+        }
+    }
 
     [[nodiscard]] bool Usable() const noexcept {
         return !failed && device.IsExtExternalMemoryHost();
@@ -41,9 +60,10 @@ public:
         if (!Usable() || host_ptr == nullptr || size == 0) {
             return false;
         }
+        const uintptr_t align_mask = alignment - 1;
         const uintptr_t address = reinterpret_cast<uintptr_t>(host_ptr);
-        const uintptr_t first = address & ~uintptr_t{PageMask};
-        const uintptr_t last = (address + size + PageMask) & ~uintptr_t{PageMask};
+        const uintptr_t first = address & ~align_mask;
+        const uintptr_t last = (address + size + align_mask) & ~align_mask;
         const Key key{first, last - first};
         auto it = windows.find(key);
         if (it == windows.end()) {
@@ -69,7 +89,6 @@ public:
     }
 
 private:
-    static constexpr uintptr_t PageMask = 0xfff;
     static constexpr size_t MaxWindows = 1024;
 
     struct Key {
@@ -103,9 +122,14 @@ private:
             return Fail("memory host pointer properties");
         }
         const bool bda = device.IsBufferDeviceAddressSupported();
+        const VkExternalMemoryBufferCreateInfo external_buffer_ci{
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+            .pNext = nullptr,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+        };
         const VkBufferCreateInfo buffer_ci{
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .pNext = nullptr,
+            .pNext = &external_buffer_ci,
             .flags = 0,
             .size = size,
             .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -174,6 +198,7 @@ private:
     }
 
     const Device& device;
+    uintptr_t alignment{4096};
     bool failed{};
     std::unordered_map<Key, Window, KeyHash> windows;
 };

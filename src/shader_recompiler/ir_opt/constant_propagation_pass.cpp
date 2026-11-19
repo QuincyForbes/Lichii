@@ -1118,7 +1118,7 @@ std::optional<std::pair<IR::Value, bool>> EvalBitZero(const IR::Value& val, u32 
 }
 
 void FoldGetZeroFromOp(IR::Block& block, IR::Inst& inst) {
-    const IR::Value arg{inst.Arg(0)};
+    const IR::Value arg{inst.Arg(0).Resolve()};
     if (arg.IsImmediate()) {
         inst.ReplaceUsesWith(IR::Value{arg.U32() == 0});
         return;
@@ -1128,8 +1128,9 @@ void FoldGetZeroFromOp(IR::Block& block, IR::Inst& inst) {
         producer->Arg(1).IsImmediate() && producer->Arg(2).IsImmediate()) {
         const u32 shift{producer->Arg(1).U32()};
         const u32 count{producer->Arg(2).U32()};
-        if (producer->Arg(0).IsImmediate() && shift + count <= 32) {
-            const u32 extracted{(producer->Arg(0).U32() >> shift) & ((1U << count) - 1)};
+        if (producer->Arg(0).IsImmediate() && static_cast<size_t>(shift) + static_cast<size_t>(count) <= 32) {
+            const u32 mask{count == 32 ? ~0U : (1U << count) - 1};
+            const u32 extracted{count == 0 ? 0U : (producer->Arg(0).U32() >> shift) & mask};
             inst.ReplaceUsesWith(IR::Value{extracted == 0});
             if (!producer->HasAssociatedPseudoOperation()) {
                 producer->ReplaceUsesWith(IR::Value{extracted});
@@ -1296,7 +1297,11 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
                 throw LogicError("Undefined result in {}({}, {}, {})", IR::Opcode::BitFieldUExtract,
                                  base, shift, count);
             }
-            return (base >> shift) & ((1U << count) - 1);
+            if (count == 0) {
+                return 0U;
+            }
+            const u32 mask{count == 32 ? ~0U : (1U << count) - 1};
+            return (base >> shift) & mask;
         });
         return;
     case IR::Opcode::BitFieldSExtract:

@@ -456,9 +456,10 @@ private:
     vk::DescriptorSetLayout fallback_empty_set_layout;
     bool linked{};
 
-    vk::DescriptorSetLayout descriptor_set_layout;
+    VkDescriptorSetLayout descriptor_set_layout{}; ///< Owned by the PipelineLayoutCache
     DescriptorAllocator descriptor_allocator;
-    vk::PipelineLayout pipeline_layout;
+    VkPipelineLayout pipeline_layout{}; ///< Owned by the PipelineLayoutCache (or owned_pipeline_layout)
+    vk::PipelineLayout owned_pipeline_layout;
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
 
@@ -468,8 +469,10 @@ private:
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};
+    u64 last_descriptor_set_serial{};
     std::vector<u32> binding_kinds; ///< EDEN_NX2_BINDMEMO: per texture/image view, in read order
 
+    Common::ThreadWorker* const worker_thread;
     const bool worker_only_build;
     Common::ThreadWorker* const held_workers;
     bool uses_push_descriptor{false};

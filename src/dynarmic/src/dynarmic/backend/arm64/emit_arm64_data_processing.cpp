@@ -7,6 +7,7 @@
  */
 
 #include <cstddef>
+#include <cstdlib>
 
 #include <fmt/ostream.h>
 #include <oaknut/oaknut.hpp>
@@ -200,8 +201,22 @@ void EmitIR<IR::Opcode::TestBit>(oaknut::CodeGenerator& code, EmitContext& ctx, 
     code.UBFX(Xresult, Xoperand, args[1].GetImmediateU8(), 1);
 }
 
+namespace {
+
+bool ReuseDataProcFlagsOn() {
+    static const bool on = [] {
+        const char* const value = std::getenv("EDEN_NX2_JIT_FLAGS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+
+}  // namespace
+
 template<>
 void EmitIR<IR::Opcode::ConditionalSelect32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    const bool flags_live = ReuseDataProcFlagsOn() && ctx.ebi.nzcv_live_pos != nullptr &&
+                            code.xptr<const void*>() == ctx.ebi.nzcv_live_pos;
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const IR::Cond cond = args[0].GetImmediateCond();
     auto Wresult = ctx.reg_alloc.WriteW(inst);
@@ -212,13 +227,20 @@ void EmitIR<IR::Opcode::ConditionalSelect32>(oaknut::CodeGenerator& code, EmitCo
 
     // TODO: FSEL for fprs
 
-    code.LDR(Wscratch0, Xstate, ctx.conf.state_nzcv_offset);
-    code.MSR(oaknut::SystemReg::NZCV, Xscratch0);
+    if (!flags_live) {
+        code.LDR(Wscratch0, Xstate, ctx.conf.state_nzcv_offset);
+        code.MSR(oaknut::SystemReg::NZCV, Xscratch0);
+    }
     code.CSEL(Wresult, Wthen, Welse, static_cast<oaknut::Cond>(cond));
+    if (ReuseDataProcFlagsOn()) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
 }
 
 template<>
 void EmitIR<IR::Opcode::ConditionalSelect64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    const bool flags_live = ReuseDataProcFlagsOn() && ctx.ebi.nzcv_live_pos != nullptr &&
+                            code.xptr<const void*>() == ctx.ebi.nzcv_live_pos;
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const IR::Cond cond = args[0].GetImmediateCond();
     auto Xresult = ctx.reg_alloc.WriteX(inst);
@@ -229,9 +251,14 @@ void EmitIR<IR::Opcode::ConditionalSelect64>(oaknut::CodeGenerator& code, EmitCo
 
     // TODO: FSEL for fprs
 
-    code.LDR(Wscratch0, Xstate, ctx.conf.state_nzcv_offset);
-    code.MSR(oaknut::SystemReg::NZCV, Xscratch0);
+    if (!flags_live) {
+        code.LDR(Wscratch0, Xstate, ctx.conf.state_nzcv_offset);
+        code.MSR(oaknut::SystemReg::NZCV, Xscratch0);
+    }
     code.CSEL(Xresult, Xthen, Xelse, static_cast<oaknut::Cond>(cond));
+    if (ReuseDataProcFlagsOn()) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
 }
 
 template<>

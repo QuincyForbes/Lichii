@@ -190,6 +190,35 @@ u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 f
         if (!provoking_last) {
             break;
         }
+        if (!source.empty() && source.size() >= size_t{count} * index_size) {
+            const u32 tris = count / 3 * 3;
+            if (index_size == 2) {
+                const u8* ptr = source.data();
+                for (u32 vertex = 0; vertex < tris; vertex += 3) {
+                    u16 a, b, c;
+                    std::memcpy(&a, ptr + size_t{vertex} * 2, 2);
+                    std::memcpy(&b, ptr + size_t{vertex + 1} * 2, 2);
+                    std::memcpy(&c, ptr + size_t{vertex + 2} * 2, 2);
+                    out[written++] = restart && c == 0xFFFF ? 0xFFFFFFFFU : u32{c};
+                    out[written++] = restart && a == 0xFFFF ? 0xFFFFFFFFU : u32{a};
+                    out[written++] = restart && b == 0xFFFF ? 0xFFFFFFFFU : u32{b};
+                }
+                return written;
+            }
+            if (index_size == 4) {
+                const u8* ptr = source.data();
+                for (u32 vertex = 0; vertex < tris; vertex += 3) {
+                    u32 a, b, c;
+                    std::memcpy(&a, ptr + size_t{vertex} * 4, 4);
+                    std::memcpy(&b, ptr + size_t{vertex + 1} * 4, 4);
+                    std::memcpy(&c, ptr + size_t{vertex + 2} * 4, 4);
+                    out[written++] = c;
+                    out[written++] = a;
+                    out[written++] = b;
+                }
+                return written;
+            }
+        }
         for (u32 vertex = 0; vertex + 3 <= count; vertex += 3) {
             triangle(vertex, vertex + 1, vertex + 2);
         }
@@ -323,6 +352,20 @@ u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 f
         return written;
     default:
         break;
+    }
+    if (!source.empty() && source.size() >= size_t{count} * index_size && index_size == 1) {
+        const u8* ptr = source.data();
+        if (restart) {
+            for (u32 vertex = 0; vertex < count; ++vertex) {
+                const u8 v = ptr[vertex];
+                out[vertex] = v == 0xFF ? 0xFFFFFFFFU : u32{v};
+            }
+        } else {
+            for (u32 vertex = 0; vertex < count; ++vertex) {
+                out[vertex] = u32{ptr[vertex]};
+            }
+        }
+        return count;
     }
     for (u32 vertex = 0; vertex < count; ++vertex) {
         emit(vertex);

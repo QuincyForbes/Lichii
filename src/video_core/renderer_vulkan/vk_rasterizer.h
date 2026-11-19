@@ -282,9 +282,15 @@ private:
     void UpdateDepthBiasEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateLogicOpEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateDepthClampEnable(Tegra::Engines::Maxwell3D::Regs& regs);
-    void UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs);
+    void UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs,
+                                     const GraphicsPipeline* draw_pipeline);
     bool alpha_to_coverage_enable{}; ///< Last value recorded with SetAlphaToCoverageEnableEXT
-    void UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& regs);
+    bool last_a2c_supported{};
+    u64 last_a2c_epoch{~0ULL};
+    void UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& regs,
+                                const GraphicsPipeline* draw_pipeline);
+    bool last_a2o_supported{};
+    u64 last_a2o_epoch{~0ULL};
     void UpdateFrontFace(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateStencilOp(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateStencilTestEnable(Tegra::Engines::Maxwell3D::Regs& regs);
@@ -347,9 +353,9 @@ private:
     /// FSR with the frame.
     void UpdateOcarinaJitter();
     void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect);
-    bool TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace);
+    bool TryOcarinaUpscale(const ComputePipeline& pipeline, u64 native_key, bool replace);
     /// The recognized upscale dispatch as one bilinear tap (EDEN_NX2_OOT_BILINEAR_UPSCALE).
-    bool TryOcarinaBilinear(const ComputePipeline& pipeline);
+    bool TryOcarinaBilinear(const ComputePipeline& pipeline, u64 native_key);
     void ReadOcarinaActor(struct OcarinaActorMesh& mesh);
     /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
     bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
@@ -476,6 +482,9 @@ private:
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
     /// Fragment output components the dynamic color write mask was last recorded with
     u32 last_color_output_mask{};
+    u32 last_integer_rt_mask{~0U};
+    u32 last_dual_src_mask{~0U};
+    u64 last_blend_epoch{~0ULL};
     u64 nx2_dispatch_serial = 0;
     u64 nx2_wfi_dispatch_serial = 0;
     VideoCommon::OotNetwork::BypassState oot_network_bypass;
@@ -576,8 +585,8 @@ private:
     struct DynamicStateCache {
         u64 epoch{};
         u64 valid{};
-        std::array<u32, 10 + 16 * 7> viewports{};
-        std::array<u32, 6 + 16 * 3> scissors{};
+        std::array<u32, 12 + 16 * 7> viewports{};
+        std::array<u32, 8 + 16 * 3> scissors{};
         std::array<f32, 3> depth_bias{};
         std::array<f32, 4> blend_constants{};
         std::array<f32, 2> depth_bounds{};
@@ -600,7 +609,6 @@ private:
     DynamicStateCache dyn_cache;
     Tegra::Engines::Maxwell3D::DirtyState::Flags dyn_state_mask{};
     bool dyn_state_mask_built{};
-    bool dyn_state_never_skip{};
 
     std::unordered_map<VertexInputKey, std::unique_ptr<VertexInputLayout>, VertexInputKeyHash>
         vertex_input_layouts;

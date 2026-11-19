@@ -334,8 +334,8 @@ private:
                                            : Common::PerfSched::SyncptArmed);
             armed_ns = reached ? 0 : Common::PerfReport::NowNs();
         }
-        // The action runs on the GPU thread under the manager's lock, or inline if the value is
-        // already reached.
+        // The action runs on the thread that reaches the value, or inline if it is already
+        // reached.
         request.handle = manager.RegisterGuestAction(
             syncpoint, static_cast<u32>(value),
             [shared = m_shared, &kernel = system.Kernel(), &request, event, armed_ns] {
@@ -1925,7 +1925,7 @@ private:
         if (Common::DkbFrameTrace::Enabled()) {
             m_vsync->trace_present.store(m_presents, std::memory_order_relaxed);
         }
-        VideoCommon::Nx2GpuLatency::NotePresent();
+        VideoCommon::Nx2GpuLatency::NotePresent(SwapInterval(w[12]));
         Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
         if (m_presents <= 4 || (m_presents % 600) == 0) {
             LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
@@ -4832,11 +4832,24 @@ public:
 
     ~INx2GraphicsSystemSession() override {
         if (m_syncpt_watch_state) {
-            {
-                std::scoped_lock lk{m_syncpt_watch_state->mutex};
-                m_syncpt_watch_state->alive = false;
-                m_syncpt_watch_state->core_timing = nullptr;
+            std::scoped_lock lk{m_syncpt_watch_state->mutex};
+            m_syncpt_watch_state->alive = false;
+            m_syncpt_watch_state->core_timing = nullptr;
+        }
+        if (m_syncpt_request_thread.joinable()) {
+            m_syncpt_request_thread.request_stop();
+            if (m_syncpt_stop_event != nullptr) {
+                m_syncpt_stop_event->Signal(system.Kernel());
             }
+            m_syncpt_request_thread.join();
+        }
+        if (m_syncpt_poll_now) {
+            system.CoreTiming().UnscheduleEvent(m_syncpt_poll_now);
+        }
+        if (m_syncpt_poll) {
+            system.CoreTiming().UnscheduleEvent(m_syncpt_poll);
+        }
+        if (m_syncpt_watch_state) {
             auto& manager = system.Host1x().GetSyncpointManager();
             for (u32 id = 0; id < HostSyncpoints; ++id) {
                 if (m_syncpt_watch_handles[id] != 0) {
@@ -4845,14 +4858,11 @@ public:
                 }
             }
         }
-        if (m_syncpt_poll_now) {
-            system.CoreTiming().UnscheduleEvent(m_syncpt_poll_now);
-        }
         if (m_syncpt_memory != nullptr) {
             system.Host1x().GetSyncpointManager().SetGuestMirror({});
         }
-        if (m_syncpt_poll) {
-            system.CoreTiming().UnscheduleEvent(m_syncpt_poll);
+        if (m_syncpt_stop_event != nullptr) {
+            m_context.CloseEvent(m_syncpt_stop_event);
         }
         for (auto* event : m_syncpt_events) {
             if (event != nullptr) {
@@ -5004,54 +5014,57 @@ private:
         auto rw = ctx.GetObjectFromHandle<Kernel::KTransferMemory>(ctx.GetCopyHandle(0));
         auto ro = ctx.GetObjectFromHandle<Kernel::KTransferMemory>(ctx.GetCopyHandle(1));
         if (rw.IsNotNull() && ro.IsNotNull() && ro->GetSize() >= 0x2000) {
-            m_syncpt_memory = &ro->GetOwner()->GetMemory();
-            m_syncpt_rw = GetInteger(rw->GetSourceAddress());
-            m_syncpt_ro = GetInteger(ro->GetSourceAddress());
-            m_syncpt_count = max_syncpoints;
-            m_last_syncpt_values.fill(~u64{0});
-            m_last_ro_bits.fill(0);
-            m_last_ro_summary = ~u64{0};
-            m_active_syncpt_mask.fill(0);
-            auto& memory = *m_syncpt_memory;
-            for (u32 w = 0; w < (m_syncpt_count + 63) / 64; ++w) {
-                m_last_ro_bits[w] = memory.Read64(m_syncpt_ro + SyncptRoBitsOffset + w * 8);
-            }
-            memory.Write32(m_syncpt_ro + 0x00, 1); // version
-            memory.Write32(m_syncpt_ro + 0x04, 0); // base id (guess)
-            memory.Write32(m_syncpt_ro + 0x08, max_syncpoints);
-            memory.Write32(m_syncpt_ro + 0x0c, SyncptValuesOffset);
-            memory.Write32(m_syncpt_ro + 0x10, SyncptRwSummaryOffset);
-            memory.Write32(m_syncpt_ro + 0x14, SyncptRoSummaryOffset);
-            memory.Write32(m_syncpt_ro + 0x18, SyncptRwBitsOffset);
-            memory.Write32(m_syncpt_ro + 0x1c, SyncptRoBitsOffset);
-            if (!m_syncpt_watch_state) {
-                m_syncpt_watch_state = std::make_shared<SyncptWatchState>();
-                m_syncpt_watch_state->core_timing = &system.CoreTiming();
-            }
-            if (!m_syncpt_poll_now) {
-                m_syncpt_poll_now = Core::Timing::CreateEvent(
-                    "nx2:gsv:SyncptPollNow",
-                    [this](s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
-                        m_syncpt_watch_state->pending.store(false, std::memory_order_release);
-                        PollSyncpts();
-                        return std::nullopt;
+            {
+                std::scoped_lock poll_lk{m_syncpt_poll_mutex};
+                m_syncpt_memory = &ro->GetOwner()->GetMemory();
+                m_syncpt_rw = GetInteger(rw->GetSourceAddress());
+                m_syncpt_ro = GetInteger(ro->GetSourceAddress());
+                m_syncpt_count = max_syncpoints;
+                m_last_syncpt_values.fill(~u64{0});
+                m_last_ro_bits.fill(0);
+                m_last_ro_summary = ~u64{0};
+                m_active_syncpt_mask.fill(0);
+                auto& memory = *m_syncpt_memory;
+                for (u32 w = 0; w < (m_syncpt_count + 63) / 64; ++w) {
+                    m_last_ro_bits[w] = memory.Read64(m_syncpt_ro + SyncptRoBitsOffset + w * 8);
+                }
+                memory.Write32(m_syncpt_ro + 0x00, 1); // version
+                memory.Write32(m_syncpt_ro + 0x04, 0); // base id (guess)
+                memory.Write32(m_syncpt_ro + 0x08, max_syncpoints);
+                memory.Write32(m_syncpt_ro + 0x0c, SyncptValuesOffset);
+                memory.Write32(m_syncpt_ro + 0x10, SyncptRwSummaryOffset);
+                memory.Write32(m_syncpt_ro + 0x14, SyncptRoSummaryOffset);
+                memory.Write32(m_syncpt_ro + 0x18, SyncptRwBitsOffset);
+                memory.Write32(m_syncpt_ro + 0x1c, SyncptRoBitsOffset);
+                if (!m_syncpt_watch_state) {
+                    m_syncpt_watch_state = std::make_shared<SyncptWatchState>();
+                    m_syncpt_watch_state->core_timing = &system.CoreTiming();
+                }
+                if (!m_syncpt_poll_now) {
+                    m_syncpt_poll_now = Core::Timing::CreateEvent(
+                        "nx2:gsv:SyncptPollNow",
+                        [this](s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
+                            m_syncpt_watch_state->pending.store(false, std::memory_order_release);
+                            PollSyncpts();
+                            return std::nullopt;
+                        });
+                    std::scoped_lock lk{m_syncpt_watch_state->mutex};
+                    m_syncpt_watch_state->poll_now_event = m_syncpt_poll_now;
+                }
+                UpdateSyncptValues();
+                // Mirror each guest increment as it happens, before the waits it meets are answered:
+                // the client's TryWaitNativeSync reads this page, and a client woken by an answered
+                // wait (nx2:syncpt 201) before the next poll read the old value. Yoshi and the
+                // Mysterious Book's movie player then aborted on purpose (2162-0001) a few minutes in.
+                system.Host1x().GetSyncpointManager().SetGuestMirror(
+                    [syncpt_memory = m_syncpt_memory, values = m_syncpt_ro + SyncptValuesOffset,
+                     count = std::min(m_syncpt_count, HostSyncpoints)](u32 id, u32 value) {
+                        if (id < count) {
+                            syncpt_memory->Write64(values + u64{id} * 8, value);
+                        }
                     });
-                std::scoped_lock lk{m_syncpt_watch_state->mutex};
-                m_syncpt_watch_state->poll_now_event = m_syncpt_poll_now;
+                ArmSyncptWatches();
             }
-            UpdateSyncptValues();
-            // Mirror each guest increment as it happens, before the waits it meets are answered:
-            // the client's TryWaitNativeSync reads this page, and a client woken by an answered
-            // wait (nx2:syncpt 201) before the next poll read the old value. Yoshi and the
-            // Mysterious Book's movie player then aborted on purpose (2162-0001) a few minutes in.
-            system.Host1x().GetSyncpointManager().SetGuestMirror(
-                [memory = m_syncpt_memory, values = m_syncpt_ro + SyncptValuesOffset,
-                 count = std::min(m_syncpt_count, HostSyncpoints)](u32 id, u32 value) {
-                    if (id < count) {
-                        memory->Write64(values + u64{id} * 8, value);
-                    }
-                });
-            ArmSyncptWatches();
             if (!m_syncpt_poll) {
                 m_syncpt_poll = Core::Timing::CreateEvent(
                     "nx2:gsv:SyncptPoll",
@@ -5069,6 +5082,28 @@ private:
         if (m_syncpt_events[0] == nullptr) {
             m_syncpt_events[0] = m_context.CreateEvent("nx2:gsv:SyncptRequest");
             m_syncpt_events[1] = m_context.CreateEvent("nx2:gsv:SyncptNotify");
+            m_syncpt_stop_event = m_context.CreateEvent("nx2:gsv:SyncptStop");
+        }
+        if (m_syncpt_memory != nullptr && !m_syncpt_request_thread.joinable()) {
+            m_syncpt_request_thread = std::jthread([this](std::stop_token stop_token) {
+                Common::SetCurrentThreadName("nx2:gsv:Syncpt");
+                system.RegisterHostThread();
+                while (!stop_token.stop_requested()) {
+                    s32 index{};
+                    std::array<Kernel::KSynchronizationObject*, 2> objects{
+                        &m_syncpt_events[0]->GetReadableEvent(),
+                        &m_syncpt_stop_event->GetReadableEvent(),
+                    };
+                    const Result result = Kernel::KSynchronizationObject::Wait(
+                        system.Kernel(), &index, objects.data(),
+                        static_cast<s32>(objects.size()), -1);
+                    if (stop_token.stop_requested() || R_FAILED(result) || index != 0) {
+                        break;
+                    }
+                    m_syncpt_events[0]->Clear(system.Kernel());
+                    PollSyncpts();
+                }
+            });
         }
         IPC::ResponseBuilder rb{ctx, 2, 2, 0};
         rb.Push(ResultSuccess);
@@ -5077,8 +5112,8 @@ private:
     }
 
     // Mirrors Eden's guest syncpoint values into the shared RO page, skipping unchanged slots via
-    // L1-cached m_last_syncpt_values instead of 192 guest Memory::Read64 calls every 500 us.
-    bool UpdateSyncptValues() {
+    // L1-cached m_last_syncpt_values instead of 192 guest Memory::Read64 calls on every poll.
+    bool UpdateSyncptValues(std::array<u64, 0x40>* changed_ids = nullptr) {
         auto& manager = system.Host1x().GetSyncpointManager();
         bool changed = false;
         manager.WithGuestValuesStable([&] {
@@ -5092,6 +5127,9 @@ private:
                     m_last_syncpt_values[id] = value;
                     m_syncpt_memory->Write64(m_syncpt_ro + SyncptValuesOffset + id * 8, value);
                     changed = true;
+                    if (changed_ids != nullptr && id / 64 < changed_ids->size()) {
+                        (*changed_ids)[id / 64] |= u64{1} << (id % 64);
+                    }
                     EndSyncptWait(id);
                 }
             }
@@ -5100,8 +5138,8 @@ private:
     }
 
     // Registers one-shot guest increment callbacks on active/armed syncpoints (< HostSyncpoints)
-    // so SyncptNotify fires immediately when the GPU releases a syncpoint instead of up to 500 us
-    // later at the next periodic poll.
+    // so SyncptNotify fires immediately when the GPU releases a syncpoint instead of waiting for
+    // the fallback periodic poll.
     void ArmSyncptWatches() {
         if (!m_syncpt_watch_state) {
             return;
@@ -5142,6 +5180,7 @@ private:
     // and rearms if it still has to wait. Acknowledging without a value change costs the client a
     // wakeup per poll, which keeps waits whose syncpoint we never see from hanging.
     void PollSyncpts() {
+        std::scoped_lock poll_lk{m_syncpt_poll_mutex};
         if (m_syncpt_memory == nullptr) {
             return;
         }
@@ -5150,19 +5189,23 @@ private:
         for (u32 w = 0; w < words; ++w) {
             armed[w] = m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwBitsOffset + w * 8);
         }
-        UpdateSyncptValues();
+        std::array<u64, 0x40> changed_ids{};
+        UpdateSyncptValues(&changed_ids);
         bool acked = false;
         for (u32 w = 0; w < words; ++w) {
             const u64 diff = armed[w] ^ m_last_ro_bits[w];
             for (u64 bits = diff; bits != 0; bits &= bits - 1) {
                 BeginSyncptWait(w * 64 + static_cast<u32>(std::countr_zero(bits)));
             }
+            if (w < m_active_syncpt_mask.size()) {
+                m_active_syncpt_mask[w] |= armed[w] | diff;
+            }
             if (diff != 0) {
-                if (w < m_active_syncpt_mask.size()) {
-                    m_active_syncpt_mask[w] |= diff;
-                }
                 m_last_ro_bits[w] = armed[w];
                 m_syncpt_memory->Write64(m_syncpt_ro + SyncptRoBitsOffset + w * 8, armed[w]);
+                acked = true;
+            }
+            if (w < changed_ids.size() && (armed[w] & changed_ids[w]) != 0) {
                 acked = true;
             }
         }
@@ -5637,7 +5680,7 @@ private:
         ReturnRawSession(system, ctx, std::move(nvsrv));
     }
 
-    static constexpr std::chrono::nanoseconds SyncptPollInterval{std::chrono::microseconds{500}};
+    static constexpr std::chrono::nanoseconds SyncptPollInterval{std::chrono::microseconds{2000}};
 
     struct SyncptWatchState {
         std::mutex mutex;
@@ -5651,6 +5694,8 @@ private:
     std::shared_ptr<Nx2NativeObjects> m_objects{std::make_shared<Nx2NativeObjects>()};
     KernelHelpers::ServiceContext m_context;
     std::array<Kernel::KEvent*, 2> m_syncpt_events{};
+    Kernel::KEvent* m_syncpt_stop_event{};
+    std::mutex m_syncpt_poll_mutex;
     Core::Memory::Memory* m_syncpt_memory{};
     u64 m_syncpt_rw{};
     u64 m_syncpt_ro{};
@@ -5664,6 +5709,7 @@ private:
     std::shared_ptr<SyncptWatchState> m_syncpt_watch_state;
     std::shared_ptr<Core::Timing::EventType> m_syncpt_poll;
     std::shared_ptr<Core::Timing::EventType> m_syncpt_poll_now;
+    std::jthread m_syncpt_request_thread;
 };
 
 } // namespace Service

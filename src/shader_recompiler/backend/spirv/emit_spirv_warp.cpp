@@ -136,6 +136,65 @@ Id BroadcastLane(EmitContext& ctx, Id value, u32 lane) {
     }
     return result;
 }
+bool IsActiveSubgroupBallot(const IR::Value& value) {
+    if (value.IsImmediate()) {
+        return false;
+    }
+    const IR::Inst* const inst{value.InstRecursive()};
+    const IR::Value pred{inst->GetOpcode() == IR::Opcode::SubgroupBallot ? inst->Arg(0).Resolve()
+                                                                         : IR::Value{}};
+    return !pred.IsEmpty() && pred.IsImmediate() && pred.U1();
+}
+
+bool IsNegatedValue(const IR::Value& maybe_neg, const IR::Value& target) {
+    if (maybe_neg.IsImmediate()) {
+        return false;
+    }
+    const IR::Inst* inst{maybe_neg.InstRecursive()};
+    if (inst->GetOpcode() == IR::Opcode::IAdd32) {
+        if (inst->Arg(0).Resolve() == IR::Value{0U}) {
+            if (inst->Arg(1).IsImmediate()) {
+                return false;
+            }
+            inst = inst->Arg(1).InstRecursive();
+        } else if (inst->Arg(1).Resolve() == IR::Value{0U}) {
+            if (inst->Arg(0).IsImmediate()) {
+                return false;
+            }
+            inst = inst->Arg(0).InstRecursive();
+        }
+    }
+    if (inst->GetOpcode() == IR::Opcode::INeg32) {
+        return inst->Arg(0).Resolve() == target.Resolve();
+    }
+    if (inst->GetOpcode() == IR::Opcode::ISub32 && inst->Arg(0).Resolve() == IR::Value{0U}) {
+        return inst->Arg(1).Resolve() == target.Resolve();
+    }
+    return false;
+}
+
+bool IsBroadcastFirstLane(const IR::Value& lane) {
+    if (lane.IsImmediate()) {
+        return false;
+    }
+    const IR::Inst* const find{lane.InstRecursive()};
+    if (find->GetOpcode() != IR::Opcode::FindUMsb32 &&
+        find->GetOpcode() != IR::Opcode::FindSMsb32) {
+        return false;
+    }
+    const IR::Value mask{find->Arg(0).Resolve()};
+    if (mask.IsImmediate()) {
+        return false;
+    }
+    const IR::Inst* const bit_and{mask.InstRecursive()};
+    if (bit_and->GetOpcode() != IR::Opcode::BitwiseAnd32) {
+        return false;
+    }
+    const IR::Value lhs{bit_and->Arg(0).Resolve()};
+    const IR::Value rhs{bit_and->Arg(1).Resolve()};
+    return (IsActiveSubgroupBallot(lhs) && IsNegatedValue(rhs, lhs)) ||
+           (IsActiveSubgroupBallot(rhs) && IsNegatedValue(lhs, rhs));
+}
 } // Anonymous namespace
 
 Id EmitLaneId(EmitContext& ctx) {
@@ -254,6 +313,11 @@ Id EmitShuffleIndex(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id cla
         }
         if (lane.IsImmediate()) {
             return BroadcastLane(ctx, value, lane.U32() & 31U);
+        }
+        if (!ctx.profile.warp_size_potentially_larger_than_guest && !UseShuffleFallback(ctx) &&
+            IsBroadcastFirstLane(lane)) {
+            ctx.AddCapability(spv::Capability::GroupNonUniformBallot);
+            return ctx.OpGroupNonUniformBroadcastFirst(ctx.U32[1], SubgroupScope(ctx), value);
         }
         return ShuffleAbsolute(ctx, value, HostThreadId(ctx, GuestLane(ctx, index)));
     }

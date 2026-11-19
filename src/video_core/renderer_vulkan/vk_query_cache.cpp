@@ -181,7 +181,15 @@ public:
         accumulation_buffer = memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.Record([buffer = *accumulation_buffer](vk::CommandBuffer cmdbuf) {
+            static constexpr VkMemoryBarrier post_fill_barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            };
             cmdbuf.FillBuffer(buffer, 0, 8, 0);
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, post_fill_barrier);
         });
     }
 
@@ -405,7 +413,23 @@ public:
         } else {
             scheduler.RequestOutsideRenderPassOperationContext();
             scheduler.Record([buffer = *accumulation_buffer](vk::CommandBuffer cmdbuf) {
+                static constexpr VkMemoryBarrier pre_fill_barrier{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                };
+                static constexpr VkMemoryBarrier post_fill_barrier{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, pre_fill_barrier);
                 cmdbuf.FillBuffer(buffer, 0, 8, 0);
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, post_fill_barrier);
             });
         }
 
@@ -1561,9 +1585,12 @@ void QueryCacheRuntime::HostConditionalRenderingCompareValueImpl(VideoCommon::Lo
         impl->hcr_buffer = buffer->Handle();
         impl->hcr_offset = offset;
     }
+    const VkConditionalRenderingFlagsEXT flags =
+        is_equal ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT : 0;
     if (impl->hcr_is_set) {
         if (impl->hcr_setup.buffer == impl->hcr_buffer &&
-            impl->hcr_setup.offset == impl->hcr_offset) {
+            impl->hcr_setup.offset == impl->hcr_offset &&
+            impl->hcr_setup.flags == flags) {
             return;
         }
     }
@@ -1574,7 +1601,7 @@ void QueryCacheRuntime::HostConditionalRenderingCompareValueImpl(VideoCommon::Lo
     impl->hcr_setup.buffer = impl->hcr_buffer;
     impl->hcr_setup.offset = impl->hcr_offset;
     impl->hcr_guest_address = object.address;
-    impl->hcr_setup.flags = is_equal ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT : 0;
+    impl->hcr_setup.flags = flags;
     impl->hcr_is_set = true;
     impl->is_hcr_running = false;
     if (was_running) {
@@ -1834,9 +1861,7 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
             const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
             const auto [buffer, offset] = impl->buffer_cache.ObtainCPUBuffer(
                 pair.first, static_cast<u32>(pair.second - pair.first), sync_info, post_op);
-            if (VideoCommon::LazyPayloadSync()) {
-                buffer->MarkUsage(offset, pair.second - pair.first);
-            }
+            buffer->MarkUsage(offset, pair.second - pair.first);
             impl->buffers_to_upload_to.emplace_back(buffer->Handle(), offset);
         }
     });

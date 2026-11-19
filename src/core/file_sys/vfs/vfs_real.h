@@ -25,6 +25,7 @@ namespace FileSys {
 
 struct FileReference : public Common::IntrusiveListBaseNode<FileReference> {
     std::shared_ptr<Common::FS::IOFile> file{};
+    u32 in_flight{};
 };
 
 class RealVfsFile;
@@ -65,6 +66,9 @@ private:
     friend class RealVfsFile;
     std::unique_lock<std::mutex> RefreshReference(const std::string& path, OpenMode perms,
                                                   FileReference& reference);
+    std::shared_ptr<Common::FS::IOFile> PinReference(const std::string& path, OpenMode perms,
+                                                     FileReference& reference);
+    void UnpinReference(FileReference& reference);
     void DropReference(std::unique_ptr<FileReference>&& reference, const std::string& path);
 
 private:

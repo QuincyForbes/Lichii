@@ -92,6 +92,7 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
                      !g_trace_first_method_writes && !VideoCommon::Nx2Profile::Enabled();
     const char* skip_same = std::getenv("EDEN_NX2_SKIP_SAME");
     skip_same_value_writes = skip_same == nullptr || skip_same[0] != '0';
+    super_macro_enabled = SuperMacroEnabled();
     perf_verify = VideoCommon::Nx2Perf::Verify();
 }
 
@@ -347,28 +348,10 @@ size_t Maxwell3D::EstimateIndexBufferSize() {
     return std::min<size_t>(memory_manager.GetMemoryLayoutSize(start_address, byte_size * max_size) / byte_size, lower_cap);
 }
 
-u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
-    // Keep track of the register value in shadow_state when requested.
-    auto const c = shadow_state.shadow_ram_control;
-    if (c == Regs::ShadowRamControl::Track || c == Regs::ShadowRamControl::TrackWithFilter)
-        return shadow_state.reg_array[method] = argument;
-    else if (c == Regs::ShadowRamControl::Replay)
-        return shadow_state.reg_array[method];
-    return argument;
-}
-
-inline void Maxwell3D::SetDirtyFlags(u32 method) noexcept {
-    const u8 f0 = dirty.tables[0][method];
-    const u8 f1 = dirty.tables[1][method];
-    if (f0 != 0) {
-        dirty.flags[f0] = true;
-    }
-    if (f1 != 0) {
-        dirty.flags[f1] = true;
-    }
-}
-
 void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
+    if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) {
+        ReleaseFront();
+    }
     const auto control = shadow_state.shadow_ram_control;
     // Sunk methods are state writes only (not in execution_mask): skip unchanged values, as
     // CallMethod does.
@@ -427,20 +410,6 @@ void Maxwell3D::ApplyPairs(Core::System& system, const u64* pairs, u32 count) {
             ProcessDirtyRegisters(method, value);
         }
     }
-}
-
-void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
-    // The instances after the first are drawn together once their loop ends, and they must see
-    // the state they were begun with: NVN's draw macros reset the base instance (and its copy in
-    // c[0][0x644]) right after the loop, before the macro returns.
-    if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
-        draw_manager.DrawDeferred(*this, true);
-    }
-    if (SuperMacroEnabled() && !execution_mask[method] && regs.reg_array[method] == argument) {
-        return;
-    }
-    regs.reg_array[method] = argument;
-    SetDirtyFlags(method);
 }
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
@@ -586,6 +555,10 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
     if (draw_manager.pending_vertex_arguments) [[unlikely]] {
         draw_manager.NoteVertexArgumentWrite(method);
     }
+    if (fast_maxwell3d && executing_macro == 0 && method < MacroRegistersStart &&
+        !execution_mask[method] && !perf_verify) {
+        return WriteStateRegister(method, method_argument);
+    }
     if (!fast_maxwell3d || executing_macro != 0 || method >= MacroRegistersStart ||
         method == MAXWELL3D_REG_INDEX(shadow_ram_control)) {
         return CallMethodSlow(system, method, method_argument, is_last_call);
@@ -617,13 +590,10 @@ bool IsStoreOnlyExecutable(u32 method) {
 // no write history, trace or profile, not a macro call or SET_SHADOW_RAM_CONTROL. The hot
 // executable methods go straight to their handler.
 void Maxwell3D::CallMethodFast(u32 method, u32 method_argument, bool is_last_call) {
-    const u32 argument = ProcessShadowRam(method, method_argument);
     if (!execution_mask[method]) {
-        if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
-            ProcessDirtyRegisters(method, argument);
-        }
-        return;
+        return WriteStateRegister(method, method_argument);
     }
+    const u32 argument = ProcessShadowRam(method, method_argument);
     ProcessDirtyRegisters(method, argument);
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     if (method - cb_data < 16) {
@@ -1771,6 +1741,27 @@ void Maxwell3D::ReleaseFront() {
     LOG_INFO(HW_GPU, "GPU thread split stopped: 3D macros back on the engine");
 }
 
+void Maxwell3D::ClearPendingMacro() {
+    executing_macro = 0;
+    macro_params.clear();
+    macro_segments.clear();
+    current_macro_dirty = false;
+    if (front) {
+        front->executing_macro = 0;
+        front->parameters.clear();
+    }
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        split.Defer(
+            [this] {
+                executing_macro = 0;
+                macro_params.clear();
+                macro_segments.clear();
+                current_macro_dirty = false;
+            },
+            VideoCommon::GpuSplit::Effect::None);
+    }
+}
+
 namespace {
 
 // Indexed draws that bind an index buffer other than the registers' (inline indices, small index
@@ -2340,6 +2331,335 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
     }
 }
 
+#ifndef ARCHITECTURE_x86_64
+namespace {
+template <typename Read, typename Emit>
+TuringMacroInterpreter::Result ExecuteTuringMacroSpan(TuringMacroInterpreter& interp,
+                                                      std::span<const u32> code, u64 generation,
+                                                      u32 start, std::span<const u32>& borrowed,
+                                                      std::vector<u32>& parameters, Read&& read_reg,
+                                                      Emit&& emit_reg, bool track_data_ram) {
+    using Word = TuringMacroInterpreter::Word;
+    interp.Prepare(code, generation);
+    const std::size_t code_count = interp.decoded.size();
+    std::array<Word, 32> regs{};
+    Word valid_regs = 0x3f000000U;
+    Word carry{}, out_method{}, increment{};
+    Word pc = start, loop_count{}, loop_start{}, loop_end{};
+    std::size_t consumed{};
+    bool end_next{}, stopped{};
+    const char* error = nullptr;
+    const auto fail = [&](const char* message) {
+        if (error == nullptr) {
+            error = message;
+        }
+    };
+    interp.read_registers = false;
+    interp.reread_data_ram = false;
+    interp.data_ram_reads.clear();
+    interp.data_ram_writes.clear();
+    if (track_data_ram && interp.data_ram_reads.capacity() < 16) {
+        interp.data_ram_reads.reserve(16);
+        interp.data_ram_writes.reserve(16);
+    }
+    const auto active_span = [&]() -> std::span<const Word> {
+        return !borrowed.empty() && parameters.empty() ? borrowed
+                                                       : std::span<const Word>{parameters};
+    };
+    std::span<const Word> current_params = active_span();
+    const Word* param_data = current_params.data();
+    std::size_t param_size = current_params.size();
+    for (Word steps = 0; steps < 1000000; ++steps) {
+        if (static_cast<std::size_t>(pc) >= code_count) {
+            fail("instruction outside uploaded RAM");
+            break;
+        }
+        const TuringMacroInterpreter::Decoded& d = interp.decoded[pc];
+        if (d.load[0]) {
+            if (consumed >= param_size) {
+                fail("parameter FIFO underflow");
+                break;
+            }
+            regs[28] = param_data[consumed++];
+        }
+        if (d.load[1]) {
+            if (consumed >= param_size) {
+                fail("parameter FIFO underflow");
+                break;
+            }
+            regs[29] = param_data[consumed++];
+        }
+        const auto get = [&](Word reg, Word lane) -> Word {
+            if (!(valid_regs & (1U << reg))) {
+                fail(reg < 24 ? "uninitialized register read" : "invalid source register");
+                return 0;
+            }
+            if ((reg - 25U) > 2U) {
+                return regs[reg];
+            }
+            if (reg == 25) {
+                return Word(std::int32_t(std::int16_t(d.imm[lane])));
+            }
+            if (reg == 26) {
+                return Word(std::int32_t(std::int16_t(d.imm[1 - lane])));
+            }
+            return (Word{d.imm[0]} << 16) | d.imm[1];
+        };
+        const Word mask = d.pred_mode ? (get(d.pred_reg, 0) ? d.mask_true : d.mask_false) : 15U;
+        std::array<Word, 2> xs{}, ys{}, alu{};
+        if (mask & 1U) {
+            xs[0] = get(d.src_a[0], 0);
+            ys[0] = get(d.src_b[0], 0);
+        }
+        if (mask & 2U) {
+            xs[1] = get(d.src_a[1], 1);
+            ys[1] = get(d.src_b[1], 1);
+        }
+        if (error != nullptr) {
+            break;
+        }
+        Word next_pc = pc + 1;
+        bool branch_cancels_end{};
+        for (Word lane = 0; lane < 2 && error == nullptr; ++lane) {
+            if (!(mask & (1U << lane))) {
+                continue;
+            }
+            const Word x = xs[lane], y = ys[lane];
+            const Word imm = d.imm[lane];
+            Word value{};
+            const auto condition = [&](Word comparison) {
+                switch (comparison) {
+                case 17:
+                case 25:
+                    return std::int32_t(x) < std::int32_t(y);
+                case 18:
+                case 26:
+                    return x < y;
+                case 19:
+                case 27:
+                    return std::int32_t(x) <= std::int32_t(y);
+                case 20:
+                case 28:
+                    return x <= y;
+                default:
+                    return x == y;
+                }
+            };
+            switch (d.op[lane]) {
+            case 0:
+                value = x + y;
+                carry = value < x;
+                break;
+            case 1:
+                value = x + y + carry;
+                break;
+            case 2:
+                value = x - y;
+                carry = value > x;
+                break;
+            case 3:
+                value = x - y - carry;
+                break;
+            case 4:
+            case 6: {
+                const std::uint64_t a =
+                    d.op[lane] == 4 ? std::uint64_t(std::int64_t(std::int32_t(x))) : x;
+                const std::uint64_t b =
+                    d.op[lane] == 4 ? std::uint64_t(std::int64_t(std::int32_t(y))) : y;
+                const auto product = a * b;
+                value = Word(product);
+                carry = Word(product >> 32);
+                break;
+            }
+            case 5:
+                value = carry;
+                break;
+            case 7:
+                if (x != 0x1000) {
+                    fail("unsupported extended operation");
+                }
+                break;
+            case 8:
+                value = Word(std::countl_zero(x));
+                break;
+            case 9:
+                value = x << (y & 31);
+                break;
+            case 10:
+                value = x >> (y & 31);
+                break;
+            case 11:
+                value = Word(std::int32_t(x) >> (y & 31));
+                break;
+            case 12:
+                value = x & y;
+                break;
+            case 13:
+                value = ~(x & y);
+                break;
+            case 14:
+                value = x | y;
+                break;
+            case 15:
+                value = x ^ y;
+                break;
+            case 16: {
+                const Word dest = (imm >> 10) & 63, bit_count = (imm >> 5) & 31;
+                const Word src_bit = imm & 31;
+                if (dest >= 32) {
+                    fail("invalid merge destination");
+                    break;
+                }
+                const Word bits_mask = (1U << bit_count) - 1;
+                value = (x & ~(bits_mask << dest)) | (((y >> src_bit) & bits_mask) << dest);
+                break;
+            }
+            case 17:
+            case 18:
+            case 19:
+            case 20:
+            case 21:
+                value = condition(d.op[lane]) ? ~0U : 0;
+                break;
+            case 22:
+                value = read_reg((x + y) & 0xffff);
+                interp.read_registers = true;
+                break;
+            case 23:
+                if (loop_count || imm < 2) {
+                    fail("invalid loop");
+                    break;
+                }
+                if (x == 0) {
+                    next_pc = pc + imm;
+                    break;
+                }
+                loop_count = x - 1;
+                loop_start = pc;
+                loop_end = pc + imm - 1;
+                break;
+            case 24:
+                next_pc = pc + (imm & 0x7fff);
+                break;
+            case 25:
+            case 26:
+            case 27:
+            case 28:
+            case 29:
+                if (condition(d.op[lane]) == bool(imm & 0x8000)) {
+                    const auto branch_offset = std::int32_t(imm << 19) >> 19;
+                    if (branch_offset == -4096) {
+                        stopped = true;
+                    } else {
+                        next_pc = Word(std::int32_t(pc) + branch_offset);
+                        branch_cancels_end = (imm & 0x4000) != 0;
+                    }
+                }
+                break;
+            case 30:
+                if (x >= interp.active_dram->size()) {
+                    fail("data RAM read out of bounds");
+                    break;
+                }
+                value = (*interp.active_dram)[x];
+                if (track_data_ram && !interp.reread_data_ram) {
+                    if (std::ranges::find(interp.data_ram_writes, x,
+                                          &TuringMacroInterpreter::DataRamAccess::first) !=
+                        interp.data_ram_writes.end()) {
+                        interp.reread_data_ram = true;
+                    } else {
+                        interp.data_ram_reads.emplace_back(x, value);
+                    }
+                }
+                break;
+            case 31:
+                if (x >= interp.active_dram->size()) {
+                    fail("data RAM write out of bounds");
+                    break;
+                }
+                (*interp.active_dram)[x] = y;
+                if (track_data_ram && !interp.reread_data_ram) {
+                    interp.data_ram_writes.emplace_back(x, y);
+                }
+                break;
+            }
+            alu[lane] = value;
+            if (d.dst[lane] < 24) {
+                regs[d.dst[lane]] = value;
+                valid_regs |= 1U << d.dst[lane];
+            } else if (d.dst[lane] != 24) {
+                fail("invalid destination register");
+            }
+        }
+        const auto output = [&](Word selector) -> Word {
+            switch (selector) {
+            case 1:
+                return alu[0];
+            case 2:
+                return alu[1];
+            case 3:
+                return regs[28];
+            case 4:
+                return regs[29];
+            case 5:
+                return d.imm[0];
+            case 6:
+                return d.imm[1];
+            case 8:
+                return Word{d.imm[0]} >> 12;
+            case 9:
+                return Word{d.imm[1]} >> 12;
+            case 10:
+                return (Word{d.imm[0]} << 16) | d.imm[1];
+            default:
+                fail("invalid output selector");
+                return 0;
+            }
+        };
+        for (Word lane = 0; lane < 2 && error == nullptr; ++lane) {
+            if (!(mask & (4U << lane))) {
+                continue;
+            }
+            if (d.out_method[lane]) {
+                const Word addr_word = output(d.out_method[lane]);
+                out_method = addr_word & 0xfff;
+                increment = (addr_word >> 12) & 15;
+            }
+            if (d.out_emit[lane]) {
+                const Word value = output(d.out_emit[lane]);
+                if (error == nullptr) {
+                    if (!emit_reg(out_method, value)) {
+                        fail("unsupported emitted method");
+                    } else {
+                        current_params = active_span();
+                        param_data = current_params.data();
+                        param_size = current_params.size();
+                    }
+                }
+                out_method += increment;
+            }
+        }
+        if (error != nullptr) {
+            break;
+        }
+        if (end_next || stopped) {
+            return {true, pc, consumed, {}};
+        }
+        end_next = d.end && !branch_cancels_end;
+        if (loop_count && pc == loop_end) {
+            --loop_count;
+            next_pc = loop_start + 1;
+        }
+        pc = next_pc;
+    }
+    if (error == nullptr) {
+        error = "instruction limit exceeded";
+    }
+    return {false, pc, consumed, error};
+}
+} // namespace
+#endif
+
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
                               FrontState& fs, std::span<const u32> borrowed) {
     namespace Profile = VideoCommon::Nx2Profile;
@@ -2353,12 +2673,6 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     Profile::CountMethod(method, false);
 #ifdef ARCHITECTURE_x86_64
     const auto& options = FrontMacroOptions();
-#else
-    // No borrowed parameters without the JIT (nothing else reads them).
-    if (!borrowed.empty()) {
-        fs.parameters.assign(borrowed.begin(), borrowed.end());
-        borrowed = {};
-    }
 #endif
     const bool profile = Profile::Enabled();
     // EDEN_NX2_MACRO_TRACE=<macro index>: log the first 32 calls of one macro (its parameters,
@@ -2540,13 +2854,8 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 fs.oot_writes.clear();
             }
         }
-        if (replacement != OotMacros::Id::None && !borrowed.empty() && fs.parameters.empty()) {
-            // The replacement reads fs.parameters.
-            fs.parameters.assign(borrowed.begin(), borrowed.end());
-            borrowed = {};
-        }
         if (replacement == OotMacros::Id::None ||
-            !FrontRunOotMacro(system, split, fs, method, replacement)) {
+            !FrontRunOotMacro(system, split, fs, method, replacement, borrowed)) {
 #ifdef ARCHITECTURE_x86_64
             if (!engine.native_jit) {
                 engine.native_jit = std::make_shared<TuringMacroJit>();
@@ -2658,12 +2967,15 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                           start, result.consumed, parameter_count, result.error);
             }
 #else
-            const auto parameter_count = fs.parameters.size();
+            const auto initial_params = !borrowed.empty() && fs.parameters.empty()
+                                            ? borrowed
+                                            : std::span<const u32>{fs.parameters};
+            const auto parameter_count = initial_params.size();
             const auto read = [&fs](u32 address) {
                 return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
             };
             const auto emit = [&](u32 address, u32 value) {
-                if (trace) [[unlikely]] {
+                if (trace) {
                     trace_line += fmt::format(" {:#x}={:#x}", address, value);
                 }
                 if (address >= MacroRegistersStart) {
@@ -2672,6 +2984,10 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 FrontWrite(split, fs, address, value, true, true);
                 // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
                 if (address == 0x157 || address == 0x158) {
+                    if (!borrowed.empty() && fs.parameters.empty()) {
+                        fs.parameters.assign(borrowed.begin(), borrowed.end());
+                        borrowed = {};
+                    }
                     ++dma_reads;
                     FrontDmaRead(split, fs, method, address, value);
                 }
@@ -2685,7 +3001,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             if (use_memo && !trace && !fs.oot_dump) {
                 engine.native_memo.Synchronize(engine.native_code_generation);
                 if (decltype(engine.native_memo)::Effects effects;
-                    engine.native_memo.Find(start, fs.parameters, native_data_ram, effects)) {
+                    engine.native_memo.Find(start, initial_params, native_data_ram, effects)) {
                     for (size_t i = 0; i < effects.data_ram_writes.size(); i += 2) {
                         native_data_ram[effects.data_ram_writes[i]] = effects.data_ram_writes[i + 1];
                     }
@@ -2701,9 +3017,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 bool read_memory = false;
                 const bool track_memo = use_memo && !trace && !fs.oot_dump;
                 const u64 code_generation = engine.native_code_generation;
-                engine.native_interpreter.Prepare(engine.native_code, code_generation);
-                const auto result = engine.native_interpreter.Execute(
-                    engine.native_code, start, fs.parameters, read,
+                const auto result = ExecuteTuringMacroSpan(
+                    engine.native_interpreter, engine.native_code, code_generation, start, borrowed,
+                    fs.parameters, read,
                     [&](u32 address, u32 value) {
                         if (address == 0x157 || address == 0x158) {
                             read_memory = true;
@@ -2720,9 +3036,12 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                     !engine.native_interpreter.read_registers &&
                     !engine.native_interpreter.reread_data_ram &&
                     code_generation == engine.native_code_generation) {
+                    const std::span<const u32> store_params =
+                        !borrowed.empty() && fs.parameters.empty()
+                            ? borrowed
+                            : std::span<const u32>{fs.parameters.data(), parameter_count};
                     engine.native_memo.Store(
-                        start, std::span<const u32>(fs.parameters.data(), parameter_count),
-                        engine.native_interpreter.data_ram_reads,
+                        start, store_params, engine.native_interpreter.data_ram_reads,
                         engine.native_interpreter.data_ram_writes, engine.native_writes);
                 }
                 if (!result.success) {
@@ -2772,7 +3091,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                  trace_line);
         ++traced_calls;
     }
-    fs.parameters.clear();
+    if (!fs.parameters.empty()) {
+        fs.parameters.clear();
+    }
     if (fs.pending_instances != 0) {
         const u32 more = std::exchange(fs.pending_instances, 0);
         split.Defer([this, more] { draw_manager.draw_state.instance_count += more; },
@@ -2892,8 +3213,8 @@ bool Maxwell3D::FrontDrawFromGpuArguments(Core::System& system, VideoCommon::Gpu
     fs.regs[end_method] = draw->end;
     fs.vertex_arguments_unknown = 3;
     split.Defer(
-        [this, &system, arguments, device = *device, end = draw->end] {
-            DrawFromGpuArguments(system, arguments, device, end);
+        [this, &system, arguments, device_addr = *device, end = draw->end] {
+            DrawFromGpuArguments(system, arguments, device_addr, end);
         },
         VideoCommon::GpuSplit::Effect::Gpu);
     // The end of the macro, as FrontRunMacro ends it (its writes include draw manager methods).
@@ -3406,12 +3727,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                             return dispatches.unbounded[static_cast<size_t>(reason)];
                         };
                         u64 dispatch_drains = 0;
-                        for (const u64 count : dispatch_checks) {
-                            dispatch_drains += count;
+                        for (const u64 n : dispatch_checks) {
+                            dispatch_drains += n;
                         }
                         u64 dispatches_unbounded = 0;
-                        for (const u64 count : dispatches.unbounded) {
-                            dispatches_unbounded += count;
+                        for (const u64 n : dispatches.unbounded) {
+                            dispatches_unbounded += n;
                         }
                         using Release = VideoCommon::GpuSplit::ReleaseNote;
                         const auto& releases = split.ReleaseNotes();
@@ -3819,12 +4140,17 @@ struct Maxwell3D::OotContext {
     VideoCommon::GpuSplit& split;
     FrontState& fs;
     u32 macro_method;
+    std::span<const u32>& borrowed;
 
+    [[nodiscard]] std::span<const u32> Params() const {
+        return !borrowed.empty() && fs.parameters.empty() ? borrowed
+                                                          : std::span<const u32>{fs.parameters};
+    }
     [[nodiscard]] u32 Count() const {
-        return static_cast<u32>(fs.parameters.size());
+        return static_cast<u32>(Params().size());
     }
     [[nodiscard]] u32 Param(u32 index) const {
-        return fs.parameters[index];
+        return Params()[index];
     }
     [[nodiscard]] u32* Dram() {
         return engine.native_data_ram.data();
@@ -3941,7 +4267,11 @@ struct Maxwell3D::OotContext {
             fs.oot_writes.push_back(value);
         }
         engine.FrontWrite(split, fs, method, value, true, true);
-        if (method == 0x157 || method == 0x158) [[unlikely]] {
+        if (method == 0x157 || method == 0x158) {
+            if (!borrowed.empty() && fs.parameters.empty()) {
+                fs.parameters.assign(borrowed.begin(), borrowed.end());
+                borrowed = {};
+            }
             engine.FrontDmaRead(split, fs, macro_method, method, value);
         }
     }
@@ -3987,9 +4317,10 @@ struct Maxwell3D::OotContext {
 };
 
 bool Maxwell3D::FrontRunOotMacro(Core::System& system, VideoCommon::GpuSplit& split,
-                                 FrontState& fs, u32 method, OotMacros::Id id) {
+                                 FrontState& fs, u32 method, OotMacros::Id id,
+                                 std::span<const u32>& borrowed) {
     static_assert(sizeof(native_data_ram) == OotMacros::DataRamWords * sizeof(u32));
-    OotContext context{*this, system, split, fs, method};
+    OotContext context{*this, system, split, fs, method, borrowed};
     return OotMacros::Run(id, context);
 }
 

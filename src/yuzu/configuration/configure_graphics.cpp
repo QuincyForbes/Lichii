@@ -47,6 +47,7 @@
 #include "qt_common/config/uisettings.h"
 #include "qt_common/util/vk.h"
 #include "ui_configure_graphics.h"
+#include "yuzu/configuration/amd_fsr4_panel.h"
 #include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_graphics.h"
 #include "yuzu/configuration/nvidia_dlss_panel.h"
@@ -289,7 +290,6 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 
     std::map<u32, QWidget*> hold_graphics;
     std::vector<QWidget*> hold_api;
-    QCheckBox* frame_gen_checkbox = nullptr;
     QCheckBox* flow_scale_auto_checkbox = nullptr;
     QComboBox* oot_preset_combobox = nullptr;
     QComboBox* texture_quality_combobox = nullptr;
@@ -434,6 +434,43 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 
         if (setting->Id() == Settings::values.frame_gen_type.Id()) {
             frame_gen_type_combobox = widget->combobox;
+            if (frame_gen_type_combobox != nullptr) {
+                connect(frame_gen_type_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                        this, [this] { UpdateFeatureAvailability(); });
+                connect(frame_gen_type_combobox, QOverload<int>::of(&QComboBox::activated), this,
+                        [this] {
+                            if (frame_gen_type_combobox->currentData().toUInt() !=
+                                static_cast<u32>(Settings::FrameGenType::NvidiaDlssG)) {
+                                return;
+                            }
+                            if (vulkan_device_combobox == nullptr || vulkan_device_widget == nullptr ||
+                                !vulkan_device_widget->isEnabled()) {
+                                return;
+                            }
+                            const int cur = vulkan_device_combobox->currentIndex();
+                            if (cur >= 0 && size_t(cur) < records.size() &&
+                                records[cur].dlss_capable) {
+                                return;
+                            }
+                            for (size_t i = 0; i < records.size(); ++i) {
+                                if (records[i].dlss_capable &&
+                                    static_cast<int>(i) < vulkan_device_combobox->count()) {
+                                    vulkan_device_combobox->setCurrentIndex(static_cast<int>(i));
+                                    UpdateDeviceSelection(static_cast<int>(i));
+                                    PopulateVSyncModeSelection(false);
+                                    UpdateFeatureAvailability();
+                                    break;
+                                }
+                            }
+                        });
+            }
+        } else if (setting->Id() == Settings::values.nvidia_dlss_quality.Id()) {
+            nvidia_dlss_quality_combobox = widget->combobox;
+            if (nvidia_dlss_quality_combobox != nullptr) {
+                connect(nvidia_dlss_quality_combobox,
+                        QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                        [this] { UpdateFeatureAvailability(); });
+            }
         } else if (setting->Id() == Settings::values.scaling_filter.Id()) {
             scaling_filter_combobox = widget->combobox;
         } else if (setting->Id() == Settings::values.frame_gen_target_rate.Id() &&
@@ -456,8 +493,11 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             api_restore_global_button = widget->restore_button;
             if (!Settings::IsConfiguringGlobal()) {
                 api_restore_global_button->connect(api_restore_global_button,
-                                                   &QAbstractButton::clicked,
-                                                   [this](bool) { UpdateAPILayout(); });
+                                                   &QAbstractButton::clicked, [this](bool) {
+                                                       UpdateAPILayout();
+                                                       PopulateVSyncModeSelection(false);
+                                                       UpdateFeatureAvailability();
+                                                   });
                 // Detach API's restore button and place it where we want
                 // Lets us put it on the side, and it will automatically scale if there's a
                 // second combobox (vulkan_device)
@@ -530,21 +570,68 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             upscaler_combobox = widget->combobox;
             connect(widget->combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
                     [this] { UpdateFeatureAvailability(); });
-#ifdef EGLANTINE_STREAMLINE
-            // NVIDIA's files and a download button under the upscaler while DLSS is chosen.
+            connect(widget->combobox, QOverload<int>::of(&QComboBox::activated), this, [this] {
+                if (upscaler_combobox == nullptr || vulkan_device_combobox == nullptr ||
+                    vulkan_device_widget == nullptr || !vulkan_device_widget->isEnabled()) {
+                    return;
+                }
+                const auto chosen =
+                    static_cast<Settings::Upscaler>(upscaler_combobox->currentData().toUInt());
+                const int cur = vulkan_device_combobox->currentIndex();
+                const auto* cur_rec =
+                    cur >= 0 && size_t(cur) < records.size() ? &records[cur] : nullptr;
+                int switch_to = -1;
+                if (chosen == Settings::Upscaler::Dlss &&
+                    (cur_rec == nullptr || !cur_rec->dlss_capable)) {
+                    for (size_t i = 0; i < records.size(); ++i) {
+                        if (records[i].dlss_capable) {
+                            switch_to = static_cast<int>(i);
+                            break;
+                        }
+                    }
+                } else if (chosen == Settings::Upscaler::Fsr4 &&
+                           (cur_rec == nullptr || !cur_rec->fsr4_capable)) {
+                    for (size_t i = 0; i < records.size(); ++i) {
+                        if (records[i].fsr4_capable &&
+                            (switch_to < 0 || !records[i].integrated)) {
+                            switch_to = static_cast<int>(i);
+                            if (!records[i].integrated) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (switch_to >= 0 && switch_to < vulkan_device_combobox->count()) {
+                    vulkan_device_combobox->setCurrentIndex(switch_to);
+                    UpdateDeviceSelection(switch_to);
+                    PopulateVSyncModeSelection(false);
+                    UpdateFeatureAvailability();
+                }
+            });
+#if defined(EGLANTINE_STREAMLINE) || defined(_WIN32) || defined(__linux__)
             QWidget* group = new QWidget(this);
             QVBoxLayout* group_layout = new QVBoxLayout(group);
             group_layout->setContentsMargins(0, 0, 0, 0);
             group_layout->setSpacing(2);
             group_layout->addWidget(widget);
+#ifdef EGLANTINE_STREAMLINE
             nvidia_dlss_panel = new NvidiaDlssPanel(group);
             group_layout->addWidget(nvidia_dlss_panel);
+#endif
+#if defined(_WIN32) || defined(__linux__)
+            amd_fsr4_panel = new AmdFsr4Panel(group);
+            group_layout->addWidget(amd_fsr4_panel);
+#endif
             hold_graphics.emplace(setting->Id(), group);
 #else
             hold_graphics.emplace(setting->Id(), widget);
 #endif
         } else if (setting->Id() == Settings::values.frame_gen.Id()) {
             frame_gen_checkbox = widget->checkbox;
+            if (frame_gen_checkbox != nullptr) {
+                connect(frame_gen_checkbox, &QCheckBox::toggled, this,
+                        [this] { UpdateFeatureAvailability(); });
+            }
             hold_graphics.emplace(setting->Id(), widget);
         } else {
             hold_graphics.emplace(setting->Id(), widget);
@@ -563,8 +650,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                  : QString(),
              {v.resolution_setup.Id(), v.texture_quality.Id(), v.aspect_ratio.Id()}},
             {UiText::Text("category.Upscaling"), UiText::Text("category.Upscaling.footer"),
-             {v.upscaler.Id(), v.nvidia_dlss_preset.Id(), v.scaling_filter.Id(),
-              v.fsr_sharpening_slider.Id(), v.anti_aliasing.Id()}},
+             {v.upscaler.Id(), v.nvidia_dlss_quality.Id(), v.nvidia_dlss_preset.Id(),
+              v.scaling_filter.Id(), v.fsr_sharpening_slider.Id(), v.anti_aliasing.Id()}},
             {UiText::Text("category.FrameRate"), UiText::Text("category.FrameRate.footer"),
              {v.frame_rate_limit.Id(), v.vsync_mode.Id(), v.frame_gen.Id(), v.frame_gen_type.Id(),
               v.frame_gen_multiplier.Id(), v.frame_gen_target_rate.Id(),
@@ -670,6 +757,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         const auto it = hold_graphics.find(setting.Id());
         return it != hold_graphics.end() ? it->second : nullptr;
     };
+    nvidia_dlss_quality_widget = held(Settings::values.nvidia_dlss_quality);
     nvidia_dlss_preset_widget = held(Settings::values.nvidia_dlss_preset);
     frame_gen_widget = held(Settings::values.frame_gen);
 
@@ -795,6 +883,40 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     for (auto widget : hold_api) {
         api_grid_layout->addWidget(widget);
     }
+
+    discrete_gpu_hint_widget = new QWidget(api_grid_widget);
+    QHBoxLayout* hint_layout = new QHBoxLayout(discrete_gpu_hint_widget);
+    hint_layout->setContentsMargins(24, 2, 0, 4);
+    hint_layout->setSpacing(8);
+    discrete_gpu_hint_label = new QLabel(discrete_gpu_hint_widget);
+    discrete_gpu_hint_label->setTextFormat(Qt::RichText);
+    discrete_gpu_hint_label->setWordWrap(true);
+    discrete_gpu_hint_label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    QPushButton* use_discrete_btn =
+        new QPushButton(tr("Use Discrete GPU"), discrete_gpu_hint_widget);
+    hint_layout->addWidget(discrete_gpu_hint_label, 1);
+    hint_layout->addWidget(use_discrete_btn);
+    discrete_gpu_hint_widget->setVisible(false);
+    api_grid_layout->addWidget(discrete_gpu_hint_widget);
+    connect(use_discrete_btn, &QPushButton::clicked, this, [this] {
+        if (vulkan_device_combobox == nullptr) {
+            return;
+        }
+        int best = -1;
+        u64 best_vram = 0;
+        for (size_t i = 0; i < records.size(); ++i) {
+            if (!records[i].integrated && (best < 0 || records[i].vram_mib > best_vram)) {
+                best = static_cast<int>(i);
+                best_vram = records[i].vram_mib;
+            }
+        }
+        if (best >= 0 && best < vulkan_device_combobox->count()) {
+            vulkan_device_combobox->setCurrentIndex(best);
+            UpdateDeviceSelection(best);
+            PopulateVSyncModeSelection(false);
+            UpdateFeatureAvailability();
+        }
+    });
 
     // Background color is too specific to build into the new system, so we manage it here
     // (3 settings, all collected into a single widget with a QColor to manage on top)
@@ -965,30 +1087,95 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     [[maybe_unused]] const VkDeviceInfo::Record* record =
         device >= 0 && size_t(device) < records.size() ? &records[device] : nullptr;
 
-    // NVIDIA DLSS is offered only where it can run: a build with Streamline (Windows), the Vulkan
-    // renderer and an NVIDIA RTX GPU selected; MetalFX only in Apple builds. Their entries in the
-    // upscaler list hide elsewhere (unless chosen, as in a config from another machine).
+    int best_discrete_index = -1;
+    u64 best_discrete_vram = 0;
+    int best_rtx_index = -1;
+    u64 best_rtx_vram = 0;
+    int best_fsr4_index = -1;
+    u64 best_fsr4_vram = 0;
+    for (size_t i = 0; i < records.size(); ++i) {
+        if (!records[i].integrated &&
+            (best_discrete_index < 0 || records[i].vram_mib > best_discrete_vram)) {
+            best_discrete_index = static_cast<int>(i);
+            best_discrete_vram = records[i].vram_mib;
+        }
+        if (records[i].dlss_capable &&
+            (best_rtx_index < 0 || records[i].vram_mib > best_rtx_vram)) {
+            best_rtx_index = static_cast<int>(i);
+            best_rtx_vram = records[i].vram_mib;
+        }
+        if (records[i].fsr4_capable &&
+            (best_fsr4_index < 0 ||
+             (!records[i].integrated && records[best_fsr4_index].integrated) ||
+             (records[i].integrated == records[best_fsr4_index].integrated &&
+              records[i].vram_mib > best_fsr4_vram))) {
+            best_fsr4_index = static_cast<int>(i);
+            best_fsr4_vram = records[i].vram_mib;
+        }
+    }
+
+    if (discrete_gpu_hint_widget != nullptr && discrete_gpu_hint_label != nullptr) {
+        const bool show_hint = vulkan && record != nullptr && record->integrated &&
+                               best_discrete_index >= 0 && vulkan_device_widget != nullptr &&
+                               vulkan_device_widget->isEnabled();
+        if (show_hint) {
+            discrete_gpu_hint_label->setText(
+                tr("<span style=\"color:#d29922\">&#9888;</span> Integrated GPU selected — "
+                   "<b>%1</b> is available.")
+                    .arg(QString::fromStdString(records[best_discrete_index].name).toHtmlEscaped()));
+        }
+        discrete_gpu_hint_widget->setVisible(show_hint);
+    }
+
 #ifdef EGLANTINE_STREAMLINE
-    const bool dlss_offered = vulkan && record != nullptr && record->dlss_capable;
+    const bool dlss_selected_capable = vulkan && record != nullptr && record->dlss_capable;
+    const bool dlss_offered = vulkan && best_rtx_index >= 0;
 #else
+    [[maybe_unused]] constexpr bool dlss_selected_capable = false;
     constexpr bool dlss_offered = false;
 #endif
+    [[maybe_unused]] const bool fsr4_selected_capable =
+        vulkan && record != nullptr && record->fsr4_capable;
+    [[maybe_unused]] const bool fsr4_offered = vulkan && best_fsr4_index >= 0;
+
     const auto upscaler_is = [this](Settings::Upscaler value) {
         return upscaler_combobox != nullptr &&
                upscaler_combobox->currentData().toUInt() == static_cast<u32>(value);
     };
+    [[maybe_unused]] const bool frame_gen_dlssg_chosen =
+        frame_gen_checkbox != nullptr && frame_gen_checkbox->isChecked() &&
+        frame_gen_type_combobox != nullptr &&
+        frame_gen_type_combobox->currentData().toUInt() ==
+            static_cast<u32>(Settings::FrameGenType::NvidiaDlssG);
+
     [[maybe_unused]] const bool dlss_on = dlss_offered && upscaler_is(Settings::Upscaler::Dlss);
-#ifdef EGLANTINE_STREAMLINE
-    if (nvidia_dlss_panel != nullptr) {
-        nvidia_dlss_panel->setVisible(dlss_on);
+    if (nvidia_dlss_quality_widget != nullptr) {
+        nvidia_dlss_quality_widget->setVisible(dlss_on);
     }
-#endif
     if (nvidia_dlss_preset_widget != nullptr) {
         nvidia_dlss_preset_widget->setVisible(dlss_on);
     }
 #ifdef EGLANTINE_STREAMLINE
-    // Ocarina of Time's fixed sizes are DLSS's input then: name the mode each one is.
+    if (nvidia_dlss_panel != nullptr) {
+        const VkDeviceInfo::Record* dlss_record =
+            dlss_selected_capable ? record
+                                  : (best_rtx_index >= 0 ? &records[best_rtx_index] : record);
+        nvidia_dlss_panel->SetDevice(
+            dlss_record != nullptr ? QString::fromStdString(dlss_record->name) : QString(),
+            dlss_selected_capable || (dlss_offered && !upscaler_is(Settings::Upscaler::Dlss)));
+        nvidia_dlss_panel->SetFrameGenWanted(frame_gen_dlssg_chosen);
+        nvidia_dlss_panel->SetUpscalerSelected(upscaler_is(Settings::Upscaler::Dlss));
+        nvidia_dlss_panel->setVisible(upscaler_is(Settings::Upscaler::Dlss) ||
+                                      frame_gen_dlssg_chosen ||
+                                      (dlss_offered && upscaler_is(Settings::Upscaler::Auto)));
+    }
+    // Ocarina of Time's fixed sizes are DLSS's input when DLSS Quality is Automatic: name the mode
+    // each one corresponds to.
     if (oot_resolution_combobox != nullptr) {
+        const bool auto_dlss_quality =
+            nvidia_dlss_quality_combobox == nullptr ||
+            nvidia_dlss_quality_combobox->currentData().toUInt() ==
+                static_cast<u32>(Settings::DlssQuality::Auto);
         const auto& names =
             combobox_translations.at(Settings::EnumMetadata<Settings::OotResolution>::Index());
         for (int i = 0; i < oot_resolution_combobox->count(); ++i) {
@@ -998,21 +1185,28 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
                 continue;
             }
             QString mode;
-            if (dlss_on) {
+            if (dlss_on && auto_dlss_quality) {
+                const u32 dlss_quality_enum =
+                    Settings::EnumMetadata<Settings::DlssQuality>::Index();
                 switch (static_cast<Settings::OotResolution>(value)) {
                 case Settings::OotResolution::Full:
-                    mode = tr("DLSS Quality");
+                    mode = QStringLiteral("DLSS %1").arg(UiText::ChoiceLabel(
+                        dlss_quality_enum, static_cast<u32>(Settings::DlssQuality::Quality)));
                     break;
                 case Settings::OotResolution::Percent87:
-                    mode = tr("DLSS Balanced");
+                    mode = QStringLiteral("DLSS %1").arg(UiText::ChoiceLabel(
+                        dlss_quality_enum, static_cast<u32>(Settings::DlssQuality::Balanced)));
                     break;
                 case Settings::OotResolution::Percent75:
-                    mode = tr("DLSS Performance");
+                    mode = QStringLiteral("DLSS %1").arg(UiText::ChoiceLabel(
+                        dlss_quality_enum, static_cast<u32>(Settings::DlssQuality::Performance)));
                     break;
                 case Settings::OotResolution::Percent50:
                 case Settings::OotResolution::Percent40:
                 case Settings::OotResolution::Percent33:
-                    mode = tr("DLSS Ultra Performance");
+                    mode = QStringLiteral("DLSS %1").arg(UiText::ChoiceLabel(
+                        dlss_quality_enum,
+                        static_cast<u32>(Settings::DlssQuality::UltraPerformance)));
                     break;
                 default:
                     break;
@@ -1022,16 +1216,27 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
                 i, mode.isEmpty() ? name->second : tr("%1 - %2 to 4K").arg(name->second, mode));
         }
     }
-    if (nvidia_dlss_panel != nullptr && record != nullptr) {
-        nvidia_dlss_panel->SetDevice(QString::fromStdString(record->name));
+#endif
+#if defined(_WIN32) || defined(__linux__)
+    if (amd_fsr4_panel != nullptr) {
+        const VkDeviceInfo::Record* fsr4_record =
+            fsr4_selected_capable ? record
+                                  : (best_fsr4_index >= 0 ? &records[best_fsr4_index] : record);
+        amd_fsr4_panel->SetDevice(
+            fsr4_record != nullptr ? QString::fromStdString(fsr4_record->name) : QString(),
+            fsr4_selected_capable || (fsr4_offered && !upscaler_is(Settings::Upscaler::Fsr4)));
+        amd_fsr4_panel->SetUpscalerSelected(upscaler_is(Settings::Upscaler::Fsr4));
+        amd_fsr4_panel->setVisible(upscaler_is(Settings::Upscaler::Fsr4) ||
+                                   (fsr4_offered && upscaler_is(Settings::Upscaler::Auto)));
     }
 #endif
 
     // The native Metal renderer runs FSR 3, MetalFX and LSFG frame generation.
 #ifdef LICHII_METAL_RENDERER
-    const bool metal = GetCurrentGraphicsBackend() == Settings::RendererBackend::Metal;
+    [[maybe_unused]] const bool metal =
+        GetCurrentGraphicsBackend() == Settings::RendererBackend::Metal;
 #else
-    constexpr bool metal = false;
+    [[maybe_unused]] constexpr bool metal = false;
 #endif
 #ifdef HAS_LSFG
     ConfigurationShared::SetUnavailable(
@@ -1053,28 +1258,94 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
     constexpr bool metalfx = false;
     constexpr bool metalfx_frame_gen = false;
 #endif
-    // The entries of the lists that can't run here show only while one is the current value.
+    // Platform-unrelated entries hide (and are disabled in the model so mouse-wheel/arrow-key
+    // navigation skips them) unless currently chosen.
     const auto gate_item = [&](QComboBox* combobox, u32 enumeration, u32 value, bool offered) {
-        auto* view = combobox != nullptr ? qobject_cast<QListView*>(combobox->view()) : nullptr;
-        if (view == nullptr) {
+        if (combobox == nullptr) {
             return;
         }
-        const auto& items = combobox_translations.at(enumeration);
+        const auto found = combobox_translations.find(enumeration);
+        if (found == combobox_translations.end()) {
+            return;
+        }
+        auto* view = qobject_cast<QListView*>(combobox->view());
+        auto* model = qobject_cast<QStandardItemModel*>(combobox->model());
+        const auto& items = found->second;
         for (size_t i = 0; i < items.size(); ++i) {
-            if (items[i].first == value) {
-                view->setRowHidden(static_cast<int>(i),
-                                   !offered && combobox->currentIndex() != static_cast<int>(i));
+            if (items[i].first != value) {
+                continue;
+            }
+            const bool keep = offered || combobox->currentIndex() == static_cast<int>(i);
+            if (view != nullptr) {
+                view->setRowHidden(static_cast<int>(i), !keep);
+            }
+            if (model != nullptr) {
+                if (QStandardItem* item = model->item(static_cast<int>(i))) {
+                    item->setEnabled(keep);
+                }
             }
         }
     };
+    // Desktop hardware-gated options stay visible on Windows/Linux so users can see them and read
+    // why they are enabled or disabled in the tooltip.
+    [[maybe_unused]] const auto enable_item = [&](QComboBox* combobox, u32 enumeration, u32 value,
+                                                  bool enabled, const QString& disabled_tooltip) {
+        if (combobox == nullptr) {
+            return;
+        }
+        const auto found = combobox_translations.find(enumeration);
+        if (found == combobox_translations.end()) {
+            return;
+        }
+        auto* view = qobject_cast<QListView*>(combobox->view());
+        auto* model = qobject_cast<QStandardItemModel*>(combobox->model());
+        const auto& items = found->second;
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (items[i].first != value) {
+                continue;
+            }
+            if (view != nullptr) {
+                view->setRowHidden(static_cast<int>(i), false);
+            }
+            if (model != nullptr) {
+                if (QStandardItem* item = model->item(static_cast<int>(i))) {
+                    const bool selectable =
+                        enabled || combobox->currentIndex() == static_cast<int>(i);
+                    item->setEnabled(selectable);
+                    item->setToolTip(enabled ? QString() : disabled_tooltip);
+                }
+            }
+        }
+    };
+
     gate_item(scaling_filter_combobox, Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
               static_cast<u32>(Settings::ScalingFilter::MetalFxSpatial), metalfx);
     gate_item(frame_gen_type_combobox, Settings::EnumMetadata<Settings::FrameGenType>::Index(),
               static_cast<u32>(Settings::FrameGenType::MetalFx), metalfx_frame_gen);
     gate_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
               static_cast<u32>(Settings::Upscaler::MetalFx), metalfx);
+#ifdef __APPLE__
     gate_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
-              static_cast<u32>(Settings::Upscaler::Dlss), dlss_offered);
+              static_cast<u32>(Settings::Upscaler::Dlss), false);
+    gate_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
+              static_cast<u32>(Settings::Upscaler::Fsr4), false);
+    gate_item(frame_gen_type_combobox, Settings::EnumMetadata<Settings::FrameGenType>::Index(),
+              static_cast<u32>(Settings::FrameGenType::NvidiaDlssG), false);
+#else
+    enable_item(upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
+                static_cast<u32>(Settings::Upscaler::Dlss), dlss_offered,
+                tr("Requires Windows, the Vulkan renderer, and an NVIDIA GeForce RTX GPU."));
+    enable_item(
+        upscaler_combobox, Settings::EnumMetadata<Settings::Upscaler>::Index(),
+        static_cast<u32>(Settings::Upscaler::Fsr4), fsr4_offered,
+        tr("Requires an AMD Radeon RX 6000/7000/9000 or Ryzen RDNA 3+ GPU on Vulkan (falls back "
+           "to %1).")
+            .arg(UiText::ChoiceLabel("upscaler", "Fsr3")));
+    enable_item(frame_gen_type_combobox, Settings::EnumMetadata<Settings::FrameGenType>::Index(),
+                static_cast<u32>(Settings::FrameGenType::NvidiaDlssG), dlss_offered,
+                tr("Requires %1 on an NVIDIA GeForce RTX 40/50 GPU.")
+                    .arg(UiText::ChoiceLabel("upscaler", "Dlss")));
+#endif
 }
 
 void ConfigureGraphics::UpdateLosslessStatus() {

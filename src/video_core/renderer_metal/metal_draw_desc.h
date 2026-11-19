@@ -46,4 +46,6 @@ void ApplyTessellation(RenderPipelineDesc& desc, const Tessellation& tessellatio
 [[nodiscard]] DepthStencilDesc DepthStencilState(const Maxwell& regs, bool has_depth,
                                                  bool has_stencil);
 
+[[nodiscard]] u64 PackDepthStencilKey(const DepthStencilDesc& desc) noexcept;
+
 } // namespace Metal

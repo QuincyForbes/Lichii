@@ -221,16 +221,15 @@ void ReportSubmitCounts() {
 
 void Scheduler::CommandChunk::ExecuteAll(const vk::CommandBuffer& cmdbuf,
                                          const vk::CommandBuffer& upload_cmdbuf) {
-    auto command = first;
-    while (command != nullptr) {
-        auto next = command->GetNext();
+    while (first != nullptr) {
+        auto* command = first;
+        auto* next = command->GetNext();
         command->Execute(cmdbuf, upload_cmdbuf);
         command->~Command();
-        command = next;
+        first = next;
     }
     submit = false;
     command_offset = 0;
-    first = nullptr;
     last = nullptr;
 }
 
@@ -1976,6 +1975,7 @@ void Scheduler::InvalidateState() {
     state.graphics_pipeline = nullptr;
     state.rescaling_defined = false;
     state.descriptor_buffer_bound = false;
+    ++state.descriptor_buffer_bind_serial;
     state.pushed_rescaling_words.Forget();
     state.pushed_render_area.Forget();
     state_tracker.InvalidateCommandBufferState();
@@ -2018,10 +2018,12 @@ void Scheduler::EndRenderPass()
         query_cache->CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, false);
         query_cache->NotifySegment(false);
 
+        const bool use_xfb_barrier =
+            device.IsExtTransformFeedbackSupported() && std::exchange(render_pass_used_xfb, false);
         Record([this, num_images = num_renderpass_images,
                        images = renderpass_images,
                        ranges = renderpass_image_ranges,
-                       has_transform_feedback = device.IsExtTransformFeedbackSupported(),
+                       use_xfb_barrier,
                        time_pass = static_cast<bool>(pass_time_pool), draws = pass_draws](
                           vk::CommandBuffer cmdbuf) {
             std::array<VkImageMemoryBarrier, 9> barriers;
@@ -2066,7 +2068,7 @@ void Scheduler::EndRenderPass()
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
                                    0, nullptr, nullptr, vk::Span(barriers.data(), num_images));
-            if (has_transform_feedback) {
+            if (use_xfb_barrier) {
                 static constexpr VkMemoryBarrier XFB_OUTPUT_BARRIER{
                     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                     .pNext = nullptr,

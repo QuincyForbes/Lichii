@@ -503,6 +503,32 @@ void Device::RemoveExtensionFeatureIfUnsuitable(bool is_suitable, Feature& featu
     }
 }
 
+namespace {
+/// FSR 4 runs AMD's own shaders: inside AMD's runtime on Windows with AMD's driver, and through
+/// the fsr4-vk port on Linux with RADV. They need float16 and, on RDNA 4, float8 on the device;
+/// the emulator's shaders use neither for it.
+bool WantsAmdFsr4(VkDriverId driver_id) {
+#ifdef _WIN32
+    return driver_id == VK_DRIVER_ID_AMD_PROPRIETARY && Settings::AmdFsr4Chosen();
+#elif defined(__linux__) && !defined(__ANDROID__)
+    return driver_id == VK_DRIVER_ID_MESA_RADV && Settings::AmdFsr4Chosen();
+#else
+    (void)driver_id;
+    return false;
+#endif
+}
+
+/// The fsr4-vk port's shaders use features the emulator's don't; they're enabled only for it.
+bool WantsFsr4Port(VkDriverId driver_id) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    return WantsAmdFsr4(driver_id);
+#else
+    (void)driver_id;
+    return false;
+#endif
+}
+} // Anonymous namespace
+
 Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR surface,
                const vk::InstanceDispatch& dld_)
     : instance{instance_}, dld{dld_}, physical{physical_},
@@ -801,7 +827,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         descriptor_indexing.descriptorBindingStorageTexelBufferUpdateAfterBind = false;
         descriptor_indexing.descriptorBindingUpdateUnusedWhilePending = false;
         descriptor_indexing.descriptorBindingVariableDescriptorCount = false;
-        descriptor_indexing.runtimeDescriptorArray = false;
+        // The fsr4-vk port's shaders declare runtime descriptor arrays.
+        descriptor_indexing.runtimeDescriptorArray =
+            descriptor_indexing.runtimeDescriptorArray && WantsFsr4Port(driver_id);
     }
 
     // VK_EXT_descriptor_buffer requires VK_KHR_buffer_device_address
@@ -829,7 +857,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     // (IsFloat16Supported).
     const bool guest_float16 = features.shader_float16_int8.shaderFloat16;
     float16_math = guest_float16;
-    features.shader_float16_int8.shaderFloat16 = host_float16_supported;
+    features.shader_float16_int8.shaderFloat16 = host_float16_supported ? VK_TRUE : VK_FALSE;
     if (extensions.cooperative_matrix) {
         features.shader_float16_int8.shaderFloat16 = VK_TRUE;
         LOG_INFO(Render_Vulkan, "VK_KHR_cooperative_matrix enabled for guest tensor operations");
@@ -908,6 +936,75 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         }
     }
 
+#ifdef EGLANTINE_STREAMLINE
+    // With manual hooking the renderer creates the features and queues DLSS Frame Generation
+    // needs. Anything missing turns frame generation off, never the device.
+    std::vector<float> streamline_queue_priorities;
+    u32 first_streamline_queue = 0;
+    if (streamline_extensions && Streamline::FrameGenPending()) {
+        const bool has_descriptor_indexing =
+            instance_version >= VK_API_VERSION_1_2 || extensions.descriptor_indexing;
+        const std::array<std::pair<std::string_view, bool>, 16> enabled{{
+            {"timelineSemaphore", features.timeline_semaphore.timelineSemaphore == VK_TRUE},
+            {"bufferDeviceAddress",
+             features.buffer_device_address.bufferDeviceAddress == VK_TRUE},
+            {"descriptorIndexing", has_descriptor_indexing},
+            {"hostQueryReset", features.host_query_reset.hostQueryReset == VK_TRUE},
+            {"storageBuffer8BitAccess", features.bit8_storage.storageBuffer8BitAccess == VK_TRUE},
+            {"uniformAndStorageBuffer8BitAccess",
+             features.bit8_storage.uniformAndStorageBuffer8BitAccess == VK_TRUE},
+            {"shaderFloat16", features.shader_float16_int8.shaderFloat16 == VK_TRUE},
+            {"shaderInt8", features.shader_float16_int8.shaderInt8 == VK_TRUE},
+            {"vulkanMemoryModel", features.vulkan_memory_model.vulkanMemoryModel == VK_TRUE},
+            {"synchronization2", features.synchronization2.synchronization2 == VK_TRUE},
+            {"maintenance4", features.maintenance4.maintenance4 == VK_TRUE},
+            {"subgroupSizeControl",
+             features.subgroup_size_control.subgroupSizeControl == VK_TRUE},
+            {"computeFullSubgroups",
+             features.subgroup_size_control.computeFullSubgroups == VK_TRUE},
+            {"robustImageAccess", features.robust_image_access.robustImageAccess == VK_TRUE},
+            {"shaderDemoteToHelperInvocation",
+             features.shader_demote_to_helper_invocation.shaderDemoteToHelperInvocation ==
+                 VK_TRUE},
+            {"uniformBufferStandardLayout",
+             features.uniform_buffer_standard_layout.uniformBufferStandardLayout == VK_TRUE},
+        }};
+        std::string missing;
+        for (const std::string& name : Streamline::FrameGenDeviceFeatures()) {
+            const auto it = std::ranges::find(enabled, std::string_view{name},
+                                              &std::pair<std::string_view, bool>::first);
+            if (it == enabled.end() || !it->second) {
+                missing += (missing.empty() ? "" : ", ") + name;
+            }
+        }
+        if (!missing.empty()) {
+            Streamline::DropFrameGen(fmt::format("the device does not enable {}", missing));
+        }
+    }
+    if (const Streamline::QueueCounts extra = Streamline::ExtraQueues();
+        streamline_extensions && extra.graphics + extra.compute != 0) {
+        const auto ci = std::ranges::find(all_queue_cis, graphics_family,
+                                          &VkDeviceQueueCreateInfo::queueFamilyIndex);
+        const u32 available = physical.GetQueueFamilyProperties()[graphics_family].queueCount;
+        const u32 wanted = ci->queueCount + extra.graphics + extra.compute;
+        if (wanted > available) {
+            Streamline::DropFrameGen(
+                fmt::format("it needs {} graphics and {} compute queues beyond the renderer's {}, "
+                            "and the graphics family has {}",
+                            extra.graphics, extra.compute, ci->queueCount, available));
+        } else {
+            // Streamline's queues come after the renderer's. Priority 0 as Streamline's own
+            // vkCreateDevice gives them.
+            first_streamline_queue = ci->queueCount;
+            streamline_queue_priorities.assign(ci->pQueuePriorities,
+                                               ci->pQueuePriorities + ci->queueCount);
+            streamline_queue_priorities.resize(wanted, 0.0f);
+            ci->queueCount = wanted;
+            ci->pQueuePriorities = streamline_queue_priorities.data();
+        }
+    }
+#endif
+
     logical = vk::Device::Create(physical, all_queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
     features.shader_float16_int8.shaderFloat16 = guest_float16;
 
@@ -923,8 +1020,8 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
 #ifdef EGLANTINE_STREAMLINE
     if (streamline_extensions) {
-        streamline_attached =
-            Streamline::AttachDevice(instance, physical, *logical, graphics_family, dld);
+        streamline_attached = Streamline::AttachDevice(instance, physical, *logical,
+                                                       graphics_family, first_streamline_queue, dld);
     } else if (Streamline::WantsDevice()) {
         Streamline::Stop();
     }
@@ -1016,6 +1113,39 @@ Device::~Device() {
         }
     }
     vmaDestroyAllocator(allocator);
+}
+
+VideoCommon::Fsr4PortDevice Device::Fsr4PortDevice() const {
+    return {
+        .vendor_id = properties.properties.vendorID,
+        .device_id = properties.properties.deviceID,
+        .radv = properties.driver.driverID == VK_DRIVER_ID_MESA_RADV,
+        .mixed_dot4_accelerated = properties.integer_dot_product
+                                      .integerDotProduct4x8BitPackedMixedSignednessAccelerated !=
+                                  VK_FALSE,
+        .descriptor_buffer = extensions.descriptor_buffer && extensions.buffer_device_address &&
+                             features.descriptor_indexing.runtimeDescriptorArray,
+        .synchronization2 = extensions.synchronization2,
+        .compute_wave32 = extensions.subgroup_size_control &&
+                          features.subgroup_size_control.computeFullSubgroups &&
+                          IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT),
+        .shader_arithmetic = features.shader_float16_int8.shaderInt8 &&
+                             features.features.shaderInt16 &&
+                             (host_float16_supported ||
+                              features.shader_float16_int8.shaderFloat16) &&
+                             properties.float_controls.shaderDenormPreserveFloat16 &&
+                             extensions.shader_integer_dot_product,
+        .compute_derivatives = extensions.compute_shader_derivatives &&
+                               (properties.subgroup_properties.supportedStages &
+                                VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+                               IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_QUAD_BIT),
+        .fp8_matrices = fp8_matrix_shapes && extensions.cooperative_matrix &&
+                        extensions.shader_float8 &&
+                        features.shader_float8.shaderFloat8CooperativeMatrix &&
+                        extensions.cooperative_matrix2 &&
+                        features.vulkan_memory_model.vulkanMemoryModel &&
+                        features.bit8_storage.storageBuffer8BitAccess,
+    };
 }
 
 VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
@@ -1354,10 +1484,23 @@ bool Device::GetSuitability(bool requires_swapchain) {
 #ifdef EGLANTINE_STREAMLINE
     // The extensions NVIDIA's DLSS asks for, where the device has them all.
     if (Streamline::WantsDevice()) {
-        const std::vector<std::string> wanted = Streamline::DeviceExtensions();
+        const auto supported = [&](const std::string& name) {
+            return supported_extensions.contains(name);
+        };
+        std::vector<std::string> wanted = Streamline::DeviceExtensions();
+        // Frame generation's extensions must not cost DLSS its own.
+        if (!std::ranges::all_of(wanted, supported) && Streamline::FrameGenPending()) {
+            std::string missing;
+            for (const std::string& name : wanted) {
+                if (!supported(name)) {
+                    missing += (missing.empty() ? "" : ", ") + name;
+                }
+            }
+            Streamline::DropFrameGen(fmt::format("the device lacks {}", missing));
+            wanted = Streamline::DeviceExtensions();
+        }
         // Streamline may ask for no extensions at all.
-        const bool all = std::ranges::all_of(
-            wanted, [&](const std::string& name) { return supported_extensions.contains(name); });
+        const bool all = std::ranges::all_of(wanted, supported);
         std::string names;
         for (const std::string& name : wanted) {
             if (all) {
@@ -1988,6 +2131,18 @@ void Device::RemoveUnsuitableExtensions() {
             properties.subgroup_size_control.maxSubgroupSize == GuestWarpSize;
         cooperative_hmma_16x16x16 =
             usable && has_shape(16) && IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
+        const auto has_fp32_result_shape = [&](VkComponentTypeKHR input) {
+            return std::ranges::any_of(shapes, [=](const VkCooperativeMatrixPropertiesKHR& shape) {
+                return shape.MSize == 16 && shape.NSize == 16 && shape.KSize == 16 &&
+                       shape.AType == input && shape.BType == input &&
+                       shape.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                       shape.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                       shape.saturatingAccumulation == VK_FALSE &&
+                       shape.scope == VK_SCOPE_SUBGROUP_KHR;
+            });
+        };
+        fp8_matrix_shapes = has_fp32_result_shape(VK_COMPONENT_TYPE_FLOAT16_KHR) &&
+                            has_fp32_result_shape(VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT);
         extensions.cooperative_matrix = cooperative_hmma_16x8x16 || cooperative_hmma_16x16x16;
         features.cooperative_matrix.cooperativeMatrixRobustBufferAccess = VK_FALSE;
         RemoveExtensionFeatureIfUnsuitable(extensions.cooperative_matrix,
@@ -2026,6 +2181,37 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.maintenance5 = features.maintenance5.maintenance5;
     RemoveExtensionFeatureIfUnsuitable(extensions.maintenance5, features.maintenance5,
                                        VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+
+    // VK_EXT_shader_float8, only for AMD FSR 4: its RDNA 4 network runs in FP8 and drew a black
+    // picture without the feature on the device (found by CheezerWheezer).
+    if (extensions.shader_float8 &&
+        (!features.shader_float8.shaderFloat8 || !WantsAmdFsr4(properties.driver.driverID))) {
+        RemoveExtensionFeature(extensions.shader_float8, features.shader_float8,
+                               VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+    }
+
+    // Only for the fsr4-vk port: integer dot products and compute derivatives for its INT8
+    // network, and VK_NV_cooperative_matrix2's matrix conversions (all RADV implements of it,
+    // behind its radv_cooperative_matrix2_nv option) for its FP8 network.
+    const bool fsr4_port = WantsFsr4Port(properties.driver.driverID);
+    if (extensions.shader_integer_dot_product &&
+        (!fsr4_port || !features.shader_integer_dot_product.shaderIntegerDotProduct)) {
+        RemoveExtensionFeature(extensions.shader_integer_dot_product,
+                               features.shader_integer_dot_product,
+                               VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
+    }
+    if (extensions.compute_shader_derivatives &&
+        (!fsr4_port || !features.compute_shader_derivatives.computeDerivativeGroupLinear)) {
+        RemoveExtensionFeature(extensions.compute_shader_derivatives,
+                               features.compute_shader_derivatives,
+                               VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+    }
+    if (extensions.cooperative_matrix2 &&
+        (!fsr4_port || !extensions.cooperative_matrix ||
+         !features.cooperative_matrix2.cooperativeMatrixConversions)) {
+        RemoveExtensionFeature(extensions.cooperative_matrix2, features.cooperative_matrix2,
+                               VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME);
+    }
 
     // VK_KHR_maintenance6
     extensions.maintenance6 = features.maintenance6.maintenance6;

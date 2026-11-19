@@ -23,8 +23,22 @@ template <size_t Q>
 static void ApplyMix(std::span<s32> output, std::span<const s32> input, const f32 volume_,
                      const u32 sample_count) {
     const Common::FixedPoint<64 - Q, Q> volume{volume_};
-    for (u32 i = 0; i < sample_count; i++) {
-        output[i] = (output[i] + input[i] * volume).to_int();
+    const s64 gain_raw = volume.to_raw();
+    constexpr s64 frac_mask = Common::FixedPoint<64 - Q, Q>::fractional_mask;
+    s32* const out = output.data();
+    const s32* const in = input.data();
+    if (out != in) {
+        s32* __restrict dst = out;
+        const s32* __restrict src = in;
+        for (u32 i = 0; i < sample_count; i++) {
+            const s64 scaled = s64{src[i]} * gain_raw;
+            dst[i] = static_cast<s32>(s64{dst[i]} + ((scaled + ((scaled & frac_mask) >> 1)) >> Q));
+        }
+    } else {
+        for (u32 i = 0; i < sample_count; i++) {
+            const s64 scaled = s64{out[i]} * gain_raw;
+            out[i] = static_cast<s32>(s64{out[i]} + ((scaled + ((scaled & frac_mask) >> 1)) >> Q));
+        }
     }
 }
 

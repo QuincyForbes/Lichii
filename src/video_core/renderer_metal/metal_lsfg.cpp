@@ -181,7 +181,8 @@ LsfgChain::Image LsfgChain::MakeImage(std::array<u32, 2> size, u32 format) {
                                            .width = image.size[0],
                                            .height = image.size[1],
                                            .render_target = true,
-                                           .shader_write = true});
+                                           .shader_write = true,
+                                           .pixel_format_view = false});
     if (image.texture) {
         // Vulkan's images start undefined; these start black.
         ClearPass clear{};

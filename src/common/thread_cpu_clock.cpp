@@ -61,6 +61,8 @@ std::optional<u64> CurrentThreadCpuTimeNs() {
     return ReadNativeClock(reinterpret_cast<std::intptr_t>(GetCurrentThread()));
 #elif defined(__linux__)
     return ReadNativeClock(CLOCK_THREAD_CPUTIME_ID);
+#elif defined(__APPLE__)
+    return ReadNativeClock(static_cast<std::intptr_t>(pthread_mach_thread_np(pthread_self())));
 #else
     return std::nullopt;
 #endif

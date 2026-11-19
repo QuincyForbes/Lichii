@@ -355,6 +355,10 @@ void RecommendDesktop(const Device& device, Profile& p) {
                                                 (device.vram_mib != 0 && device.vram_mib < 6000));
     const bool small_mac = device.os == Os::MacOS && device.memory_mib < 12000;
 
+    if (device.recommended_vulkan_device.has_value()) {
+        Add(p, v.vulkan_device, *device.recommended_vulkan_device,
+            "Discrete GPU instead of the integrated graphics adapter.");
+    }
     Add(p, v.resolution_setup, ResolutionSetup::Res1X,
         "1x for games other than Ocarina of Time: a higher scale costs fps (Frizti tuning).");
     Add(p, v.use_docked_mode, ConsoleMode::Docked, "Docked: the TV resolution, as on a Switch 2.");

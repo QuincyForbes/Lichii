@@ -73,6 +73,8 @@ SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
 SWITCHABLE(Upscaler, false);
+SWITCHABLE(DlssQuality, false);
+SWITCHABLE(DlssPreset, false);
 SWITCHABLE(OotMovieUpscale, false);
 SWITCHABLE(TextureQuality, false);
 SWITCHABLE(OotResolution, false);
@@ -439,11 +441,13 @@ struct Values {
                                                   Specialization::Scalar,
                                                   true,
                                                   true};
+    SwitchableSetting<DlssQuality> nvidia_dlss_quality{linkage, DlssQuality::Auto,
+                                                       "nvidia_dlss_quality", Category::Renderer};
     // The DLSS model (preset) for every mode: K by default (NVIDIA's defaults for Performance and
     // Ultra Performance drew thin lines); Default leaves the choice to NVIDIA. EDEN_NX2_DLSS_PRESET
     // still overrides it.
-    Setting<DlssPreset> nvidia_dlss_preset{linkage, DlssPreset::K, "nvidia_dlss_preset",
-                                           Category::Renderer};
+    SwitchableSetting<DlssPreset> nvidia_dlss_preset{linkage, DlssPreset::K, "nvidia_dlss_preset",
+                                                     Category::Renderer};
     // Apple only: which bundled MoltenVK to load. Read once per process, at the first Vulkan start.
     Setting<MoltenVkDriver> moltenvk_driver{linkage, MoltenVkDriver::Legacy, "moltenvk_driver",
                                             Category::Renderer};
@@ -1261,10 +1265,11 @@ ResolutionSetup EffectiveResolutionSetup();
 
 // Settings upscaler, by what reads it.
 bool NvidiaDlssChosen();
+[[nodiscard]] bool AmdFsr4Chosen();
 bool MetalFxTemporalChosen();
 // A Switch 2 game's own translated DLSS network in place of AMD FSR 3.1.
 bool GameDlssNetworkChosen();
-// AMD FSR 3.1 in place of Ocarina of Time's upscale pass.
+// AMD FSR 3.1 or AMD FSR 4 in place of Ocarina of Time's upscale pass.
 bool OcarinaFsrChosen();
 
 void SetSpeedMode(const SpeedMode &mode);

@@ -128,7 +128,11 @@ void CheckUnchangedProfile() {
     CHECK(values.use_vulkan_driver_pipeline_cache.GetValue());
     CHECK_FALSE(values.use_video_framerate.GetValue());
     CHECK(values.mkw_frame_rate.GetValue() == Settings::MkwFrameRate::Game);
+#ifdef __APPLE__
+    CHECK_FALSE(values.use_reactive_flushing.GetValue());
+#else
     CHECK(values.use_reactive_flushing.GetValue());
+#endif
     CHECK(values.barrier_feedback_loops.GetValue());
     CHECK_FALSE(values.enable_buffer_history.GetValue());
     CHECK_FALSE(values.skip_cpu_inner_invalidation.GetValue());

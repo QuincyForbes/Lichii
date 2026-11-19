@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "common/alignment.h"
+#include "video_core/gpu_split.h"
 #include "video_core/renderer_metal/metal_buffer_cache.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_resources.h"
@@ -24,6 +25,9 @@ Buffer::Buffer(BufferCacheRuntime& runtime_, VAddr cpu_addr_, u64 size_bytes_, b
 
 Buffer::~Buffer() {
     if (buffer && runtime != nullptr) {
+        if (runtime->write_hook != nullptr) {
+            runtime->write_hook(runtime->write_hook_user, buffer.Get(), 0, ~u64{0});
+        }
         runtime->allocated_bytes -= bytes;
     }
 }
@@ -104,7 +108,7 @@ u64 BufferCacheRuntime::GetDeviceLocalMemory() const {
 }
 
 StagingBufferRef BufferCacheRuntime::UploadStagingBuffer(size_t size) {
-    return staging_pool.Request(size);
+    return staging_pool.Request(size, false, true);
 }
 
 StagingBufferRef BufferCacheRuntime::DownloadStagingBuffer(size_t size, bool deferred) {
@@ -115,9 +119,26 @@ void BufferCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
     staging_pool.FreeDeferred(ref);
 }
 
+void BufferCacheRuntime::WaitSubmittedTick(u64 tick, u64) {
+    if (scheduler.IsFree(tick)) {
+        return;
+    }
+    if (auto& split = VideoCommon::GpuSplit::Get();
+        split.Active() && !VideoCommon::GpuSplit::OnBackThread()) {
+        split.Publish();
+    }
+    if (scheduler.IsSubmitted(tick)) {
+        scheduler.WaitSubmitted(tick);
+    } else if (VideoCommon::GpuSplit::OwnsScheduler()) {
+        scheduler.Wait(tick);
+    } else {
+        scheduler.WaitCompleted(tick);
+    }
+}
+
 bool BufferCacheRuntime::CanReorderUpload(
     const Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies) const noexcept {
-    return scheduler.CanUploadAhead() && !scheduler.UsedInOrder(buffer.Handle()) &&
+    return scheduler.CanUploadAhead() &&
            std::ranges::none_of(copies, [&](const VideoCommon::BufferCopy& copy) {
                return buffer.IsRegionUsed(copy.dst_offset, copy.size);
            });
@@ -129,20 +150,63 @@ void BufferCacheRuntime::CopyBuffer(BufferHandle dst_buffer, BufferHandle src_bu
     // A blit encoder runs its copies in order; Metal orders encoders on tracked resources.
     // The scheduler notes the buffers of the copies it records in order.
     for (const VideoCommon::BufferCopy& copy : copies) {
+        if (write_hook != nullptr) {
+            write_hook(write_hook_user, dst_buffer, copy.dst_offset, copy.size);
+        }
         scheduler.CopyBuffer(src_buffer, copy.src_offset, dst_buffer, copy.dst_offset, copy.size,
                              can_reorder_upload);
     }
 }
 
+void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, BufferHandle src_buffer,
+                                    std::span<const VideoCommon::BufferCopy> copies, bool barrier,
+                                    bool can_reorder_upload) {
+    const bool ahead = can_reorder_upload && scheduler.CanUploadAhead();
+    if (!ahead) {
+        for (const VideoCommon::BufferCopy& copy : copies) {
+            dst_buffer.MarkUsage(copy.dst_offset, copy.size);
+        }
+    }
+    CopyBuffer(dst_buffer.Handle(), src_buffer, copies, barrier, ahead);
+}
+
+void BufferCacheRuntime::CopyBuffer(BufferHandle dst_buffer, Buffer& src_buffer,
+                                    std::span<const VideoCommon::BufferCopy> copies, bool barrier,
+                                    bool can_reorder_upload) {
+    const bool ahead = can_reorder_upload && scheduler.CanUploadAhead();
+    if (!ahead) {
+        for (const VideoCommon::BufferCopy& copy : copies) {
+            src_buffer.MarkUsage(copy.src_offset, copy.size);
+        }
+    }
+    CopyBuffer(dst_buffer, src_buffer.Handle(), copies, barrier, ahead);
+}
+
+void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, Buffer& src_buffer,
+                                    std::span<const VideoCommon::BufferCopy> copies, bool barrier,
+                                    bool can_reorder_upload) {
+    const bool ahead = can_reorder_upload && scheduler.CanUploadAhead();
+    if (!ahead) {
+        for (const VideoCommon::BufferCopy& copy : copies) {
+            src_buffer.MarkUsage(copy.src_offset, copy.size);
+            dst_buffer.MarkUsage(copy.dst_offset, copy.size);
+        }
+    }
+    CopyBuffer(dst_buffer.Handle(), src_buffer.Handle(), copies, barrier, ahead);
+}
+
 void BufferCacheRuntime::ClearBuffer(BufferHandle dest_buffer, u32 offset, size_t size,
                                      u32 value) {
+    if (write_hook != nullptr) {
+        write_hook(write_hook_user, dest_buffer, offset, size);
+    }
     const u8 byte = static_cast<u8>(value);
     if (value == u32{byte} * 0x01010101U) {
         scheduler.FillBuffer(dest_buffer, offset, size, byte);
         return;
     }
     // fillBuffer takes one byte: other patterns are copied from a staging buffer.
-    const StagingBufferRef pattern = staging_pool.Request(size);
+    const StagingBufferRef pattern = staging_pool.Request(size, false, true);
     for (size_t at = 0; at + sizeof(u32) <= size; at += sizeof(u32)) {
         std::memcpy(pattern.mapped_span.data() + at, &value, sizeof(u32));
     }
@@ -223,7 +287,11 @@ void BufferCacheRuntime::BindTransformFeedbackBuffers(
 
 std::span<u8> BufferCacheRuntime::BindMappedUniformBuffer(size_t, u32, u32 size) {
     const StagingBufferRef ref = staging_pool.Stream(size, GetUniformBufferAlignment());
-    bindings.push_back({Binding::Kind::Buffer, ref.buffer, static_cast<u32>(ref.offset), size, {}});
+    last_stream_uniform = StreamUniformRef{
+        .buffer = ref.buffer,
+        .offset = static_cast<u32>(ref.offset),
+    };
+    RebindStreamUniform(last_stream_uniform, size);
     return ref.mapped_span;
 }
 

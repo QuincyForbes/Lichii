@@ -408,6 +408,7 @@ int RegAlloc::RealizeReadWriteImpl(const IR::Value& read_value, const IR::Inst* 
         return write_loc;
     } else if constexpr (kind == HostLoc::Kind::Flags) {
         ASSERT(false && "Incorrect function for ReadWrite of flags");
+        UNREACHABLE();
     } else {
         UNREACHABLE();
     }
@@ -423,14 +424,18 @@ template int RegAlloc::RealizeReadWriteImpl<HostLoc::Kind::Gpr>(const IR::Value&
 template int RegAlloc::RealizeReadWriteImpl<HostLoc::Kind::Fpr>(const IR::Value&, const IR::Inst*);
 template int RegAlloc::RealizeReadWriteImpl<HostLoc::Kind::Flags>(const IR::Value&, const IR::Inst*);
 
-int RegAlloc::AllocateRegister(const std::array<HostLocInfo, 32>& regs, const std::vector<int>& order) const {
+int RegAlloc::AllocateRegister(const std::array<HostLocInfo, 32>& regs, std::span<const int> order) const {
     const auto empty = std::find_if(order.begin(), order.end(), [&](int i) { return regs[i].IsCompletelyEmpty(); });
     if (empty != order.end()) {
         return *empty;
     }
 
-    std::vector<int> candidates;
-    std::copy_if(order.begin(), order.end(), std::back_inserter(candidates), [&](int i) { return regs[i].MaybeAllocatable(); });
+    boost::container::static_vector<int, 32> candidates;
+    for (const int i : order) {
+        if (regs[i].MaybeAllocatable()) {
+            candidates.push_back(i);
+        }
+    }
 
     // TODO: The candidate was chosen randomly before, and a LRU was
     // suggested as an improvement. However, using an incrementing index
@@ -592,11 +597,14 @@ HostLocInfo& RegAlloc::ValueInfo(const IR::Inst* value) {
 
     if (const auto iter = std::find_if(gprs.begin(), gprs.end(), contains_value); iter != gprs.end()) {
         return *iter;
-    } else if (const auto iter = std::find_if(fprs.begin(), fprs.end(), contains_value); iter != fprs.end()) {
+    }
+    if (const auto iter = std::find_if(fprs.begin(), fprs.end(), contains_value); iter != fprs.end()) {
         return *iter;
-    } else if (contains_value(flags)) {
+    }
+    if (contains_value(flags)) {
         return flags;
-    } else if (const auto iter = std::find_if(spills.begin(), spills.end(), contains_value); iter != spills.end()) {
+    }
+    if (const auto iter = std::find_if(spills.begin(), spills.end(), contains_value); iter != spills.end()) {
         return *iter;
     }
     UNREACHABLE();

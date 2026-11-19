@@ -67,16 +67,23 @@ VkFormat GetFormat(const Tegra::FramebufferConfig& framebuffer) {
 
 } // Anonymous namespace
 
-Layer::Layer(const Device& device, MemoryAllocator& memory_allocator_, Scheduler& scheduler_, Tegra::MaxwellDeviceMemoryManager& device_memory_, size_t image_count_, VkExtent2D output_size, VkDescriptorSetLayout layout, const PresentFilters& filters_)
+Layer::Layer(const Device& device, MemoryAllocator& memory_allocator_, Scheduler& scheduler_, Tegra::MaxwellDeviceMemoryManager& device_memory_, size_t image_count_, VkExtent2D output_size_, VkDescriptorSetLayout layout, const PresentFilters& filters_)
     : memory_allocator(memory_allocator_)
     , scheduler(scheduler_)
     , device_memory(device_memory_)
     , filters(filters_)
     , image_count(image_count_)
+    , output_size(output_size_)
+    , descriptor_set_layout(layout)
 {
     CreateDescriptorPool(device);
-    CreateDescriptorSets(device, layout);
+    CreateDescriptorSets(device, descriptor_set_layout);
     resource_ticks.resize(image_count, 0);
+    CreateScalingFilter(device);
+}
+
+void Layer::CreateScalingFilter(const Device& device) {
+    sr_filter.emplace<std::monostate>();
     if (filters.get_scaling_filter() == Settings::ScalingFilter::Fsr) {
         sr_filter.emplace<FSR>(device, memory_allocator, image_count, output_size);
     } else if (filters.get_scaling_filter() == Settings::ScalingFilter::Sgsr) {
@@ -95,6 +102,40 @@ Layer::Layer(const Device& device, MemoryAllocator& memory_allocator_, Scheduler
         // FSR 1 where MetalFX can't run (other platforms, older OS versions).
         sr_filter.emplace<FSR>(device, memory_allocator, image_count, output_size);
     }
+}
+
+void Layer::EnsureImageCount(const Device& device, size_t image_index) {
+    if (image_index < image_count) {
+        return;
+    }
+    for (const u64 tick : resource_ticks) {
+        scheduler.Wait(tick);
+    }
+    scheduler.WaitWorker();
+
+    image_count = image_index + 1;
+    resource_ticks.resize(image_count, 0);
+    descriptor_sets = {};
+    descriptor_pool.reset();
+    CreateDescriptorPool(device);
+    CreateDescriptorSets(device, descriptor_set_layout);
+
+    if (!raw_images.empty()) {
+        ReleaseRawImages();
+    }
+    anti_alias.emplace<std::monostate>();
+#ifdef HAS_RESHADE
+    post_process.reset();
+    post_process_generation = 0;
+#endif
+    CreateScalingFilter(device);
+}
+
+void Layer::NoteSubmittedTick(size_t image_index) {
+    if (image_index >= resource_ticks.size()) {
+        resource_ticks.resize(image_index + 1, 0);
+    }
+    resource_ticks[image_index] = scheduler.CurrentTick();
 }
 
 Layer::~Layer() {
@@ -131,6 +172,7 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
             ReleaseRawImages();
         }
     }
+    EnsureImageCount(device, image_index);
     SetAntiAliasPass(device);
 #ifdef HAS_RESHADE
     SetPostProcessPass(device, is_applet);

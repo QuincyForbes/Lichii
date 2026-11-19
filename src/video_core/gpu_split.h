@@ -663,6 +663,9 @@ public:
     [[nodiscard]] u64 LastUnrangedPosition() const {
         return last_unranged_position;
     }
+    [[nodiscard]] u64 LastFunctionPosition() const {
+        return last_function_position;
+    }
     /// whether work sent after position `since` may write device bytes
     /// [begin, begin + size): compute or copies (any range), unranged writers, or a noted write
     /// that overlaps the range. Also true when more writes were noted since than are remembered.
@@ -1134,8 +1137,9 @@ private:
     bool front_macros{};
     std::unique_ptr<u64[]> ring;
 
-    // Front side.
-    u64 write_position{};
+    // Front side, in its own 128-byte block: the back writes back_engine and back_entry_position,
+    // so keeping them apart avoids cache-line ping-pong on every ring write.
+    alignas(128) u64 write_position{};
     u64 last_writer_position{};
     u64 last_memory_writer_position{};
     u64 last_unranged_position{};
@@ -1192,7 +1196,7 @@ private:
     static constexpr size_t DispatchWrittenPageWords = (size_t{1} << (36 - 12)) / 64;
     std::unique_ptr<DispatchWrite[]> dispatch_writes;
     std::unique_ptr<std::atomic<u64>[]> dispatch_written_pages;
-    alignas(64) std::atomic<u64> dispatch_write_count{};
+    alignas(128) std::atomic<u64> dispatch_write_count{};
     std::atomic<u64> last_unbounded_dispatch_position{};
     std::atomic<u64> dispatches_bounded{};
     std::array<std::atomic<u64>, static_cast<size_t>(DispatchUnbounded::Count)>
@@ -1211,7 +1215,7 @@ private:
         }
     }
     void AppendDispatchWrite(u64 begin, u64 end);
-    u64 last_sync_position{};
+    alignas(128) u64 last_sync_position{};
     u64 last_memory_write_position{};
     static constexpr u32 DeferredWrite = ~0U;
     static constexpr u32 OtherEngineWrite = ~0U - 1;
@@ -1335,8 +1339,8 @@ private:
     u32 publishes{};
     void ReportBatched();
 
-    // Back side.
-    Tegra::Engines::EngineInterface* back_engine{};
+    // Back side, in its own 128-byte block.
+    alignas(128) Tegra::Engines::EngineInterface* back_engine{};
     /// The position of the entry being run (dispatch writes record it).
     u64 back_entry_position{};
     /// EXP10: the front asked the back to record dispatch writes (NoteDispatchWriter).
@@ -1431,7 +1435,7 @@ private:
     [[nodiscard]] static size_t AsyncWriteBucket(u64 slot) {
         return static_cast<size_t>((slot ^ (slot >> 16) ^ (slot >> 32)) & (AsyncWriteBuckets - 1));
     }
-    std::vector<u64> async_writes = std::vector<u64>(AsyncWriteBuckets);
+    alignas(128) std::vector<u64> async_writes = std::vector<u64>(AsyncWriteBuckets);
     bool any_async_write{};
     /// A position the front waits for (WaitFor): the back stores `consumed` once past it.
     alignas(128) std::atomic<u64> wait_target{~u64{0}};

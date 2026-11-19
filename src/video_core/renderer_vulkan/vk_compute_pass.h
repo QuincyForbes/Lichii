@@ -173,6 +173,7 @@ public:
         bool initialized;
         std::function<VkImageView(s32 host_level)> level_view;
         bool wait; ///< Wait for the GPU afterwards (the decoded image itself is sampled).
+        bool compute_only{}; ///< Only compute shaders read the decoded image (TranscodeAstcToBcn).
         /// When set, the input holds only these layers (in order), each decoded into
         /// layer_view(host level, layer).
         std::span<const u32> layers{};
@@ -200,10 +201,23 @@ public:
                            ComputePassDescriptorQueue& compute_pass_descriptor_queue_);
     ~BcEncoderPass();
 
+    struct LevelEncode {
+        VkImageView source;
+        u32 width;
+        u32 height;
+        VkDeviceSize out_offset;
+    };
+
     /// Encodes every layer of one level (`source` is its RGBA8 storage view) into `buffer`,
     /// `out_offset` bytes past `buffer_offset`; blocks are row-major, layer after layer.
     void Encode(VkImageView source, u32 width, u32 height, u32 layers, bool bc3, VkBuffer buffer,
                 VkDeviceSize buffer_offset, VkDeviceSize buffer_size, VkDeviceSize out_offset);
+
+    /// Encodes multiple mip levels into `buffer` in a single command batch, optionally emitting
+    /// a compute-to-transfer buffer barrier after the final dispatch.
+    void EncodeLevels(std::span<const LevelEncode> levels, u32 layers, bool bc3, VkBuffer buffer,
+                      VkDeviceSize buffer_offset, VkDeviceSize buffer_size,
+                      bool transfer_barrier = false);
 
 private:
     Scheduler& scheduler;

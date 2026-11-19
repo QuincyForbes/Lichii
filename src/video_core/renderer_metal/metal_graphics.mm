@@ -5,6 +5,7 @@
 #include <chrono>
 #include <mutex>
 #include <shared_mutex>
+#include <unordered_map>
 
 #import <Metal/Metal.h>
 #include <TargetConditionals.h>
@@ -282,6 +283,29 @@ void SetTargets(Descriptor* descriptor, const RenderPipelineDesc& desc) {
     descriptor.stencilAttachmentPixelFormat = static_cast<MTLPixelFormat>(desc.stencil_format);
 }
 
+///MTLMeshRenderPipelineDescriptor requires a fragmentFunction whenever rasterization is enabled,
+///even for depth-only shadow and pre-pass draws that bind no guest fragment shader.
+id<MTLFunction> EmptyMeshFragmentFunction(id<MTLDevice> mtl_device) {
+    static std::mutex mutex;
+    static std::unordered_map<const void*, Object> cache;
+    const void* const key = (__bridge const void*)mtl_device;
+    std::scoped_lock lock{mutex};
+    Object& function = cache[key];
+    if (!function) {
+        NSError* ns_error = nil;
+        id<MTLLibrary> library = [mtl_device
+            newLibraryWithSource:@"#include <metal_stdlib>\n"
+                                  "using namespace metal;\n"
+                                  "fragment void empty_mesh_fragment() {}\n"
+                         options:nil
+                           error:&ns_error];
+        if (library != nil) {
+            function = Retain([library newFunctionWithName:@"empty_mesh_fragment"]);
+        }
+    }
+    return (__bridge id<MTLFunction>)function.Get();
+}
+
 } // Anonymous namespace
 
 std::optional<u32> PrimitiveType(Maxwell::PrimitiveTopology topology) {
@@ -481,7 +505,7 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
         // to serialize the whole archive ("expecting 'fragment' stage in pipeline no. N"), so
         // nothing was ever saved.
         if (!hit && descriptor.fragmentFunction != nil && descriptor.rasterizationEnabled) {
-            auto* const copy = [descriptor copy];
+            MTLRenderPipelineDescriptor* const copy = [descriptor copy];
             archive->DeferAdd([binary, copy] {
                 return [binary addRenderPipelineFunctionsWithDescriptor:copy error:nil] == YES;
             });
@@ -506,7 +530,10 @@ Object CreateMeshRenderPipelineState(const Device& device, const RenderPipelineD
     MTLMeshRenderPipelineDescriptor* descriptor = [MTLMeshRenderPipelineDescriptor new];
     descriptor.objectFunction = (__bridge id<MTLFunction>)functions.object_function;
     descriptor.meshFunction = (__bridge id<MTLFunction>)functions.mesh_function;
-    descriptor.fragmentFunction = (__bridge id<MTLFunction>)functions.fragment_function;
+    descriptor.fragmentFunction =
+        functions.fragment_function != nullptr
+            ? (__bridge id<MTLFunction>)functions.fragment_function
+            : (desc.rasterize != 0 ? EmptyMeshFragmentFunction(device.GetDevice()) : nil);
     if (functions.object_function != nullptr) {
         // Metal wants the payload in 16-byte steps.
         descriptor.payloadMemoryLength = (functions.payload_bytes + 15) & ~15U;
@@ -563,7 +590,7 @@ Object CreateMeshRenderPipelineState(const Device& device, const RenderPipelineD
                                                      .count()));
         if (!hit && descriptor.fragmentFunction != nil && descriptor.rasterizationEnabled) {
             if (@available(iOS 18.0, macOS 15.0, *)) {
-                auto* const copy = [descriptor copy];
+                MTLMeshRenderPipelineDescriptor* const copy = [descriptor copy];
                 archive->DeferAdd([binary, copy] {
                     return [binary addMeshRenderPipelineFunctionsWithDescriptor:copy error:nil] == YES;
                 });

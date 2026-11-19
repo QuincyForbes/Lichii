@@ -146,7 +146,7 @@ jobs:
             libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
             spirv-tools spirv-headers libusb-1.0-0-dev \
             libboost-dev libboost-fiber-dev libboost-context-dev \
-            libopus-dev libasound2-dev ccache \
+            libopus-dev libasound2-dev ccache llvm python3-zstandard \
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
             libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
 
@@ -520,9 +520,33 @@ jobs:
             .sccache
           key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
 
-      # Plain tar.gz with the two programs. GitHub artifacts drop the executable bit, so a tar is
-      # what keeps it. This one is not self-contained: it needs Qt 6 and the usual libraries
-      # installed on the system.
+      # fsr4-vk, the community Vulkan port of FSR 4 that the x86-64 Linux packages ship
+      # (tools/fsr4-vk/build.sh pins its commit and AMD's DLL it is built from). The build's inputs
+      # are all in the script, so its output is cached by the script's hash. Its shader conversion
+      # fails its own asset check on arm64 hosts, so the aarch64 packages go without it.
+      - name: Restore fsr4-vk
+        if: startsWith(matrix.platform, 'linux-x86_64')
+        id: fsr4-vk
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/fsr4-vk
+          key: fsr4-vk-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/fsr4-vk/build.sh') }}
+
+      - name: Build fsr4-vk
+        if: startsWith(matrix.platform, 'linux-x86_64') && steps.fsr4-vk.outputs.cache-hit != 'true'
+        shell: bash
+        run: bash tools/fsr4-vk/build.sh "$RUNNER_TEMP/fsr4-vk-work" "$RUNNER_TEMP/fsr4-vk"
+
+      - name: Save fsr4-vk
+        if: startsWith(matrix.platform, 'linux-x86_64') && steps.fsr4-vk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/fsr4-vk
+          key: ${{ steps.fsr4-vk.outputs.cache-primary-key }}
+
+      # Plain tar.gz with the two programs (and fsr4-vk plus its licences on x86-64). GitHub
+      # artifacts drop the executable bit, so a tar is what keeps it. This one is not
+      # self-contained: it needs Qt 6 and the usual libraries installed on the system.
       - name: Package Linux tar.gz
         if: startsWith(matrix.platform, 'linux')
         shell: bash
@@ -531,8 +555,26 @@ jobs:
           test -x build/release/bin/lichii
           test -x build/release/bin/eden-cli
           strip build/release/bin/lichii build/release/bin/eden-cli
-          tar -czf "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" \
-            -C build/release/bin lichii eden-cli
+          stage="$RUNNER_TEMP/tar-stage"
+          rm -rf "$stage"
+          mkdir -p "$stage/bin"
+          cp build/release/bin/lichii build/release/bin/eden-cli "$stage/bin/"
+          ln -s bin/lichii "$stage/lichii"
+          ln -s bin/eden-cli "$stage/eden-cli"
+          fsr4=amd_fidelityfx_upscaler_vk.so
+          if [ "$(uname -m)" = x86_64 ]; then
+            # FfxRuntime::PortLibraryPath loads <exe dir>/../lib/amd_fidelityfx_upscaler_vk.so.
+            mkdir -p "$stage/lib" "$stage/share/licenses"
+            cp "$RUNNER_TEMP/fsr4-vk/$fsr4" "$stage/lib/"
+            cp -r "$RUNNER_TEMP/fsr4-vk/licenses/fsr4-vk" "$stage/share/licenses/"
+          fi
+          (cd "$stage" && tar -czf "$GITHUB_WORKSPACE/lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" *)
+          if [ "$(uname -m)" = x86_64 ]; then
+            test "$(tar -tzf "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" |
+              grep -cFx -e "lib/$fsr4" -e share/licenses/fsr4-vk/LICENSE \
+                -e share/licenses/fsr4-vk/AMD-FidelityFX-SDK-license.md)" = 3
+            nm -D --defined-only "$stage/lib/$fsr4" | grep -w ffxCreateContext
+          fi
           ls -la "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz"
 
       # A self-contained AppImage: linuxdeploy bundles every library the two programs need except
@@ -566,14 +608,36 @@ jobs:
           export LDAI_OUTPUT="lichii-${GITHUB_SHA}-${{ matrix.platform }}.AppImage"
           export OUTPUT="$LDAI_OUTPUT"
           export ARCH="$arch"
+          # The emulator loads fsr4-vk from <exe dir>/../lib (FfxRuntime::PortLibraryPath).
+          fsr4=amd_fidelityfx_upscaler_vk.so
+          fsr4_library=()
+          if [ "$arch" = x86_64 ]; then
+            mkdir -p AppDir/usr/share/licenses
+            cp -r "$RUNNER_TEMP/fsr4-vk/licenses/fsr4-vk" AppDir/usr/share/licenses/
+            fsr4_library=(--library "$RUNNER_TEMP/fsr4-vk/$fsr4")
+          fi
           "$tools/linuxdeploy-$arch.AppImage" --appdir AppDir \
             --executable build/release/bin/lichii \
             --executable build/release/bin/eden-cli \
+            "${fsr4_library[@]}" \
             --desktop-file dist/io.github.zortos293.lichii.desktop \
             --icon-file "$icon" \
             --plugin qt \
             --output appimage
           test -s "$LDAI_OUTPUT"
+          if [ "$arch" = x86_64 ]; then
+            extract="$RUNNER_TEMP/appimage-check"
+            rm -rf "$extract"
+            mkdir -p "$extract"
+            (cd "$extract" &&
+              "$GITHUB_WORKSPACE/$LDAI_OUTPUT" --appimage-extract "usr/lib/$fsr4" > /dev/null &&
+              "$GITHUB_WORKSPACE/$LDAI_OUTPUT" --appimage-extract "usr/share/licenses/fsr4-vk/LICENSE" > /dev/null &&
+              "$GITHUB_WORKSPACE/$LDAI_OUTPUT" --appimage-extract "usr/share/licenses/fsr4-vk/AMD-FidelityFX-SDK-license.md" > /dev/null)
+            test -s "$extract/squashfs-root/usr/lib/$fsr4"
+            test -s "$extract/squashfs-root/usr/share/licenses/fsr4-vk/LICENSE"
+            test -s "$extract/squashfs-root/usr/share/licenses/fsr4-vk/AMD-FidelityFX-SDK-license.md"
+            nm -D --defined-only "$extract/squashfs-root/usr/lib/$fsr4" | grep -w ffxCreateContext
+          fi
           ls -la "$LDAI_OUTPUT"
 
       - name: Package Windows binary

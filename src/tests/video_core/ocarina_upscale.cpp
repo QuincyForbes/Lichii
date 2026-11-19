@@ -38,14 +38,21 @@ TEST_CASE("One upscaler setting picks Ocarina's upscaler and the DLSS replacemen
     const auto previous = upscaler.GetValue();
     upscaler.SetValue(Upscaler::Auto);
     CHECK_FALSE(Settings::OcarinaFsrChosen());
+    CHECK_FALSE(Settings::AmdFsr4Chosen());
     CHECK_FALSE(Settings::NvidiaDlssChosen());
     CHECK_FALSE(Settings::GameDlssNetworkChosen());
     upscaler.SetValue(Upscaler::Fsr3);
+    CHECK(Settings::OcarinaFsrChosen());
+    CHECK_FALSE(Settings::AmdFsr4Chosen());
+    CHECK_FALSE(Settings::NvidiaDlssChosen());
+    upscaler.SetValue(Upscaler::Fsr4);
+    CHECK(Settings::AmdFsr4Chosen());
     CHECK(Settings::OcarinaFsrChosen());
     CHECK_FALSE(Settings::NvidiaDlssChosen());
     upscaler.SetValue(Upscaler::Dlss);
     CHECK(Settings::NvidiaDlssChosen());
     CHECK_FALSE(Settings::OcarinaFsrChosen());
+    CHECK_FALSE(Settings::AmdFsr4Chosen());
     upscaler.SetValue(Upscaler::MetalFx);
     CHECK(Settings::MetalFxTemporalChosen());
     upscaler.SetValue(Upscaler::Game);
@@ -56,6 +63,30 @@ TEST_CASE("One upscaler setting picks Ocarina's upscaler and the DLSS replacemen
     CHECK(static_cast<u32>(Settings::OotAntiAliasing::NoSharpening) == 1);
     CHECK(static_cast<u32>(Upscaler::Auto) == 0);
     CHECK(static_cast<u32>(Upscaler::MetalFx) == 4);
+    CHECK(static_cast<u32>(Upscaler::Fsr4) == 5);
+}
+
+TEST_CASE("OoT upscale passes are recognised by native program key", "[video_core][ocarina]") {
+    using enum VideoCommon::OcarinaUpscalePass;
+    using VideoCommon::FindOcarinaUpscalePass;
+    // Each key matches its pass even when lowering changes the shader hash.
+    CHECK(FindOcarinaUpscalePass(0x6f9367bd41dc0b58ULL, 0xe40f5efb5480e692ULL) == ThreeQuarter);
+    CHECK(FindOcarinaUpscalePass(0x6f9367bd41dc0b58ULL, 0x0123456789abcdefULL) == ThreeQuarter);
+    CHECK(FindOcarinaUpscalePass(0xda6df3e54c716df2ULL, 0x6bd913e1f34e83ebULL) == OneToOne);
+    CHECK(FindOcarinaUpscalePass(0xda6df3e54c716df2ULL, 0x0123456789abcdefULL) == OneToOne);
+    CHECK(FindOcarinaUpscalePass(0xe4cda162ff6009e2ULL, 0x9302bc0d6d1d9bc1ULL) == Scaled);
+    CHECK(FindOcarinaUpscalePass(0xe4cda162ff6009e2ULL, 0x0123456789abcdefULL) == Scaled);
+    CHECK(FindOcarinaUpscalePass(0xd8efd9f0c95abd80ULL, 0x03bf0ffc7d2d0bedULL) == Scaled);
+    CHECK(FindOcarinaUpscalePass(0xd8efd9f0c95abd80ULL, 0x0123456789abcdefULL) == Scaled);
+    CHECK(VideoCommon::OcarinaDepthReaderKey == 0x20ab4117f4db5bdbULL);
+    CHECK(VideoCommon::OcarinaDepthReaderShader == 0x1fc7a0423116281fULL);
+    // Shader hash fallback for passes without a captured native key.
+    CHECK(FindOcarinaUpscalePass(0, 0xef542df87cacfe9eULL) == ThreeQuarter);
+    CHECK(FindOcarinaUpscalePass(0, 0xc033c3ddc9f0897bULL) == OneToOne);
+    CHECK(FindOcarinaUpscalePass(0, 0x4c1ae2fe58f30a97ULL) == Scaled);
+    CHECK(FindOcarinaUpscalePass(0, 0x31c0acb7c5e87c89ULL) == Scaled);
+    CHECK(FindOcarinaUpscalePass(0, 0x0123456789abcdefULL) == None);
+    CHECK(FindOcarinaUpscalePass(0x1111111111111111ULL, 0x0123456789abcdefULL) == None);
 }
 
 TEST_CASE("OoT jitter uses AMD's phase count for the upscale ratio", "[video_core][ocarina]") {

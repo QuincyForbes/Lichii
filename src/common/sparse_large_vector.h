@@ -74,12 +74,14 @@ public:
 
             auto denom = HostPageSize * 64;
             committed_pages = std::vector<std::atomic<u64>>((alloc_size + denom - 1) / denom);
+        } else if (count != 0) {
+            ZeroRegion(0, count);
         }
     }
 
     /// Returns a reference to the value of the requested index and allocates memory if needed.
     T& GetAndFault(std::size_t index) noexcept {
-        if (index > alloc_size / sizeof(T)) {
+        if (index >= alloc_size / sizeof(T)) {
             UNREACHABLE_MSG("Out of bounds RW access on SparseLargeVector @ {}", index);
         }
 
@@ -101,7 +103,7 @@ public:
     }
 
     void Set(std::size_t index, const T& value) noexcept {
-        if (index > alloc_size / sizeof(T)) {
+        if (index >= alloc_size / sizeof(T)) {
             LOG_CRITICAL(Common_Memory, "Out of bounds write on SparseLargeVector @ {}", index);
             return;
         }
@@ -110,6 +112,9 @@ public:
     }
 
     void ZeroRegion(std::size_t start, std::size_t end_) noexcept {
+        if (start >= end_) {
+            return;
+        }
         u64 base = reinterpret_cast<u64>(&base_ptr[start]);
         const u64 end = reinterpret_cast<u64>(&base_ptr[end_]);
 
@@ -135,6 +140,9 @@ public:
     }
 
     constexpr void CommitRegion(size_t index, size_t end_) {
+        if (index >= end_) {
+            return;
+        }
         const u64 base = static_cast<u64>(index) * sizeof(T);
         const u64 end = static_cast<u64>(end_) * sizeof(T);
 
@@ -172,7 +180,7 @@ public:
 
 private:
     [[nodiscard]] constexpr bool IsCommittedPage(std::size_t index) const noexcept {
-        if (index > alloc_size / sizeof(T)) {
+        if (index >= alloc_size / sizeof(T)) {
             LOG_CRITICAL(Common_Memory, "Out of bounds access on large vector @ {}", index);
             return false;
         }

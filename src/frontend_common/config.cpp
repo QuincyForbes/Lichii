@@ -31,7 +31,142 @@
 #include "common/assert.h"
 #include "common/device_profile.h"
 
+#if !defined(__ANDROID__) && !defined(__APPLE__) && !defined(LICHII_CONFIG_NO_VULKAN_PROBE)
+#include "video_core/vulkan_common/vulkan_instance.h"
+#include "video_core/vulkan_common/vulkan_library.h"
+#include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "vulkan/vulkan_core.h"
+#endif
+
 namespace FS = Common::FS;
+
+#if !defined(__ANDROID__) && !defined(__APPLE__) && !defined(LICHII_CONFIG_NO_VULKAN_PROBE)
+namespace {
+
+struct ProbedVulkanHost {
+    bool gpu_known = false;
+    std::string gpu_name;
+    Settings::DeviceProfile::GpuVendor gpu_vendor = Settings::DeviceProfile::GpuVendor::Unknown;
+    bool gpu_integrated = false;
+    u64 vram_mib = 0;
+    bool dlss_capable = false;
+    u32 best_device_index = 0;
+};
+
+// Lightweight headless physical-device query on first run so multi-GPU PCs (Ryzen / Intel iGPU at
+// index 0 + discrete NVIDIA RTX / AMD Radeon at index 1) select the discrete GPU automatically.
+ProbedVulkanHost ProbeHeadlessVulkanHost() {
+    static const ProbedVulkanHost cached = [] {
+        ProbedVulkanHost out;
+        try {
+            Vulkan::vk::InstanceDispatch dld;
+            const auto library = Vulkan::OpenLibrary();
+            if (!library) {
+                return out;
+            }
+            const Vulkan::vk::Instance instance = Vulkan::CreateInstance(
+                *library, dld, VK_API_VERSION_1_1, Core::Frontend::WindowSystemType::Headless);
+            const std::vector<VkPhysicalDevice> physical_devices =
+                instance.EnumeratePhysicalDevices();
+            int best_score = -1;
+            for (size_t idx = 0; idx < physical_devices.size(); ++idx) {
+                try {
+                    const Vulkan::vk::PhysicalDevice physical_device(physical_devices[idx], dld);
+                    const VkPhysicalDeviceProperties base_props = physical_device.GetProperties();
+                    VkPhysicalDeviceDriverProperties driver_properties{};
+                    driver_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+                    VkPhysicalDeviceProperties2 properties{};
+                    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR;
+                    properties.pNext = &driver_properties;
+                    properties.properties = base_props;
+                    if (base_props.apiVersion >= VK_API_VERSION_1_1 &&
+                        dld.vkGetPhysicalDeviceProperties2 != nullptr) {
+                        dld.vkGetPhysicalDeviceProperties2(physical_device, &properties);
+                    }
+
+                    const auto device_type = properties.properties.deviceType;
+                    if (device_type == VK_PHYSICAL_DEVICE_TYPE_CPU ||
+                        device_type == VK_PHYSICAL_DEVICE_TYPE_OTHER) {
+                        continue;
+                    }
+                    const std::string raw_name = properties.properties.deviceName;
+                    const auto driver_id = driver_properties.driverID;
+                    const bool integrated = device_type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+                    const bool discrete = device_type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+
+                    const auto memory = physical_device.GetMemoryProperties().memoryProperties;
+                    u64 vram = 0;
+                    for (u32 h = 0; h < memory.memoryHeapCount; ++h) {
+                        if ((memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+                            vram = (std::max)(vram, u64{memory.memoryHeaps[h].size});
+                        }
+                    }
+                    const u64 vram_mib = vram >> 20;
+
+                    bool dlss = false;
+                    if (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY) {
+                        dlss = raw_name.find("RTX") != std::string::npos;
+                        if (!dlss) {
+                            try {
+                                for (const auto& ext :
+                                     physical_device.EnumerateDeviceExtensionProperties()) {
+                                    const std::string_view ext_name{ext.extensionName};
+                                    if (ext_name == VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME ||
+                                        ext_name == VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) {
+                                        dlss = true;
+                                        break;
+                                    }
+                                }
+                            } catch (...) {
+                            }
+                        }
+                    }
+
+                    const int score = (discrete ? 1000000 : (integrated ? 100 : 1000)) +
+                                      static_cast<int>((std::min)(vram_mib, u64{500000}));
+                    if (score > best_score) {
+                        best_score = score;
+                        out.gpu_known = true;
+                        out.gpu_name = raw_name;
+                        out.gpu_integrated = integrated;
+                        out.vram_mib = vram_mib;
+#ifdef EGLANTINE_STREAMLINE
+                        out.dlss_capable = dlss;
+#else
+                        (void)dlss;
+                        out.dlss_capable = false;
+#endif
+                        out.best_device_index = static_cast<u32>(idx);
+                        switch (driver_id) {
+                        case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
+                            out.gpu_vendor = Settings::DeviceProfile::GpuVendor::Nvidia;
+                            break;
+                        case VK_DRIVER_ID_AMD_PROPRIETARY:
+                        case VK_DRIVER_ID_AMD_OPEN_SOURCE:
+                        case VK_DRIVER_ID_MESA_RADV:
+                            out.gpu_vendor = Settings::DeviceProfile::GpuVendor::Amd;
+                            break;
+                        case VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS:
+                        case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA:
+                            out.gpu_vendor = Settings::DeviceProfile::GpuVendor::Intel;
+                            break;
+                        default:
+                            out.gpu_vendor = Settings::DeviceProfile::GpuVendor::Other;
+                            break;
+                        }
+                    }
+                } catch (...) {
+                }
+            }
+        } catch (...) {
+        }
+        return out;
+    }();
+    return cached;
+}
+
+} // namespace
+#endif
 
 Config::Config(const ConfigType config_type)
     : type(config_type), global{config_type == ConfigType::GlobalConfig} {}
@@ -176,7 +311,21 @@ void Config::SetUpIni() {
     if (new_global_config) {
         // A new configuration starts from the recommended settings for this device. Written as
         // chosen values, so a later change of a built-in default doesn't move them.
-        const auto profile = Settings::DeviceProfile::ForHost();
+        auto device = Settings::DeviceProfile::DetectHost();
+        u32 best_vulkan_device = 0;
+#if !defined(__ANDROID__) && !defined(__APPLE__) && !defined(LICHII_CONFIG_NO_VULKAN_PROBE)
+        const auto probed = ProbeHeadlessVulkanHost();
+        if (probed.gpu_known) {
+            device.gpu_known = true;
+            device.gpu_name = probed.gpu_name;
+            device.gpu_vendor = probed.gpu_vendor;
+            device.gpu_integrated = probed.gpu_integrated;
+            device.vram_mib = probed.vram_mib;
+            device.dlss_capable = probed.dlss_capable;
+            best_vulkan_device = probed.best_device_index;
+        }
+#endif
+        const auto profile = Settings::DeviceProfile::Recommend(device);
         for (const auto& value : profile.settings) {
             const auto it = Settings::values.linkage.by_key.find(value.key);
             if (it == Settings::values.linkage.by_key.end() || !it->second->Save()) {
@@ -185,6 +334,13 @@ void Config::SetUpIni() {
             BeginGroup(Settings::TranslateCategory(it->second->GetCategory()));
             WriteStringSetting(value.key, value.value);
             WriteBooleanSetting(value.key + "\\default", false);
+            EndGroup();
+        }
+        if (best_vulkan_device > 0) {
+            BeginGroup(Settings::TranslateCategory(Settings::values.vulkan_device.GetCategory()));
+            WriteStringSetting(Settings::values.vulkan_device.GetLabel(),
+                               std::to_string(best_vulkan_device));
+            WriteBooleanSetting(Settings::values.vulkan_device.GetLabel() + "\\default", false);
             EndGroup();
         }
         LOG_INFO(Config, "New configuration: recommended settings for {} ({} tier)",

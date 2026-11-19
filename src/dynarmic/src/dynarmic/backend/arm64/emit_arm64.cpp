@@ -8,6 +8,7 @@
 
 #include "dynarmic/backend/arm64/emit_arm64.h"
 
+#include <span>
 #include <oaknut/oaknut.hpp>
 
 #include "dynarmic/backend/arm64/abi.h"
@@ -232,7 +233,8 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
     EmittedBlockInfo ebi;
 
     FpsrManager fpsr_manager{code, conf.state_fpsr_offset};
-    RegAlloc reg_alloc{code, fpsr_manager, GPR_ORDER, FPR_ORDER};
+    RegAlloc reg_alloc{code, fpsr_manager, std::span<const int>{GPR_ORDER.begin(), GPR_ORDER.size()},
+                       std::span<const int>{FPR_ORDER.begin(), FPR_ORDER.size()}};
     EmitContext ctx{block, reg_alloc, conf, ebi, fpsr_manager, fastmem_manager, {}};
 
     ebi.entry_point = code.xptr<CodePtr>();
@@ -289,12 +291,20 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
 #endif
     }
 
+    const bool flags_live = ebi.nzcv_live_pos != nullptr && ebi.nzcv_live_pos == code.xptr<const void*>();
     fpsr_manager.Spill();
+    if (flags_live) {
+        ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
 
     reg_alloc.AssertNoMoreUses();
 
     EmitAddCycles(code, ctx, block.CycleCount());
+    if (conf.enable_cycle_counting) {
+        ebi.nzcv_live_pos = nullptr;
+    }
     conf.emit_terminal(code, ctx);
+    ebi.nzcv_live_pos = nullptr;
     code.BRK(0);
 #ifdef DYNARMIC_EMIT_STATS
     stat(~1u, false);

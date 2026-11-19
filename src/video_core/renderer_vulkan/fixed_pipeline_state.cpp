@@ -176,8 +176,8 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     alpha_to_one_enabled.Assign(regs.anti_alias_alpha_control.alpha_to_one != 0 ? 1 : 0);
     app_stage.Assign(maxwell3d.engine_state);
 
-    depth_bounds_min = static_cast<u32>(regs.depth_bounds[0]);
-    depth_bounds_max = static_cast<u32>(regs.depth_bounds[1]);
+    depth_bounds_min = 0;
+    depth_bounds_max = 0;
 
     line_stipple_factor = regs.line_stipple_params.factor;
     line_stipple_pattern = regs.line_stipple_params.pattern;

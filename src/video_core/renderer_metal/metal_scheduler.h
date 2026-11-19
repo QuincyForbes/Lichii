@@ -146,8 +146,9 @@ struct ConvertPass {
 /// How the guest lays out depth and stencil in memory (OpenGL's GL_UNSIGNED_INT_24_8 and
 /// GL_FLOAT_32_UNSIGNED_INT_24_8_REV, which take the guest's bytes as they are).
 enum class DepthLayout : u8 {
-    Packed24_8,   ///< u32: depth in the high 24 bits, stencil in the low 8 (D24S8, S8D24, X8D24)
+    Packed24_8,   ///< u32: depth in the high 24 bits, stencil in the low 8 (S8_UINT_D24_UNORM)
     Float32_X24S8, ///< f32 depth, then u32 with the stencil in the low 8 bits
+    Packed8_24,   ///< u32: stencil in the high 8 bits, depth in the low 24 (D24_UNORM_S8_UINT, X8_D24_UNORM)
 };
 
 /// The attachments draws render into. Equal sets share one render encoder.
@@ -367,6 +368,9 @@ public:
     /// being read or written in the segment so far.
     [[nodiscard]] bool CanUploadAhead() const noexcept;
 
+    /// Whether a staging buffer upload into `texture` may go ahead of the open render pass.
+    [[nodiscard]] bool CanUploadTextureAhead(TextureHandle texture) const noexcept;
+
     /// Whether a copy, fill or texture copy of the segment reads or writes `buffer` in order.
     [[nodiscard]] bool UsedInOrder(BufferHandle buffer) const noexcept;
 
@@ -393,7 +397,7 @@ public:
 
     void CopyBufferToTexture(BufferHandle src, u64 offset, u32 bytes_per_row, u32 bytes_per_image,
                              TextureHandle dst, u32 level, u32 slice, Offset3D origin,
-                             Extent3D extent);
+                             Extent3D extent, bool ahead = false);
 
     void CopyTextureToBuffer(TextureHandle src, u32 level, u32 slice, Offset3D origin,
                              Extent3D extent, BufferHandle dst, u64 offset, u32 bytes_per_row,
@@ -507,16 +511,19 @@ public:
     void SetDrawState(const DrawState& state);
 
     void BindVertexBuffer(u32 slot, BufferHandle buffer, u32 offset);
-    void BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset);
+    void BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset,
+                    bool write = false);
     void BindBytes(ShaderStage stage, u32 slot, const void* data, u32 size);
     /// Makes `buffer` resident for `stage`'s next draws or dispatches without binding it (a
     /// program reads it through an address: ShaderTranslate::Options::spill_buffers); returns the
     /// address `offset` bytes into it.
-    [[nodiscard]] u64 UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset);
+    [[nodiscard]] u64 UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset,
+                                bool write = false);
     /// on_buffer=false: `texture` is known not to be a view of a buffer (a texture cache image
     /// view or a placeholder): render stages skip noting a buffer under it for the segment
     /// (EDEN_NX2_METAL_IMAGE_NOTE_SKIP).
-    void BindTexture(ShaderStage stage, u32 slot, TextureHandle texture, bool on_buffer = true);
+    void BindTexture(ShaderStage stage, u32 slot, TextureHandle texture, bool on_buffer = true,
+                     bool write = false);
     void BindSampler(ShaderStage stage, u32 slot, void* sampler);
     /// The sampler's MTLResourceID, what a program reads from a table of spilled samplers
     /// (ShaderTranslate::Result::sampler_spill_slot). 0 for none.
@@ -575,8 +582,12 @@ public:
                      u64 index_offset, u32 instance_count, s32 base_vertex, u32 base_instance);
 
     /// Ends the open encoder and returns the command buffer being recorded (an
-    /// id<MTLCommandBuffer>, for presentDrawable and MetalFX).
-    [[nodiscard]] void* CommandBuffer();
+    /// id<MTLCommandBuffer>, for presentDrawable and MetalFX). `allow_proxy`: keeps the recorder
+    /// proxy when presentDrawable can be recorded on it without draining.
+    [[nodiscard]] void* CommandBuffer(bool allow_proxy = false);
+
+    /// The shared event signalled with each committed tick's number (id<MTLSharedEvent>).
+    [[nodiscard]] void* SharedEvent() const noexcept;
 
     /// GPU time (MTLCommandBuffer GPUStartTime..GPUEndTime) of the command buffers completed
     /// since the last call.

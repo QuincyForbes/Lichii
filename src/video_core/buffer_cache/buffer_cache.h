@@ -208,6 +208,7 @@ void BufferCache<P>::TickFrame() {
         return;
     }
     runtime.TickFrame(slot_buffers);
+    frame_created_buffers.clear();
     if (nx2_buffer_deps && frame_tick % 600 == 0) {
         LOG_INFO(HW_GPU, "nx2 buffer deps snapshot: frame {} rows {}", frame_tick,
                  nx2_buffer_deps->Edges().size());
@@ -1638,6 +1639,16 @@ void BufferCache<P>::CommitAsyncFlushes() {
 }
 
 template <class P>
+bool BufferCache<P>::TryCommitAsyncFlushes() {
+    CommitAsyncFlushesHigh();
+    if (!async_buffers.empty() && !async_buffers.back().has_value()) {
+        async_buffers.pop_back();
+        return false;
+    }
+    return !async_buffers.empty();
+}
+
+template <class P>
 u64 BufferCache<P>::Nx2BatchDownloads(const Nx2Downloads& downloads, Nx2Downloads& batched) {
     // Ocarina downloaded ~13 ranges per fence, each its own recorded copy command. Merged ranges
     // copy their gap (at most 4 KiB) to staging too, but PopAsyncBuffers writes back only
@@ -1755,6 +1766,7 @@ void BufferCache<P>::Nx2StampPreflushBlocks(DAddr begin, DAddr end, bool marked)
             if (const auto it = nx2_preflush_blocks.find(block);
                 it != nx2_preflush_blocks.end() && !it->second.dropped) {
                 it->second.last_read_frame = frame_tick;
+                it->second.unread_write_frames = 0;
             }
             continue;
         }
@@ -1765,6 +1777,7 @@ void BufferCache<P>::Nx2StampPreflushBlocks(DAddr begin, DAddr end, bool marked)
         }
         Nx2PreflushBlock& entry = it->second;
         entry.last_read_frame = frame_tick;
+        entry.unread_write_frames = 0;
         if (!entry.dropped) {
             continue;
         }
@@ -1810,7 +1823,7 @@ void BufferCache<P>::Nx2AgePreflushBlocks() {
             ++it;
             continue;
         }
-        if (frame_tick - entry.last_read_frame <= entry.limit_frames) {
+        if (entry.unread_write_frames <= entry.limit_frames) {
             ++marked;
             ++it;
             continue;
@@ -1821,6 +1834,7 @@ void BufferCache<P>::Nx2AgePreflushBlocks() {
             ArmReadTraps(start, end - start);
         });
         entry.dropped = true;
+        entry.unread_write_frames = 0;
         entry.limit_frame = frame_tick;
         ++nx2_preflush_drops;
         ++it;
@@ -1966,7 +1980,8 @@ bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
 template <class P>
 bool BufferCache<P>::IsRegionRegistered(DAddr addr, size_t size) {
     const DAddr end_addr = addr + size;
-    const u64 page_end = Common::DivCeil(end_addr, CACHING_PAGESIZE);
+    const u64 page_end =
+        (std::min<u64>)(Common::DivCeil(end_addr, CACHING_PAGESIZE), page_table.size());
     for (u64 page = addr >> CACHING_PAGEBITS; page < page_end;) {
         const BufferId buffer_id = page_table[page];
         if (!buffer_id) {
@@ -1979,7 +1994,7 @@ bool BufferCache<P>::IsRegionRegistered(DAddr addr, size_t size) {
         if (buf_start_addr < end_addr && addr < buf_end_addr) {
             return true;
         }
-        page = Common::DivCeil(end_addr, CACHING_PAGESIZE);
+        page = (std::max)(page + 1, Common::DivCeil(buf_end_addr, CACHING_PAGESIZE));
     }
     return false;
 }
@@ -3222,17 +3237,12 @@ void BufferCache<P>::UpdateIndexBuffer() {
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
-            memory_tracker.BumpGpuEpoch();
-            ++binding_epoch;
-            // Draws recorded before still read it (MoltenVK encodes them at submit): destroyed
-            // with the deleted buffers, not now.
             static u32 logged{};
             if (logged++ < 8) {
                 LOG_INFO(HW_GPU, "Inline index buffer grows from {} to {} bytes",
                          slot_buffers[inline_buffer_id].SizeBytes(), buffer_size);
             }
-            delayed_destruction_ring.Push(std::move(slot_buffers[inline_buffer_id]));
-            slot_buffers.erase(inline_buffer_id);
+            DeleteBuffer(inline_buffer_id);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
         channel_state->index_buffer = Binding{
@@ -4340,8 +4350,15 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
                                                                        u32 wanted_size) {
     static constexpr int STREAM_LEAP_THRESHOLD = 16;
     boost::container::small_vector<BufferId, 16> overlap_ids;
+    boost::container::small_vector<BufferId, 2> cut_ids;
     DAddr begin = device_addr;
     DAddr end = device_addr + wanted_size;
+    const DAddr wanted_begin = begin;
+    const DAddr wanted_end = end;
+    // A buffer this large that shares no more than a page with the wanted range is not joined,
+    // unless it was created in the current frame (so two large ranges of one draw never delete
+    // each other in a loop).
+    static constexpr u64 CHAIN_LIMIT = 128_MiB;
     int stream_score = 0;
     bool has_stream_leap = false;
     auto expand_begin = [&](DAddr add_value) {
@@ -4365,6 +4382,7 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
     if (begin == 0) {
         return OverlapResult{
             .ids = std::move(overlap_ids),
+            .cut = std::move(cut_ids),
             .begin = begin,
             .end = end,
             .has_stream_leap = has_stream_leap,
@@ -4380,9 +4398,20 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
         if (overlap.IsPicked()) {
             continue;
         }
+        const DAddr overlap_device_addr = overlap.CpuAddr();
+        if (overlap.SizeBytes() >= CHAIN_LIMIT &&
+            std::ranges::find(frame_created_buffers, overlap_id) == frame_created_buffers.end()) {
+            const DAddr shared_begin = (std::max)(overlap_device_addr, wanted_begin);
+            const DAddr shared_end =
+                (std::min)(overlap_device_addr + overlap.SizeBytes(), wanted_end);
+            if (shared_end <= shared_begin + CACHING_PAGESIZE) {
+                overlap.Pick();
+                cut_ids.push_back(overlap_id);
+                continue;
+            }
+        }
         overlap_ids.push_back(overlap_id);
         overlap.Pick();
-        const DAddr overlap_device_addr = overlap.CpuAddr();
         const bool expands_left = overlap_device_addr < begin;
         if (expands_left) {
             begin = overlap_device_addr;
@@ -4407,6 +4436,7 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
     }
     return OverlapResult{
         .ids = std::move(overlap_ids),
+        .cut = std::move(cut_ids),
         .begin = begin,
         .end = end,
         .has_stream_leap = has_stream_leap,
@@ -4480,10 +4510,15 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
     const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
+    for (const BufferId cut_id : overlap.cut) {
+        DownloadBufferMemory(slot_buffers[cut_id]);
+        DeleteBuffer(cut_id);
+    }
     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
     memory_tracker.BumpGpuEpoch();
     const BufferId new_buffer_id =
         slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
+    frame_created_buffers.push_back(new_buffer_id);
     VideoCommon::Churn::Add(VideoCommon::Churn::BuffersCreated);
     auto& new_buffer = slot_buffers[new_buffer_id];
     const size_t size_bytes = new_buffer.SizeBytes();
@@ -5261,6 +5296,10 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     }
 
     Unregister(buffer_id);
+    if (buffer_id == inline_buffer_id) {
+        inline_buffer_id = NULL_BUFFER_ID;
+    }
+    std::erase(frame_created_buffers, buffer_id);
 
 #ifdef YUZU_LEGACY
     if (!do_not_mark || !immediately_free)

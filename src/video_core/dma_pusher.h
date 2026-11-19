@@ -211,10 +211,11 @@ public:
     void Push(CommandList&& entries) {
         // Copied during a suspension, or behind one: copy again now, unless still suspended.
         const u64 now = suspensions.load(std::memory_order_acquire);
-        if (!entries.submitted_offsets.empty() && (now & 1) == 0) {
-            if (ResnapshotEnabled() && !TrustSubmitted() && entries.snapshot_suspensions != now) {
+        if (!entries.submitted_offsets.empty()) {
+            if (ResnapshotEnabled() && !TrustSubmitted() && (now & 1) == 0 &&
+                entries.snapshot_suspensions != now) {
                 RefreshSnapshot(entries, now);
-            } else if (!entries.deferred_entries.empty()) {
+            } else if (!entries.deferred_entries.empty() && (TrustSubmitted() || (now & 1) == 0)) {
                 // Behind a GPU map when submitted: the map has run by now (GPU::MapInOrder).
                 RefreshDeferredEntries(entries);
             }
@@ -249,6 +250,7 @@ private:
     size_t command_resume_offset{}; ///< Words of the current entry done before a suspension
 
     void SetState(const CommandHeader& command_header);
+    void ResetOpenMethod();
 
     void CallMethod(u32 argument);
     void CallMultiMethod(const u32* base_start, u32 num_methods);
@@ -278,7 +280,7 @@ public:
     /// `first_entry` on (the entries before it ran already).
     void RefreshSnapshot(CommandList& list, u64 now, size_t first_entry = 0);
     /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.
-    void RefreshDeferredEntries(CommandList& list);
+    void RefreshDeferredEntries(CommandList& list, size_t first_entry = 0);
 
     /// Ocarina of Time: command lists always run the words copied when they were submitted
     /// (except entries behind a pending GPU map, and GPU-written lists). Its lists are complete at
@@ -301,13 +303,15 @@ public:
     /// buffer cache made after the work that wrote them or from guest memory for pages flushed
     /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
     /// flushes and reads guest memory.
-    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
+    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* any_copied = nullptr);
     /// A GPU-written entry whose words are all the parameters of a 3D macro that only draws with
     /// them (Maxwell3D::FrontDrawFromGpuArguments): the draw is sent without reading the words.
     /// False when it isn't one; the caller reads the entry as usual.
     bool DrawFromGpuArguments(const CommandListHeader& header);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
-    bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+    bool FlushGpuWrittenCommands(GPUVAddr address, size_t size, bool* had_gpu_writes = nullptr);
+    [[nodiscard]] bool HasDirtyFlushedPage(GPUVAddr address, size_t size) const;
+    std::vector<u64> dirty_flushed_pages;
 
     /// Where the words of an entry being parsed came from (EDEN_NX2_LIST_VALIDATE's log line).
     enum class EntrySource : u32 { Submitted, SubmittedRefreshed, GpuWrittenCopy, Memory };

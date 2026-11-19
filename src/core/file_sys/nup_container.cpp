@@ -26,6 +26,7 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/platform_events.h"
+#include "common/scope_exit.h"
 #include "common/swap.h"
 
 namespace FileSys {
@@ -48,6 +49,7 @@ struct NupMembers {
     }
 
     VirtualFile backing;
+    u64 backing_size{};
     std::shared_ptr<NupDecompressCache> cache;
     /// The TOC's string pool.
     std::string names;
@@ -237,29 +239,49 @@ public:
             return ReadSpilled(data, length, offset);
         }
 
+        NupDecompressCache::DataPtr buffer;
         {
-            std::scoped_lock lock{cache->mutex};
-            if (const auto* cached = cache->Find(cache_index)) {
-                std::memcpy(data, cached->data() + offset, length);
-                return length;
+            std::unique_lock lock{cache->mutex};
+            buffer = cache->Find(cache_index);
+            if (!buffer) {
+                if (const auto it = cache->in_flight.find(cache_index);
+                    it != cache->in_flight.end()) {
+                    auto waiter = it->second;
+                    waiter->cv.wait(lock, [&waiter] { return waiter->done; });
+                    buffer = waiter->result;
+                    static_cast<void>(cache->Find(cache_index));
+                } else {
+                    auto leader = std::make_shared<NupDecompressCache::InFlight>();
+                    cache->in_flight.emplace(cache_index, leader);
+                    lock.unlock();
+
+                    NupDecompressCache::DataPtr decompressed;
+                    SCOPE_EXIT {
+                        lock.lock();
+                        if (decompressed) {
+                            cache->Insert(cache_index, decompressed);
+                        }
+                        leader->result = decompressed;
+                        leader->done = true;
+                        cache->in_flight.erase(cache_index);
+                        lock.unlock();
+                        leader->cv.notify_all();
+                    };
+
+                    if (std::vector<u8> scratch = Decompress(); !scratch.empty()) {
+                        decompressed =
+                            std::make_shared<const std::vector<u8>>(std::move(scratch));
+                    }
+                    buffer = decompressed;
+                }
             }
         }
-
-        // Miss: decompress without holding the lock, then publish and copy.
-        std::vector<u8> scratch = Decompress();
-        if (scratch.empty()) {
+        if (!buffer || offset >= buffer->size()) {
             return 0;
         }
-        {
-            std::scoped_lock lock{cache->mutex};
-            cache->Insert(cache_index, scratch);
-            if (const auto* cached = cache->Find(cache_index)) {
-                std::memcpy(data, cached->data() + offset, length);
-                return length;
-            }
-        }
-        std::memcpy(data, scratch.data() + offset, length);
-        return length;
+        const std::size_t avail = std::min(length, buffer->size() - offset);
+        std::memcpy(data, buffer->data() + offset, avail);
+        return avail;
     }
 
     std::size_t Write(const u8*, std::size_t, std::size_t) override {
@@ -291,18 +313,17 @@ private:
             std::scoped_lock lock{cache->mutex};
             spill = cache->GetSpill(cache_index);
         }
+        bool open_spill = false;
         {
             std::scoped_lock lock{spill->mutex};
             if (!spill->attempted) {
                 spill->attempted = true;
                 DecompressToFile(*spill);
             }
-            if (spill->file.IsOpen()) {
-                if (!spill->file.Seek(static_cast<s64>(offset))) {
-                    return 0;
-                }
-                return spill->file.ReadSpan(std::span{data, length});
-            }
+            open_spill = spill->file.IsOpen();
+        }
+        if (open_spill) {
+            return spill->file.ReadBytesAt(std::span{data, length}, offset);
         }
         // Fallback if temporary-file creation or write failed (e.g. full disk): decompress in RAM.
         std::vector<u8> scratch = Decompress();
@@ -312,14 +333,17 @@ private:
         const std::size_t avail = std::min(length, scratch.size() - offset);
         std::memcpy(data, scratch.data() + offset, avail);
         if (scratch.size() <= cache->cap) {
+            auto entry = std::make_shared<const std::vector<u8>>(std::move(scratch));
             std::scoped_lock lock{cache->mutex};
-            cache->Insert(cache_index, scratch);
+            cache->Insert(cache_index, entry);
         }
         return avail;
     }
 
     void DecompressToFile(NupSpillFile& spill) const {
         const auto& backing = members->backing;
+        const u64 backing_size =
+            members->backing_size != 0 ? members->backing_size : backing->GetSize();
         const auto& cache = members->cache;
         const std::string_view name = Name();
         const u64 extent_offset = Node().extent_offset;
@@ -334,7 +358,7 @@ private:
                 std::filesystem::remove(spill.path, ec);
             }
         };
-        if (extent_size > backing->GetSize() || extent_offset > backing->GetSize() - extent_size) {
+        if (extent_size > backing_size || extent_offset > backing_size - extent_size) {
             return fail("extent out of range");
         }
 
@@ -391,11 +415,13 @@ private:
 
     std::vector<u8> Decompress() const {
         const auto& backing = members->backing;
+        const u64 backing_size =
+            members->backing_size != 0 ? members->backing_size : backing->GetSize();
         const std::string_view name = Name();
         const u64 extent_offset = Node().extent_offset;
         const u64 extent_size = Node().extent_size;
         const u64 uncompressed_size = Node().size;
-        if (extent_size > backing->GetSize() || extent_offset > backing->GetSize() - extent_size) {
+        if (extent_size > backing_size || extent_offset > backing_size - extent_size) {
             return {};
         }
         const auto compressed = backing->ReadBytes(static_cast<std::size_t>(extent_size),
@@ -525,6 +551,7 @@ bool NupContainer::Parse() {
         status = Loader::ResultStatus::ErrorNUPBadFormat;
         return false;
     }
+    members->backing_size = file_size;
 
     const auto toc = file->ReadBytes(static_cast<std::size_t>(toc_size),
                                      static_cast<std::size_t>(toc_offset));

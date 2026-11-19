@@ -43,6 +43,7 @@
 #include "video_core/render_probe.h"
 #include "video_core/render_trace.h"
 #include "video_core/texture_cache/conversion.h"
+#include "video_core/texture_cache/eviction_age.h"
 #include "video_core/texture_cache/host_memory_limit.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/memory_budget.h"
@@ -187,10 +188,13 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
+    bool evict_bad_overlaps = false;
+    u64 mode_age = 0;
     u64 ticks_to_destroy = 0;
     size_t num_iterations = 0;
     const bool urgent = out_of_memory || host_pressure;
-    // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
+    // EDEN_NX2_TC_MIN_AGE=<frames>: keep images used more recently while there is room
+    // (thrash tests).
     static const u64 min_age = [] {
         const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
         return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
@@ -219,9 +223,9 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
         aggressive_mode =
             allow_aggressive && (urgent || total_used_memory >= critical_memory);
         const u64 idle_age = native_thresholds_applied ? NativeTextureCacheIdleAge() : u64{50};
+        mode_age = TextureCacheCollectionAge(high_priority_mode, aggressive_mode, idle_age);
         ticks_to_destroy =
-            TextureCacheCollectionAge(high_priority_mode, aggressive_mode, idle_age);
-        ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
+            EvictionAge(mode_age, min_age, total_used_memory, retention_limit, urgent);
         // EDEN_NX2_TC_GC_ITERATIONS=<n>: images a normal pass may delete (10). Ocarina of Time
         // makes ~11 render targets a frame at shifting offsets of a transient heap while the
         // view moves: 10 a frame never kept up, memory grew until the collector thrashed.
@@ -232,34 +236,48 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
         }();
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : normal_iterations);
     };
-    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly, &defer_downloads, &NeedsDownload,
+    const auto CanEvict = [this, &high_priority_mode, &aggressive_mode, &evict_old_costly,
+                           &evict_bad_overlaps, &defer_downloads, &NeedsDownload,
+                           out_of_memory](ImageId image_id, bool* out_must_download = nullptr) {
+        const auto& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::IsDecoding) ||
+            (evict_bad_overlaps && False(image.flags & ImageFlagBits::BadOverlap))) {
+            return false;
+        }
+        const bool must_download = NeedsDownload(image);
+        if (out_must_download != nullptr) {
+            *out_must_download = must_download;
+        }
+        if ((!aggressive_mode && !evict_old_costly &&
+             True(image.flags & ImageFlagBits::CostlyLoad)) ||
+            (!high_priority_mode && must_download) || (defer_downloads && must_download)) {
+            return false;
+        }
+        if (must_download && !out_of_memory && VideoCore::Nx2Debug::Experiment(57) != 0 &&
+            gc_waited_frame == frame_tick) {
+            return false;
+        }
+        return true;
+    };
+    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode, &CanEvict,
                           out_of_memory](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
+        bool must_download = false;
+        if (!CanEvict(image_id, &must_download)) {
+            if (must_download && !out_of_memory && VideoCore::Nx2Debug::Experiment(57) != 0 &&
+                gc_waited_frame == frame_tick &&
+                False(slot_images[image_id].flags & ImageFlagBits::IsDecoding)) {
+                ++gc_downloads_deferred;
+            }
+            return false;
+        }
         --num_iterations;
         auto& image = slot_images[image_id];
-        if (True(image.flags & ImageFlagBits::IsDecoding)) {
-            return false;
-        }
-        const bool must_download = NeedsDownload(image);
-        if ((!aggressive_mode && !evict_old_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||
-            (!high_priority_mode && must_download) || (defer_downloads && must_download)) {
-            return false;
-        }
         if (!must_download && IsDownloadable(image) &&
             False(image.flags & ImageFlagBits::BadOverlap)) {
             Common::PerfReport::Add(Common::PerfReport::TextureCollectorRedrawnDrops);
-        }
-        // EDEN_NX2_EXP57 (live, 0 = off): at most one download with a full wait for the GPU per
-        // frame unless an allocation failed. A player's first high-priority pass downloaded
-        // image after image and froze for 3 s (fable52_answer_3 s7); the rest wait for later
-        // frames.
-        if (must_download && !out_of_memory && VideoCore::Nx2Debug::Experiment(57) != 0 &&
-            gc_waited_frame == frame_tick) {
-            ++gc_downloads_deferred;
-            return false;
         }
         if (must_download) {
             gc_waited_frame = frame_tick;
@@ -267,18 +285,29 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
             runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
-                         swizzle_data_buffer);
             ++gc_download_deletes;
             Common::PerfReport::Add(Common::PerfReport::TextureCollectorDownloads);
-            // Guest memory holds the GPU's data now (DeleteImage must not mark it stale).
-            image.flags &= ~ImageFlagBits::GpuModified;
-            ClearStaleImage(image);
+            // Guest memory holds the GPU's data now (DeleteImage must not mark it stale), unless
+            // no live address space maps the image anymore.
+            if (WriteBackImage(image, copies, map.mapped_span)) {
+                image.flags &= ~ImageFlagBits::GpuModified;
+            } else {
+                MarkStale(image);
+            }
         } else {
             MarkStale(image); // before UntrackImage (see MarkStale)
         }
         if (True(image.flags & ImageFlagBits::Tracked)) {
             UntrackImage(image, image_id);
+        }
+        if constexpr (requires(const Image& img) { img.MemoryBlock(); }) {
+            const auto block = image.MemoryBlock();
+            if (block.block != 0) {
+                const auto it = block_image_bytes.find(block.block);
+                if (it != block_image_bytes.end()) {
+                    it->second -= (std::min)(it->second, block.size);
+                }
+            }
         }
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         Common::PerfReport::Add(Common::PerfReport::TextureCollected);
@@ -302,36 +331,23 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
     // used). Among the oldest candidates (8 per image this pass may delete), those in the
     // emptiest blocks go first, so blocks drain and go back to the driver; placement already
     // prefers the fullest blocks (best fit). Images with memory of their own sit in the middle.
-    const auto Collect = [&] {
-        if (frame_tick <= ticks_to_destroy) {
+    const auto Collect = [&](u64 age_override = 0) {
+        const u64 required_age = age_override != 0 ? age_override : ticks_to_destroy;
+        if (num_iterations == 0 || frame_tick < required_age) {
             return;
         }
+        const u64 last_tick = frame_tick - required_age;
         if constexpr (requires(const Image& image) { image.MemoryBlock(); }) {
             std::vector<ImageId> candidates;
             const size_t limit = num_iterations * 8;
             candidates.reserve(limit);
-            lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId image_id) {
-                candidates.push_back(image_id);
+            lru_cache.ForEachItemBelow(last_tick, [&](ImageId image_id) {
+                if (CanEvict(image_id)) {
+                    candidates.push_back(image_id);
+                }
                 return candidates.size() >= limit;
             });
             if (candidates.empty()) {
-                return;
-            }
-            static const bool gc_skip = [] {
-                const char* value = std::getenv("EDEN_NX2_TC_GC_SKIP");
-                return value == nullptr || value[0] != '0';
-            }();
-            if (gc_skip && std::none_of(candidates.begin(), candidates.end(), [&](ImageId image_id) {
-                    const auto& image = slot_images[image_id];
-                    if (True(image.flags & ImageFlagBits::IsDecoding)) {
-                        return false;
-                    }
-                    const bool must_download = NeedsDownload(image);
-                    return !((!aggressive_mode && !evict_old_costly &&
-                              True(image.flags & ImageFlagBits::CostlyLoad)) ||
-                             (!high_priority_mode && must_download) ||
-                             (defer_downloads && must_download));
-                })) {
                 return;
             }
             if (block_image_bytes_frame == ~0ULL || frame_tick - block_image_bytes_frame >= 60) {
@@ -365,7 +381,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
                 }
             }
         } else {
-            lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
+            lru_cache.ForEachItemBelow(last_tick, Cleanup);
         }
     };
     // A bad overlap that a newer GPU-written image covers holds nothing a later read can want:
@@ -409,6 +425,13 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
         return;
     }
     Configure(false);
+    // Images newer ones partly overwrote (BadOverlap: their bytes belong to the newer images, so
+    // they are dropped without a download) get the mode's age, not the retention floor (#1845).
+    if (ticks_to_destroy > mode_age) {
+        evict_bad_overlaps = true;
+        Collect(mode_age);
+        evict_bad_overlaps = false;
+    }
     // EDEN_NX2_TC_STALE_AGE=<frames>: images newer images partly overwrote (BadOverlap: never
     // downloaded, their bytes belong to the newer ones) are collected once idle this long, before
     // the age-based pass, up to 64 a frame. Off by default.
@@ -438,7 +461,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool host_pressure
     }();
     if (high_priority_mode && old_age != 0 && frame_tick > old_age) {
         evict_old_costly = true;
-        lru_cache.ForEachItemBelow(frame_tick - old_age, Cleanup);
+        Collect(old_age);
         evict_old_costly = false;
     }
     Collect();
@@ -545,19 +568,90 @@ void TextureCache<P>::ClearStaleImage(const ImageBase& image) {
         ClearStale(image.cpu_addr, image.guest_size_bytes);
         return;
     }
-    ClearStaleGpu(image.gpu_addr, image.guest_size_bytes);
+    if (gpu_memory != nullptr) {
+        ClearStaleGpu(*gpu_memory, image.gpu_addr, image.guest_size_bytes);
+    }
 }
 
 template <class P>
-void TextureCache<P>::ClearStaleGpu(GPUVAddr gpu_addr, size_t size) {
+Tegra::MemoryManager* TextureCache<P>::WriteBackMemory(const ImageBase& image) {
+    // The garbage collector and CPU-side downloads reach images of every address space, so the
+    // bound channel's memory may map image.gpu_addr to other memory. The image's own address
+    // space writes it; once nvdrv has closed that one, another live address space that maps all
+    // of the image's GPU range to its device memory does (FindImage shares images between them).
+    // Only for an image its own address space mapped to one device range and has not remapped
+    // since: the device pages of any other are no longer known, so it is not written back
+    // (MarkStale) rather than risk writing other memory.
+    if (gpu_memory != nullptr &&
+        (image.address_space == ~size_t{0} || gpu_memory->GetID() == image.address_space)) {
+        return gpu_memory;
+    }
+    boost::container::small_vector<Tegra::MemoryManager*, 4> others;
+    {
+        std::scoped_lock lock{config_mutex};
+        for (const size_t channel_id : active_channel_ids) {
+            Tegra::MemoryManager* const memory = &channel_storage[channel_id].gpu_memory;
+            if (memory->GetID() == image.address_space) {
+                return memory;
+            }
+            if (std::ranges::find(others, memory) == others.end()) {
+                others.push_back(memory);
+            }
+        }
+    }
+    if (gpu_memory != nullptr && std::ranges::find(others, gpu_memory) == others.end()) {
+        others.push_back(gpu_memory);
+    }
+    if (True(image.flags &
+             (ImageFlagBits::Sparse | ImageFlagBits::NonContiguous | ImageFlagBits::Remapped))) {
+        return nullptr;
+    }
+    for (Tegra::MemoryManager* const memory : others) {
+        if (memory->GpuToCpuAddress(image.gpu_addr) == image.cpu_addr &&
+            memory->IsContinuousRange(image.gpu_addr, image.guest_size_bytes)) {
+            return memory;
+        }
+    }
+    return nullptr;
+}
+
+template <class P>
+bool TextureCache<P>::WriteBackImage(const ImageBase& image,
+                                     std::span<const BufferImageCopy> copies,
+                                     std::span<const u8> data) {
+    Tegra::MemoryManager* const memory = WriteBackMemory(image);
+    if (memory == nullptr) {
+        return false;
+    }
+    SwizzleImage(*memory, image.gpu_addr, image.info, copies, data, swizzle_data_buffer);
+    if (stale_page_count == 0) {
+        return true;
+    }
+    if (False(image.flags & ImageFlagBits::Sparse)) {
+        ClearStale(image.cpu_addr, image.guest_size_bytes);
+    } else {
+        ClearStaleGpu(*memory, image.gpu_addr, image.guest_size_bytes);
+    }
+    return true;
+}
+
+template <class P>
+void TextureCache<P>::ClearStaleGpu(Tegra::MemoryManager& memory, GPUVAddr gpu_addr, size_t size) {
     if (stale_page_count == 0) {
         return;
     }
     // Each piece is contiguous in device memory (GetSubmappedRange splits where it is not).
-    for (const auto& [piece_addr, piece_size] : gpu_memory->GetSubmappedRange(gpu_addr, size)) {
-        if (const auto device_addr = gpu_memory->GpuToCpuAddress(piece_addr)) {
+    for (const auto& [piece_addr, piece_size] : memory.GetSubmappedRange(gpu_addr, size)) {
+        if (const auto device_addr = memory.GpuToCpuAddress(piece_addr)) {
             ClearStale(*device_addr, piece_size);
         }
+    }
+}
+
+template <class P>
+void TextureCache<P>::ClearStaleGpu(GPUVAddr gpu_addr, size_t size) {
+    if (gpu_memory != nullptr) {
+        ClearStaleGpu(*gpu_memory, gpu_addr, size);
     }
 }
 
@@ -891,6 +985,7 @@ void TextureCache<P>::TickFrame() {
             }
             if (native_thresholds_applied && budget_check_frames++ % 30 == 0) {
                 const u64 budget = runtime.GetDeviceMemoryBudget();
+                retention_limit = 0;
                 if (budget > 2_GiB) {
                     const u64 margin = (std::min)(budget / 8, 1_GiB);
                     if constexpr (requires { runtime.GetDeviceMemorySlack(); }) {
@@ -906,8 +1001,9 @@ void TextureCache<P>::TickFrame() {
                                 ? slack
                                 : slack_margin - (std::min)(slack_margin - slack, 16_MiB);
                     }
+                    const u64 reserved = margin + pressure_margin + slack_margin;
                     critical_memory =
-                        budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
+                        budget - (std::min)(reserved, budget / 2);
                     // The device's budget is not all the room there is: Windows charges device
                     // memory to the system's commit limit (HostCriticalMemory). The usage is the
                     // driver's, which still counts images waiting to be freed.
@@ -917,8 +1013,40 @@ void TextureCache<P>::TickFrame() {
                             ? HostCriticalMemory(runtime.GetDeviceMemoryUsage(), *commit_room)
                             : (std::numeric_limits<u64>::max)();
                     critical_memory = (std::min)(critical_memory, host_critical);
+                    retention_budget = RetentionBudget(retention_budget, budget);
+                    const u64 room_margin =
+                        (std::min)(pressure_margin + slack_margin, retention_budget / 2);
+                    retention_limit = (std::min)(retention_budget - room_margin, host_critical);
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
                     ApplyThresholdOverrides(false);
+                    u64 other_memory = 0;
+                    if constexpr (requires { runtime.GetDeviceHeapMemoryBudget(); }) {
+                        static const bool overridden =
+                            std::getenv("EDEN_NX2_TC_EXPECTED_MIB") != nullptr ||
+                            std::getenv("EDEN_NX2_TC_CRITICAL_MIB") != nullptr;
+                        const u64 heap_budget = runtime.GetDeviceHeapMemoryBudget();
+                        if (heap_budget > budget) {
+                            const u64 image_bytes = CollectableImageBytes();
+                            other_memory =
+                                total_used_memory - (std::min)(total_used_memory, image_bytes);
+                        }
+                        if (heap_budget > budget && !overridden) {
+                            const u64 heap_critical =
+                                heap_budget - (std::min)(reserved, heap_budget / 2);
+                            const u64 gap = critical_memory - expected_memory;
+                            const u64 raised = (std::min)(
+                                (std::min)(critical_memory + other_memory, heap_critical),
+                                host_critical);
+                            critical_memory = (std::max)(critical_memory, raised);
+                            expected_memory =
+                                critical_memory - (std::min)(gap, critical_memory / 2);
+                            const u64 heap_room =
+                                heap_budget - (std::min)(room_margin, heap_budget / 2);
+                            retention_limit = (std::min)(
+                                (std::min)(retention_limit + other_memory, heap_room),
+                                host_critical);
+                        }
+                    }
                     // Compared with the last values logged, so a threshold that host memory
                     // lowers a little at each check is logged too.
                     const u64 change = critical_memory > logged_critical_memory
@@ -929,8 +1057,12 @@ void TextureCache<P>::TickFrame() {
                         logged_critical_memory = critical_memory;
                         ApplyThresholdOverrides(true);
                         LOG_INFO(HW_GPU,
-                                 "Memory margins: base {} MiB, out of memory {} MiB, block slack {} MiB",
-                                 margin >> 20, pressure_margin >> 20, slack_margin >> 20);
+                                 "Memory margins: base {} MiB, out of memory {} MiB, block slack "
+                                 "{} MiB, not textures {} MiB; budget {} MiB, retention limit {} "
+                                 "MiB (lowest budget lately {} MiB)",
+                                 margin >> 20, pressure_margin >> 20, slack_margin >> 20,
+                                 other_memory >> 20, budget >> 20, retention_limit >> 20,
+                                 retention_budget >> 20);
                         if (commit_room) {
                             LOG_INFO(HW_GPU, "Host memory: {} MiB of commit left, {}",
                                      *commit_room >> 20,
@@ -1128,6 +1260,9 @@ void TextureCache<P>::TickFrame() {
         stale_upload_skips = 0;
         images_created = images_deleted = 0;
     }
+    if (frame_tick % 60 == 0) {
+        DecayRelocationGuards();
+    }
     SweepColdImages();
     CollectIdleImages();
     EvictTransientTargets();
@@ -1202,6 +1337,9 @@ void TextureCache<P>::TickFrame() {
                          HostBudget::FollowsHeadroom() ? "images" : "device memory");
             }
         }
+    }
+    if (host_memory_cap < retention_limit) {
+        retention_limit = host_memory_cap;
     }
     if (host_memory_cap < critical_memory) {
         if (HostBudget::FollowsHeadroom()) {
@@ -1730,16 +1868,19 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
             has_blacklisted = false;
         }
         u32 last_index = ~0U;
+        bool last_skip_guard = false;
         ImageViewId last_id{};
         for (ImageViewInOut& view : views) {
-            if (view.index == last_index && !has_deleted_images) {
+            if (view.index == last_index && view.skip_cross_frame_guard == last_skip_guard &&
+                !has_deleted_images) {
                 view.id = last_id;
             } else {
-                view.id = VisitImageView(view.index, compute);
+                view.id = VisitImageView(view.index, compute, view.skip_cross_frame_guard);
                 if (!view.id) [[unlikely]] {
                     view.id = NULL_IMAGE_VIEW_ID;
                 }
                 last_index = view.index;
+                last_skip_guard = view.skip_cross_frame_guard;
                 last_id = view.id;
             }
             if (blacklist) {
@@ -1770,8 +1911,45 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
     // A draw that samples its own colour target reads it while the host writes it, a feedback
     // loop: RADV reads compressed tiles back as garbage (DK Bananza's video panel came out in
     // tiles). Maxwell reads the texel before the draw's write lands, so sample a copy instead.
-    std::vector<ImageId> used_shadows;
+    if (maxwell3d == nullptr || views.empty()) {
+        return;
+    }
     const auto& regs = maxwell3d->regs;
+    if (regs.rasterize_enable == 0 || regs.rt_control.count == 0) {
+        return;
+    }
+    struct WrittenRt {
+        GPUVAddr addr;
+        s32 layers;
+    };
+    boost::container::static_vector<WrittenRt, NUM_RT> written_rts;
+    const u32 rt_count = (std::min<u32>)(regs.rt_control.count, NUM_RT);
+    for (u32 index = 0; index < rt_count; ++index) {
+        if (regs.color_mask[regs.color_mask_common ? 0 : index].raw == 0) {
+            continue;
+        }
+        const auto& rt = regs.rt[index];
+        const GPUVAddr rt_addr = rt.Address();
+        if (rt.format == Tegra::RenderTargetFormat::NONE || rt_addr == 0) {
+            continue;
+        }
+        written_rts.push_back({
+            .addr = rt_addr,
+            .layers = (std::max<s32>)(static_cast<s32>(rt.depth), 1),
+        });
+    }
+    if (written_rts.empty()) {
+        return;
+    }
+    const auto range_covers = [](const SubresourceRange& outer,
+                                 const SubresourceRange& inner) noexcept {
+        return outer.extent.levels > 0 && outer.extent.layers > 0 &&
+               outer.base.level <= inner.base.level &&
+               outer.base.level + outer.extent.levels >= inner.base.level + inner.extent.levels &&
+               outer.base.layer <= inner.base.layer &&
+               outer.base.layer + outer.extent.layers >= inner.base.layer + inner.extent.layers;
+    };
+    boost::container::small_vector<std::pair<ImageId, ImageId>, 8> draw_shadows;
     for (ImageViewInOut& view : views) {
         if (view.id == NULL_IMAGE_VIEW_ID || view.blacklist) {
             continue;
@@ -1782,24 +1960,61 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
             continue;
         }
         const ImageViewBase& image_view = slot_image_views[view.id];
-        if (image_view.IsBuffer()) {
+        if (image_view.IsBuffer() || !image_view.image_id ||
+            image_view.image_id == NULL_IMAGE_ID) {
             continue;
         }
         const ImageId image_id = image_view.image_id;
-        const GPUVAddr gpu_addr = slot_images[image_id].gpu_addr;
-        bool is_target = false;
-        for (u32 index = 0; index < regs.rt_control.count; ++index) {
-            const auto& rt = regs.rt[regs.rt_control.Map(index)];
-            is_target |= rt.format != Tegra::RenderTargetFormat::NONE && rt.Address() == gpu_addr;
+        const SubresourceRange view_range = image_view.range;
+        {
+            const ImageBase& image_base = slot_images[image_id];
+            // Rescaled and multisampled targets keep the loop; copy them when a game needs it.
+            if (True(image_base.flags & ImageFlagBits::Rescaled) ||
+                image_base.info.num_samples != 1) {
+                continue;
+            }
+            bool is_target = false;
+            for (const WrittenRt& rt : written_rts) {
+                if (!image_base.OverlapsGPU(rt.addr, 1)) {
+                    continue;
+                }
+                SubresourceBase rt_base{};
+                if (image_base.info.type == ImageType::Linear) {
+                    if (rt.addr != image_base.gpu_addr) {
+                        continue;
+                    }
+                } else {
+                    const std::optional<SubresourceBase> found = image_base.TryFindBase(rt.addr);
+                    if (!found) {
+                        continue;
+                    }
+                    rt_base = *found;
+                }
+                if (rt_base.level < view_range.base.level ||
+                    rt_base.level >= view_range.base.level + view_range.extent.levels) {
+                    continue;
+                }
+                const bool all_3d_slices = image_base.info.type == ImageType::e3D &&
+                                           image_view.type == ImageViewType::e3D;
+                if (!all_3d_slices &&
+                    (rt_base.layer >= view_range.base.layer + view_range.extent.layers ||
+                     view_range.base.layer >= rt_base.layer + rt.layers)) {
+                    continue;
+                }
+                is_target = true;
+                break;
+            }
+            if (!is_target) {
+                continue;
+            }
         }
-        // ponytail: rescaled and multisampled targets keep the loop; copy them when a game needs
-        // it.
-        if (!is_target || True(slot_images[image_id].flags & ImageFlagBits::Rescaled) ||
-            slot_images[image_id].info.num_samples != 1) {
-            continue;
-        }
+        const auto used_in_draw = [&](ImageId candidate_shadow) {
+            return std::ranges::any_of(draw_shadows, [candidate_shadow](const auto& pair) {
+                return pair.second == candidate_shadow;
+            });
+        };
         const auto same_shape = [&](const FeedbackShadow& entry) {
-            if (std::ranges::find(used_shadows, entry.id) != used_shadows.end()) {
+            if (used_in_draw(entry.id)) {
                 return false;
             }
             const ImageInfo& a = slot_images[entry.id].info;
@@ -1808,25 +2023,106 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
                    a.resources.levels == b.resources.levels &&
                    a.resources.layers == b.resources.layers;
         };
-        auto it = std::ranges::find_if(feedback_shadows, same_shape);
-        if (it == feedback_shadows.end()) {
-            const ImageInfo info = slot_images[image_id].info;
-            const DAddr cpu_addr = slot_images[image_id].cpu_addr;
-            const ImageId id = slot_images.insert(runtime, info, gpu_addr, cpu_addr);
-            total_used_memory += ImageMemoryBytes(slot_images[id]);
-            feedback_shadows.push_back({id, frame_tick});
-            LOG_INFO(HW_GPU, "Colour target {}x{} format {} sampled by its own draw: copying it",
-                     info.size.width, info.size.height, static_cast<u32>(info.format));
-            it = std::prev(feedback_shadows.end());
+        ImageId shadow_id{};
+        for (const auto& [src_id, dst_id] : draw_shadows) {
+            if (src_id == image_id) {
+                shadow_id = dst_id;
+                break;
+            }
         }
-        const ImageId shadow_id = it->id;
+        auto it = feedback_shadows.end();
+        if (shadow_id) {
+            it = std::ranges::find_if(feedback_shadows, [shadow_id](const FeedbackShadow& entry) {
+                return entry.id == shadow_id;
+            });
+        } else {
+            it = std::ranges::find_if(feedback_shadows, [&](const FeedbackShadow& entry) {
+                return entry.last_src_id == image_id && same_shape(entry);
+            });
+            if (it == feedback_shadows.end()) {
+                it = std::ranges::find_if(feedback_shadows, same_shape);
+            }
+            if (it == feedback_shadows.end()) {
+                const ImageInfo info = slot_images[image_id].info;
+                const GPUVAddr gpu_addr = slot_images[image_id].gpu_addr;
+                const DAddr cpu_addr = slot_images[image_id].cpu_addr;
+                const ImageId id = slot_images.insert(runtime, info, gpu_addr, cpu_addr);
+                total_used_memory += ImageMemoryBytes(slot_images[id]);
+                feedback_shadows.push_back({.id = id, .last_frame = frame_tick});
+                LOG_INFO(HW_GPU, "Colour target {}x{} format {} sampled by its own draw: copying it",
+                         info.size.width, info.size.height, static_cast<u32>(info.format));
+                it = std::prev(feedback_shadows.end());
+            }
+            shadow_id = it->id;
+            draw_shadows.emplace_back(image_id, shadow_id);
+        }
         it->last_frame = frame_tick;
-        used_shadows.push_back(shadow_id);
         Image& image = slot_images[image_id];
-        Image& shadow = slot_images[shadow_id];
-        const auto copies = MakeShrinkImageCopies(shadow.info, image.info, SubresourceBase{});
-        runtime.CopyImage(shadow, image, copies);
+        if (image.modification_tick == 0) {
+            image.modification_tick = ++modification_tick;
+        }
+        const u64 src_tick = image.modification_tick;
+        const bool same_source =
+            it->last_src_id == image_id && it->last_src_mod_tick == src_tick;
+        if (!same_source || !range_covers(it->copied_range, view_range)) {
+            Image& shadow = slot_images[shadow_id];
+            SubresourceRange copy_range{
+                .base = {0, 0},
+                .extent = image.info.resources,
+            };
+            if (image.info.type != ImageType::e3D) {
+                s32 base_level =
+                    std::clamp<s32>(view_range.base.level, 0, image.info.resources.levels - 1);
+                s32 end_level = std::clamp<s32>(view_range.base.level + view_range.extent.levels,
+                                                base_level + 1, image.info.resources.levels);
+                s32 base_layer =
+                    std::clamp<s32>(view_range.base.layer, 0, image.info.resources.layers - 1);
+                s32 end_layer = std::clamp<s32>(view_range.base.layer + view_range.extent.layers,
+                                                base_layer + 1, image.info.resources.layers);
+                if (same_source && it->copied_range.extent.levels > 0 &&
+                    it->copied_range.extent.layers > 0) {
+                    base_level = (std::min)(base_level, it->copied_range.base.level);
+                    end_level = (std::max)(
+                        end_level, it->copied_range.base.level + it->copied_range.extent.levels);
+                    base_layer = (std::min)(base_layer, it->copied_range.base.layer);
+                    end_layer = (std::max)(
+                        end_layer, it->copied_range.base.layer + it->copied_range.extent.layers);
+                }
+                copy_range = SubresourceRange{
+                    .base = {.level = base_level, .layer = base_layer},
+                    .extent = {.levels = end_level - base_level, .layers = end_layer - base_layer},
+                };
+            }
+            auto copies = MakeShrinkImageCopies(shadow.info, image.info, SubresourceBase{});
+            if (image.info.type != ImageType::e3D &&
+                (copy_range.base.level != 0 ||
+                 copy_range.extent.levels != image.info.resources.levels ||
+                 copy_range.base.layer != 0 ||
+                 copy_range.extent.layers != image.info.resources.layers)) {
+                boost::container::small_vector<ImageCopy, 16> sub_copies;
+                sub_copies.reserve(static_cast<size_t>(copy_range.extent.levels));
+                for (s32 l = copy_range.base.level;
+                     l < copy_range.base.level + copy_range.extent.levels &&
+                     static_cast<size_t>(l) < copies.size();
+                     ++l) {
+                    ImageCopy sub = copies[static_cast<size_t>(l)];
+                    sub.src_subresource.base_layer = copy_range.base.layer;
+                    sub.src_subresource.num_layers = copy_range.extent.layers;
+                    sub.dst_subresource.base_layer = copy_range.base.layer;
+                    sub.dst_subresource.num_layers = copy_range.extent.layers;
+                    sub_copies.push_back(sub);
+                }
+                copies = std::move(sub_copies);
+            }
+            runtime.CopyImage(shadow, image, copies);
+            it->last_src_id = image_id;
+            it->last_src_mod_tick = src_tick;
+            it->copied_range = copy_range;
+        }
         const auto view_it = std::ranges::find(image.image_view_ids, view.id);
+        if (view_it == image.image_view_ids.end()) [[unlikely]] {
+            continue;
+        }
         const ImageViewInfo view_info =
             image.image_view_infos[std::distance(image.image_view_ids.begin(), view_it)];
         view.id = FindOrEmplaceImageView(shadow_id, view_info);
@@ -2067,12 +2363,17 @@ inline void PrefetchLine(const void* address) noexcept {
 } // namespace BindingMemoDetail
 
 template <class P>
-void TextureCache<P>::BumpBindingSerial(ImageId image_id) {
+void TextureCache<P>::EnsureBindingSerialSlot(ImageId image_id) {
     const size_t index = image_id.Value();
     if (index >= image_binding_serials.size()) {
         image_binding_serials.resize((std::max)(index + 1, image_binding_serials.size() * 2), 0);
     }
-    image_binding_serials[index] = ++binding_clock;
+}
+
+template <class P>
+void TextureCache<P>::BumpBindingSerial(ImageId image_id) {
+    EnsureBindingSerialSlot(image_id);
+    image_binding_serials[image_id.Value()] = ++binding_clock;
 }
 
 template <class P>
@@ -2150,16 +2451,18 @@ void TextureCache<P>::PrefetchBinding(const BindingLookup& lookup, const Binding
 template <class P>
 typename TextureCache<P>::BindingMemo* TextureCache<P>::FindBinding(const BindingLookup& lookup,
                                                                      u32 tic_handle,
-                                                                     u32 tsc_index, u32 kind) {
+                                                                     u32 tsc_index, u32 kind,
+                                                                     bool skip_cross_frame_guard) {
     return FindBinding(lookup, tic_handle, tsc_index, kind,
-                       ProbeBinding(tic_handle, tsc_index, kind));
+                       ProbeBinding(tic_handle, tsc_index, kind), skip_cross_frame_guard);
 }
 
 template <class P>
 typename TextureCache<P>::BindingMemo* TextureCache<P>::FindBinding(const BindingLookup& lookup,
                                                                      u32 tic_handle,
                                                                      u32 tsc_index, u32 kind,
-                                                                     const BindingProbe& probe) {
+                                                                     const BindingProbe& probe,
+                                                                     bool skip_cross_frame_guard) {
     using namespace BindingMemoDetail;
     if (binding_memos.empty()) {
         return nullptr;
@@ -2234,27 +2537,98 @@ typename TextureCache<P>::BindingMemo* TextureCache<P>::FindBinding(const Bindin
                 continue;
             }
         }
-        if (has_image && rt_active_mask != 0) {
-            // The image is a bound colour target: the full path samples a copy of it instead
-            // (ReplaceColorFeedbackViews), which the recorded payload would skip.
+        if (has_image && !lookup.compute && maxwell3d != nullptr &&
+            maxwell3d->regs.rasterize_enable != 0) {
+            // The image is an active written colour target: the full path samples a copy of it
+            // instead (ReplaceColorFeedbackViews), which the recorded payload would skip.
+            const auto& regs = maxwell3d->regs;
+            const ImageBase& image = slot_images[image_id];
+            const u32 rt_count = (std::min<u32>)(regs.rt_control.count, NUM_RT);
             bool is_color_target = false;
-            for (size_t i = 0; i < NUM_RT; ++i) {
-                is_color_target |= (rt_active_mask & (1u << i)) != 0 && rt_image_id[i] == image_id;
+            for (u32 i = 0; i < rt_count; ++i) {
+                if (regs.color_mask[regs.color_mask_common ? 0 : i].raw == 0) {
+                    continue;
+                }
+                const auto& rt = regs.rt[i];
+                if (rt.format != Tegra::RenderTargetFormat::NONE && rt.Address() != 0 &&
+                    image.OverlapsGPU(rt.Address(), 1)) {
+                    is_color_target = true;
+                    break;
+                }
             }
             if (is_color_target) {
                 continue;
             }
         }
         if (memo.touch_tick != frame_tick) {
+            const bool skip_guard = skip_cross_frame_guard || (kind & (1U << 14)) != 0;
             if (has_image) {
-                CheckCrossFrameUse(slot_images[image_id], false, false);
+                CheckCrossFrameUse(slot_images[image_id], false, false, skip_guard);
                 lru_cache.Touch(slot_images[image_id].lru_index, frame_tick);
             }
-            memo.touch_tick = frame_tick;
+            if (!skip_guard) {
+                memo.touch_tick = frame_tick;
+            }
         }
         return &memo;
     }
     return nullptr;
+}
+
+template <class P>
+bool TextureCache<P>::MemoStillValid(const BindingMemo& memo) const noexcept {
+    if (memo.kind == 0 || memo.epoch != binding_memo_epoch || memo.channel != channel_state) {
+        return false;
+    }
+    if (memo.view != NULL_IMAGE_VIEW_ID && !slot_image_views.contains(memo.view)) {
+        return false;
+    }
+    if (memo.tsc_index != ~0U && memo.sampler != NULL_SAMPLER_ID &&
+        !slot_samplers.contains(memo.sampler)) {
+        return false;
+    }
+    const ImageId image_id = memo.image;
+    const bool has_image = image_id && image_id != NULL_IMAGE_ID;
+    if (has_image) {
+        if (!slot_images.contains(image_id)) {
+            return false;
+        }
+        const size_t index = image_id.Value();
+        if (index >= image_binding_serials.size() ||
+            image_binding_serials[index] != memo.image_serial) {
+            return false;
+        }
+        const ImageBase& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::CpuModified)) {
+            return false;
+        }
+        if (memo.aliased != 0 || !image.aliased_images.empty()) {
+            for (const AliasedImage& alias : image.aliased_images) {
+                if (slot_images[alias.id].modification_tick > image.modification_tick) {
+                    return false;
+                }
+            }
+        }
+        if ((memo.kind & BINDING_KIND_COMPUTE) == 0 && maxwell3d != nullptr &&
+            maxwell3d->regs.rasterize_enable != 0) {
+            const auto& regs = maxwell3d->regs;
+            const u32 rt_count = (std::min<u32>)(regs.rt_control.count, NUM_RT);
+            for (u32 i = 0; i < rt_count; ++i) {
+                if (regs.color_mask[regs.color_mask_common ? 0 : i].raw == 0) {
+                    continue;
+                }
+                const auto& rt = regs.rt[i];
+                if (rt.format != Tegra::RenderTargetFormat::NONE && rt.Address() != 0 &&
+                    image.OverlapsGPU(rt.Address(), 1)) {
+                    return false;
+                }
+            }
+        }
+    } else if (memo.map_dependent != 0 && gpu_memory != nullptr &&
+               memo.map_serial != gpu_memory->GetMapSerial()) {
+        return false;
+    }
+    return true;
 }
 
 template <class P>
@@ -2584,7 +2958,8 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     const auto& regs = maxwell3d->regs;
     const auto color_modified = [&](size_t index) {
         if (!is_clear) {
-            return index < regs.rt_control.count && regs.color_mask[index].raw != 0;
+            return regs.rasterize_enable != 0 && index < regs.rt_control.count &&
+                   regs.color_mask[regs.color_mask_common ? 0 : index].raw != 0;
         }
         return index == regs.clear_surface.RT &&
                (regs.clear_surface.R || regs.clear_surface.G || regs.clear_surface.B ||
@@ -2791,9 +3166,11 @@ bool TextureCache<P>::RenderTargetsStillPrepared() const {
         if (image_view.IsBuffer()) {
             continue;
         }
-        const bool mod = index < NUM_RT
-                             ? (index < regs.rt_control.count && regs.color_mask[index].raw != 0)
-                             : depth_mod;
+        const bool mod =
+            index < NUM_RT
+                ? (regs.rasterize_enable != 0 && index < regs.rt_control.count &&
+                   regs.color_mask[regs.color_mask_common ? 0 : index].raw != 0)
+                : depth_mod;
         const ImageBase& image = slot_images[image_view.image_id];
         if ((mod && ((prepared.modified_mask & (1u << index)) == 0 ||
                      False(image.flags & ImageFlagBits::GpuModified))) ||
@@ -2842,7 +3219,7 @@ typename P::Framebuffer* TextureCache<P>::GetFramebuffer() {
 }
 
 template <class P>
-ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
+ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute, bool skip_cross_frame_guard) {
     auto& table =
         compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
     index = Tegra::Texture::TextureHeaderIndex(index, table.current_limit,
@@ -2891,7 +3268,7 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
     }
     const auto id = table.bound_ids[index];
     if (id != NULL_IMAGE_VIEW_ID) {
-        PrepareImageView(id, false, false);
+        PrepareImageView(id, false, false, skip_cross_frame_guard);
         const ImageViewBase& view = slot_image_views[id];
         if (!view.IsBuffer()) {
             const ImageBase& image = slot_images[view.image_id];
@@ -2903,7 +3280,9 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
             }
         }
     }
-    table.MarkPrepared(index, DescriptorTick());
+    if (!skip_cross_frame_guard) {
+        table.MarkPrepared(index, DescriptorTick());
+    }
     return id;
 }
 
@@ -3007,8 +3386,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         if (!IsDownloadable(image)) {
             return;
         }
-        if (True(image.flags & ImageFlagBits::GpuModified) &&
-            (image.relocation_guard_noted & GuardCpuRead) == 0 && RelocationShaped(image.info)) {
+        if (True(image.flags & ImageFlagBits::GpuModified) && RelocationShaped(image.info)) {
             NoteRelocationGuard(image, GuardCpuRead);
         }
         image.flags &= ~ImageFlagBits::GpuModified;
@@ -3039,10 +3417,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         }
         runtime.Finish();
         for (Pending& entry : pending) {
-            Image& image = slot_images[entry.image_id];
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
-                         entry.map.mapped_span, swizzle_data_buffer);
-            ClearStaleImage(image);
+            WriteBackImage(slot_images[entry.image_id], entry.copies, entry.map.mapped_span);
         }
         pending.clear();
         pending_bytes = 0;
@@ -3086,7 +3461,7 @@ std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(D
         }
         area->preemtive &= image.info.forced_flushed;
         image.info.forced_flushed = true;
-        if ((image.relocation_guard_noted & GuardCpuRead) == 0 && RelocationShaped(image.info)) {
+        if (RelocationShaped(image.info)) {
             NoteRelocationGuard(image, GuardCpuRead);
         }
     });
@@ -3758,8 +4133,7 @@ void TextureCache<P>::PopAsyncFlushes() {
                 download_buffer.offset -= Common::AlignUp(image.unswizzled_size_bytes, 64);
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
-                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
-                ClearStaleImage(image);
+                WriteBackImage(image, copies, download_span);
             } else {
                 const BufferDownload& buffer_info = slot_buffer_downloads[download_info.object_id];
                 std::span<u8> download_span =
@@ -3808,8 +4182,7 @@ void TextureCache<P>::PopAsyncFlushes() {
             }
             const ImageBase& image = download_info.GetImage(slot_images);
             const auto copies = FullDownloadCopies(image.info);
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
-            ClearStaleImage(image);
+            WriteBackImage(image, copies, download_span);
             download_map.offset += image.unswizzled_size_bytes;
             download_span = download_span.subspan(image.unswizzled_size_bytes);
         }
@@ -5304,8 +5677,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             const int mode = VideoCore::Nx2Debug::Experiment(43);
             relocation_seen = true;
             ++relocation_candidates;
-            if (shape.guard != 0 || relocation_guarded_addresses.contains(gpu_addr) ||
-                relocation_guarded_addresses.contains(old_gpu_addr)) {
+            const auto addr_guarded = [this](GPUVAddr addr) {
+                const auto it = relocation_guarded_addresses.find(addr);
+                return it != relocation_guarded_addresses.end() && it->second.guard != 0;
+            };
+            if (shape.guard != 0 || addr_guarded(gpu_addr) || addr_guarded(old_gpu_addr)) {
                 ++relocation_guarded;
             } else {
                 if (!shape.candidate_logged) {
@@ -5399,7 +5775,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
     Image& new_image = slot_images[new_image_id];
     ++bindings_epoch;
-    BumpBindingSerial(new_image_id);
+    EnsureBindingSerialSlot(new_image_id);
 
     // EDEN_NX2_TC_TRACE=<first frame>: one line per created image (at most 6000) with what it
     // overlapped, to see why images are created (diagnostic).
@@ -5478,11 +5854,13 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         Churn::Add(Churn::ImagesCreated);
     }
 
-    if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
-        (new_info.is_sparse ||
-         (new_info.native_tiling &&
-          Tegra::Nx2InSparseRegion(new_image.gpu_addr, new_image.guest_size_bytes)))) {
-        new_image.flags |= ImageFlagBits::Sparse;
+    if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes)) {
+        new_image.flags |= ImageFlagBits::NonContiguous;
+        if (new_info.is_sparse ||
+            (new_info.native_tiling &&
+             Tegra::Nx2InSparseRegion(new_image.gpu_addr, new_image.guest_size_bytes))) {
+            new_image.flags |= ImageFlagBits::Sparse;
+        }
     }
 
     for (const ImageId overlap_id : join_ignore_textures) {
@@ -6346,6 +6724,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    image.address_space = current_address_space;
     total_used_memory += ImageMemoryBytes(slot_images[image_id]);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
 
@@ -6470,8 +6849,11 @@ template <class P>
 void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
     ASSERT(False(image.flags & ImageFlagBits::Tracked));
     image.flags |= ImageFlagBits::Tracked;
+    // Marked before the pages trap: a new image is tracked (and uploaded) before RegisterImage
+    // marks it, and OnCPUWrite skips the texture cache on unmarked pages.
     if (False(image.flags & ImageFlagBits::Sparse)) {
         if (image.cpu_addr < ~(1ULL << 40)) {
+            page_filter.Mark(image.cpu_addr, image.guest_size_bytes);
             device_memory.UpdatePagesCachedCount(image.cpu_addr, image.guest_size_bytes, 1);
         }
         return;
@@ -6484,12 +6866,14 @@ void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
             const auto& map = slot_map_views[map_view_id];
             const DAddr cpu_addr = map.cpu_addr;
             const std::size_t size = map.size;
+            page_filter.Mark(cpu_addr, size);
             device_memory.UpdatePagesCachedCount(cpu_addr, size, 1);
         }
         return;
     }
     ForEachSparseSegment(image,
                          [this]([[maybe_unused]] GPUVAddr gpu_addr, DAddr cpu_addr, size_t size) {
+                             page_filter.Mark(cpu_addr, size);
                              device_memory.UpdatePagesCachedCount(cpu_addr, size, 1);
                          });
 }
@@ -6523,6 +6907,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     Churn::Add(Churn::ImagesDeleted);
     ++bindings_epoch;
     BumpBindingSerial(image_id);
+    InvalidateFeedbackShadowSource(image_id);
     MarkStale(image);
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
@@ -6767,11 +7152,17 @@ void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr c
         }
     }
     RemoveImageViewReferences(image.image_view_ids);
+    InvalidateFeedbackShadowSource(image_id);
     image.gpu_addr = gpu_addr;
     image.cpu_addr = cpu_addr;
     image.cpu_addr_end = cpu_addr + image.guest_size_bytes;
     image.flags &= ~ImageFlagBits::GpuModified;
     image.flags |= ImageFlagBits::CpuModified;
+    if (gpu_memory != nullptr && !gpu_memory->IsContinuousRange(gpu_addr, image.guest_size_bytes)) {
+        image.flags |= ImageFlagBits::NonContiguous;
+    } else {
+        image.flags &= ~ImageFlagBits::NonContiguous;
+    }
     image.last_write_frame = ~u64{0};
     image.relocation_guard_noted = 0;
     image.written_frames = 0;
@@ -6800,10 +7191,14 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     NoteGpuModified(image);
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
-    if (image.last_write_frame != RenderFrame() && image.written_frames != 0xFFFF) {
-        ++image.written_frames;
+    const u64 render_frame = RenderFrame();
+    if (image.last_write_frame != render_frame) {
+        if (image.written_frames != 0xFFFF) {
+            ++image.written_frames;
+        }
+        image.relocation_guard_noted &= static_cast<u8>(~(GuardSampled | GuardLoaded));
     }
-    image.last_write_frame = RenderFrame();
+    image.last_write_frame = render_frame;
     if (!clearing_render_targets) {
         image.drawn_since_clear = true;
     }
@@ -6917,9 +7312,13 @@ ImageId TextureCache<P>::RelocationCandidate(const ImageInfo& new_info, GPUVAddr
 
 template <class P>
 void TextureCache<P>::NoteRelocationGuard(ImageBase& image, RelocationGuard reason) {
+    const size_t slot = reason == GuardSampled ? 0 : (reason == GuardLoaded ? 1 : 2);
     image.relocation_guard_noted |= reason;
-    relocation_guarded_addresses[image.gpu_addr] |= reason;
+    auto& addr_entry = relocation_guarded_addresses[image.gpu_addr];
+    addr_entry.guard |= reason;
+    addr_entry.last_guard_frame[slot] = frame_tick;
     RelocationShape& shape = relocation_shapes[RelocationShapeKey(image.info)];
+    shape.last_guard_frame[slot] = frame_tick;
     if ((shape.guard & reason) != 0) {
         return;
     }
@@ -6934,6 +7333,35 @@ void TextureCache<P>::NoteRelocationGuard(ImageBase& image, RelocationGuard reas
               image.gpu_addr,
               image.last_write_frame == ~u64{0} ? s64{-1} : static_cast<s64>(image.last_write_frame),
               RenderFrame());
+}
+
+template <class P>
+void TextureCache<P>::DecayRelocationGuards() {
+    if (frame_tick <= RelocationGuardDecayFrames) {
+        return;
+    }
+    const auto decay_mask = [this](u8& guard, const std::array<u64, 3>& stamps) {
+        constexpr std::array<u8, 3> bits{GuardSampled, GuardLoaded, GuardCpuRead};
+        for (size_t i = 0; i < bits.size(); ++i) {
+            if ((guard & bits[i]) != 0 && frame_tick - stamps[i] > RelocationGuardDecayFrames) {
+                guard &= ~bits[i];
+            }
+        }
+    };
+    for (auto& [key, shape] : relocation_shapes) {
+        if (shape.guard != 0) {
+            decay_mask(shape.guard, shape.last_guard_frame);
+        }
+    }
+    for (auto it = relocation_guarded_addresses.begin();
+         it != relocation_guarded_addresses.end();) {
+        decay_mask(it->second.guard, it->second.last_guard_frame);
+        if (it->second.guard == 0) {
+            it = relocation_guarded_addresses.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 template <class P>
@@ -7166,9 +7594,10 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
 }
 
 template <class P>
-void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
+void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate,
+                                   bool skip_cross_frame_guard) {
     Image& image = slot_images[image_id];
-    CheckCrossFrameUse(image, is_modification, invalidate);
+    CheckCrossFrameUse(image, is_modification, invalidate, skip_cross_frame_guard);
     if (!tombstone_born.empty()) {
         CheckTombstonePrepare(image_id, image, is_modification, invalidate); // EXP43=4
     }
@@ -7249,7 +7678,7 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
 
 template <class P>
 void TextureCache<P>::PrepareImageView(ImageViewId image_view_id, bool is_modification,
-                                       bool invalidate) {
+                                       bool invalidate, bool skip_cross_frame_guard) {
     if (!image_view_id) {
         return;
     }
@@ -7257,7 +7686,7 @@ void TextureCache<P>::PrepareImageView(ImageViewId image_view_id, bool is_modifi
     if (image_view.IsBuffer()) {
         return;
     }
-    PrepareImage(image_view.image_id, is_modification, invalidate);
+    PrepareImage(image_view.image_id, is_modification, invalidate, skip_cross_frame_guard);
 }
 
 template <class P>
@@ -7283,8 +7712,6 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
         // same guest data, which is uploaded from guest memory instead.
         return;
     }
-    // As in BlitImage: land a parked deferred clear before the copy overwrites the image.
-    runtime.FlushDeferredClear();
     const bool is_rescaled = True(src.flags & ImageFlagBits::Rescaled);
     if (is_rescaled) {
         ASSERT(True(dst.flags & ImageFlagBits::Rescaled));

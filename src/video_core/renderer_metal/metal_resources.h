@@ -45,6 +45,7 @@ struct TextureDesc {
     u32 samples{1};
     bool render_target{};
     bool shader_write{};
+    bool pixel_format_view{true};
 };
 
 /// MTLTextureSwizzleRed..Alpha: the identity.
@@ -67,6 +68,9 @@ struct FormatInfo {
     FormatClass format_class{FormatClass::Float};
     std::array<u8, 4> swizzle{IdentitySwizzle}; ///< Applied before the guest's own swizzle
 };
+
+/// Raw MTLDevice pointer for cache keys in plain C++.
+[[nodiscard]] const void* DeviceHandle(const Device& device);
 
 /// Device::MemoryBudget for plain C++.
 [[nodiscard]] u64 DeviceMemoryBudget(const Device& device);

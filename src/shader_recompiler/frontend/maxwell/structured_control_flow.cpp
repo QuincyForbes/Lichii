@@ -343,7 +343,17 @@ public:
         return root_stmt;
     }
 
+    [[nodiscard]] const std::vector<bool>& UsedGotoVariables() const noexcept {
+        return used_goto_vars;
+    }
+
 private:
+    void MarkGotoVariableUsed(u32 id) {
+        if (id >= used_goto_vars.size()) {
+            used_goto_vars.resize(id + 1, false);
+        }
+        used_goto_vars[id] = true;
+    }
     void RemoveGoto(Node goto_stmt) {
         // Force goto_stmt and label_stmt to be directly related
         const Node label_stmt{goto_stmt->label};
@@ -555,6 +565,7 @@ private:
 
         Tree if_body;
         if_body.splice(if_body.begin(), body, std::next(goto_stmt), label_nested_stmt);
+        MarkGotoVariableUsed(label_id);
         Statement* const variable{pool.Create(Variable{}, label_id, &root_stmt)};
         Statement* const neg_var{pool.Create(Not{}, variable, &root_stmt)};
         if (!if_body.empty()) {
@@ -590,6 +601,7 @@ private:
         Tree loop_body;
         loop_body.splice(loop_body.begin(), body, label_nested_stmt, goto_stmt);
         SanitizeNoBreaks(loop_body);
+        MarkGotoVariableUsed(label_id);
         Statement* const variable{pool.Create(Variable{}, label_id, &root_stmt)};
         Statement* const loop_stmt{pool.Create(Loop{}, variable, std::move(loop_body), parent)};
         UpdateTreeUp(loop_stmt);
@@ -617,6 +629,7 @@ private:
         Tree if_body;
         if_body.splice(if_body.begin(), body, std::next(goto_stmt), body.end());
         if_body.pop_front();
+        MarkGotoVariableUsed(label_id);
         Statement* const cond{pool.Create(Variable{}, label_id, &root_stmt)};
         Statement* const neg_cond{pool.Create(Not{}, cond, &root_stmt)};
         Statement* const if_stmt{pool.Create(If{}, neg_cond, std::move(if_body), &*parent)};
@@ -635,6 +648,7 @@ private:
         Statement* const parent{goto_stmt->up};
         Tree& body{parent->children};
         const u32 label_id{goto_stmt->label->id};
+        MarkGotoVariableUsed(label_id);
         Statement* const goto_cond{goto_stmt->cond};
         Statement* const set_goto_var{pool.Create(SetVariable{}, label_id, goto_cond, parent)};
         Statement* const cond{pool.Create(Variable{}, label_id, &root_stmt)};
@@ -654,6 +668,7 @@ private:
     Statement root_stmt{FunctionTag{}};
     bool converge_exits{};
     std::optional<Node> exit_label;
+    std::vector<bool> used_goto_vars;
 };
 
 [[nodiscard]] Statement* TryFindForwardBlock(Statement& stmt) {
@@ -690,10 +705,11 @@ class TranslatePass {
 public:
     TranslatePass(ObjectPool<IR::Inst>& inst_pool_, ObjectPool<IR::Block>& block_pool_,
                   ObjectPool<Statement>& stmt_pool_, Environment& env_, Statement& root_stmt,
-                  IR::AbstractSyntaxList& syntax_list_, const HostTranslateInfo& host_info)
+                  IR::AbstractSyntaxList& syntax_list_, const HostTranslateInfo& host_info,
+                  const std::vector<bool>& used_goto_vars)
         : stmt_pool{stmt_pool_}, inst_pool{inst_pool_}, block_pool{block_pool_}, env{env_},
           syntax_list{syntax_list_} {
-        Visit(root_stmt, nullptr, nullptr);
+        Visit(root_stmt, nullptr, nullptr, used_goto_vars);
 
         IR::Block& first_block{*syntax_list.front().data.block};
         IR::IREmitter ir(first_block, first_block.begin());
@@ -704,7 +720,8 @@ public:
     }
 
 private:
-    void Visit(Statement& parent, IR::Block* break_block, IR::Block* fallthrough_block) {
+    void Visit(Statement& parent, IR::Block* break_block, IR::Block* fallthrough_block,
+               const std::vector<bool>& used_goto_vars) {
         IR::Block* current_block{};
         const auto ensure_block{[&] {
             if (current_block) {
@@ -729,8 +746,10 @@ private:
             }
             case StatementType::SetVariable: {
                 ensure_block();
-                IR::IREmitter ir{*current_block};
-                ir.SetGotoVariable(stmt.id, VisitExpr(ir, *stmt.op));
+                if (stmt.id < used_goto_vars.size() && used_goto_vars[stmt.id]) {
+                    IR::IREmitter ir{*current_block};
+                    ir.SetGotoVariable(stmt.id, VisitExpr(ir, *stmt.op));
+                }
                 break;
             }
             case StatementType::SetIndirectBranchVariable: {
@@ -753,7 +772,7 @@ private:
 
                 // Visit children
                 const size_t then_block_index{syntax_list.size()};
-                Visit(stmt, break_block, merge_block);
+                Visit(stmt, break_block, merge_block, used_goto_vars);
 
                 IR::Block* const then_block{syntax_list.at(then_block_index).data.block};
                 current_block->AddBranch(then_block);
@@ -792,7 +811,7 @@ private:
 
                 // Visit children
                 const size_t body_block_index{syntax_list.size()};
-                Visit(stmt, merge_block, continue_block);
+                Visit(stmt, merge_block, continue_block, used_goto_vars);
 
                 // The continue block is located at the end of the loop
                 IR::IREmitter ir{*continue_block};
@@ -1029,7 +1048,8 @@ IR::AbstractSyntaxList BuildASL(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::
     GotoPass goto_pass{cfg, stmt_pool, stage == Stage::Task || stage == Stage::Mesh};
     Statement& root{goto_pass.RootStatement()};
     IR::AbstractSyntaxList syntax_list;
-    TranslatePass{inst_pool, block_pool, stmt_pool, env, root, syntax_list, host_info};
+    TranslatePass{inst_pool, block_pool, stmt_pool, env, root, syntax_list, host_info,
+                  goto_pass.UsedGotoVariables()};
     stmt_pool.ReleaseContents();
     return syntax_list;
 }

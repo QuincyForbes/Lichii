@@ -107,8 +107,9 @@ public:
         bool free_zero{};
     };
     /// Windows: resident pages of guest memory (backing and its views) that hold only zeros leave
-    /// the working set, like HintCold. Apple: resident and compressed zero pages of the backing
-    /// leave the footprint (MADV_FREE_REUSABLE). Returns {resident bytes looked at, bytes trimmed}.
+    /// the working set, like HintCold. Apple: resident zero pages of an untagged backing leave the
+    /// footprint (MADV_FREE_REUSABLE); compressed pages stay untouched. Returns {resident bytes
+    /// looked at, bytes trimmed}.
     /// pause runs after each slice of a few MiB; it returns false to end the pass. Windows, with
     /// state: only pages the previous pass found zero too are trimmed (a page the game clears and
     /// fills again stays).
@@ -132,9 +133,11 @@ public:
 
     /// Bytes ClearBackingRegion has filled with zeros (memset) since start.
     static u64 ZeroFilledBytes() noexcept;
+    /// Bytes Map, Unmap and Protect have covered since start.
+    static u64 MappedBytes() noexcept;
     /// Apple: bytes ClearBackingRegion has zeroed with MADV_ZERO (no pages faulted in) since start.
     static u64 ZeroAdvisedBytes() noexcept;
-    /// iOS: the guest memory object is ledger-tagged, so the footprint counts each of its pages
+    /// Apple: the guest memory object is ledger-tagged, so the footprint counts each of its pages
     /// once however many views map it, and zero trimming can't make them reusable. Also true for
     /// guest memory in a file, which the footprint doesn't count at all.
     [[nodiscard]] bool PagesCountedOnce() const noexcept;

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -38,6 +39,8 @@ struct Device {
     bool gpu_integrated = false;
     u64 vram_mib = 0;           ///< Device-local memory
     bool dlss_capable = false;  ///< NVIDIA RTX (tensor cores), in a build with NVIDIA Streamline
+    bool fsr4_capable = false;  ///< AMD Radeon RX 6000/7000/9000 or Ryzen RDNA 3+ GPU
+    std::optional<u32> recommended_vulkan_device; ///< Discrete GPU index when an iGPU is selected
 };
 
 /// What the host tells without a graphics device: OS, memory, Apple model and chip.

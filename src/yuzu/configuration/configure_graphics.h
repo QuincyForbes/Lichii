@@ -28,6 +28,7 @@ class QObject;
 class QCheckBox;
 class QComboBox;
 class QLabel;
+class AmdFsr4Panel;
 class NvidiaDlssPanel;
 
 namespace Settings {
@@ -122,10 +123,16 @@ private:
 
     QComboBox* upscaler_combobox{};
     NvidiaDlssPanel* nvidia_dlss_panel{};
+    AmdFsr4Panel* amd_fsr4_panel{};
+    QWidget* nvidia_dlss_quality_widget{};
+    QComboBox* nvidia_dlss_quality_combobox{};
     QWidget* nvidia_dlss_preset_widget{};
     QComboBox* oot_resolution_combobox{};
     QWidget* frame_gen_widget{};
+    QCheckBox* frame_gen_checkbox{};
     QComboBox* frame_gen_type_combobox{};
     QLabel* lossless_status_label{};
     QComboBox* scaling_filter_combobox{};
+    QWidget* discrete_gpu_hint_widget{};
+    QLabel* discrete_gpu_hint_label{};
 };

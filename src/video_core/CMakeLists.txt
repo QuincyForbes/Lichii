@@ -46,6 +46,7 @@ add_library(video_core STATIC
     delayed_destruction_ring.h
     dirty_flags.cpp
     dirty_flags.h
+    dlss_mode.h
     dma_pusher.cpp
     dma_pusher.h
     engines/sw_blitter/blitter.cpp
@@ -74,6 +75,7 @@ add_library(video_core STATIC
     render_trace.h
     fsr.cpp
     fsr.h
+    fsr4_support.h
     game_dlss_status.cpp
     game_dlss_status.h
     host_budget.h
@@ -113,6 +115,7 @@ add_library(video_core STATIC
     feature_census.cpp
     feature_census.h
     fence_manager.h
+    frame_gen_choice.h
     gpu.cpp
     gpu.h
     gpu_timestamp.h
@@ -219,6 +222,11 @@ add_library(video_core STATIC
     renderer_vulkan/vk_compute_pass.h
     renderer_vulkan/vk_fsr3_upscaler.cpp
     renderer_vulkan/vk_fsr3_upscaler.h
+    renderer_vulkan/vk_fsr4_upscaler.cpp
+    renderer_vulkan/vk_fsr4_upscaler.h
+    vulkan_common/ffx_files.h
+    vulkan_common/ffx_runtime.cpp
+    vulkan_common/ffx_runtime.h
     vulkan_common/descriptor_limits.h
     renderer_vulkan/vk_dlss_network_probe.cpp
     renderer_vulkan/vk_dlss_network_probe.h
@@ -519,7 +527,9 @@ endif()
 
 target_link_libraries(video_core PUBLIC common core)
 if(WIN32)
-    target_link_libraries(video_core PRIVATE advapi32 dwmapi)
+    target_link_libraries(video_core PRIVATE advapi32 dwmapi bcrypt wintrust crypt32 version)
+elseif(UNIX AND NOT ANDROID)
+    target_link_libraries(video_core PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 # Shader precache builder: game archives use zstd (also with dictionaries) and zlib.
@@ -540,6 +550,8 @@ target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
 
 add_dependencies(video_core host_shaders)
 target_include_directories(video_core PRIVATE ${HOST_SHADERS_INCLUDE})
+# AMD's FFX API headers (MIT), for calling AMD's FSR 4 runtime (vk_fsr4_upscaler.cpp).
+target_include_directories(video_core SYSTEM PUBLIC ${CMAKE_SOURCE_DIR}/externals/ffx-api)
 
 target_link_libraries(video_core PRIVATE sirit::sirit)
 
@@ -604,7 +616,7 @@ endif()
 # setting is on. Only Streamline's MIT-licensed headers are compiled in and nothing of NVIDIA's is
 # linked or copied: sl.interposer.dll and the DLSS plugins are loaded at run time from the user's PC.
 cmake_dependent_option(ENABLE_NVIDIA_DLSS "Enable NVIDIA DLSS through NVIDIA Streamline" ON
-                       "MSVC AND ARCHITECTURE_x86_64" OFF)
+                       "WIN32 AND ARCHITECTURE_x86_64" OFF)
 set(EGLANTINE_STREAMLINE_SDK "" CACHE PATH
     "NVIDIA Streamline SDK directory for its headers (empty: download them)")
 if (ENABLE_NVIDIA_DLSS)
@@ -620,9 +632,18 @@ if (ENABLE_NVIDIA_DLSS)
         vulkan_common/streamline.cpp
         vulkan_common/streamline.h
         vulkan_common/streamline_api.h
+        vulkan_common/streamline_frame_gen.cpp
+        vulkan_common/streamline_frame_gen.h
     )
-    target_include_directories(video_core PRIVATE "${STREAMLINE_INCLUDE_DIR}")
-    target_link_libraries(video_core PRIVATE version wintrust crypt32)
+    target_include_directories(video_core SYSTEM PRIVATE "${STREAMLINE_INCLUDE_DIR}")
+    if (MINGW AND NOT CMAKE_HOST_WIN32)
+        # sl_security.h includes <Softpub.h> with an upper-case S.
+        file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/streamline_shim/Softpub.h"
+             "#pragma once\n#include <softpub.h>\n")
+        target_include_directories(video_core SYSTEM PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}/streamline_shim")
+    endif()
+    target_link_libraries(video_core PRIVATE bcrypt version wintrust crypt32)
     target_compile_definitions(video_core PUBLIC EGLANTINE_STREAMLINE)
     message(STATUS "NVIDIA DLSS through Streamline: ${STREAMLINE_INCLUDE_DIR}")
 endif()
@@ -818,6 +839,10 @@ if (ENABLE_METAL)
             COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
         target_include_directories(lichii-metal-smoke PRIVATE ${METAL_SMOKE_DIR})
         target_sources(lichii-metal-smoke PRIVATE renderer_metal/metal_smoke_stubs.cpp)
+        if (NOT MSVC)
+            set_source_files_properties(renderer_metal/metal_smoke_stubs.cpp PROPERTIES
+                COMPILE_OPTIONS "-Wno-conversion;-Wno-unused-variable;-Wno-unused-parameter;-Wno-missing-field-initializers")
+        endif()
         target_link_libraries(lichii-metal-smoke PRIVATE video_core "-framework Metal"
                               "-framework Foundation")
     endif()

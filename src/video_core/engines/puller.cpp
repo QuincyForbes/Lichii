@@ -50,8 +50,8 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
                                                           VideoCommon::CacheType::BufferCache)) {
         // The flush downloads through the Vulkan scheduler, which the split's back owns.
         VideoCommon::GpuSplit::Get().Run(
-            [rasterizer = dma_pusher.rasterizer, device = *device] {
-                rasterizer->FlushRegion(device, sizeof(u32), VideoCommon::CacheType::BufferCache);
+            [rasterizer = dma_pusher.rasterizer, device_addr = *device] {
+                rasterizer->FlushRegion(device_addr, sizeof(u32), VideoCommon::CacheType::BufferCache);
             },
             VideoCommon::DrainSite::SemaphoreFlush);
     }
@@ -225,6 +225,10 @@ bool MetByQueuedRelease(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
                         u32* miss_out = nullptr) {
     auto& split = VideoCommon::GpuSplit::Get();
     if (!split.Active()) {
+        return false;
+    }
+    // Equal and mask acquires must not pass on a release whose host fence has yet to run.
+    if (VideoCore::Nx2Debug::DelayedFences() && acquire.operation != 0x4) {
         return false;
     }
     auto& memory = dma_pusher.memory_manager;
@@ -442,34 +446,55 @@ private:
     std::chrono::steady_clock::time_point last_report = std::chrono::steady_clock::now();
 };
 
-// EDEN_NX2_ACQUIRE_EQUAL=1: an equal acquire whose word holds the value continues without a
-// drain, unless a release of another payload to the word is still queued. NVN2's queue-sync slots
-// get one release per frame number, so the word changes again only after the acquiring queue
-// moved on. Ocarina drained ~30 ms/s on such acquires that were met before the drain.
-bool EqualMetWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value) {
+// EDEN_NX2_ACQUIRE_EQUAL=1: an equal or mask acquire whose word is settled and meets the value
+// continues without a drain. NVN2's queue-sync slots get one release per frame number, so the
+// word changes again only after the acquiring queue moved on.
+bool EqualMetWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
     static const bool enabled = [] {
         const char* setting = std::getenv("EDEN_NX2_ACQUIRE_EQUAL");
         return setting == nullptr || setting[0] != '0';
     }();
     auto& split = VideoCommon::GpuSplit::Get();
-    if (!enabled || !split.Active()) {
+    if (!enabled || !split.Active() || VideoCore::Nx2Debug::DelayedFences()) {
+        return false;
+    }
+    const GPUVAddr address = acquire.address;
+    if ((address % sizeof(u32)) != 0) {
         return false;
     }
     auto& memory = dma_pusher.memory_manager;
-    if (memory.OverlapsNativeSyncpointShim(address, sizeof(u32)) || memory.Read<u32>(address) != value) {
+    if (memory.OverlapsNativeSyncpointShim(address, sizeof(u32))) {
+        return false;
+    }
+    const u64 done = split.ConsumedNow();
+    if (split.LastFunctionPosition() > done) {
         return false;
     }
     const auto device = memory.GpuToCpuAddress(address);
-    if (!device) {
+    if (!device || (*device % sizeof(u32)) != 0) {
+        return false;
+    }
+    if (u32 method = 0; split.QueuedWriterKind(address, address + sizeof(u32), method) != 0) {
+        return false;
+    }
+    if (split.MayBeWrittenSince(done, *device, sizeof(u32))) {
         return false;
     }
     u32 miss = 0;
-    if (const auto payload = split.QueuedReleasePayload(*device, address, &miss);
-        (payload && *payload != value) || miss == 3) {
+    if (split.QueuedReleasePayload(*device, address, &miss).has_value() || miss == 3 ||
+        split.QueuedReleaseTo(*device, done).has_value()) {
         return false;
     }
-    if (u32 method = 0; split.QueuedWriterKind(address, address + sizeof(u32), method) == 4) {
-        return false; // An upload to the word is queued
+    if (const u64 async_position = split.HasAsyncWrite(*device, sizeof(u32));
+        async_position != 0 &&
+        (async_position > done || !Nx2AsyncReportsSettled(*device, sizeof(u32)))) {
+        return false;
+    }
+    if (Nx2MayBeGpuWritten(*device, sizeof(u32))) {
+        return false;
+    }
+    if (!acquire.Matches(memory.Read<u32>(address))) {
+        return false;
     }
     split.NoteSync();
     VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquiresFast, 1);
@@ -746,6 +771,15 @@ static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
         stats.Tick();
         return result;
     }
+    if (mode == 2 && split.LastFunctionPosition() <= split.ConsumedNow()) {
+        split.Defer([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+        split.NoteMemoryWrite();
+        split.NoteSync();
+        split.Publish();
+        ++stats.suspended;
+        stats.Tick();
+        return false;
+    }
     const u64 target = split.UntrackedWriterPosition(*device);
     split.Defer([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
     split.NoteMemoryWrite();
@@ -776,6 +810,10 @@ static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
     return met_there;
 }
 
+Puller::~Puller() {
+    Nx2SemaphoreWaiters::Get().Remove(this);
+}
+
 bool Puller::PendingAcquire::Matches(u32 current) const {
     switch (static_cast<GpuSemaphoreOperation>(operation)) {
     case GpuSemaphoreOperation::AcquireEqual:
@@ -798,21 +836,6 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     const bool met = PollAcquire(dma_pusher);
     if (met) {
         Profile::Add(Profile::Counter::AcquirePollsMet, 1);
-        if (Nx2PendingWake::verify_resume) [[unlikely]] {
-            // pending_wake (Verify): a resume after a wake must still be met or latched.
-            DrainBack(VideoCommon::DrainSite::AcquirePoll);
-            const u32 word = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
-            if (!pending_acquire->Matches(word) && !Nx2SemaphoreWaiters::Get().Latched(this)) {
-                const u64 count = Nx2PendingWake::verify_unmet.fetch_add(1) + 1;
-                if (count <= 64) {
-                    LOG_ERROR(HW_GPU,
-                              "Nx2Perf pending_wake: resumed unmet: channel {} semaphore {:#x} "
-                              "(op {}, {:#x}, now {:#x}) ({} differences)",
-                              dma_pusher.channel_state.bind_id, pending_acquire->address,
-                              pending_acquire->operation, pending_acquire->value, word, count);
-                }
-            }
-        }
     }
     return met;
 }
@@ -849,15 +872,15 @@ bool Puller::PollAcquire(DmaPusher& dma_pusher) {
     if (MetByQueuedRelease(dma_pusher, *pending_acquire)) {
         return true;
     }
-    if (static_cast<GpuSemaphoreOperation>(pending_acquire->operation) ==
-            GpuSemaphoreOperation::AcquireGequal &&
+    const auto pending_op = static_cast<GpuSemaphoreOperation>(pending_acquire->operation);
+    if (pending_op == GpuSemaphoreOperation::AcquireGequal &&
         GequalMetWithoutDrain(dma_pusher, pending_acquire->address, pending_acquire->value,
                               readable_word)) {
         return true;
     }
-    if (static_cast<GpuSemaphoreOperation>(pending_acquire->operation) ==
-            GpuSemaphoreOperation::AcquireEqual &&
-        EqualMetWithoutDrain(dma_pusher, pending_acquire->address, pending_acquire->value)) {
+    if ((pending_op == GpuSemaphoreOperation::AcquireEqual ||
+         pending_op == GpuSemaphoreOperation::AcquireMask) &&
+        EqualMetWithoutDrain(dma_pusher, *pending_acquire)) {
         return true;
     }
     // EDEN_NX2_ACQUIRE_LEARN: resume when a release met the waiter (GPU releases notify
@@ -1141,8 +1164,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                                   readable ? std::optional<u32>{word} : std::nullopt)) {
             return;
         }
-        if (op == GpuSemaphoreOperation::AcquireEqual &&
-            EqualMetWithoutDrain(dma_pusher, acquire.address, acquire.value)) {
+        if ((op == GpuSemaphoreOperation::AcquireEqual ||
+             op == GpuSemaphoreOperation::AcquireMask) &&
+            EqualMetWithoutDrain(dma_pusher, acquire)) {
             return;
         }
         const bool trace = AcquireTrace::Enabled();
@@ -1188,7 +1212,13 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 !acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
                 AcquireLearning::early_suspends.fetch_add(1, std::memory_order_relaxed);
                 if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
-                    Nx2SemaphoreWaiters::Get().Add(this, *device, acquire.value, acquire.operation);
+                    u32* watched_word =
+                        reinterpret_cast<u32*>(dma_pusher.memory_manager.GetPointer(acquire.address));
+                    if (reinterpret_cast<uintptr_t>(watched_word) % alignof(u32) != 0) {
+                        watched_word = nullptr;
+                    }
+                    Nx2SemaphoreWaiters::Get().Add(this, *device, acquire.value, acquire.operation,
+                                                   watched_word);
                 }
                 pending_acquire = acquire;
                 dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
@@ -1239,10 +1269,21 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             }
         }
         // Registered before the fences run, so a release among them that meets the value counts
-        // even if a later one overwrites it.
+        // even if a later one overwrites it. The word in memory is watched for the guest CPU's
+        // stores (Nx2SemaphoreWaiters::WordStored).
         auto& waiters = Nx2SemaphoreWaiters::Get();
-        if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
-            waiters.Add(this, *device, acquire.value, acquire.operation);
+        u32* watched_word =
+            reinterpret_cast<u32*>(dma_pusher.memory_manager.GetPointer(acquire.address));
+        if (reinterpret_cast<uintptr_t>(watched_word) % alignof(u32) != 0) {
+            watched_word = nullptr;
+        }
+        if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+            device && !waiters.Add(this, *device, acquire.value, acquire.operation, watched_word)) {
+            if (static std::atomic<u32> full{}; full.fetch_add(1) < 8) {
+                LOG_ERROR(HW_GPU, "Channel {} waits on semaphore {:#x} unlatched: {} channels wait",
+                          dma_pusher.channel_state.bind_id, acquire.address,
+                          Nx2SemaphoreWaiters::MaxWaiters);
+            }
         }
         bool met_now;
         if (readable) {

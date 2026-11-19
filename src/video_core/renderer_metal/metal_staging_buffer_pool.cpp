@@ -81,7 +81,10 @@ StagingBufferRef StagingBufferPool::Take(size_t index, size_t size, bool deferre
     };
 }
 
-StagingBufferRef StagingBufferPool::Request(size_t size, bool deferred) {
+StagingBufferRef StagingBufferPool::Request(size_t size, bool deferred, bool host_to_device) {
+    if (!deferred && host_to_device && size <= (1ULL << 20)) {
+        return Stream(size, 256);
+    }
     const u64 rounded = std::bit_ceil((std::max)(size, size_t{4096}));
     size_t empty = entries.size();
     for (size_t index = 0; index < entries.size(); ++index) {
@@ -163,6 +166,7 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
 }
 
 StagingBufferRef StagingBufferPool::Stream(size_t size, size_t alignment) {
+    size = (std::max<size_t>)(size, 1);
     if (size > stream_region_size) {
         return Request(size);
     }

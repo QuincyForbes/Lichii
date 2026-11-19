@@ -68,16 +68,7 @@ public:
                                  std::optional<ByteAddressedShadow>& shadow,
                                  BindCommand* deferred_bind = nullptr);
 
-    static constexpr u64 Ocarina1440pShader = 0x6bd913e1f34e83ebULL;
-    /// The same upscale to 2560x1440 when the scene renders below it (oot_resolution).
-    static constexpr u64 Ocarina1440pScaledShader = 0x4c1ae2fe58f30a97ULL;      // menus
-    static constexpr u64 Ocarina1440pScaledFieldShader = 0x9302bc0d6d1d9bc1ULL; // gameplay
-    /// The gameplay upscale when the scene is under half the target: above 0.4 of it, and 0.4 and
-    /// below (oot_resolution 40 % and 33 %).
-    static constexpr u64 OcarinaScaledUnderHalfShader = 0x03bf0ffc7d2d0bedULL;
-    static constexpr u64 OcarinaScaledLowShader = 0x31c0acb7c5e87c89ULL;
-    /// The same output pass at 1:1, run at 1920x1080 in handheld with the Max Resolution add-on.
-    static constexpr u64 OcarinaFullSizeShader = 0xc033c3ddc9f0897bULL;
+    /// Whether the bindings fit an Ocarina upscale pass: one written image, no other writes.
     [[nodiscard]] bool CanReplaceOcarinaUpscale() const;
 
     bool IsBound() const noexcept {
@@ -167,7 +158,7 @@ private:
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
 
     vk::ShaderModule spv_module;
-    vk::DescriptorSetLayout descriptor_set_layout;
+    VkDescriptorSetLayout descriptor_set_layout{}; ///< Owned by the PipelineLayoutCache
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
     DescriptorBufferLayout descriptor_buffer_layout;
@@ -179,7 +170,7 @@ private:
     u64 last_descriptor_buffer_generation{};
     bool has_last_descriptor_buffer{};
     DescriptorAllocator descriptor_allocator;
-    vk::PipelineLayout pipeline_layout;
+    VkPipelineLayout pipeline_layout{}; ///< Owned by the PipelineLayoutCache
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
 

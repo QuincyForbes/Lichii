@@ -8,10 +8,12 @@
 
 #include <array>
 #include <chrono>
+#include <list>
 #include <memory>
-#include <utility>
 #include <optional>
 #include <span>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "shader_recompiler/shader_info.h"
@@ -55,9 +57,26 @@ public:
 
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
 
-    void TickFrame() {}
+    void TickFrame();
 
     void FlushDeferredClear() {}
+
+    [[nodiscard]] u64 CurrentTick() const noexcept {
+        return scheduler.CurrentTick();
+    }
+
+    [[nodiscard]] bool IsFree(u64 tick) const noexcept {
+        return scheduler.IsFree(tick);
+    }
+
+    [[nodiscard]] u64 PooledImageBytes() const noexcept {
+        return pooled_texture_bytes;
+    }
+
+    [[nodiscard]] std::pair<Object, u64> AcquireTexture(const TextureDesc& tex_desc,
+                                                        bool* out_from_pool = nullptr);
+    void ReleaseTexture(const TextureDesc& tex_desc, Object&& tex, u64 tex_bytes);
+    void TrimTexturePool(u64 max_bytes);
 
     [[nodiscard]] u64 GetDeviceLocalMemory() const;
 
@@ -193,6 +212,30 @@ public:
     u64 reinterpret_buffer_size{};
 
     std::optional<f32> ocarina_lod_bias;
+
+private:
+    struct TextureDescHash {
+        size_t operator()(const TextureDesc& d) const noexcept;
+    };
+    struct TextureDescEqual {
+        bool operator()(const TextureDesc& a, const TextureDesc& b) const noexcept;
+    };
+    struct PooledTexture {
+        TextureDesc desc{};
+        Object texture;
+        u64 bytes{};
+        u64 frame{};
+    };
+    std::list<PooledTexture> texture_pool_lru;
+    std::unordered_map<TextureDesc, std::vector<std::list<PooledTexture>::iterator>,
+                       TextureDescHash, TextureDescEqual>
+        texture_pool_index;
+    u64 pooled_texture_bytes{};
+    u64 pool_frame{};
+    u64 pool_hits{};
+    u64 pool_misses{};
+    u64 pool_recycled{};
+    u64 pool_evicted{};
 };
 
 class Image : public VideoCommon::ImageBase {
@@ -210,7 +253,7 @@ public:
     Image& operator=(Image&&) = default;
 
     void UploadMemory(BufferHandle buffer, size_t offset,
-                      std::span<const VideoCommon::BufferImageCopy> copies);
+                      std::span<const VideoCommon::BufferImageCopy> copies, bool ahead = false);
 
     void UploadMemory(const StagingBufferRef& map,
                       std::span<const VideoCommon::BufferImageCopy> copies);
@@ -298,6 +341,12 @@ public:
         return pack16;
     }
 
+    [[nodiscard]] bool FromPool() const noexcept {
+        return from_pool;
+    }
+
+    void ReleaseToPool();
+
     u64 allocation_tick{};
 
 private:
@@ -335,11 +384,14 @@ private:
     Object scaled_texture;
     Object sample_grid;
     TextureDesc desc{};
+    TextureDesc scaled_desc{};
     FormatInfo host_format{};
     TextureKind kind{TextureKind::e2D};
     u64 bytes{};
+    u64 base_texture_bytes{};
     u64 scaled_bytes{};
     bool rescaled{};
+    bool from_pool{};
 };
 
 class ImageView : public VideoCommon::ImageViewBase {
@@ -564,7 +616,7 @@ struct TextureCacheParams {
     static constexpr bool FRAMEBUFFER_BLITS = false;
     static constexpr bool HAS_EMULATED_COPIES = false;
     static constexpr bool HAS_DEVICE_MEMORY_INFO = true;
-    static constexpr bool IMPLEMENTS_ASYNC_DOWNLOADS = false;
+    static constexpr bool IMPLEMENTS_ASYNC_DOWNLOADS = true;
     static constexpr bool HAS_MSAA_DOWNLOADS = true;
 
     using Runtime = Metal::TextureCacheRuntime;

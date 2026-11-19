@@ -39,11 +39,13 @@
 #endif
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
+#include "video_core/renderer_vulkan/vk_fsr4_upscaler.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/textures/decoders.h"
+#include "video_core/vulkan_common/ffx_runtime.h"
 #include "video_core/vulkan_common/vulkan_debug_callback.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
@@ -53,6 +55,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
+#include "video_core/vulkan_common/streamline_frame_gen.h"
 #endif
 #ifdef __ANDROID__
 #include <jni.h>
@@ -124,10 +127,54 @@ std::string BuildCommaSeparatedExtensions(
 
 Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dld, VkSurfaceKHR surface) {
     const std::vector<VkPhysicalDevice> devices = instance.EnumeratePhysicalDevices();
-    const u32 device_index = Settings::values.vulkan_device.GetValue();
+    u32 device_index = Settings::values.vulkan_device.GetValue();
     if (device_index >= u32(devices.size())) {
         LOG_ERROR(Render_Vulkan, "Invalid device index {}!", device_index);
         throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+    }
+    const bool want_dlss = Settings::NvidiaDlssChosen();
+    const bool want_fsr4 = Settings::AmdFsr4Chosen();
+    if (device_index == 0 && Settings::values.vulkan_device.UsingGlobal() && devices.size() > 1 &&
+        (want_dlss || want_fsr4)) {
+        const vk::PhysicalDevice first(devices[0], dld);
+        const auto first_props = first.GetProperties();
+        if (first_props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+            for (u32 i = 1; i < static_cast<u32>(devices.size()); ++i) {
+                const vk::PhysicalDevice candidate(devices[i], dld);
+                const auto props = candidate.GetProperties();
+                if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+                    continue;
+                }
+                const bool vendor_match =
+                    (want_dlss && props.vendorID == 0x10DE) ||
+                    (want_fsr4 && props.vendorID == 0x1002);
+                if (!vendor_match) {
+                    continue;
+                }
+                const auto families = candidate.GetQueueFamilyProperties();
+                bool has_graphics = false;
+                bool has_present = surface == VK_NULL_HANDLE;
+                for (u32 f = 0; f < static_cast<u32>(families.size()); ++f) {
+                    if (families[f].queueCount == 0) {
+                        continue;
+                    }
+                    if ((families[f].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+                        has_graphics = true;
+                    }
+                    if (!has_present && candidate.GetSurfaceSupportKHR(f, surface)) {
+                        has_present = true;
+                    }
+                }
+                if (has_graphics && has_present) {
+                    LOG_INFO(Render_Vulkan,
+                             "Selected discrete GPU '{}' (device {}) over integrated GPU '{}' for {}",
+                             props.deviceName, i, first_props.deviceName,
+                             want_dlss ? "NVIDIA DLSS" : "AMD FSR 4");
+                    device_index = i;
+                    break;
+                }
+            }
+        }
     }
     const vk::PhysicalDevice physical_device(devices[device_index], dld);
     return Device(*instance, physical_device, surface, dld);
@@ -144,7 +191,7 @@ try
     , library(OpenLibrary(context.get()))
     , dld()
 #ifdef EGLANTINE_STREAMLINE
-    , streamline_started(Streamline::Start())
+    , streamline_started(Streamline::Start(render_window.GetWindowInfo().render_surface))
 #endif
     // Create raw Vulkan instance first
     , instance(CreateInstance(*library,
@@ -165,7 +212,7 @@ try
     , memory_allocator(device)
     , state_tracker()
     , scheduler(device, state_tracker)
-    , swapchain(*surface,
+    , swapchain(PresentationSurface(),
                 device,
                 scheduler,
                render_window.GetFramebufferLayout().width,
@@ -200,6 +247,10 @@ try
     , frame_gen(memory_allocator, scheduler)
 #endif
 {
+    FfxRuntime::ResetSessionStatus();
+    if (Settings::AmdFsr4Chosen()) {
+        static_cast<void>(Fsr4Upscaler::IsWanted(device));
+    }
 
     if (Settings::values.renderer_force_max_clock.GetValue() && device.ShouldBoostClocks()) {
         turbo_mode.emplace(instance, dld);
@@ -217,6 +268,7 @@ try
 }
 
 RendererVulkan::~RendererVulkan() {
+    FfxRuntime::StopSession();
     scheduler.RegisterOnSubmit([] {});
     // Members are destroyed before the scheduler: run the commands that still point into them,
     // such as frame generation's optical flow copies.
@@ -295,13 +347,30 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     SCOPE_EXIT {
         render_window.OnFrameDisplayed();
     };
+#ifdef EGLANTINE_STREAMLINE
+    // DLSS Frame Generation: this guest frame ends here, presented or not.
+    Streamline::FrameGenBeginFrame();
+    SCOPE_EXIT {
+        Streamline::FrameGenNextFrame();
+    };
+#endif
 
     RenderAppletCaptureLayer(framebuffers);
 
     if (!render_window.IsShown()) {
-        // The capture pass bound its own pipeline, descriptors, viewport and push constants and
-        // no flush follows here: the next guest draw must not trust the tracked state.
+        // Flush recorded GPU work and advance frame lifecycles even while hidden or minimized.
+        if (trace) {
+            scheduler.MarkFrameEnd(++trace_frame);
+        }
         scheduler.InvalidateState();
+        scheduler.Flush();
+#ifdef EGLANTINE_STREAMLINE
+        const auto ended = Streamline::FrameGenEndFrame();
+        present_manager.WaitPresent();
+        Streamline::FrameGenClosePresent(ended.index);
+#endif
+        gpu.RendererFrameEndNotify(0);
+        rasterizer.TickFrame();
         return;
     }
 
@@ -367,6 +436,25 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         scheduler.MarkFrameEnd(++trace_frame);
     }
     frame->render_tick = scheduler.Flush(*frame->render_ready, flow_wait);
+#ifdef EGLANTINE_STREAMLINE
+    {
+        const Streamline::FrameGenFrame ended = Streamline::FrameGenEndFrame();
+        const Common::Rectangle<u32>& screen = render_window.GetFramebufferLayout().screen;
+        frame->frame_gen = Streamline::FrameGenSession();
+        frame->frame_gen_frame = ended;
+        frame->guest_rect = VkRect2D{
+            .offset = {static_cast<s32>(screen.left), static_cast<s32>(screen.top)},
+            .extent = {screen.GetWidth(), screen.GetHeight()},
+        };
+        if (Streamline::FrameGenActive()) {
+            const u64 now_generated = Streamline::FrameGenTotalGenerated();
+            generated_frames = static_cast<size_t>(now_generated - last_dlssg_generated);
+            last_dlssg_generated = now_generated;
+        } else {
+            last_dlssg_generated = Streamline::FrameGenTotalGenerated();
+        }
+    }
+#endif
 
     const auto presenting = trace ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
@@ -561,6 +649,48 @@ void RendererVulkan::RenderAppletCaptureLayer(
     scheduler.RequestOutsideRenderPassOperationContext();
     blit_applet.DrawToFrame(device, rasterizer, &applet_frame, capture_layers, VideoCore::Capture::Layout, 1,
                             CaptureFormat);
+}
+
+VkSurfaceKHR RendererVulkan::PresentationSurface() {
+#ifdef EGLANTINE_STREAMLINE
+    // DLSS-G looks the window up by the swapchain's surface: replace the surface made before the
+    // device with one made through Streamline, for the same window. Present support stays valid,
+    // as it belongs to the window and the queue family.
+    const auto& window_info = render_window.GetWindowInfo();
+    if (Streamline::FrameGenSession()) {
+        const VkSurfaceKHR registered =
+            window_info.type == Core::Frontend::WindowSystemType::Windows
+                ? Streamline::CreateFrameGenSurface(*instance, window_info.render_surface)
+                : VK_NULL_HANDLE;
+        if (registered) {
+            surface = vk::SurfaceKHR(registered, *instance, instance.Dispatch());
+        } else {
+            Streamline::DisableFrameGen("Streamline could not make the window's surface");
+        }
+    }
+#endif
+    return *surface;
+}
+
+u64 RendererVulkan::GeneratedFrames() const {
+#ifdef EGLANTINE_STREAMLINE
+    if (Streamline::FrameGenActive()) {
+        return Streamline::FrameGenTotalGenerated();
+    }
+#endif
+#ifdef HAS_LSFG
+    return frame_gen.TotalGeneratedFrames();
+#else
+    return 0;
+#endif
+}
+
+bool RendererVulkan::IsNvidiaFrameGenActive() const {
+#ifdef EGLANTINE_STREAMLINE
+    return Streamline::FrameGenActive();
+#else
+    return false;
+#endif
 }
 
 } // namespace Vulkan

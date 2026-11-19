@@ -105,6 +105,14 @@ public:
 
     virtual bool TryAppendOutputBlock(SinkBuffer& buffer, std::span<s16> samples);
 
+    /// Bound queued sysmix blocks; discard sinks use one to preserve the timer cadence.
+    virtual u32 SysmixQueueLimit() const;
+
+    /// Whether a host output callback has requested frames from this stream.
+    bool HasHostCallback() const {
+        return largest_request_frames.load(std::memory_order_relaxed) != 0;
+    }
+
     /**
      * Check if the stream is paused.
      *
@@ -295,8 +303,12 @@ protected:
     std::string name{};
 
 private:
+    void UpdateSampleCount(std::size_t frames_added);
+
+    /// Samples the ring below holds, across all channels
+    static constexpr std::size_t SampleRingCapacity = 0x10000;
     /// Ring buffer of the samples waiting to be played or consumed
-    Common::RingBuffer<s16, 0x10000> samples_buffer;
+    Common::RingBuffer<s16, SampleRingCapacity> samples_buffer;
     bool input_preview{};
     std::atomic<float> input_preview_gain{1.0f};
     std::atomic<u32> input_peak{};
@@ -309,18 +321,24 @@ private:
     /// EDEN_NX2_AUDIO_LEVEL meter state.
     s32 level_peak{};
     u64 level_frames{};
+    u64 level_rendered_frames{};
+    u64 level_callbacks{};
+    u64 level_underrun_callbacks{};
+    u64 level_max_missing_frames{};
     /// Number of buffers waiting to be played
     std::atomic<u32> queued_buffers{};
+    /// Largest number of frames the host device has asked for in one callback (sysmix streams)
+    std::atomic<u64> largest_request_frames{};
     /// The ring size for audio out buffers (usually 4, rarely 2 or 8)
     u32 max_queue_size{};
-    /// Locks access to sample count tracking info
-    std::mutex sample_count_lock;
+    /// Sequence counter for lock-free sample count updates (odd while writing, even when stable)
+    std::atomic<u64> sample_count_seq{};
     /// Minimum number of total samples that have been played since the last callback
-    u64 min_played_sample_count{};
+    std::atomic<u64> min_played_sample_count{};
     /// Maximum number of total samples that can be played since the last callback
-    u64 max_played_sample_count{};
-    /// The time the two above tracking variables were last written to
-    std::chrono::nanoseconds last_sample_count_update_time{};
+    std::atomic<u64> max_played_sample_count{};
+    /// Global time in nanoseconds when sample count tracking variables were last written
+    std::atomic<s64> last_sample_count_update_ns{};
     /// Set by the audio render/in/out system which uses this stream
     f32 system_volume{1.0f};
     /// Set via IAudioDevice service calls

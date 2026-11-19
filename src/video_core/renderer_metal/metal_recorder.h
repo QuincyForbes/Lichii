@@ -43,6 +43,9 @@ enum class Op : u16 {
     CbCompute,   ///< target: new encoder +1; obj: cb
     CbBlit,      ///< target: new encoder +1; obj: cb
     CbCompleted, ///< obj: the handler block
+    CbSignalEvent,
+    CbPresent,
+    CbPresentAfter,
     CbCommit,
     Call,        ///< a function on the encoder thread, in stream order
     // Any proxy
@@ -103,7 +106,7 @@ enum class Op : u16 {
     BFill,
 };
 
-/// One command. obj and obj2 are owned (+1) references released once it is replayed.
+/// One command. obj and obj2 are held once per unique object in Chunk::kept until the chunk finishes.
 struct Cmd {
     Op op;
     u8 stage;
@@ -119,6 +122,8 @@ static_assert(sizeof(Cmd) == 80);
 struct Chunk {
     std::vector<Cmd> cmds;
     std::vector<u8> bytes;
+    std::array<void*, 128> keep_set{};
+    std::vector<void*> kept;
 };
 
 template <typename T>
@@ -323,8 +328,10 @@ public:
         }
         work_cv.notify_all();
         thread.join();
+        ReleaseKept(*current);
         delete current;
         for (Chunk* chunk : free_chunks) {
+            ReleaseKept(*chunk);
             delete chunk;
         }
     }
@@ -355,12 +362,29 @@ public:
         return static_cast<u32>(at);
     }
 
+    /// Retains `object` at most once per chunk, avoiding per-bind atomic ARC retain/release bounces.
+    void* Keep(id object) {
+        if (object == nil) {
+            return nullptr;
+        }
+        void* const raw = (__bridge void*)object;
+        const size_t slot =
+            ((reinterpret_cast<uintptr_t>(raw) >> 4) ^ (reinterpret_cast<uintptr_t>(raw) >> 12)) &
+            (current->keep_set.size() - 1);
+        if (current->keep_set[slot] == raw) {
+            return raw;
+        }
+        current->keep_set[slot] = raw;
+        current->kept.push_back((__bridge_retained void*)object);
+        return raw;
+    }
+
     /// A command buffer proxy; the real one is made by the encoder thread.
     id<MTLCommandBuffer> NewCommandBuffer(MTLCommandBufferDescriptor* descriptor) {
         LichiiRecCommandBuffer* const proxy = [[LichiiRecCommandBuffer alloc] init];
         proxy->rec = this;
         Cmd& cmd = Push(Op::CbNew, (__bridge_retained void*)proxy);
-        cmd.obj = (__bridge_retained void*)descriptor;
+        cmd.obj = Keep(descriptor);
         return (id<MTLCommandBuffer>)proxy;
     }
 
@@ -470,7 +494,16 @@ private:
         Chunk* const chunk = new Chunk;
         chunk->cmds.reserve(ChunkCommands + 1);
         chunk->bytes.reserve(4096);
+        chunk->kept.reserve(64);
         return chunk;
+    }
+
+    static void ReleaseKept(Chunk& chunk) {
+        for (void* kept_obj : chunk.kept) {
+            CFRelease(kept_obj);
+        }
+        chunk.kept.clear();
+        chunk.keep_set.fill(nullptr);
     }
 
     void NoteDrain(const char* reason) {
@@ -511,6 +544,7 @@ private:
                 for (const Cmd& cmd : chunk->cmds) {
                     Execute(cmd, *chunk);
                 }
+                ReleaseKept(*chunk);
             }
             busy_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                    std::chrono::steady_clock::now() - start)
@@ -568,7 +602,7 @@ private:
 // Recording helpers of the proxies' methods.
 #define LICHII_REC(op_name)                                                                        \
     Metal::Rec::Cmd& cmd = rec->Push(Metal::Rec::Op::op_name, (__bridge void*)self)
-#define LICHII_KEEP(field, object) cmd.field = (__bridge_retained void*)(object)
+#define LICHII_KEEP(field, object) cmd.field = rec->Keep(object)
 
 @implementation LichiiRecProxy
 
@@ -655,6 +689,23 @@ private:
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {
     LICHII_REC(CbCompleted);
     LICHII_KEEP(obj, [block copy]);
+}
+
+- (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value {
+    LICHII_REC(CbSignalEvent);
+    LICHII_KEEP(obj, event);
+    Metal::Rec::Put(cmd, value);
+}
+
+- (void)presentDrawable:(id<MTLDrawable>)drawable {
+    LICHII_REC(CbPresent);
+    LICHII_KEEP(obj, drawable);
+}
+
+- (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration {
+    LICHII_REC(CbPresentAfter);
+    LICHII_KEEP(obj, drawable);
+    Metal::Rec::Put(cmd, duration);
 }
 
 - (void)commit {
@@ -1065,9 +1116,9 @@ LICHII_STAGE_BINDS(Mesh, 3)
 namespace Metal::Rec {
 
 inline void Recorder::Execute(const Cmd& c, const Chunk& chunk) {
-    // Owned references, released when this returns.
-    const id obj = (__bridge_transfer id)c.obj;
-    const id obj2 = (__bridge_transfer id)c.obj2;
+    // Chunk::kept owns obj and obj2 across the whole chunk, so no per-command ARC retain/release.
+    const __unsafe_unretained id obj = (__bridge id)c.obj;
+    const __unsafe_unretained id obj2 = (__bridge id)c.obj2;
     LichiiRecProxy* const __unsafe_unretained proxy = (__bridge LichiiRecProxy*)c.target;
     const u8* const bytes = chunk.bytes.data() + c.payload;
     switch (c.op) {
@@ -1097,6 +1148,17 @@ inline void Recorder::Execute(const Cmd& c, const Chunk& chunk) {
     }
     case Op::CbCompleted:
         [(id<MTLCommandBuffer>)proxy->real addCompletedHandler:(MTLCommandBufferHandler)obj];
+        return;
+    case Op::CbSignalEvent:
+        [(id<MTLCommandBuffer>)proxy->real encodeSignalEvent:(id<MTLEvent>)obj
+                                                       value:Get<uint64_t>(c)];
+        return;
+    case Op::CbPresent:
+        [(id<MTLCommandBuffer>)proxy->real presentDrawable:(id<MTLDrawable>)obj];
+        return;
+    case Op::CbPresentAfter:
+        [(id<MTLCommandBuffer>)proxy->real presentDrawable:(id<MTLDrawable>)obj
+                                      afterMinimumDuration:Get<CFTimeInterval>(c)];
         return;
     case Op::CbCommit:
         [(id<MTLCommandBuffer>)proxy->real commit];

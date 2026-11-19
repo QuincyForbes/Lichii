@@ -531,6 +531,7 @@ const std::map<u32, std::vector<EnumChoice>>& EnumTable() {
         AddEnum<AntiAliasing>(t);
         AddEnum<OotAntiAliasing>(t);
         AddEnum<Upscaler>(t);
+        AddEnum<DlssQuality>(t);
         AddEnum<DlssPreset>(t);
         AddEnum<OcarinaDlssMode>(t);
         AddEnum<OotMovieUpscale>(t);

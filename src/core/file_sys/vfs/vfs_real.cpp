@@ -16,6 +16,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_real.h"
 
@@ -259,6 +260,38 @@ std::unique_lock<std::mutex> RealVfsFilesystem::RefreshReference(const std::stri
     return lk;
 }
 
+std::shared_ptr<Common::FS::IOFile> RealVfsFilesystem::PinReference(const std::string& path,
+                                                                    OpenMode perms,
+                                                                    FileReference& reference) {
+    std::scoped_lock lk{list_lock};
+
+    this->RemoveReferenceFromListLocked(reference);
+
+    if (!reference.file) {
+        this->EvictSingleReferenceLocked();
+
+        reference.file =
+            FS::FileOpen(path, ModeFlagsToFileAccessMode(perms), FS::FileType::BinaryFile);
+        if (reference.file) {
+            num_open_files++;
+        }
+    }
+
+    this->InsertReferenceIntoListLocked(reference);
+
+    if (!reference.file) {
+        return nullptr;
+    }
+    ++reference.in_flight;
+    return reference.file;
+}
+
+void RealVfsFilesystem::UnpinReference(FileReference& reference) {
+    std::scoped_lock lk{list_lock};
+    ASSERT(reference.in_flight > 0);
+    --reference.in_flight;
+}
+
 void RealVfsFilesystem::DropReference(std::unique_ptr<FileReference>&& reference,
                                       const std::string& path) {
     if (in_dtor)
@@ -286,18 +319,21 @@ void RealVfsFilesystem::EvictSingleReferenceLocked() {
         return;
     }
 
-    // Get and remove from list.
-    auto& reference = open_references.back();
-    this->RemoveReferenceFromListLocked(reference);
+    for (auto it = open_references.rbegin(); it != open_references.rend(); ++it) {
+        if (it->in_flight != 0) {
+            continue;
+        }
+        FileReference& reference = *it;
+        this->RemoveReferenceFromListLocked(reference);
 
-    // Close the file.
-    if (reference.file) {
-        reference.file.reset();
-        num_open_files--;
+        if (reference.file) {
+            reference.file.reset();
+            num_open_files--;
+        }
+
+        this->InsertReferenceIntoListLocked(reference);
+        return;
     }
-
-    // Reinsert into closed list.
-    this->InsertReferenceIntoListLocked(reference);
 }
 
 void RealVfsFilesystem::InsertReferenceIntoListLocked(FileReference& reference) {
@@ -344,6 +380,16 @@ std::size_t RealVfsFile::GetSize() const {
     if (size) {
         return *size;
     }
+    if (!IsWritable()) {
+        auto file = base.PinReference(path, perms, *reference);
+        if (!file) {
+            return 0;
+        }
+        SCOPE_EXIT {
+            base.UnpinReference(*reference);
+        };
+        return file->GetSize();
+    }
     auto lk = base.RefreshReference(path, perms, *reference);
     return reference->file ? reference->file->GetSize() : 0;
 }
@@ -367,6 +413,16 @@ bool RealVfsFile::IsReadable() const {
 }
 
 std::size_t RealVfsFile::Read(u8* data, std::size_t length, std::size_t offset) const {
+    if (!IsWritable()) {
+        auto file = base.PinReference(path, perms, *reference);
+        if (!file) {
+            return 0;
+        }
+        SCOPE_EXIT {
+            base.UnpinReference(*reference);
+        };
+        return file->ReadBytesAt(std::span{data, length}, offset);
+    }
     auto lk = base.RefreshReference(path, perms, *reference);
     if (!reference->file || !reference->file->Seek(static_cast<s64>(offset))) {
         return 0;

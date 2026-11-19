@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <list>
 #include <memory>
@@ -22,9 +23,11 @@
 
 #include <fmt/format.h>
 
+#include "common/assert.h"
 #include "common/fs/file.h"
 #include "common/logging.h"
 #include "common/platform_events.h"
+#include "common/scope_exit.h"
 #include "core/file_sys/bntx_reduce.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_vector.h"
@@ -36,8 +39,8 @@ namespace {
 constexpr u32 ZstdMagic = 0xFD2FB528;
 constexpr std::size_t RawBlockMax = ZSTD_BLOCKSIZE_MAX;
 constexpr u64 MaxBntxSize = 512 * 1024 * 1024;
-// Partially read files keep their replacement here until the rest is read.
-constexpr std::size_t CacheCap = 32 * 1024 * 1024;
+// Reduced textures kept in memory across whole and partial reads.
+constexpr std::size_t CacheCap = 128 * 1024 * 1024;
 
 struct DCtxDeleter {
     void operator()(ZSTD_DCtx* dctx) const {
@@ -75,11 +78,11 @@ u64 RawZstdFrameSize(u64 content_size) {
 
 std::vector<u8> MakeRawZstdFrame(std::span<const u8> content) {
     const u64 size = content.size();
-    std::vector<u8> out;
-    out.reserve(RawZstdFrameSize(size));
-    const auto put = [&out](u64 value, std::size_t bytes) {
+    std::vector<u8> out(static_cast<std::size_t>(RawZstdFrameSize(size)));
+    u8* dst = out.data();
+    const auto put = [&dst](u64 value, std::size_t bytes) {
         for (std::size_t i = 0; i < bytes; ++i) {
-            out.push_back(static_cast<u8>(value >> (8 * i)));
+            *dst++ = static_cast<u8>(value >> (8 * i));
         }
     };
     put(ZstdMagic, 4);
@@ -102,10 +105,13 @@ std::vector<u8> MakeRawZstdFrame(std::span<const u8> content) {
         const std::size_t block = std::min<std::size_t>(RawBlockMax, content.size() - offset);
         const bool last = offset + block == content.size();
         put((u64{block} << 3) | (last ? 1 : 0), 3);
-        out.insert(out.end(), content.begin() + static_cast<std::ptrdiff_t>(offset),
-                   content.begin() + static_cast<std::ptrdiff_t>(offset + block));
+        if (block != 0) {
+            std::memcpy(dst, content.data() + offset, block);
+            dst += block;
+        }
         offset += block;
     } while (offset < content.size());
+    ASSERT(dst == out.data() + out.size());
     return out;
 }
 
@@ -194,10 +200,20 @@ std::optional<ReducedTexture> ReduceZstdTexture(std::span<const u8> file, u32 le
 namespace {
 
 struct TextureQualityState {
+    using DataPtr = std::shared_ptr<const std::vector<u8>>;
+    using Entry = std::pair<const void*, DataPtr>;
+
+    struct InFlight {
+        std::condition_variable cv;
+        DataPtr result;
+        bool done{};
+    };
+
     TextureQualityState(u32 levels_, bool arrays_) : levels{levels_}, arrays{arrays_} {
         pressure_listener = Common::PlatformEvents::AddMemoryPressureListener([this] {
             std::scoped_lock lock{mutex};
             lru.clear();
+            index.clear();
             bytes = 0;
         });
     }
@@ -206,35 +222,37 @@ struct TextureQualityState {
         Common::PlatformEvents::RemoveMemoryPressureListener(pressure_listener);
     }
 
-    const std::vector<u8>* Find(const void* key) {
-        const auto it = std::find_if(lru.begin(), lru.end(),
-                                     [key](const auto& entry) { return entry.first == key; });
-        if (it == lru.end()) {
+    DataPtr Find(const void* key) {
+        const auto it = index.find(key);
+        if (it == index.end()) {
             return nullptr;
         }
-        lru.splice(lru.begin(), lru, it);
-        return &lru.front().second;
+        lru.splice(lru.begin(), lru, it->second);
+        return it->second->second;
     }
 
-    void Insert(const void* key, std::vector<u8> data) {
-        if (data.size() > CacheCap || Find(key) != nullptr) {
+    void Insert(const void* key, const DataPtr& data) {
+        if (!data || data->size() > CacheCap || index.contains(key)) {
             return;
         }
-        while (bytes + data.size() > CacheCap && !lru.empty()) {
-            bytes -= lru.back().second.size();
+        const std::size_t data_size = data->size();
+        while (bytes + data_size > CacheCap && !lru.empty()) {
+            bytes -= lru.back().second->size();
+            index.erase(lru.back().first);
             lru.pop_back();
         }
-        bytes += data.size();
-        lru.emplace_front(key, std::move(data));
+        bytes += data_size;
+        lru.emplace_front(key, data);
+        index.emplace(key, lru.begin());
     }
 
     void Erase(const void* key) {
         std::scoped_lock lock{mutex};
-        const auto it = std::find_if(lru.begin(), lru.end(),
-                                     [key](const auto& entry) { return entry.first == key; });
-        if (it != lru.end()) {
-            bytes -= it->second.size();
-            lru.erase(it);
+        const auto it = index.find(key);
+        if (it != index.end()) {
+            bytes -= it->second->second->size();
+            lru.erase(it->second);
+            index.erase(it);
         }
     }
 
@@ -259,7 +277,9 @@ struct TextureQualityState {
     const bool arrays;
     std::size_t pressure_listener{};
     std::mutex mutex;
-    std::list<std::pair<const void*, std::vector<u8>>> lru;
+    std::list<Entry> lru;
+    std::unordered_map<const void*, std::list<Entry>::iterator> index;
+    std::unordered_map<const void*, std::shared_ptr<InFlight>> in_flight;
     std::size_t bytes{};
     std::atomic<u32> reduced_count{};
     std::atomic<u32> partial_reads{};
@@ -268,8 +288,7 @@ struct TextureQualityState {
 };
 
 /// A `.bntx.zs` file as Settings texture_quality serves it, with the size PlanZstdTexture gave:
-/// generated at each read that is not served from the cache, kept only while a read in parts
-/// leaves the rest of it to read.
+/// generated on miss and cached in a bounded byte-capped LRU across whole and partial reads.
 class TextureQualityFile final : public VfsFile {
 public:
     TextureQualityFile(VirtualFile base_, std::shared_ptr<TextureQualityState> state_, u64 size_)
@@ -309,31 +328,55 @@ public:
         }
         length = std::min<std::size_t>(length, size - offset);
         const bool whole = offset == 0 && length == size;
-        if (!whole) {
-            std::scoped_lock lock{state->mutex};
-            if (const auto* cached = state->Find(this)) {
-                std::memcpy(data, cached->data() + offset, length);
-                return length;
+        TextureQualityState::DataPtr cached;
+        {
+            std::unique_lock lock{state->mutex};
+            cached = state->Find(this);
+            if (!cached) {
+                if (const auto it = state->in_flight.find(this); it != state->in_flight.end()) {
+                    auto waiter = it->second;
+                    waiter->cv.wait(lock, [&waiter] { return waiter->done; });
+                    cached = waiter->result;
+                    static_cast<void>(state->Find(this));
+                } else {
+                    auto leader = std::make_shared<TextureQualityState::InFlight>();
+                    state->in_flight.emplace(this, leader);
+                    lock.unlock();
+
+                    TextureQualityState::DataPtr built;
+                    SCOPE_EXIT {
+                        lock.lock();
+                        if (built) {
+                            state->Insert(this, built);
+                        }
+                        leader->result = built;
+                        leader->done = true;
+                        state->in_flight.erase(this);
+                        lock.unlock();
+                        leader->cv.notify_all();
+                    };
+
+                    const auto begin = std::chrono::steady_clock::now();
+                    auto reduced =
+                        ReduceZstdTexture(base->ReadAllBytes(), state->levels, state->arrays);
+                    const auto time = std::chrono::steady_clock::now() - begin;
+                    if (reduced && reduced->file.size() == size) {
+                        if (!counted.exchange(true)) {
+                            state->Count(*reduced, time, !whole);
+                        }
+                        built = std::make_shared<const std::vector<u8>>(std::move(reduced->file));
+                    }
+                    cached = built;
+                }
             }
         }
-
-        const auto begin = std::chrono::steady_clock::now();
-        auto reduced = ReduceZstdTexture(base->ReadAllBytes(), state->levels, state->arrays);
-        const auto time = std::chrono::steady_clock::now() - begin;
-        if (!reduced || reduced->file.size() != size) {
+        if (!cached || cached->size() != size) {
             LOG_ERROR(Common_Memory, "Texture quality: {} could not be reduced as planned",
                       GetName());
             std::memset(data, 0, length);
             return length;
         }
-        if (!counted.exchange(true)) {
-            state->Count(*reduced, time, !whole);
-        }
-        std::memcpy(data, reduced->file.data() + offset, length);
-        if (!whole) {
-            std::scoped_lock lock{state->mutex};
-            state->Insert(this, std::move(reduced->file));
-        }
+        std::memcpy(data, cached->data() + offset, length);
         return length;
     }
 

@@ -57,7 +57,7 @@ bool Nx2EnvOn(const char* name) {
 
 // Fast dispatch table size: unset = 2^16 entries, 4-way set associative (1 MiB per core instead of
 // 16 MiB); "0" = the old direct-mapped 2^20 table; a number 8-24 = that many bits, 4-way.
-u32 Nx2DispatchBits() {
+[[maybe_unused]] u32 Nx2DispatchBits() {
     const char* value = std::getenv("EDEN_NX2_JIT_DISPATCH");
     if (value == nullptr || value[0] == '\0' || (value[0] == '1' && value[1] == '\0')) {
         return 16;
@@ -71,7 +71,11 @@ u32 Nx2DispatchBits() {
 bool InlineExclusives() {
     static const bool on = [] {
         const char* value = std::getenv("EDEN_NX2_JIT_INLINE_EXCLUSIVES");
+#if defined(ARCHITECTURE_arm64)
+        return value == nullptr || value[0] != '0';
+#else
         return value != nullptr && value[0] == '1';
+#endif
     }();
     return on;
 }
@@ -304,6 +308,8 @@ u32 JitEvictSliceBytes() {
         }
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         return u32(Common::IosJit::EvictSliceBytes());
+#elif defined(ARCHITECTURE_arm64)
+        return u32(16_MiB);
 #else
         return u32{0};
 #endif
@@ -316,6 +322,8 @@ JitFaultPolicy GetJitFaultPolicy() {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         JitFaultPolicy result{Common::IosJit::FaultSharedMarkers(),
                               u8((std::min)(Common::IosJit::FaultBlockAfter(), 255U)), 0};
+#elif defined(__APPLE__) && defined(ARCHITECTURE_arm64)
+        JitFaultPolicy result{true, 2, 0};
 #else
         JitFaultPolicy result{false, 0, 0};
 #endif
@@ -457,9 +465,11 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     if (!m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32)))
         return std::nullopt;
     auto const aligned_vaddr = vaddr & ~Core::Memory::YUZU_PAGEMASK;
-    if (last_code_addr != aligned_vaddr) {
+    const u32 generation = code_generation.load(std::memory_order_acquire);
+    if (last_code_addr != aligned_vaddr || cached_code_generation != generation) {
         m_memory.ReadBlock(aligned_vaddr, &cached_code_page, sizeof(cached_code_page));
         last_code_addr = aligned_vaddr;
+        cached_code_generation = generation;
     }
     const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
@@ -858,6 +868,17 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
             config.inline_cntpct_spin_ticks = static_cast<u32>(m_cb->m_spin_ticks);
         }
     }
+#elif defined(ARCHITECTURE_arm64) && defined(__SIZEOF_INT128__)
+    if (m_uses_wall_clock && Common::g_wall_clock.IsNative() &&
+        Settings::values.cpu_clock.GetValue() == Settings::CpuClock::Normal &&
+        !Settings::values.sync_core_speed.GetValue() &&
+        !ClockPollSleepSetting().Enabled() &&
+        Nx2EnvOn("EDEN_NX2_INLINE_CNTPCT")) {
+        const auto factor = Common::g_wall_clock.GetGuestCNTFRQFactor();
+        config.inline_cntpct = true;
+        config.cntpct_scale_lo = static_cast<u64>(factor);
+        config.cntpct_scale_hi = static_cast<u64>(factor >> 64);
+    }
 #endif
 
     // Code cache size
@@ -934,6 +955,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         if (!Settings::values.cpuopt_ignore_memory_aborts) {
             config.check_halt_on_memory_access = true;
         }
+        config.optimizations &= ~Dynarmic::OptimizationFlag::DisableVerification;
         break;
     // Unsafe optimizations
     case Settings::CpuAccuracy::Unsafe:
@@ -1129,6 +1151,13 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_exclusive_access = false;
     }
 #endif
+    // The IR verification pass only checks dynarmic's own invariants (soft asserts), and builds
+    // a hash map of every instruction's uses for each compiled block. Debugging and Paranoid
+    // keep it.
+    if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Debugging &&
+        Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
+        config.optimizations |= Dynarmic::OptimizationFlag::DisableVerification;
+    }
     // EDEN_NX2_PERF_MEMCB=0 keeps the perf report but drops the callback breakdown.
     static const bool slow_breakdown = Nx2EnvOn("EDEN_NX2_PERF_MEMCB");
     m_cb->m_slow_breakdown = Common::PerfReport::Enabled() && slow_breakdown;
@@ -1228,7 +1257,7 @@ void ArmDynarmic64::RewindBreakpointInstruction() {
 
 ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process, DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index)
     : ArmInterface{uses_wall_clock}, m_system{system}, m_exclusive_monitor{exclusive_monitor}
-    , m_cb(std::make_optional<DynarmicCallbacks64>(*this, process))
+    , m_cb(std::in_place, *this, process)
     , m_core_index{core_index}
 {
     auto& page_table = process->GetPageTable().GetBasePageTable();
@@ -1291,7 +1320,7 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 }
 
 void ArmDynarmic64::ClearInstructionCache() {
-    m_cb->last_code_addr = u64(-1);
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
     m_jit->ClearCache();
     VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::JitClear);
 }
@@ -1300,7 +1329,7 @@ void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
     // Drop the cached code page too: blocks recompiled after the invalidation would
     // otherwise still decode the old instructions (e.g. a gdbstub breakpoint written
     // into or removed from that page).
-    m_cb->last_code_addr = u64(-1);
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
     m_jit->InvalidateCacheRange(addr, size);
     VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::JitInvalidate, {}, size);
 }

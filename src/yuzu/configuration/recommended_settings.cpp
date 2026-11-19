@@ -47,7 +47,14 @@ QString Label(const ConfigurationShared::Builder& builder, const Settings::Basic
 // where they have none (VSync's list is built from the GPU).
 QString ValueText(const ConfigurationShared::Builder& builder,
                   const Settings::BasicSetting& setting, const std::string& value,
-                  const std::string& fallback) {
+                  const std::string& fallback,
+                  const std::vector<VkDeviceInfo::Record>* records = nullptr) {
+    if (&setting == &Settings::values.vulkan_device && records != nullptr) {
+        const unsigned long idx = std::strtoul(value.c_str(), nullptr, 0);
+        if (idx < records->size()) {
+            return QString::fromStdString((*records)[idx].name);
+        }
+    }
     if (setting.TypeId() == "bool") {
         return value == "true" ? QObject::tr("On") : QObject::tr("Off");
     }
@@ -70,12 +77,29 @@ Settings::DeviceProfile::Device HostDevice(const std::vector<VkDeviceInfo::Recor
     auto device = Profile::DetectHost();
     const u32 index = Settings::values.vulkan_device.GetValue(true);
     if (Settings::values.renderer_backend.GetValue(true) == Settings::RendererBackend::Vulkan &&
-        index < records.size()) {
-        const auto& record = records[index];
+        !records.empty()) {
+        u32 target = index < records.size() ? index : 0;
+        if (records[target].integrated && records.size() > 1) {
+            u64 best_vram = 0;
+            int best_discrete = -1;
+            for (size_t i = 0; i < records.size(); ++i) {
+                if (!records[i].integrated &&
+                    (best_discrete < 0 || records[i].vram_mib > best_vram)) {
+                    best_discrete = static_cast<int>(i);
+                    best_vram = records[i].vram_mib;
+                }
+            }
+            if (best_discrete >= 0) {
+                target = static_cast<u32>(best_discrete);
+                device.recommended_vulkan_device = target;
+            }
+        }
+        const auto& record = records[target];
         device.gpu_known = true;
         device.gpu_name = record.name;
         device.gpu_integrated = record.integrated;
         device.vram_mib = record.vram_mib;
+        device.fsr4_capable = record.fsr4_capable;
 #ifdef EGLANTINE_STREAMLINE
         device.dlss_capable = record.dlss_capable;
 #endif
@@ -114,14 +138,14 @@ bool ConfirmAndApply(QWidget* parent, const ConfigurationShared::Builder& builde
             continue;
         }
         const QString label = Label(builder, *setting);
-        const QString to = ValueText(builder, *setting, value.value, value.display);
+        const QString to = ValueText(builder, *setting, value.value, value.display, &records);
         all << QStringLiteral("%1: %2\n    %3")
                    .arg(label, to, QString::fromStdString(value.reason));
         if (setting->ToStringGlobal() != value.value) {
             changes << UiText::Text("change.line")
                            .arg(label,
                                 ValueText(builder, *setting, setting->ToStringGlobal(),
-                                          setting->Canonicalize()),
+                                          setting->Canonicalize(), &records),
                                 to);
         }
     }

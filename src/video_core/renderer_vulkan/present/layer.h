@@ -68,7 +68,11 @@ public:
                        const Tegra::FramebufferConfig& framebuffer,
                        const Layout::FramebufferLayout& layout);
 
+    void NoteSubmittedTick(size_t image_index);
+
 private:
+    void EnsureImageCount(const Device& device, size_t image_index);
+    void CreateScalingFilter(const Device& device);
     void CreateDescriptorPool(const Device& device);
     void CreateDescriptorSets(const Device& device, VkDescriptorSetLayout layout);
     void CreateStagingBuffer(const Device& device, const Tegra::FramebufferConfig& framebuffer);
@@ -94,7 +98,9 @@ private:
     Scheduler& scheduler;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
     const PresentFilters& filters;
-    const size_t image_count{};
+    size_t image_count{};
+    VkExtent2D output_size{};
+    VkDescriptorSetLayout descriptor_set_layout{};
     vk::DescriptorPool descriptor_pool{};
     vk::DescriptorSets descriptor_sets{};
 

@@ -196,6 +196,10 @@ public:
     bool DropAction(QDropEvent* event);
     void AcceptDropEvent(QDropEvent* event);
 
+    [[nodiscard]] bool IsNvidiaFrameGenActive() const {
+        return nvidia_frame_gen_active;
+    }
+
     std::filesystem::path GetShortcutPath(QtCommon::Game::ShortcutTarget target);
 
 signals:
@@ -591,9 +595,13 @@ private:
     QLabel* message_label = nullptr;
     QLabel* shader_building_label = nullptr;
     QLabel* res_scale_label = nullptr;
+    QLabel* upscaler_status_label = nullptr;
     QLabel* emu_speed_label = nullptr;
     QLabel* game_fps_label = nullptr;
     QLabel* emu_frametime_label = nullptr;
+    u64 last_renderer_generated_frames = 0;
+    QElapsedTimer renderer_gen_fps_timer;
+    bool nvidia_frame_gen_active = false;
     QLabel* tas_label = nullptr;
     QLabel* firmware_label = nullptr;
     QPushButton* gpu_accuracy_button = nullptr;

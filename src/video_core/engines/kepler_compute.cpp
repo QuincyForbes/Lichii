@@ -1062,12 +1062,18 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     if (dlss_chain.spatial_only) {
         return false;
     }
+    const auto blocker = GameDlssBlocker();
     const bool replacement = dlss_chain.failure != VideoCore::GameDlssReason::None ||
-                             GameDlssBlocker() != VideoCore::GameDlssReason::None;
+                             blocker != VideoCore::GameDlssReason::None;
     if (dlss_chain.output_pass) {
         return replacement && FinishDlssEvaluation();
     }
-    return dlss_chain.failure != VideoCore::GameDlssReason::None &&
+    // While the network can't be shown at all (turned off or replaced on request, resolution
+    // scaling, no support), its own passes are skipped like a network dropped for good: the
+    // replacement draws over their result anyway, and a pass that can't run (tensor operations
+    // unavailable) would drop the prepass's jitter, motion vectors and depth the replacement needs.
+    return (blocker != VideoCore::GameDlssReason::None ||
+            dlss_chain.failure != VideoCore::GameDlssReason::None) &&
            native_key != passes->prepass &&
            dlss_chain.programs.contains(native_key);
 }
@@ -1723,23 +1729,23 @@ void KeplerCompute::TraceDlssContract(u64 native_key, bool warn_unvalidated) {
 
 bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     using namespace VideoCommon::FireEmblemUpscale;
-    static const bool requested_history = [] {
+    // Temporal by default: a spatial upscale of the jittered input crawls from frame to frame.
+    // EDEN_NX2_DLSS_REPLACEMENT=spatial keeps the spatial de-jitter for comparisons.
+    static const bool spatial_requested = [] {
         const char* const option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return option && (std::string_view{option} == "fsr" || std::string_view{option} == "dlss");
+        return option && std::string_view{option} == "spatial";
     }();
-    // NVIDIA DLSS, when on and running, takes the temporal inputs like the explicit overrides.
-    const bool use_history = allow_history && (requested_history || rasterizer->UsesNvidiaDlss());
     const size_t game_index = dlss_chain.spatial_only ? 1 : 0;
     const char* const game = dlss_chain.spatial_only ? "Star Fox" : "Fire Emblem";
     const auto jitter = fe_upscale_jitter.Take();
     const auto motion = std::exchange(dlss_motion_vectors, std::nullopt);
     const auto depth = std::exchange(dlss_depth, std::nullopt);
-    if (!jitter || (use_history && (!motion || !depth))) {
+    if (!jitter) {
         static std::array<bool, 2> reported{};
         if (!reported[game_index]) {
             reported[game_index] = true;
-            LOG_WARNING(HW_GPU, "{} replacement lacks current inputs: jitter={} motion={} depth={} temporal={}; retaining native dispatch",
-                        game, jitter.has_value(), motion.has_value(), depth.has_value(), use_history);
+            LOG_WARNING(HW_GPU, "{} replacement lacks this frame's jitter; retaining native dispatch",
+                        game);
         }
         return false;
     }
@@ -1760,10 +1766,14 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     const auto input = image(OutputColorInputOffset);
     const auto output = image(OutputColorOffset);
     if (!input || !output || !ValidPair(*input, *output, dlss_chain.spatial_only) ||
-        jitter->color != input->Address() || (use_history && dlss_motion_color != input->Address()) ||
-        jitter->width != input->Width() || jitter->height != input->Height()) {
+        jitter->color != input->Address() || jitter->width != input->Width() ||
+        jitter->height != input->Height()) {
         return false;
     }
+    // A frame without matching motion vectors and depth is scaled spatially, as is one the
+    // temporal upscale turns down; never left to the native pass.
+    bool use_history = allow_history && !spatial_requested && motion && depth &&
+                       dlss_motion_color == input->Address();
     const auto surface = [](const Texture::TICEntry& tic, Tegra::RenderTargetFormat format) {
         Fermi2D::Surface result{};
         result.format = format;
@@ -1782,11 +1792,18 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
                                                      : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
     const auto output_format = dlss_chain.spatial_only ? Tegra::RenderTargetFormat::R16G16B16A16_FLOAT
                                                       : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
-    const bool done = rasterizer->AccelerateTemporalUpscale(
-        surface(*input, input_format), surface(*output, output_format),
-        use_history ? surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT) : Fermi2D::Surface{},
-        use_history ? &*depth : nullptr, jitter->offset,
-        use_history ? std::array{1.0f, 1.0f} : std::array{0.0f, 0.0f}, use_history);
+    const auto upscale = [&](bool history) {
+        return rasterizer->AccelerateTemporalUpscale(
+            surface(*input, input_format), surface(*output, output_format),
+            history ? surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT) : Fermi2D::Surface{},
+            history ? &*depth : nullptr, jitter->offset,
+            history ? std::array{1.0f, 1.0f} : std::array{0.0f, 0.0f}, history);
+    };
+    bool done = upscale(use_history);
+    if (!done && use_history) {
+        use_history = false;
+        done = upscale(false);
+    }
     static std::array<u32, 2> logged{};
     if (logged[game_index]++ < 8) {
         LOG_INFO(HW_GPU, "{} DLSS replacement: {} temporal={} input={:#x} {}x{} output={:#x} {}x{} jitter={},{}",

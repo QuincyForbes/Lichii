@@ -64,6 +64,9 @@ public:
         return device.GetDriverName();
     }
 
+    [[nodiscard]] u64 GeneratedFrames() const override;
+    [[nodiscard]] bool IsNvidiaFrameGenActive() const override;
+
     // Enhanced platform-specific initialization
     void InitializePlatformSpecific();
 
@@ -77,6 +80,8 @@ private:
     VkCommandBuffer BeginSingleTimeCommands();
     void EndSingleTimeCommands(VkCommandBuffer command_buffer);
     void Report() const;
+    /// The surface the swapchain is made for, once the device exists.
+    VkSurfaceKHR PresentationSurface();
     /// One Info line naming every size a frame goes through, when one of them changes.
     void LogFrameChain(u32 game_width, u32 game_height, u32 screen_width, u32 screen_height);
     std::array<u64, 4> chain_key{};
@@ -99,6 +104,7 @@ private:
     vk::InstanceDispatch dld;
 #ifdef EGLANTINE_STREAMLINE
     bool streamline_started; ///< NVIDIA Streamline starts before the instance.
+    u64 last_dlssg_generated{};
 #endif
 
     // Keep original handles for compatibility with existing code
