@@ -1107,6 +1107,8 @@ private:
     bool clearing_render_targets = false;
     u32 rt_cleared_undrawn_mask = 0;
     bool is_rescaling = false;
+    /// The bound depth target is wider than tall by padding only (see FindDepthBuffer).
+    bool depth_target_padded = false;
     u64 total_used_memory = 0;
     u64 minimum_memory;
     u64 expected_memory;

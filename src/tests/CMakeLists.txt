@@ -9,6 +9,7 @@
 
 add_executable(tests
     video_core/metal_index_convert.cpp
+    video_core/padded_square.cpp
     video_core/metal_textures.cpp
     video_core/metal_work_policy.cpp
     video_core/vulkan_overlay_filter.cpp
