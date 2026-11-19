@@ -9,6 +9,9 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstdlib>
+
 #include "common/common_types.h"
 
 namespace Shader {
@@ -45,6 +48,30 @@ struct HostTranslateInfo {
                                         ///< control flow
     bool single_lane_geometry_subgroups{};
     bool support_byte_addressed_r16{};
+    /// Elements of the descriptor array a handle read from a table at a per-invocation index
+    /// becomes (the table's first entries, indexed by the shader); 0 keeps the cbuf fallback.
+    u32 handle_table_size{};
+
+    /// The handle table array size EDEN_NX2_DYNAMIC_HANDLE_ARRAYS asks for: unset or 1 gives the
+    /// default, 0 turns the arrays off, another value is the size (2 to 256).
+    [[nodiscard]] static u32 DynamicHandleArraySize() noexcept {
+        static const u32 size = [] {
+            constexpr u32 default_size = 64;
+            const char* const value = std::getenv("EDEN_NX2_DYNAMIC_HANDLE_ARRAYS");
+            if (value == nullptr || *value == '\0') {
+                return default_size;
+            }
+            const unsigned long parsed = std::strtoul(value, nullptr, 10);
+            if (parsed == 0) {
+                return 0U;
+            }
+            if (parsed == 1) {
+                return default_size;
+            }
+            return static_cast<u32>(std::clamp<unsigned long>(parsed, 2, 256));
+        }();
+        return size;
+    }
 
     void ApplyDescriptorLimitPolicy() noexcept {
         if (min_ssbo_alignment == 0) {

@@ -2198,7 +2198,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                                        ? cbufs[cbuf].address
                                        : GPUVAddr{};
                         },
-                        buffer_cache_runtime.GetStorageBufferAlignment()),
+                        buffer_cache_runtime.GetStorageBufferAlignment(), element),
                     via_header_index);
             }
             const u32 offset = desc.cbuf_offset + (element << desc.size_shift);
@@ -5304,7 +5304,7 @@ void RasterizerMetal::DispatchCompute() {
                                    ? cbufs[cbuf].Address()
                                    : GPUVAddr{};
                     },
-                    buffer_cache_runtime.GetStorageBufferAlignment()),
+                    buffer_cache_runtime.GetStorageBufferAlignment(), element),
                 via_header_index);
         }
         const GPUVAddr addr =

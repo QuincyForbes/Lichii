@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iterator>
+#include <mutex>
 
 #include <boost/container/small_vector.hpp>
 
@@ -427,6 +428,15 @@ PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_m
         .support_conditional_barrier = true,
     };
     host_info.ApplyDescriptorLimitPolicy();
+    // EDEN_NX2_DYNAMIC_HANDLE_ARRAYS: a handle read from a table at a per-invocation index becomes
+    // a texture array the shader indexes, which goes to the resource ID table (spvArrayTable)
+    // past Metal's sampler slots.
+    host_info.handle_table_size = Shader::HostTranslateInfo::DynamicHandleArraySize();
+    static std::once_flag logged_handle_arrays;
+    std::call_once(logged_handle_arrays, [size = host_info.handle_table_size] {
+        LOG_INFO(Render_Metal, "Dynamic handle arrays (EDEN_NX2_DYNAMIC_HANDLE_ARRAYS): {} elements{}",
+                 size, size == 0 ? ", off" : "");
+    });
     translate_options.ios = ios;
     translate_options.apple_family = apple_family;
     translate_options.sampler_reduction = ShaderTranslate::SamplerReductionEnabled();

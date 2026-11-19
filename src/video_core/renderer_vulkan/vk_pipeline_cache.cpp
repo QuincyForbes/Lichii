@@ -1015,6 +1015,26 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                  limits->per_stage_sampled_images);
     }
     host_info.ApplyDescriptorLimitPolicy();
+    {
+        // EDEN_NX2_DYNAMIC_HANDLE_ARRAYS: a handle read from a table at a per-invocation index
+        // becomes a sampled image array the shader indexes (Ocarina's clustered light shadow
+        // maps). It needs nonuniform indexing (MoltenVK indexes its argument buffers either way)
+        // and room for the array's samplers in a stage.
+        const u32 requested = Shader::HostTranslateInfo::DynamicHandleArraySize();
+        const auto uab_limits = device.UpdateAfterBindSampledLimits();
+        const u32 stage_samplers = uab_limits ? uab_limits->per_stage_samplers
+                                              : device.CoreSampledLimits().per_stage_samplers;
+        const bool nonuniform =
+            device.IsSampledImageArrayNonUniformIndexingSupported() || device.IsMoltenVK();
+        const bool room = stage_samplers >= requested + 32;
+        host_info.handle_table_size = requested > 1 && nonuniform && room ? requested : 0;
+        LOG_INFO(Render_Vulkan,
+                 "Dynamic handle arrays (EDEN_NX2_DYNAMIC_HANDLE_ARRAYS): {} elements{} "
+                 "(nonuniform indexing {}, {} samplers a stage)",
+                 host_info.handle_table_size,
+                 requested <= 1 ? ", off" : host_info.handle_table_size == 0 ? ", unsupported" : "",
+                 nonuniform ? "yes" : "no", stage_samplers);
+    }
 
     if (device.GetMaxVertexInputAttributes() < Maxwell::NumVertexAttributes) {
         LOG_WARNING(Render_Vulkan, "maxVertexInputAttributes is too low: {} < {}",

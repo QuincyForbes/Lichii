@@ -903,10 +903,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                             return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address
                                                                               : GPUVAddr{};
                         },
-                        align);
+                        align, index);
                 }};
                 const u32 raw{evaluate(active_storage_alignment)};
-                if (raw == 0) [[unlikely]] {
+                // A handle table array (count above 1) holds unused entries as 0.
+                if (raw == 0 && desc.count == 1) [[unlikely]] {
                     ++zero_texture_handles;
                     static std::set<std::pair<u64, u32>> logged;
                     const std::pair key_program{key.unique_hashes[stage + 1], desc.handle_program};

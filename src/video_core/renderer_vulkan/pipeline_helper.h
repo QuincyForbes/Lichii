@@ -799,7 +799,18 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                     continue;
                 }
             }
-            const VideoCommon::ImageViewId image_view_id{view->id};
+            VideoCommon::ImageViewId image_view_id{view->id};
+            if (desc.is_depth && desc.handle_program != ~0U &&
+                image_view_id != VideoCommon::NULL_IMAGE_VIEW_ID) {
+                const ImageView& candidate{texture_cache.GetImageView(image_view_id)};
+                // A depth-compare sample of a color image a handle read from memory names (an
+                // unused entry of a light table, say) is undefined: bind nothing.
+                if (!candidate.SupportsDepthComparison() &&
+                    VideoCore::Surface::GetFormatType(candidate.format) ==
+                        VideoCore::Surface::SurfaceType::ColorTexture) {
+                    image_view_id = VideoCommon::NULL_IMAGE_VIEW_ID;
+                }
+            }
             ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             VkImageView vk_image_view{image_view.Handle(desc.type)};
             if (vk_image_view == VK_NULL_HANDLE) {
