@@ -159,6 +159,7 @@ add_library(
     scm_rev.h
     scope_exit.h
     shutdown_progress.h
+    spin_deadline.h
     spin_recursive_mutex.h
     scratch_buffer.h
     settings.cpp

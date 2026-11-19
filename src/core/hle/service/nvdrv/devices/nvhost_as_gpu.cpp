@@ -29,6 +29,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Service::Nvidia::Devices {
@@ -471,6 +472,7 @@ bool nvhost_as_gpu::FreeMappingLocked(u64 offset) noexcept {
             allocator.Free(u32(mapping.offset >> page_size_bits), u32(aligned_size >> page_size_bits));
         }
         nvmap.UnpinHandle(mapping.handle);
+        Tegra::Nx2CommandMemoryReleases::Get().Note(offset, mapping.size);
         // Sparse mappings shouldn't be fully unmapped, just returned to their sparse state
         // Only FreeSpace can unmap them fully
         if (mapping.sparse_alloc) {
@@ -499,6 +501,7 @@ NvResult nvhost_as_gpu::FreeSpace(IoctlFreeSpace& params) {
             if (!FreeMappingLocked(mapping_offset))
                 return NvResult::BadValue;
 
+        Tegra::Nx2CommandMemoryReleases::Get().Note(params.offset, allocation.size);
         // Unset sparse flag if required
         if (allocation.sparse)
             gmmu->Unmap(params.offset, allocation.size);
@@ -539,6 +542,7 @@ NvResult nvhost_as_gpu::Remap(std::span<IoctlRemapEntry> entries) {
         }
 
         const bool use_big_pages = alloc->second.big_pages;
+        Tegra::Nx2CommandMemoryReleases::Get().Note(virtual_address, size);
         if (!entry.handle) {
             gmmu->MapSparse(virtual_address, size, use_big_pages);
         } else {
@@ -582,6 +586,7 @@ NvResult nvhost_as_gpu::MapBufferEx(IoctlMapBufferEx& params) {
             }
             u64 gpu_address = u64(params.offset + params.buffer_offset);
             VAddr device_address{mapping.ptr + params.buffer_offset};
+            Tegra::Nx2CommandMemoryReleases::Get().Note(gpu_address, params.mapping_size);
             gmmu->Map(gpu_address, device_address, params.mapping_size, Tegra::PTEKind(params.kind), mapping.big_page);
             return NvResult::Success;
         } else {
@@ -658,6 +663,7 @@ NvResult nvhost_as_gpu::UnmapBuffer(IoctlUnmapBuffer& params) {
             allocator.Free(u32(mapping.offset >> page_size_bits), u32(mapping.size >> page_size_bits));
         }
 
+        Tegra::Nx2CommandMemoryReleases::Get().Note(params.offset, mapping.size);
         // Sparse mappings shouldn't be fully unmapped, just returned to their sparse state
         // Only FreeSpace can unmap them fully
         if (mapping.sparse_alloc) {

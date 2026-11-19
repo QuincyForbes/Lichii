@@ -31,6 +31,7 @@
 #include "video_core/renderer_metal/metal_bridge.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_device.h"
+#include "video_core/renderer_metal/metal_recorder.h"
 #include "video_core/renderer_metal/metal_graphics.h"
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_scheduler.h"
@@ -819,6 +820,19 @@ bool StaticLabelsEnabled() {
 // needed. Otherwise a serial queue keeps a few made ahead (commandBufferWithDescriptor and the
 // system's frame pacing hook on it run there): the GPU thread takes one, uncommitted and not
 // enqueued, so the commit order stays the recording thread's. With constant labels only.
+// EDEN_NX2_METAL_RECORDER=1: Metal encoding on an encoder thread (metal_recorder.h); the
+// recording thread appends commands to a stream it replays and commits in order. Read at boot.
+bool RecorderEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_RECORDER");
+        const bool on = value != nullptr && value[0] == '1';
+        LOG_INFO(Render_Metal, "Metal: encoding on an encoder thread: {} (EDEN_NX2_METAL_RECORDER)",
+                 on ? "on" : "off");
+        return on;
+    }();
+    return enabled;
+}
+
 bool CommandBufferPremakeEnabled() {
     static const bool enabled =
         SwitchOn("EDEN_NX2_METAL_CB_PREMAKE", "command buffers made ahead off the GPU thread");
@@ -1128,6 +1142,9 @@ struct Scheduler::Impl {
         visibility = [device.GetDevice() newBufferWithLength:VisibilitySlots * sizeof(u64)
                                                      options:MTLResourceStorageModeShared];
         std::memset(visibility.contents, 0, VisibilitySlots * sizeof(u64));
+        if (RecorderEnabled()) {
+            recorder = std::make_unique<Rec::Recorder>(queue);
+        }
     }
 
     id<MTLCommandBuffer> NewCommandBuffer(NSString* label) {
@@ -1137,6 +1154,21 @@ struct Scheduler::Impl {
             return value == nullptr || value[0] != '0';
         }();
         id<MTLCommandBuffer> buffer = nil;
+        if (recorder != nullptr) {
+            // A proxy; the encoder thread makes the command buffer.
+            MTLCommandBufferDescriptor* descriptor = nil;
+            if (encoder_status) {
+                static MTLCommandBufferDescriptor* const recorder_descriptor = [] {
+                    MTLCommandBufferDescriptor* const made = [MTLCommandBufferDescriptor new];
+                    made.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+                    return made;
+                }();
+                descriptor = recorder_descriptor;
+            }
+            buffer = recorder->NewCommandBuffer(descriptor);
+            buffer.label = label;
+            return buffer;
+        }
         if (encoder_status) {
             // One descriptor for all (EDEN_NX2_METAL_STATIC_LABELS): only read by Metal.
             static MTLCommandBufferDescriptor* const shared_descriptor = [] {
@@ -1264,6 +1296,9 @@ struct Scheduler::Impl {
             ReportFailure(finished, tick, errors);
         }];
         [buffer commit];
+        if (recorder != nullptr) {
+            recorder->Publish();
+        }
         ++command_buffers;
         in_flight.emplace_back(tick, buffer);
     }
@@ -2598,6 +2633,9 @@ struct Scheduler::Impl {
     std::chrono::steady_clock::time_point heartbeat = std::chrono::steady_clock::now();
     std::atomic<bool> completed_logged{false};
     std::atomic<u32> errors_logged{0};
+    /// EDEN_NX2_METAL_RECORDER: the encoder thread's stream. Last: destroyed (drained, joined)
+    /// before the rest.
+    std::unique_ptr<Rec::Recorder> recorder;
 };
 
 Scheduler::Scheduler(const Device& device) : impl{std::make_unique<Impl>(device)} {}
@@ -2617,6 +2655,18 @@ bool Scheduler::IsFree(u64 tick) const noexcept {
 void Scheduler::Wait(u64 tick, CommitReason reason) {
     if (tick >= impl->current_tick) {
         Flush(reason);
+    }
+    if (impl->recorder != nullptr) {
+        // The tick's commands were published by its Flush; the encoder thread commits them and
+        // the completion handler moves completed_tick (only after the real commit).
+        if (!IsFree(tick)) {
+            std::unique_lock lock{impl->completed_mutex};
+            impl->completed_cv.wait(lock, [&] { return IsFree(tick); });
+        }
+        while (!impl->in_flight.empty() && impl->in_flight.front().first <= tick) {
+            impl->in_flight.pop_front();
+        }
+        return;
     }
     while (!impl->in_flight.empty() && impl->in_flight.front().first <= tick) {
         [impl->in_flight.front().second waitUntilCompleted];
@@ -2792,6 +2842,11 @@ u64 Scheduler::Flush(CommitReason reason) {
     }];
     impl->CommitAhead(tick);
     [command_buffer commit];
+    if (impl->recorder != nullptr) {
+        // Committed by the encoder thread after what was recorded before. submitted_tick still
+        // moves now: it means "will complete without the owner doing more", which holds.
+        impl->recorder->Publish();
+    }
     impl->submitted_tick.store(tick, std::memory_order_release);
     ++impl->command_buffers;
     if (impl->committed++ == 0) {
@@ -4607,6 +4662,13 @@ void* Scheduler::CommandBuffer() {
     impl->segment_opaque = true;
     // What the caller encodes is not known here: nothing goes ahead of it by its targets.
     ++impl->segment_encoders;
+    if (impl->recorder != nullptr) {
+        // Sync point: the caller (present, MetalFX) encodes on the real command buffer on this
+        // thread, after the encoder thread replayed everything before it.
+        const id<MTLCommandBuffer> proxy = impl->Commands();
+        impl->recorder->Drain("CommandBuffer()");
+        return (__bridge void*)Rec::Recorder::RealOf(proxy);
+    }
     return (__bridge void*)impl->Commands();
 }
 
@@ -4781,6 +4843,9 @@ std::string Scheduler::TakeCommitLine(double frames) {
     line += fmt::format(" (command buffers made ahead {:.1f}/frame, made when needed {:.1f}/frame)",
                         static_cast<double>(impl->premade.hits.exchange(0)) / per,
                         static_cast<double>(impl->premade.misses.exchange(0)) / per);
+    if (impl->recorder != nullptr) {
+        line += impl->recorder->TakeLine(frames);
+    }
     return line;
 }
 

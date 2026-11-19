@@ -33,6 +33,7 @@
 #include "video_core/capture.h"
 #include "video_core/framebuffer_config.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/nx2_perf.h"
 #ifdef HAS_RESHADE
 #include "video_core/post_processing/fx_chain.h"
@@ -404,6 +405,8 @@ struct RendererMetal::Impl {
     std::chrono::steady_clock::time_point report_start = std::chrono::steady_clock::now();
     u64 presented{};
     u64 skipped{};
+    u64 drawable_wait_ns{};     ///< Composite's nextDrawable waits since the last report
+    u64 drawable_wait_max_ns{};
     u64 from_cache{};
     u64 from_memory{};
 };
@@ -741,8 +744,21 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
             VideoCore::Probe::StoreFrameExtents(game_width, game_height, layout.width,
                                                 layout.height);
         }
+        // nextDrawable blocks the compositing thread (the GPU back) while every drawable is
+        // queued for display (display sync on, game faster than the display): timed for the
+        // nx2:vi2 critical path line and the report below.
+        const auto drawable_start = std::chrono::steady_clock::now();
         const id<CAMetalDrawable> drawable =
             impl->swapchain.NextDrawable(layout.width, layout.height);
+        {
+            const u64 waited = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - drawable_start)
+                    .count());
+            VideoCommon::SplitStats::AddPresentBlock(waited);
+            impl->drawable_wait_ns += waited;
+            impl->drawable_wait_max_ns = (std::max)(impl->drawable_wait_max_ns, waited);
+        }
         if (drawable != nil) {
 #ifdef HAS_LSFG
             if (FrameGen::Wanted()) {
@@ -811,6 +827,12 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                  work.staging_freed,
                  impl->rasterizer.TextureRuntime().allocated_bytes >> 20,
                  impl->rasterizer.BufferRuntime().GetDeviceMemoryUsage() >> 20);
+        LOG_INFO(Render_Metal,
+                 "Metal present: the GPU back waited {:.1f} ms for drawables in {} frames "
+                 "(longest {:.2f} ms)",
+                 static_cast<double>(std::exchange(impl->drawable_wait_ns, u64{0})) / 1e6,
+                 impl->presented + impl->skipped,
+                 static_cast<double>(std::exchange(impl->drawable_wait_max_ns, u64{0})) / 1e6);
         if (const std::string coverage = Coverage::TakeLine(); !coverage.empty()) {
             LOG_INFO(Render_Metal, "Perf Metal coverage: {}", coverage);
         }

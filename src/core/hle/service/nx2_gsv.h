@@ -50,6 +50,7 @@
 #include "core/frontend/framebuffer_layout.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/framebuffer_config.h"
 #include "core/core_timing.h"
@@ -101,6 +102,23 @@
 #include "core/hle/service/service.h"
 
 namespace Service {
+
+// Running totals for nx2:vi2's per-frame "critical path" line (every 600 presents; it takes the
+// differences). Written by nx2:gsv's syncpoint page service and the vsync timer.
+namespace Nx2CriticalPath {
+/// Wall time during which at least one guest wait on a syncpoint (nx2:gsv shared page, armed
+/// through its RW bits) was pending, from when the server saw it armed (at most one 500 us poll
+/// late) until that syncpoint's value changed.
+inline std::atomic<u64> guest_syncpt_wait_ns{};
+inline std::atomic<u64> guest_syncpt_waits{}; ///< Such waits ended by a value change
+inline std::atomic<s64> vsync_last_tick_ns{}; ///< steady_clock ns of the last vsync signal
+inline std::atomic<s64> vsync_interval_ns{};
+inline s64 NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace Nx2CriticalPath
 
 // Creates a session served by `iface` and returns its client end. Unlike PushIpcInterface this
 // works from a domain too, for callers that want a raw session handle.
@@ -2062,6 +2080,18 @@ private:
             m_stats.composite_us += to_us(composited - waited);
             m_stats.pace_us += to_us(paced - composited);
             m_stats.max_fence_us = (std::max<long long>)(m_stats.max_fence_us, static_cast<long long>(to_us(waited - entered)));
+            // A game that starts its frames on the vsync event waits about this long for it
+            // after the present returns (the event's rate quantizes its frame time).
+            if (const s64 interval =
+                    Nx2CriticalPath::vsync_interval_ns.load(std::memory_order_relaxed);
+                interval > 0) {
+                const s64 since = Nx2CriticalPath::NowNs() -
+                                  Nx2CriticalPath::vsync_last_tick_ns.load(std::memory_order_relaxed);
+                if (since >= 0) {
+                    m_stats.next_vsync_us += (interval - since % interval) / 1000;
+                    ++m_stats.vsync_samples;
+                }
+            }
             // Counted at the reply: the game gets its buffers back with this frame unfinished.
             if (const u32 fence_id = ~w[22]; fence_id < 192 &&
                 !system.Host1x().GetSyncpointManager().IsReadyGuest(fence_id, w[24])) {
@@ -2084,6 +2114,7 @@ private:
                          m_stats.fence_us / 600, m_stats.max_fence_us, m_stats.composite_us / 600,
                          m_stats.pace_us / 600, m_stats.ran_ahead, m_stats.release_backstops);
                 VideoCommon::Nx2Hazard::LogSummary();
+                LogCriticalPath();
                 m_stats = {.last_present = entered};
             }
         }
@@ -2135,6 +2166,74 @@ private:
     }
     u32 m_release_queued{};
     bool m_release_backstop_logged{};
+
+    /// Running totals as of the previous critical path line (Nx2CriticalPath, SplitStats).
+    struct CriticalPathTotals {
+        std::array<u64, static_cast<size_t>(VideoCommon::DrainSite::Count)> front_wait_ns{};
+        u64 back_idle_ns{}, present_block_ns{}, present_blocks{};
+        u64 syncpt_wait_ns{}, syncpt_waits{};
+        bool valid{};
+    } m_critical_totals;
+
+    /// One line per 600 presents: where a frame's time goes on the chain guest CPU -> present ->
+    /// GPU front -> GPU back -> guest syncpoints, in ms per frame. Called before m_stats resets.
+    void LogCriticalPath() {
+        namespace Split = VideoCommon::SplitStats;
+        CriticalPathTotals now{.valid = true};
+        for (size_t i = 0; i < now.front_wait_ns.size(); ++i) {
+            now.front_wait_ns[i] = Split::g_total_front_wait_ns[i].load(std::memory_order_relaxed);
+        }
+        now.back_idle_ns = Split::g_total_back_idle_ns.load(std::memory_order_relaxed);
+        now.present_block_ns = Split::g_total_present_block_ns.load(std::memory_order_relaxed);
+        now.present_blocks = Split::g_total_present_blocks.load(std::memory_order_relaxed);
+        now.syncpt_wait_ns = Nx2CriticalPath::guest_syncpt_wait_ns.load(std::memory_order_relaxed);
+        now.syncpt_waits = Nx2CriticalPath::guest_syncpt_waits.load(std::memory_order_relaxed);
+        const CriticalPathTotals before = std::exchange(m_critical_totals, now);
+        if (!before.valid) {
+            return;
+        }
+        constexpr double frames = 600.0;
+        const auto per_frame_ms = [&](u64 ns) { return static_cast<double>(ns) / 1e6 / frames; };
+        const double frame_ms = static_cast<double>(m_stats.frame_us) / 599.0 / 1000.0;
+        const double present_ms =
+            static_cast<double>(m_stats.fence_us + m_stats.composite_us + m_stats.pace_us) /
+            frames / 1000.0;
+        std::string front = "n/a (EDEN_NX2_SPLIT_STATS=1)";
+        if (Split::Enabled()) {
+            std::array<std::pair<u64, size_t>, static_cast<size_t>(VideoCommon::DrainSite::Count)>
+                sites{};
+            u64 total = 0;
+            for (size_t i = 0; i < sites.size(); ++i) {
+                sites[i] = {now.front_wait_ns[i] - before.front_wait_ns[i], i};
+                total += sites[i].first;
+            }
+            std::partial_sort(sites.begin(), sites.begin() + 3, sites.end(),
+                              [](const auto& a, const auto& b) { return a.first > b.first; });
+            front = fmt::format("{:.2f} [", per_frame_ms(total));
+            for (size_t i = 0; i < 3 && sites[i].first != 0; ++i) {
+                front += fmt::format("{}{} {:.2f}", i ? ", " : "",
+                                     VideoCommon::drain_site_names[sites[i].second],
+                                     per_frame_ms(sites[i].first));
+            }
+            front += fmt::format("], back idle {:.2f}",
+                                 per_frame_ms(now.back_idle_ns - before.back_idle_ns));
+        }
+        const u64 waits = now.syncpt_waits - before.syncpt_waits;
+        LOG_INFO(Service,
+                 "nx2 critical path per frame (ms, last 600 presents): frame {:.2f} = guest {:.2f} "
+                 "+ present call {:.2f} (GPU fence {:.2f}); guest blocked on GPU syncpoints {:.2f} "
+                 "({:.1f} waits); next vsync {:.2f} after the present returns; GPU front waited "
+                 "on the back {}; present blocked the GPU back {:.2f} ({} over 100 us)",
+                 frame_ms, frame_ms - present_ms, present_ms,
+                 static_cast<double>(m_stats.fence_us) / frames / 1000.0,
+                 per_frame_ms(now.syncpt_wait_ns - before.syncpt_wait_ns),
+                 static_cast<double>(waits) / frames,
+                 m_stats.vsync_samples != 0
+                     ? static_cast<double>(m_stats.next_vsync_us) / m_stats.vsync_samples / 1000.0
+                     : 0.0,
+                 front, per_frame_ms(now.present_block_ns - before.present_block_ns),
+                 now.present_blocks - before.present_blocks);
+    }
 
     /// Returns the allocator for display release syncpoints.
     Nvidia::NvCore::SyncpointManager& NvdrvSyncpoints() {
@@ -2196,6 +2295,8 @@ private:
     struct PresentStats {
         long long frame_us{}, fence_us{}, composite_us{}, pace_us{}, max_fence_us{};
         long long max_frame_us{}, hitches{};
+        long long next_vsync_us{}; ///< From the present's return to the next vsync signal
+        u32 vsync_samples{};
         u32 presents{}, ran_ahead{};
         u32 release_backstops{}; ///< Presents ReleaseBackstop held for an old release fence
         std::chrono::steady_clock::time_point last_present{};
@@ -3189,6 +3290,10 @@ private:
                     for (auto* vsync : vsync_state->events) {
                         vsync->Signal(kernel);
                     }
+                    Nx2CriticalPath::vsync_last_tick_ns.store(Nx2CriticalPath::NowNs(),
+                                                              std::memory_order_relaxed);
+                    Nx2CriticalPath::vsync_interval_ns.store(vsync_state->interval.count(),
+                                                             std::memory_order_relaxed);
                     // The frame rate limit can change while the game runs.
                     std::optional<std::chrono::nanoseconds> changed;
                     if (const u32 hz = Nx2VsyncRateHz();
@@ -4987,6 +5092,7 @@ private:
                     m_last_syncpt_values[id] = value;
                     m_syncpt_memory->Write64(m_syncpt_ro + SyncptValuesOffset + id * 8, value);
                     changed = true;
+                    EndSyncptWait(id);
                 }
             }
         });
@@ -5048,6 +5154,9 @@ private:
         bool acked = false;
         for (u32 w = 0; w < words; ++w) {
             const u64 diff = armed[w] ^ m_last_ro_bits[w];
+            for (u64 bits = diff; bits != 0; bits &= bits - 1) {
+                BeginSyncptWait(w * 64 + static_cast<u32>(std::countr_zero(bits)));
+            }
             if (diff != 0) {
                 if (w < m_active_syncpt_mask.size()) {
                     m_active_syncpt_mask[w] |= diff;
@@ -5067,6 +5176,35 @@ private:
             m_syncpt_events[1]->Signal(system.Kernel());
         }
     }
+
+    // Critical-path accounting (Nx2CriticalPath): a toggled RW bit is a guest wait (or a rearm
+    // of one); it lasts until the syncpoint's value changes. Only the union of the pending waits
+    // is summed, so waits on several syncpoints at once count once.
+    void BeginSyncptWait(u32 id) {
+        if (id >= HostSyncpoints || m_syncpt_wait_since[id] != 0) {
+            return;
+        }
+        const s64 now = Nx2CriticalPath::NowNs();
+        m_syncpt_wait_since[id] = now;
+        if (m_syncpt_waiting++ == 0) {
+            m_syncpt_union_since = now;
+        }
+    }
+    void EndSyncptWait(u32 id) {
+        if (id >= HostSyncpoints || m_syncpt_wait_since[id] == 0) {
+            return;
+        }
+        m_syncpt_wait_since[id] = 0;
+        Nx2CriticalPath::guest_syncpt_waits.fetch_add(1, std::memory_order_relaxed);
+        if (--m_syncpt_waiting == 0) {
+            const s64 span = Nx2CriticalPath::NowNs() - m_syncpt_union_since;
+            Nx2CriticalPath::guest_syncpt_wait_ns.fetch_add(static_cast<u64>((std::max)(span, s64{0})),
+                                                            std::memory_order_relaxed);
+        }
+    }
+    std::array<s64, HostSyncpoints> m_syncpt_wait_since{};
+    u32 m_syncpt_waiting{};
+    s64 m_syncpt_union_since{};
 
     // nn::gsv::shim::CalculateRequirements(u64* size, u64* alignment, preference, u32): the 0x40-byte
     // InterModuleUserImagePreference (words 2..17) and a u32 (word 18). A block-linear preference

@@ -32,6 +32,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 
 namespace Service::Nvidia::Devices {
 namespace {
@@ -415,6 +416,9 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                 entries.submit_hashes.push_back(Tegra::HashPushbufferWords(words));
             }
         }
+        // Before the copy: a release during it counts as one after it.
+        entries.release_tracked = true;
+        entries.release_checked = Tegra::Nx2CommandMemoryReleases::Get().Generation();
         // The present returns before the GPU thread reaches this frame's work (nx2_gsv.h,
         // frames ahead), and Mario Kart World then refills command memory it already
         // submitted: the end of a frame ran with the next frame's present image as its render

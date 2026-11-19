@@ -9,12 +9,14 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <atomic>
 #include <condition_variable>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 #include <deque>
@@ -173,6 +175,14 @@ struct CommandList final {
     u64 snapshot_suspensions = 0;
     /// How often the words were copied from memory again after the submit (RefreshSnapshot).
     u32 refreshes = 0;
+    /// Submitted by the guest (nvhost-gpu): released memory is tracked from the submit on.
+    bool release_tracked = false;
+    /// Nx2CommandMemoryReleases generation up to which releases were checked (at first, the
+    /// submit's).
+    u64 release_checked = 0;
+    /// Entries (ascending) whose memory was released or remapped since the submit: never read from
+    /// memory again (DmaPusher::UpdateReleasedEntries).
+    std::vector<u32> released_entries;
 };
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
@@ -306,6 +316,19 @@ public:
     size_t RefreshEntry(CommandList& list, size_t index, bool guard, size_t carry);
     std::vector<CommandHeader> recovered_words;
     std::vector<CommandHeader> refresh_words;
+
+    /// EDEN_NX2_RELEASED_LISTS (on unless 0): adds the list's entries whose memory was released or
+    /// remapped since the last check to CommandList::released_entries. Cheap when nothing was.
+    void UpdateReleasedEntries(CommandList& list);
+    [[nodiscard]] static bool IsReleasedEntry(const CommandList& list, size_t index) {
+        return !list.released_entries.empty() &&
+               std::ranges::binary_search(list.released_entries, static_cast<u32>(index));
+    }
+    /// Counts (and logs the first few, then every 1024th of) the entries released memory changed
+    /// how they run.
+    enum class ReleasedUse : u32 { RefreshKept, ParseUsedCopy, ParseSkipped, GpuWritten, Count };
+    void NoteReleasedEntry(ReleasedUse use, const CommandList& list, size_t index);
+    std::vector<std::pair<u64, u64>> released_ranges;
 
 private:
 

@@ -1447,8 +1447,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 u64 start = SplitStats::Enabled() ? Common::PerfReport::NowNs() : 0;
                 ~IdleTimer() {
                     if (start != 0) {
-                        SplitStats::g_back_idle_ns.fetch_add(
-                            Common::PerfReport::NowNs() - start, std::memory_order_relaxed);
+                        const u64 idle_ns = Common::PerfReport::NowNs() - start;
+                        SplitStats::g_back_idle_ns.fetch_add(idle_ns, std::memory_order_relaxed);
+                        SplitStats::g_total_back_idle_ns.fetch_add(idle_ns,
+                                                                  std::memory_order_relaxed);
                         SplitStats::g_back_idle_count.fetch_add(1, std::memory_order_relaxed);
                     }
                 }

@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <optional>
 #include <thread>
 
 #ifdef __APPLE__
@@ -19,6 +20,7 @@
 #endif
 
 #include "common/nx2_address_wait.h"
+#include "common/spin_deadline.h"
 
 namespace Kernel {
 
@@ -122,7 +124,7 @@ void KSpinLock::LockContendedNx2() {
     if (budget_us > 0) {
         const auto budget = std::chrono::microseconds{budget_us};
         const u32 max_spins = IsLowCoreDevice() ? 64U : 4096U;
-        std::chrono::steady_clock::time_point deadline{};
+        std::optional<Common::SpinDeadline::Deadline> deadline;
         for (u32 spin = 1; spin <= max_spins; ++spin) {
             Pause();
             if (m_state.load(std::memory_order_relaxed) == 0) {
@@ -133,10 +135,9 @@ void KSpinLock::LockContendedNx2() {
                 }
             }
             if ((spin & 15U) == 0) {
-                const auto now = std::chrono::steady_clock::now();
                 if (spin == 16U) {
-                    deadline = now + budget;
-                } else if (now >= deadline) {
+                    deadline.emplace(budget);
+                } else if (deadline->Expired()) {
                     break;
                 }
             }

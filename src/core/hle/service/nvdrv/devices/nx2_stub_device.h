@@ -19,6 +19,7 @@
 
 #include "common/logging.h"
 #include "core/hle/service/nvdrv/devices/nvdevice.h"
+#include "video_core/nx2.h"
 
 namespace Service::Nvidia::Devices {
 
@@ -67,6 +68,7 @@ public:
 
     void MapAt(u32 handle, u64 offset, u64 gpu_address, u64 cpu_address, u64 size) {
         std::scoped_lock lk{mutex};
+        NoteRemaps(gpu_address, cpu_address, size);
         TrimMappings(gpu_address, size);
         mappings.push_back({gpu_address, cpu_address, size, handle, offset});
         for (auto& [owner, listener] : listeners) {
@@ -77,6 +79,7 @@ public:
     // NormalUnmapGpuMemory4K, or destroying the memory: the GPU range stops reaching it.
     void Unmap(u64 gpu_address, u64 size) {
         std::scoped_lock lk{mutex};
+        Tegra::Nx2CommandMemoryReleases::Get().Note(gpu_address, size);
         TrimMappings(gpu_address, size);
         for (auto& [owner, listener] : listeners) {
             listener.unmap(gpu_address, size);
@@ -114,6 +117,7 @@ public:
 
     void DestroySparse(u64 gpu_address, u64 size) {
         std::scoped_lock lk{mutex};
+        Tegra::Nx2CommandMemoryReleases::Get().Note(gpu_address, size);
         sparse_regions.erase(gpu_address);
         for (auto& [owner, listener] : listeners) {
             if (listener.sparse) {
@@ -300,6 +304,21 @@ private:
         BackListener back;
         TileListener tile;
     };
+
+    // Parts of [gpu_address, +size) mapped to other memory than a map to cpu_address gives them
+    // now show other memory: noted for queued command lists (Nx2CommandMemoryReleases). The same
+    // mapping made again changes nothing.
+    void NoteRemaps(u64 gpu_address, u64 cpu_address, u64 size) {
+        const u64 end = gpu_address + size;
+        for (const auto& m : mappings) {
+            const u64 start = std::max(m.gpu_address, gpu_address);
+            const u64 stop = std::min(m.gpu_address + m.size, end);
+            if (start < stop && m.cpu_address + (start - m.gpu_address) !=
+                                    cpu_address + (start - gpu_address)) {
+                Tegra::Nx2CommandMemoryReleases::Get().Note(start, stop - start);
+            }
+        }
+    }
 
     // Drops [gpu_address, +size) from the recorded mappings, keeping the parts outside it.
     void TrimMappings(u64 gpu_address, u64 size) {

@@ -495,6 +495,21 @@ bool DmaPusher::Step() {
             !SkipWriterWait(u64{header.size} * sizeof(u32))) {
             gpu_written = WaitForListWriters(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         }
+        // Memory released or remapped since the submit (Nx2CommandMemoryReleases) is not read:
+        // the submit-time copy runs instead, or nothing when there is none. GPU-written entries
+        // are left to their own path.
+        UpdateReleasedEntries(command_list);
+        const bool released = !gpu_written && IsReleasedEntry(command_list, dma_pushbuffer_subindex);
+        const bool has_copy =
+            dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
+            command_list.submitted_offsets[dma_pushbuffer_subindex] + header.size <=
+                command_list.submitted_words.size() &&
+            !std::ranges::binary_search(command_list.deferred_entries,
+                                        static_cast<u32>(dma_pushbuffer_subindex));
+        if (gpu_written && command_resume_offset == 0 &&
+            IsReleasedEntry(command_list, dma_pushbuffer_subindex)) {
+            NoteReleasedEntry(ReleasedUse::GpuWritten, command_list, dma_pushbuffer_subindex);
+        }
         // Resume and GPU-written entries need live words, even after a flush cleared dirty state.
         const bool submitted = (command_list.snapshot_suspensions & 1) == 0 &&
                                command_list.snapshot_suspensions ==
@@ -507,7 +522,27 @@ bool DmaPusher::Step() {
             gpu_written,
             use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
                                                      header.size * sizeof(u32)));
-        if (submitted) {
+        if (released && !has_copy) {
+            NoteReleasedEntry(ReleasedUse::ParseSkipped, command_list, dma_pushbuffer_subindex);
+            // A method left open would take the next entry's words as its data.
+            dma_state.method_count = 0;
+        } else if (released && (!submitted || command_resume_offset != 0)) {
+            NoteReleasedEntry(ReleasedUse::ParseUsedCopy, command_list, dma_pushbuffer_subindex);
+            std::span<const CommandHeader> commands{
+                command_list.submitted_words.data() +
+                    command_list.submitted_offsets[dma_pushbuffer_subindex],
+                header.size};
+            if (command_resume_offset == 0) {
+                commands = CheckEntryWords(header, commands, command_list,
+                                           command_list.refreshes != 0
+                                               ? EntrySource::SubmittedRefreshed
+                                               : EntrySource::Submitted);
+            }
+            RecordParsedEntry(header, commands);
+            Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Submitted);
+            command_resume_offset +=
+                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+        } else if (submitted) {
             const std::span<const CommandHeader> commands = CheckEntryWords(
                 header,
                 {command_list.submitted_words.data() +
@@ -1069,6 +1104,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
 void DmaPusher::RefreshSnapshot(CommandList& list, u64 now, size_t first_entry) {
     list.snapshot_suspensions = now;
     ++list.refreshes;
+    UpdateReleasedEntries(list);
     // Entries still deferred hold zeros, not a submit-time copy worth keeping. `carry`: the
     // words of a method an earlier entry opened (unknown for the first: none assumed).
     const bool guard = ListValidateEnabled();
@@ -1080,7 +1116,9 @@ void DmaPusher::RefreshSnapshot(CommandList& list, u64 now, size_t first_entry) 
                                                                   static_cast<u32>(i)),
                              carry);
     }
-    list.deferred_entries.clear();
+    // A deferred entry whose memory was released since has no copy to run: it stays deferred.
+    std::erase_if(list.deferred_entries,
+                  [&list](u32 i) { return !IsReleasedEntry(list, i); });
 }
 
 size_t DmaPusher::RefreshEntry(CommandList& list, size_t index, bool guard, size_t carry) {
@@ -1090,18 +1128,35 @@ size_t DmaPusher::RefreshEntry(CommandList& list, size_t index, bool guard, size
         return carry;
     }
     CommandHeader* const words = list.submitted_words.data() + offset;
+    const std::span<const CommandHeader> old_words{words, entry.size};
     size_t carry_out = 0;
+    // Released or remapped since the submit: what memory holds now is not this list's.
+    const auto keep = [&] {
+        NoteReleasedEntry(ReleasedUse::RefreshKept, list, index);
+        PlausibleCommandWords(old_words, carry, &carry_out);
+        return carry_out;
+    };
+    if (IsReleasedEntry(list, index)) {
+        return keep();
+    }
+    refresh_words.resize(entry.size);
+    memory_manager.ReadBlockUnsafe(entry.addr, refresh_words.data(), entry.size * sizeof(u32));
+    // Released while it was read (the game may reuse the memory as soon as the call returns).
+    if (list.release_tracked &&
+        Nx2CommandMemoryReleases::Get().Generation() != list.release_checked) {
+        UpdateReleasedEntries(list);
+        if (IsReleasedEntry(list, index)) {
+            return keep();
+        }
+    }
     if (!guard) {
-        memory_manager.ReadBlockUnsafe(entry.addr, words, entry.size * sizeof(u32));
-        PlausibleCommandWords({words, entry.size}, carry, &carry_out);
+        std::memcpy(words, refresh_words.data(), entry.size * sizeof(u32));
+        PlausibleCommandWords(old_words, carry, &carry_out);
         return carry_out;
     }
     // The game may already have refilled a queued list's memory for a later frame (the present
     // returns frames ahead, nx2_gsv.h): those words, read now, are another list's commands at
     // other offsets.
-    refresh_words.resize(entry.size);
-    memory_manager.ReadBlockUnsafe(entry.addr, refresh_words.data(), entry.size * sizeof(u32));
-    const std::span<const CommandHeader> old_words{words, entry.size};
     if (!std::ranges::equal(old_words, refresh_words,
                             [](CommandHeader a, CommandHeader b) { return a.argument == b.argument; }) &&
         !PlausibleCommandWords(refresh_words, carry) &&
@@ -1125,6 +1180,89 @@ size_t DmaPusher::RefreshEntry(CommandList& list, size_t index, bool guard, size
     std::memcpy(words, refresh_words.data(), entry.size * sizeof(u32));
     PlausibleCommandWords(old_words, carry, &carry_out);
     return carry_out;
+}
+
+void DmaPusher::UpdateReleasedEntries(CommandList& list) {
+    if (!list.release_tracked || !Nx2CommandMemoryReleases::Enabled()) {
+        return;
+    }
+    auto& releases = Nx2CommandMemoryReleases::Get();
+    const u64 now = releases.Generation();
+    const u64 since = list.release_checked;
+    if (now == since) {
+        return;
+    }
+    list.release_checked = now;
+    u64 low = ~u64{0};
+    u64 high = 0;
+    for (const CommandListHeader& entry : list.command_lists) {
+        if (entry.size != 0) {
+            low = std::min<u64>(low, entry.addr);
+            high = std::max<u64>(high, entry.addr + u64{entry.size} * sizeof(u32));
+        }
+    }
+    if (low >= high) {
+        return;
+    }
+    // Incomplete (more releases than the log keeps since the last check): all of them count.
+    const bool complete = releases.Collect(since, now, low, high, released_ranges);
+    if (complete && released_ranges.empty()) {
+        return;
+    }
+    const size_t before = list.released_entries.size();
+    for (size_t i = 0; i < list.command_lists.size(); ++i) {
+        const CommandListHeader& entry = list.command_lists[i];
+        if (entry.size == 0) {
+            continue;
+        }
+        const u64 start = entry.addr;
+        const u64 end = start + u64{entry.size} * sizeof(u32);
+        const bool hit = !complete || std::ranges::any_of(released_ranges, [&](const auto& range) {
+            return range.first < end && start < range.second;
+        });
+        if (hit && !std::ranges::binary_search(list.released_entries.begin(),
+                                               list.released_entries.begin() +
+                                                   static_cast<std::ptrdiff_t>(before),
+                                               static_cast<u32>(i))) {
+            list.released_entries.push_back(static_cast<u32>(i));
+        }
+    }
+    if (list.released_entries.size() != before) {
+        std::ranges::sort(list.released_entries);
+    }
+    if (!complete) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+            LOG_WARNING(HW_GPU,
+                        "Released lists: more than the logged releases since a queued list's last "
+                        "check ({} -> {}); all {} of its entries treated as released",
+                        since, now, list.command_lists.size());
+        }
+    }
+}
+
+void DmaPusher::NoteReleasedEntry(ReleasedUse use, const CommandList& list, size_t index) {
+    static std::array<std::atomic<u64>, static_cast<size_t>(ReleasedUse::Count)> counts{};
+    static std::atomic<u32> logged{};
+    static constexpr std::array names{"refresh kept the submit-time words",
+                                      "parse used the submit-time words instead of memory",
+                                      "parse skipped it (no copy to run)",
+                                      "GPU-written, read as usual"};
+    const u64 count =
+        counts[static_cast<size_t>(use)].fetch_add(1, std::memory_order_relaxed) + 1;
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 24 && (count & 0x3ff) != 0) {
+        return;
+    }
+    const CommandListHeader& entry = list.command_lists[index];
+    LOG_WARNING(HW_GPU,
+                "Released lists: entry {:#x}+{:#x} (ch {}, {} of {}) lies in memory released or "
+                "remapped since its submit: {}; so far: {} refreshes kept, {} parses from the copy, "
+                "{} skipped, {} GPU-written ({} releases noted)",
+                u64{entry.addr}, u64{entry.size}, channel_state.bind_id, index,
+                list.command_lists.size(), names[static_cast<size_t>(use)],
+                counts[0].load(std::memory_order_relaxed), counts[1].load(std::memory_order_relaxed),
+                counts[2].load(std::memory_order_relaxed), counts[3].load(std::memory_order_relaxed),
+                Nx2CommandMemoryReleases::Get().Generation());
 }
 
 std::span<const CommandHeader> DmaPusher::CheckEntryWords(const CommandListHeader& header,
@@ -1157,7 +1295,9 @@ std::span<const CommandHeader> DmaPusher::CheckEntryWords(const CommandListHeade
         });
     };
     const bool memory_differs = !same(memory, words);
-    const bool memory_valid = memory_differs && PlausibleCommandWords(memory, carry);
+    // Memory released since the submit holds something else now, whether it parses or not.
+    const bool memory_valid = memory_differs && !IsReleasedEntry(list, dma_pushbuffer_subindex) &&
+                              PlausibleCommandWords(memory, carry);
     // The submit-time copy, when the words parsed were not that copy.
     std::span<const CommandHeader> submitted;
     const size_t index = dma_pushbuffer_subindex;
@@ -1203,8 +1343,10 @@ std::span<const CommandHeader> DmaPusher::CheckEntryWords(const CommandListHeade
 }
 
 void DmaPusher::RefreshDeferredEntries(CommandList& list) {
+    UpdateReleasedEntries(list);
     for (const u32 i : list.deferred_entries) {
-        if (i >= list.command_lists.size() || i >= list.submitted_offsets.size()) {
+        if (i >= list.command_lists.size() || i >= list.submitted_offsets.size() ||
+            IsReleasedEntry(list, i)) {
             continue;
         }
         const CommandListHeader& entry = list.command_lists[i];
@@ -1215,7 +1357,9 @@ void DmaPusher::RefreshDeferredEntries(CommandList& list) {
         memory_manager.ReadBlockUnsafe(entry.addr, list.submitted_words.data() + offset,
                                        entry.size * sizeof(u32));
     }
-    list.deferred_entries.clear();
+    // Released ones have no copy to run: they stay deferred.
+    std::erase_if(list.deferred_entries,
+                  [&list](u32 i) { return !IsReleasedEntry(list, i); });
 }
 
 bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size) {

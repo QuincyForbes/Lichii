@@ -14,6 +14,7 @@
 #include "common/nx2_poll.h"
 #include "common/nx2_timeline.h"
 #include "common/platform_events.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #ifdef _WIN32
@@ -23,6 +24,7 @@
 #ifdef HAS_LSFG
 #include "video_core/renderer_vulkan/present/lsfg_common.h"
 #endif
+#include "video_core/gpu_split.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -262,6 +264,14 @@ PresentManager::~PresentManager() {
 }
 
 Frame* PresentManager::GetRenderFrame() {
+    // The GPU back composites here: time it blocks on the present path (nx2:vi2 critical path).
+    const auto wait_start = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        VideoCommon::SplitStats::AddPresentBlock(static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wait_start)
+                .count()));
+    };
 
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};

@@ -15,6 +15,7 @@
 #include <immintrin.h>
 #endif
 
+#include "common/spin_deadline.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_address_arbiter.h"
@@ -181,7 +182,7 @@ bool SpinBeforeWait(KernelCore& kernel, KThread* cur_thread, uint64_t addr, bool
         return !cur_thread->IsTerminationRequested();
     }
     const PhysicalCore& core = kernel.CurrentPhysicalCore();
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds{spin_us};
+    const Common::SpinDeadline::Deadline deadline{std::chrono::microseconds{spin_us}};
     for (u32 spin = 1;; ++spin) {
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
         _mm_pause();
@@ -196,7 +197,7 @@ bool SpinBeforeWait(KernelCore& kernel, KThread* cur_thread, uint64_t addr, bool
             if (core.IsInterrupted()) {
                 return false;
             }
-            if (std::chrono::steady_clock::now() >= deadline) {
+            if (deadline.Expired()) {
                 break;
             }
         }

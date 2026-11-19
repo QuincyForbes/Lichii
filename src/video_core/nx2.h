@@ -780,4 +780,77 @@ inline void Nx2NoteSyncpointSignal(u32 id, u32 new_value) {
     }
 }
 
+/// GPU address ranges whose memory went away or now shows other memory (nx2:gpu 102 destroy, 213
+/// unmap, 215 sparse region destroy, a 211 map over a different mapping, nvhost-as unmaps), noted
+/// when the service call is made, before the game can reuse the memory. A queued command list
+/// whose entry lies in such a range must not be read from memory again: the game freed it
+/// because, on the console, the GPU had long run it (the GPU thread runs frames behind), and the
+/// memory may already hold heap data (Ocarina of Time entering Kokiri Forest). Changes the game
+/// makes to memory it keeps are not noted, so lists it patches after submitting still refresh.
+class Nx2CommandMemoryReleases {
+public:
+    using Range = std::pair<u64, u64>; ///< [first, second)
+
+    static Nx2CommandMemoryReleases& Get() {
+        static Nx2CommandMemoryReleases releases;
+        return releases;
+    }
+
+    /// EDEN_NX2_RELEASED_LISTS=0: off (queued lists are read again whatever happened to them).
+    static bool Enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_RELEASED_LISTS");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
+
+    [[nodiscard]] u64 Generation() const {
+        return generation.load(std::memory_order_acquire);
+    }
+
+    void Note(u64 address, u64 size) {
+        if (size == 0 || !Enabled()) {
+            return;
+        }
+        std::scoped_lock lk{mutex};
+        const u64 next = generation.load(std::memory_order_relaxed) + 1;
+        records[next % Capacity] = {next, {address, address + size}};
+        generation.store(next, std::memory_order_release);
+    }
+
+    /// The ranges noted after generation `since` (up to `now`) that overlap [low, high). False
+    /// when some of them were overwritten already (assume everything was released).
+    bool Collect(u64 since, u64 now, u64 low, u64 high, std::vector<Range>& out) {
+        out.clear();
+        if (now <= since) {
+            return true;
+        }
+        if (now - since > Capacity) {
+            return false;
+        }
+        std::scoped_lock lk{mutex};
+        for (u64 g = since + 1; g <= now; ++g) {
+            const Record& record = records[g % Capacity];
+            if (record.generation != g) {
+                return false;
+            }
+            if (record.range.first < high && low < record.range.second) {
+                out.push_back(record.range);
+            }
+        }
+        return true;
+    }
+
+private:
+    static constexpr u64 Capacity = 65536;
+    struct Record {
+        u64 generation;
+        Range range;
+    };
+    std::mutex mutex;
+    std::array<Record, Capacity> records{};
+    std::atomic<u64> generation{0};
+};
+
 } // namespace Tegra

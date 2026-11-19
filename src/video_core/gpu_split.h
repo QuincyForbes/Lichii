@@ -95,10 +95,25 @@ inline std::atomic<u64> g_back_idle_ns{};    ///< The back waited for the front 
 inline std::atomic<u64> g_back_idle_count{};
 inline std::atomic<u64> g_e2c_forwarded{};   ///< OoT 0xe2c calls whose read ran on the back
 inline std::atomic<u64> g_e2c_read_front{};  ///< OoT 0xe2c calls that read on the front
+// Running totals, never reset (MaybeReport resets the ones above): nx2:vi2's per-frame
+// "critical path" line takes differences of these every 600 presents.
+inline std::array<std::atomic<u64>, static_cast<size_t>(DrainSite::Count)> g_total_front_wait_ns{};
+inline std::atomic<u64> g_total_back_idle_ns{};
+/// Always counted (not only with EDEN_NX2_SPLIT_STATS): the renderer's present blocked the
+/// thread that composites (Vulkan GetRenderFrame, Metal nextDrawable), i.e. the GPU back.
+inline std::atomic<u64> g_total_present_block_ns{};
+inline std::atomic<u64> g_total_present_blocks{}; ///< Presents that blocked over 100 us
 inline void AddFrontWait(DrainSite site, u64 ns) {
     const auto index = static_cast<size_t>(site);
     g_front_wait_ns[index].fetch_add(ns, std::memory_order_relaxed);
     g_front_wait_count[index].fetch_add(1, std::memory_order_relaxed);
+    g_total_front_wait_ns[index].fetch_add(ns, std::memory_order_relaxed);
+}
+inline void AddPresentBlock(u64 ns) {
+    g_total_present_block_ns.fetch_add(ns, std::memory_order_relaxed);
+    if (ns > 100'000) {
+        g_total_present_blocks.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 /// Logs and resets the totals when 5 s have passed since the last report (the back thread).
 void MaybeReport();

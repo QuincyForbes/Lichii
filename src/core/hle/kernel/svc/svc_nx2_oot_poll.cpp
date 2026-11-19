@@ -101,6 +101,26 @@ s64 MaxSleepNs() {
     return ns;
 }
 
+// EDEN_NX2_OOT_POLL_SLICE=0: one sleep of the whole length (as before). Otherwise the sleep is
+// cut into slices of this many us (default 500, at least 100) and ends early once the request
+// ring moves (head or count) or the manager leaves state 3: what would have made the walk return
+// at once had it happened during the walk. The CPU saved stays the same, while a request added or
+// completed mid-sleep is picked up within one slice instead of up to 4 ms later.
+s64 SliceNs() {
+    static const s64 ns = [] {
+        const char* value = std::getenv("EDEN_NX2_OOT_POLL_SLICE");
+        if (value == nullptr || value[0] == 0) {
+            return s64{500'000};
+        }
+        const long long parsed = std::strtoll(value, nullptr, 10);
+        if (parsed <= 0) {
+            return s64{0};
+        }
+        return static_cast<s64>((std::max)(parsed, 100LL)) * 1000;
+    }();
+    return ns;
+}
+
 s64 NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -198,6 +218,7 @@ struct Stats {
     u64 calls{};
     u64 slept{};
     u64 measured{};
+    u64 woke_early{}; ///< Sliced sleeps that ended when the ring or the state changed
     s64 walk_ns{};
     s64 sleep_ns{};
     std::array<u64, static_cast<size_t>(Outcome::Count)> outcomes{};
@@ -229,11 +250,12 @@ void LogStats(const Stats& stats, s64 interval_ns) {
     const auto n = [&](Outcome o) { return stats.outcomes[static_cast<size_t>(o)]; };
     LOG_INFO(Kernel_SVC,
              "OoT resource poll backoff: {} walks in {:.1f} s ({:.0f}/s), {} slept (avg walk {} "
-             "us, avg sleep {} us); at once: {} issued loads, {} list changed, {} state, {} exit, "
-             "{} frame",
+             "us, avg sleep {} us, {} woke early); at once: {} issued loads, {} list changed, {} "
+             "state, {} exit, {} frame",
              stats.calls, secs, secs > 0 ? static_cast<double>(stats.calls) / secs : 0.0,
              stats.slept, stats.measured ? stats.walk_ns / static_cast<s64>(stats.measured) / 1000 : 0,
              stats.slept ? stats.sleep_ns / static_cast<s64>(stats.slept) / 1000 : 0,
+             stats.woke_early,
              n(Outcome::Progress), n(Outcome::ListChanged), n(Outcome::State), n(Outcome::Exit),
              n(Outcome::Frame));
 }
@@ -316,7 +338,31 @@ bool CallNx2OotPollBackoff(Core::System& system, u32 imm) {
     }
 
     if (sleep_ns > 0) {
-        SleepThread(system, sleep_ns);
+        const s64 slice = SliceNs();
+        if (slice == 0 || sleep_ns <= slice) {
+            SleepThread(system, sleep_ns);
+        } else {
+            // Ends at the planned time (not slice count) so preemption doesn't stretch it.
+            const s64 until = NowNs() + sleep_ns;
+            bool early = false;
+            for (s64 left = sleep_ns; left > 0; left = until - NowNs()) {
+                SleepThread(system, (std::min)(left, slice));
+                if (GetCurrentThread(kernel).IsTerminationRequested() ||
+                    !Valid(memory, view.manager, kCountOffset + 4)) {
+                    break;
+                }
+                if (memory.Read32(view.manager + kHeadOffset) != view.head ||
+                    memory.Read32(view.manager + kCountOffset) != view.count ||
+                    memory.Read32(view.manager + kStateOffset) != kStateWalking) {
+                    early = until - NowNs() > 0;
+                    break;
+                }
+            }
+            if (early) {
+                std::scoped_lock lock{g_mutex};
+                ++g_stats.woke_early;
+            }
+        }
         // The next walk starts now: remember when, and the ring it starts from.
         const u32 head = memory.Read32(view.manager + kHeadOffset);
         const u32 count = memory.Read32(view.manager + kCountOffset);

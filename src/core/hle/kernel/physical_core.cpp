@@ -22,6 +22,7 @@
 #include "common/perf_report.h"
 #include "common/perf_sched.h"
 #include "common/scope_exit.h"
+#include "common/spin_deadline.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/debugger/debugger.h"
@@ -321,12 +322,12 @@ void PhysicalCore::Idle(KernelCore& kernel) {
             const char* value = std::getenv("EDEN_NX2_IDLE_PAUSE");
             return value == nullptr || value[0] != '0';
         }();
-        const auto deadline = std::chrono::steady_clock::now() + spin;
+        const Common::SpinDeadline::Deadline deadline{spin};
         for (u32 iter = 1; !m_is_interrupted.load(std::memory_order_acquire); ++iter) {
 #if defined(_M_X64) || defined(__x86_64__)
             if (idle_pause) {
                 _mm_pause();
-                if ((iter & 63) == 0 && std::chrono::steady_clock::now() >= deadline) {
+                if ((iter & 63) == 0 && deadline.Expired()) {
                     break;
                 }
                 continue;
@@ -336,14 +337,14 @@ void PhysicalCore::Idle(KernelCore& kernel) {
             // aarch64; the YIELD instruction does nothing on Apple cores).
             if (idle_pause) {
                 __isb(0xF);
-                if ((iter & 63) == 0 && std::chrono::steady_clock::now() >= deadline) {
+                if ((iter & 63) == 0 && deadline.Expired()) {
                     break;
                 }
                 continue;
             }
 #endif
             std::this_thread::yield();
-            if (std::chrono::steady_clock::now() >= deadline) {
+            if (deadline.Expired()) {
                 break;
             }
         }
