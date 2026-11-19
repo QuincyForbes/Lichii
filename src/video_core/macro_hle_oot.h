@@ -31,6 +31,10 @@ namespace Tegra::OotMacros {
 //   void Fail(const char* e)  a failure the JIT would report after its effects so far
 //   u32 Read(u32 m) const     the front's copy of 3D register m
 //   bool OcclusionHle() const EDEN_NX2_OCCLUSION_HLE (0xe2c, see there)
+//   bool ForwardCompare(u32 p0)
+//                             0xe2c after its 154/155 writes: writes 158 = 6 without the read
+//                             and leaves the read and 556 = (words 0,1 != words 4,5) ? p0 ^ 1 :
+//                             p0 to the back, in ring order; false (nothing done) when it can't
 //   void FoldFirstInstance()  the next draw.end is an instance loop's first instance (no write;
 //                             DrawManager::FoldFirstInstance on the back, EDEN_NX2_FOLD_INSTANCE)
 
@@ -336,6 +340,12 @@ bool E2C(C& c) {
     }
     c.Emit(0x154, c.Param(1));
     c.Emit(0x155, c.Param(2));
+    // Nx2Perf dma_forward for this replacement: the read only feeds the last write, so the back
+    // can make both in ring order (only with exactly the three parameters: more would be read
+    // before the DMA words).
+    if (c.Count() == 3 && c.ForwardCompare(p0)) {
+        return true;
+    }
     c.Emit(0x158, 6);
     if (c.Count() < 9) {
         c.Fail("parameter FIFO underflow");

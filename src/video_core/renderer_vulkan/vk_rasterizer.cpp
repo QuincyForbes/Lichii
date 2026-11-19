@@ -348,6 +348,53 @@ bool CountDispatch(const Scheduler& scheduler, const Device& device, bool may_ch
     return true;
 }
 
+/// EDEN_NX2_MVK_POST_DISPATCH_BARRIER: after each guest dispatch (and its byte-addressed shadow
+/// copy-back), a full memory barrier from compute and transfer to every later stage. Vulkan only
+/// orders a dispatch's writes before the next render pass (COMPUTE -> ALL_GRAPHICS at
+/// BeginRenderPass) and before the next dispatch; MoltenVK maps those stage masks onto its own
+/// Metal barrier stages, and resources reached through argument buffers with a residency set are
+/// not hazard-tracked by Metal, so a gap there reads stale froxel/probe/luminance data (OoT's
+/// Kokiri Forest blew out on MoltenVK while the native Metal backend, whose encoders Metal
+/// orders, was right). Default on for MoltenVK; =0 off; =force on every driver (A/B). It also
+/// ends a dispatch chain (EDEN_NX2_DISPATCH_CHAIN), which is off by default.
+bool PostDispatchBarrierEnabled(const Device& device) {
+    static const int mode = [] {
+        const char* value = std::getenv("EDEN_NX2_MVK_POST_DISPATCH_BARRIER");
+        if (value != nullptr && value[0] == '0') {
+            return 0;
+        }
+        return value != nullptr && std::string_view{value} == "force" ? 2 : 1;
+    }();
+    const bool enabled = mode == 2 || (mode == 1 && device.IsMoltenVK());
+    static const bool logged = [enabled] {
+        LOG_INFO(Render_Vulkan, "Post-dispatch compute barrier (EDEN_NX2_MVK_POST_DISPATCH_BARRIER) {}",
+                 enabled ? "on" : "off");
+        return true;
+    }();
+    (void)logged;
+    return enabled;
+}
+
+void RecordPostDispatchBarrier(vk::CommandBuffer cmdbuf) {
+    static constexpr VkMemoryBarrier POST_BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                         VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+    };
+    // ALL_COMMANDS plus the explicit stages, so a translation that maps only individual
+    // stage bits still waits in the vertex, fragment, indirect and transfer stages.
+    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                               VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           0, POST_BARRIER);
+}
+
 bool DynamicStateCacheEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_DYNSTATE_CACHE");
@@ -2746,6 +2793,7 @@ void RasterizerVulkan::DispatchCompute() {
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
         const bool skip_barrier{CountDispatch(scheduler, device, !byte_addressed_shadow)};
         scheduler.Record([this, pipeline, byte_addressed_shadow, skip_barrier,
+                          post_barrier = PostDispatchBarrierEnabled(device),
                           indirect_buffer = buffer->Handle(),
                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
             if (!skip_barrier) {
@@ -2762,6 +2810,9 @@ void RasterizerVulkan::DispatchCompute() {
             });
             if (byte_addressed_shadow) {
                 TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
+            }
+            if (post_barrier) {
+                RecordPostDispatchBarrier(cmdbuf);
             }
         });
         if (!byte_addressed_shadow) {
@@ -2826,7 +2877,8 @@ void RasterizerVulkan::DispatchCompute() {
     const bool skip_barrier{CountDispatch(scheduler, device, plain_dispatch)};
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind),
                       barrier_recorded = can_replace || can_bilinear || skip_barrier, replacement,
-                      bilinear](vk::CommandBuffer cmdbuf) {
+                      bilinear,
+                      post_barrier = PostDispatchBarrierEnabled(device)](vk::CommandBuffer cmdbuf) {
         if (!barrier_recorded) {
             RecordDispatchBarrier(cmdbuf);
         }
@@ -2849,6 +2901,9 @@ void RasterizerVulkan::DispatchCompute() {
                                [&] { cmdbuf.Dispatch(dim[0], dim[1], dim[2]); });
         if (byte_addressed_shadow) {
             TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
+        }
+        if (post_barrier) {
+            RecordPostDispatchBarrier(cmdbuf);
         }
     });
     if (can_replace || can_bilinear || marking_effects) {

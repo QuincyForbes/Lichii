@@ -76,6 +76,34 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "macro dma dispatch", "fence writers", "list copy writers",
 };
 
+// EDEN_NX2_SPLIT_STATS=1: a cheap stall report, without the zone timers of EDEN_NX2_GPU_PROFILE.
+// Only waits are timed (two clock reads per wait). Every 5 s the back logs "GPU split stalls":
+// the front's waits for the back in ms/s per DrainSite (and for ring space), the back's idle
+// time waiting for the front in ms/s, and OoT 0xe2c calls forwarded to the back.
+namespace SplitStats {
+[[nodiscard]] inline bool Enabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_SPLIT_STATS");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+inline std::array<std::atomic<u64>, static_cast<size_t>(DrainSite::Count)> g_front_wait_ns{};
+inline std::array<std::atomic<u64>, static_cast<size_t>(DrainSite::Count)> g_front_wait_count{};
+inline std::atomic<u64> g_ring_full_ns{};    ///< The front waited for ring space
+inline std::atomic<u64> g_back_idle_ns{};    ///< The back waited for the front (empty ring)
+inline std::atomic<u64> g_back_idle_count{};
+inline std::atomic<u64> g_e2c_forwarded{};   ///< OoT 0xe2c calls whose read ran on the back
+inline std::atomic<u64> g_e2c_read_front{};  ///< OoT 0xe2c calls that read on the front
+inline void AddFrontWait(DrainSite site, u64 ns) {
+    const auto index = static_cast<size_t>(site);
+    g_front_wait_ns[index].fetch_add(ns, std::memory_order_relaxed);
+    g_front_wait_count[index].fetch_add(1, std::memory_order_relaxed);
+}
+/// Logs and resets the totals when 5 s have passed since the last report (the back thread).
+void MaybeReport();
+} // namespace SplitStats
+
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
 // CPU's commands, parses command lists and runs the puller; engine method calls and everything
 // behind them (register state, macros, draws, the rasterizer and its caches) run in order on a

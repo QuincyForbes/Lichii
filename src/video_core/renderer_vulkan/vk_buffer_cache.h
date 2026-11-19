@@ -431,6 +431,13 @@ private:
     u64 written_in_order_serial{};
     void NoteInOrderWrite(VkBuffer buffer);
     [[nodiscard]] bool WrittenInOrder(VkBuffer buffer) const;
+    /// Buffers copies recorded in order (or before the pass) wrote in the current submission:
+    /// an upload into one of them can't be reordered to the submission's start, ahead of that
+    /// copy (EDEN_NX2_UPLOAD_INORDER_GUARD; the Metal runtime's Scheduler::UsedInOrder).
+    boost::container::small_vector<VkBuffer, 16> written_in_tick;
+    u64 written_in_tick_tick{~u64{}};
+    void NoteTickWrite(VkBuffer buffer);
+    [[nodiscard]] bool WrittenInTick(VkBuffer buffer) const;
 
     std::shared_ptr<QuadArrayIndexBuffer> quad_array_index_buffer;
     std::shared_ptr<QuadStripIndexBuffer> quad_strip_index_buffer;

@@ -324,6 +324,13 @@ private:
     /// Counts the draw PrepareDraw skipped.
     void NoteUnprepared();
 
+    /// Counts a draw of nothing (Coverage::Path::Empty); with EDEN_NX2_METAL_DRAW_TRACE=1 logs
+    /// `why` with the draw's programs and counts, once per pipeline and cause (64 at most).
+    void NoteEmptyDraw(std::string_view why);
+
+    /// Logs the task draws of task_traces whose command buffers are done.
+    void PollTaskTraces();
+
     /// While a condition is decided on the GPU (gpu_condition): whether the condition holds, read
     /// on the CPU after waiting for the reports it reads (work the kernel can't skip: clears,
     /// indirect, mesh and tessellated draws). True otherwise.
@@ -669,8 +676,39 @@ private:
     u64 draws_converted{};
     u64 mesh_draws{};
     u64 mesh_groups{};
+    /// EDEN_NX2_METAL_DRAW_SCRATCH: PrepareDraw's per-draw lists, their storage kept between
+    /// draws (a nested PrepareDraw finds them taken and allocates its own).
+    struct DrawScratch {
+        std::vector<VideoCommon::ImageViewInOut> views;
+        std::vector<VideoCommon::SamplerId> samplers;
+        std::vector<u32> sampler_handles;
+        std::vector<u32> binding_kinds;
+        std::array<std::vector<Binding>, 5> stage_bindings;
+    } draw_scratch;
     /// Why PrepareDraw skipped the draw; empty for a draw of nothing.
     std::string_view prepare_refusal;
+    /// Why PrepareDraw skipped a draw of nothing, when it says (EDEN_NX2_METAL_DRAW_TRACE).
+    const char* prepare_empty_why{};
+    /// The instance count the current draw was asked for (EDEN_NX2_METAL_DRAW_TRACE's logs).
+    u32 trace_instances{};
+    /// EDEN_NX2_METAL_DRAW_TRACE: emulated task draws whose distribution arguments and task
+    /// counts are read back from their staging memory once their command buffer is done.
+    struct TaskTrace {
+        u64 pipeline;
+        u64 task;
+        u64 mesh;
+        u64 pixel;
+        u64 tick;
+        const u32* args;
+        const u32* payload;
+        u32 groups;
+        u32 payload_words;
+        u32 depth_func;
+        u32 depth_write;
+        u32 width;
+        u32 height;
+    };
+    std::vector<TaskTrace> task_traces;
     /// DrawMayBeSkipped's answer, while skip_valid (reset by every draw).
     bool skip_valid{};
     bool skip_decision{};

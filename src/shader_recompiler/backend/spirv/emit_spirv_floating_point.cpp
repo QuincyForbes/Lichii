@@ -20,6 +20,22 @@ Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
     return op;
 }
 
+/// Profile::fp_contraction_in_fragment_compute: the stage may contract this program's operations.
+bool ContractionAllowed(const EmitContext& ctx) {
+    return ctx.profile.fp_contraction_in_fragment_compute &&
+           (ctx.stage == Stage::Fragment || ctx.stage == Stage::Compute);
+}
+
+/// Profile::fp_no_contraction_as_fma: a NoContraction operation written as a single fma.
+bool NoContractionAsFma(const EmitContext& ctx, IR::Inst* inst) {
+    return ctx.profile.fp_no_contraction_as_fma && inst->Flags<IR::FpControl>().no_contraction &&
+           !ContractionAllowed(ctx);
+}
+
+Id DecorateUnlessContracting(EmitContext& ctx, IR::Inst* inst, Id op) {
+    return ContractionAllowed(ctx) ? op : Decorate(ctx, inst, op);
+}
+
 // Maxwell's FMNMX and .SAT return the non-NaN operand (NaN saturates to 0). FMin/FMax/FClamp leave
 // NaN undefined and AMD's Windows compiler passes it through, so use the NaN-defined N variants.
 Id Clamp(EmitContext& ctx, Id type, Id value, Id zero, Id one) {
@@ -62,11 +78,17 @@ Id EmitFPAbs64(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPAdd16(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFAdd(ctx.F16[1], a, b));
+    if (NoContractionAsFma(ctx, inst)) {
+        return ctx.OpFma(ctx.F16[1], ctx.Constant(ctx.F16[1], u16{0x3c00}), a, b);
+    }
+    return DecorateUnlessContracting(ctx, inst, ctx.OpFAdd(ctx.F16[1], a, b));
 }
 
 Id EmitFPAdd32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFAdd(ctx.F32[1], a, b));
+    if (NoContractionAsFma(ctx, inst)) {
+        return ctx.OpFma(ctx.F32[1], ctx.Const(1.0f), a, b);
+    }
+    return DecorateUnlessContracting(ctx, inst, ctx.OpFAdd(ctx.F32[1], a, b));
 }
 
 Id EmitFPAdd64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
@@ -74,11 +96,11 @@ Id EmitFPAdd64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
 }
 
 Id EmitFPFma16(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
-    return Decorate(ctx, inst, ctx.OpFma(ctx.F16[1], a, b, c));
+    return DecorateUnlessContracting(ctx, inst, ctx.OpFma(ctx.F16[1], a, b, c));
 }
 
 Id EmitFPFma32(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
-    return Decorate(ctx, inst, ctx.OpFma(ctx.F32[1], a, b, c));
+    return DecorateUnlessContracting(ctx, inst, ctx.OpFma(ctx.F32[1], a, b, c));
 }
 
 Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
@@ -101,12 +123,20 @@ Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
     return ctx.OpNMin(ctx.F64[1], a, b);
 }
 
+// fma(a, b, +0) as SPIRV-Cross's own spvFMul: a -0 product becomes +0, and with signed zeros
+// preserved the compiler may not fold it back into a multiply it could contract (-0 would let it).
 Id EmitFPMul16(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFMul(ctx.F16[1], a, b));
+    if (NoContractionAsFma(ctx, inst)) {
+        return ctx.OpFma(ctx.F16[1], a, b, ctx.Constant(ctx.F16[1], u16{0}));
+    }
+    return DecorateUnlessContracting(ctx, inst, ctx.OpFMul(ctx.F16[1], a, b));
 }
 
 Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFMul(ctx.F32[1], a, b));
+    if (NoContractionAsFma(ctx, inst)) {
+        return ctx.OpFma(ctx.F32[1], a, b, ctx.Const(0.0f));
+    }
+    return DecorateUnlessContracting(ctx, inst, ctx.OpFMul(ctx.F32[1], a, b));
 }
 
 Id EmitFPMul64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {

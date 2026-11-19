@@ -690,12 +690,29 @@ void BufferCacheRuntime::Finish() {
     scheduler.Finish();
 }
 
+namespace {
+/// EDEN_NX2_UPLOAD_INORDER_GUARD (default on, =0 off): uploads stay behind in-order copies of
+/// the same bytes recorded earlier in the submission.
+bool UploadInOrderGuardEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_UPLOAD_INORDER_GUARD");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+} // Anonymous namespace
+
 bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
                                           std::span<const VideoCommon::BufferCopy> copies) {
     if (Settings::values.disable_buffer_reorder) {
         return false;
     }
     upload_before_pass = false;
+    if (WrittenInTick(buffer.Handle())) {
+        // An in-order copy into this buffer is already recorded in this submission: the upload
+        // must land after it, not at the submission's start (stale bytes would win).
+        return false;
+    }
     if (buffer.LastUsageTick() != scheduler.CurrentTick()) {
         buffer.ResetUsageTracking();
         return true;
@@ -712,6 +729,16 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
             return buffer.IsRegionUsedSince(scheduler.BeforePassSerial(), copy.dst_offset,
                                             copy.size);
         });
+    if (!can_use_upload_cmdbuf && UploadInOrderGuardEnabled()) {
+        // These copies run in order. Mark every one of them used: a copy of the batch whose own
+        // region was unused would otherwise let a later upload of the same bytes be reordered
+        // to the submission's start, ahead of it, and this copy's older bytes would win. The
+        // caller's buffer is not const (BufferCache::UploadMemory / InlineMemoryImplementation).
+        auto& mutable_buffer = const_cast<Buffer&>(buffer);
+        for (const VideoCommon::BufferCopy& copy : copies) {
+            mutable_buffer.MarkUsage(copy.dst_offset, copy.size);
+        }
+    }
     return can_use_upload_cmdbuf;
 }
 
@@ -743,6 +770,10 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
             upload_cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
         });
         return;
+    }
+    if (can_reorder_upload) {
+        // Reorderable, but its staging isn't the stream buffer: it runs in order, unmarked.
+        NoteTickWrite(dst_buffer);
     }
     if (std::exchange(upload_before_pass, false) && !can_reorder_upload &&
         scheduler.CanRecordBeforePass() && !WrittenInOrder(dst_buffer)) {
@@ -791,6 +822,25 @@ void BufferCacheRuntime::NoteInOrderWrite(VkBuffer buffer) {
     if (std::ranges::find(written_in_order, buffer) == written_in_order.end()) {
         written_in_order.push_back(buffer);
     }
+}
+
+void BufferCacheRuntime::NoteTickWrite(VkBuffer buffer) {
+    if (!UploadInOrderGuardEnabled()) {
+        return;
+    }
+    const u64 tick = scheduler.CurrentTick();
+    if (written_in_tick_tick != tick) {
+        written_in_tick_tick = tick;
+        written_in_tick.clear();
+    }
+    if (std::ranges::find(written_in_tick, buffer) == written_in_tick.end()) {
+        written_in_tick.push_back(buffer);
+    }
+}
+
+bool BufferCacheRuntime::WrittenInTick(VkBuffer buffer) const {
+    return UploadInOrderGuardEnabled() && written_in_tick_tick == scheduler.CurrentTick() &&
+           std::ranges::find(written_in_tick, buffer) != written_in_tick.end();
 }
 
 bool BufferCacheRuntime::WrittenInOrder(VkBuffer buffer) const {

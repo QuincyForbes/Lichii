@@ -2546,7 +2546,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             borrowed = {};
         }
         if (replacement == OotMacros::Id::None ||
-            !FrontRunOotMacro(split, fs, method, replacement)) {
+            !FrontRunOotMacro(system, split, fs, method, replacement)) {
 #ifdef ARCHITECTURE_x86_64
             if (!engine.native_jit) {
                 engine.native_jit = std::make_shared<TuringMacroJit>();
@@ -3815,6 +3815,7 @@ void Maxwell3D::FinishFrontMacro(Core::System& system) {
 
 struct Maxwell3D::OotContext {
     Maxwell3D& engine;
+    Core::System& system;
     VideoCommon::GpuSplit& split;
     FrontState& fs;
     u32 macro_method;
@@ -3828,11 +3829,97 @@ struct Maxwell3D::OotContext {
     [[nodiscard]] u32* Dram() {
         return engine.native_data_ram.data();
     }
-    [[nodiscard]] u32 Read(u32 method) const {
-        return method < Regs::NUM_REGS ? fs.regs[method] : 0U;
+    [[nodiscard]] u32 Read(u32 method) {
+        if (method >= Regs::NUM_REGS) {
+            return 0U;
+        }
+        // A register the back writes from words the front never read (dma_forward, and
+        // ForwardCompare below): take the back's value first, as the JIT's reads do.
+        if (fs.unknown_count != 0 && fs.unknown_regs[method]) [[unlikely]] {
+            fs.Learn(engine, split, method);
+        }
+        return fs.regs[method];
     }
     [[nodiscard]] bool OcclusionHle() const {
         return false;
+    }
+    // Nx2Perf dma_forward (EDEN_NX2_OOT_E2C_FORWARD=1 turns this on): 0xe2c's MME DMA read
+    // of two 64-bit query results only decides its last write, render_enable.mode. Waiting for
+    // the back to reach the read was most of the front's time in Ocarina (the macro runs ~35,000
+    // times a second, each read waits for the GPU work before it). The front sends 158 = 6 as
+    // the JIT would and does not read; a deferred call reads the six words on the back in ring
+    // order, after the flushes the drained read makes (buffer cache, query results: what
+    // FrontDmaRead's drained path and the x86 dma_forward path read), and writes 556 there.
+    // render_enable.mode is then unknown to the front (a later write or read takes it from the
+    // back, FrontWrite / Read). Not in shadow RAM replay (the back would write the shadow copy),
+    // nor while a diagnostic needs the front's read (macro dumps, CMDPAGE_DIAG, QUERY_DMA_TRACE,
+    // EDEN_NX2_PERF_VERIFY, EDEN_NX2_MACRO_DMA_DRAIN).
+    bool ForwardCompare(u32 p0) {
+        // 0 = off (default), 1 = on, 2 = on with the deferred call classed Effect::None. Off by
+        // default: on Vulkan it hung entering Kokiri Forest (a present fence never reached),
+        // and on Metal the front's waits only moved to list and fence writers (no fps change).
+        static const int mode = [] {
+            const char* const value = std::getenv("EDEN_NX2_OOT_E2C_FORWARD");
+            if (std::getenv("EDEN_NX2_MACRO_DMA_DRAIN") != nullptr) {
+                return 0;
+            }
+            return value == nullptr ? 0 : value[0] == '2' ? 2 : value[0] != '0' ? 1 : 0;
+        }();
+        const bool allowed = mode != 0;
+        if (!allowed || !VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::DmaForward) ||
+            VideoCommon::Nx2Perf::Verify() || fs.oot_log_call ||
+            fs.control == Regs::ShadowRamControl::Replay || Tegra::Nx2CmdPageDiag::g_enabled ||
+            VideoCommon::QueryDma::TraceEnabled()) [[unlikely]] {
+            if (VideoCommon::SplitStats::Enabled()) [[unlikely]] {
+                VideoCommon::SplitStats::g_e2c_read_front.fetch_add(1, std::memory_order_relaxed);
+            }
+            return false;
+        }
+        constexpr u32 render_enable_mode = MAXWELL3D_REG_INDEX(render_enable.mode);
+        // As FrontDmaRead: instances counted into the last draw go out before the read.
+        if (fs.pending_instances != 0) [[unlikely]] {
+            const u32 more = std::exchange(fs.pending_instances, 0);
+            split.Defer([maxwell3d = &engine,
+                         more] { maxwell3d->draw_manager.draw_state.instance_count += more; },
+                        VideoCommon::GpuSplit::Effect::Gpu);
+        }
+        engine.FrontWrite(split, fs, 0x158, 6, true, true);
+        VideoCommon::Nx2Profile::CountDmaRead(macro_method);
+        struct CompareOnBack {
+            Maxwell3D* engine;
+            Core::System* system;
+            GPUVAddr source;
+            u32 p0;
+            void operator()() const {
+                constexpr u32 words = 6;
+                constexpr size_t bytes = words * sizeof(u32);
+                auto& memory = engine->memory_manager;
+                if (memory.IsMemoryDirty(source, bytes, VideoCommon::CacheType::BufferCache)) {
+                    memory.FlushRegion(source, bytes, VideoCommon::CacheType::BufferCache);
+                }
+                memory.FlushQueryResults(source, bytes);
+                std::array<u32, words> read{};
+                memory.ReadWordsUnsafe(source, read.data(), words);
+                const u32 differ = (read[0] ^ read[4]) | (read[1] ^ read[5]);
+                engine->ConsumeSink(*system);
+                engine->CallMethod(*system, render_enable_mode, differ != 0 ? (p0 ^ 1) : p0,
+                                   true);
+            }
+        };
+        // The read's address as FrontDmaRead takes it, from the 154/155 just written.
+        const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
+        // Effect::Unknown, as the x86 dma_forward call: the flushes write guest memory, so later
+        // early reads wait for this entry. Mode 2 (experiment) classes it None: the flushes only
+        // write back GPU-written buffer bytes and reports, pages early reads refuse or check as
+        // async writes anyway.
+        split.Defer(CompareOnBack{&engine, &system, source, p0},
+                    mode == 2 ? VideoCommon::GpuSplit::Effect::None
+                              : VideoCommon::GpuSplit::Effect::Unknown);
+        fs.MarkUnknown(render_enable_mode);
+        if (VideoCommon::SplitStats::Enabled()) [[unlikely]] {
+            VideoCommon::SplitStats::g_e2c_forwarded.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
     }
     void FoldFirstInstance() {
         static const bool enabled = [] {
@@ -3899,10 +3986,10 @@ struct Maxwell3D::OotContext {
     }
 };
 
-bool Maxwell3D::FrontRunOotMacro(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
-                                 OotMacros::Id id) {
+bool Maxwell3D::FrontRunOotMacro(Core::System& system, VideoCommon::GpuSplit& split,
+                                 FrontState& fs, u32 method, OotMacros::Id id) {
     static_assert(sizeof(native_data_ram) == OotMacros::DataRamWords * sizeof(u32));
-    OotContext context{*this, split, fs, method};
+    OotContext context{*this, system, split, fs, method};
     return OotMacros::Run(id, context);
 }
 

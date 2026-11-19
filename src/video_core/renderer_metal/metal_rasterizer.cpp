@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -68,6 +69,57 @@
 namespace Metal {
 
 namespace {
+
+// EDEN_NX2_METAL_DRAW_SCRATCH=0: PrepareDraw allocates its per-draw lists afresh each draw.
+bool DrawScratchEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_DRAW_SCRATCH");
+        const bool on = value == nullptr || value[0] != '0';
+        LOG_INFO(Render_Metal, "Metal: per-draw lists reuse their storage: {} "
+                               "(EDEN_NX2_METAL_DRAW_SCRATCH)",
+                 on ? "on" : "off");
+        return on;
+    }();
+    return enabled;
+}
+
+template <typename T>
+void ClearScratch(std::vector<T>& list) {
+    list.clear();
+}
+
+template <typename T, size_t N>
+void ClearScratch(std::array<std::vector<T>, N>& lists) {
+    for (std::vector<T>& list : lists) {
+        list.clear();
+    }
+}
+
+/// A list taken from `pool` for one PrepareDraw (empty, with the pool's storage) and given
+/// back, emptied, when it ends. A nested one finds the pool taken and starts with nothing.
+template <typename T>
+class ScratchList {
+public:
+    explicit ScratchList(T& pool_) : pool{DrawScratchEnabled() ? &pool_ : nullptr} {
+        if (pool != nullptr) {
+            std::swap(value, *pool);
+            ClearScratch(value);
+        }
+    }
+    ~ScratchList() {
+        if (pool != nullptr) {
+            ClearScratch(value);
+            std::swap(value, *pool);
+        }
+    }
+    ScratchList(const ScratchList&) = delete;
+    ScratchList& operator=(const ScratchList&) = delete;
+
+    T value{};
+
+private:
+    T* pool;
+};
 
 /// IEEE half precision, rounded to nearest (tessellation factors are halves; 0..64 here).
 [[nodiscard]] u16 FloatToHalf(float value) {
@@ -577,9 +629,102 @@ void RasterizerMetal::FlushWork() {
     }
 }
 
+namespace {
+
+/// EDEN_NX2_METAL_DRAW_TRACE=1 (off by default): logs, once per pipeline, the draws into the
+/// scene's targets that test depth EQUAL or LEQUAL without writing it (a colour pass over a depth
+/// pre-pass), every task pipeline's draws past the first 24, and each draw of nothing with why.
+bool DrawTraceEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_DRAW_TRACE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+/// Whether `key` is logged for the first time in `list` (64 keys at most).
+bool DrawTraceFirst(int list, u64 key) {
+    static std::mutex mutex;
+    static std::array<std::vector<u64>, 2> keys;
+    std::scoped_lock lock{mutex};
+    std::vector<u64>& logged = keys[static_cast<size_t>(list)];
+    if (logged.size() >= 64 || std::ranges::find(logged, key) != logged.end()) {
+        return false;
+    }
+    logged.push_back(key);
+    return true;
+}
+
+} // Anonymous namespace
+
+void RasterizerMetal::NoteEmptyDraw(std::string_view why) {
+    Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+    if (!DrawTraceEnabled() || maxwell3d == nullptr) {
+        return;
+    }
+    const auto& hashes = pipeline_cache.LookupHashes();
+    const u64 key = Common::CityHash64(reinterpret_cast<const char*>(hashes.data()),
+                                       sizeof(hashes)) ^
+                    Common::CityHash64(why.data(), why.size());
+    if (!DrawTraceFirst(0, key)) {
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    LOG_WARNING(Render_Metal,
+                "Metal: draw trace: empty draw ({}): {}; mesh {}, indexed {}, vertices {} from {}, "
+                "indices {} from {}, base vertex {}, instances {} (state {}) from {}, depth test "
+                "{} func {:#x} write {}, {}x{} target",
+                why, DescribeDraw(), regs.IsMeshEnabled(), draw_state.draw_indexed,
+                draw_state.vertex_buffer.count, draw_state.vertex_buffer.first,
+                draw_state.index_buffer.count, draw_state.index_buffer.first,
+                draw_state.base_index, trace_instances, draw_state.instance_count,
+                draw_state.base_instance, regs.depth_test_enable,
+                static_cast<u32>(regs.depth_test_func), regs.depth_write_enabled,
+                regs.surface_clip.width, regs.surface_clip.height);
+}
+
+void RasterizerMetal::PollTaskTraces() {
+    namespace SPIRV = Shader::Backend::SPIRV;
+    std::erase_if(task_traces, [this](const TaskTrace& trace) {
+        if (!scheduler.IsFree(trace.tick)) {
+            return false;
+        }
+        // Best effort: the staging memory is read before this thread streams into it again.
+        const u32* const args = trace.args;
+        u64 asked = 0;
+        u32 asking = 0;
+        u32 most = 0;
+        for (u32 task = 0; trace.payload_words >= 2 && task < trace.groups; ++task) {
+            const u32 count = trace.payload[u64{task} * trace.payload_words + 1];
+            asked += count;
+            asking += count != 0 ? 1 : 0;
+            most = (std::max)(most, count);
+        }
+        LOG_WARNING(Render_Metal,
+                    "Metal: draw trace: task draw {:016x} (task {:016x}, mesh {:016x}, pixel "
+                    "{:016x}, depth func {:#x} write {}, {}x{}): {} task groups, {} of them asked "
+                    "for {} mesh groups (most {}); distribution: dispatch {} {} {}, requested {}, "
+                    "draw {} vertices x {} from {} base {}, arena word {}, tasks {}",
+                    trace.pipeline, trace.task, trace.mesh, trace.pixel, trace.depth_func,
+                    trace.depth_write, trace.width, trace.height, trace.groups, asking, asked,
+                    most, args[0], args[1], args[2], args[SPIRV::MESH_EMULATION_ARGS_REQUESTED],
+                    args[SPIRV::MESH_EMULATION_DRAW_ARGS_OFFSET / 4],
+                    args[SPIRV::MESH_EMULATION_DRAW_ARGS_OFFSET / 4 + 1],
+                    args[SPIRV::MESH_EMULATION_DRAW_ARGS_OFFSET / 4 + 2],
+                    args[SPIRV::MESH_EMULATION_DRAW_ARGS_OFFSET / 4 + 3],
+                    args[SPIRV::MESH_EMULATION_ARGS_BASE], args[SPIRV::MESH_EMULATION_ARGS_TASKS]);
+        return true;
+    });
+}
+
 void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     ++draws;
     skip_valid = false;
+    trace_instances = instance_count;
+    if (!task_traces.empty()) {
+        PollTaskTraces();
+    }
     // Cores waiting for a flush are served after each draw, as on Vulkan, not only when the
     // command list ends.
     SCOPE_EXIT {
@@ -636,7 +781,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     }
     if ((pipeline->IsMeshPipeline() || pipeline->Tess() != nullptr) && !ConditionHoldsOnCpu()) {
         // Their kernels run whatever the condition: it is decided on the CPU.
-        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        NoteEmptyDraw("mesh or tessellated draw under a condition false on the CPU");
         return;
     }
     if (pipeline->Geo() != nullptr) {
@@ -652,7 +797,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         const u32 groups = is_indexed ? draw_state.index_buffer.count
                                       : draw_state.vertex_buffer.count;
         if (groups == 0) {
-            Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+            NoteEmptyDraw("mesh draw of 0 workgroups");
             return;
         }
         DrawMesh(*pipeline, is_indexed, MeshGroups{.count = groups});
@@ -704,7 +849,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     u32 converted =
         convert ? IndexConvert::ConvertedCount(DrawTopology(*maxwell3d), count, provoking_last) : 0U;
     if (convert && converted == 0) {
-        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        NoteEmptyDraw("draw whose converted index count is 0");
         return;
     }
     gpu_memory->FlushCaching();
@@ -742,7 +887,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     // it can zero; else the CPU's answer.
     const bool under_condition = gpu_condition.active && PrepareConditionRegion();
     if (gpu_condition.active && !under_condition && !ConditionHoldsOnCpu()) {
-        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        NoteEmptyDraw("draw under a condition false on the CPU");
         return;
     }
     PrepareXfbDraw(*pipeline, is_indexed, instance_count);
@@ -1016,7 +1161,7 @@ bool RasterizerMetal::DrawMesh(GraphicsPipeline& pipeline, bool is_indexed,
 void RasterizerMetal::DrawTessellated(GraphicsPipeline& pipeline, bool is_indexed,
                                        TessellationDraw& tess_draw) {
     if (tess_draw.count == 0 || tess_draw.instances == 0) {
-        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        NoteEmptyDraw("tessellated draw of 0 vertices or instances");
         return;
     }
     gpu_memory->FlushCaching();
@@ -1130,7 +1275,7 @@ void RasterizerMetal::DrawMeshIndirect(GraphicsPipeline& pipeline) {
     for (size_t draw = 0; draw < count; ++draw) {
         const u32 groups = read_word(params.indirect_start_address + draw * stride);
         if (groups == 0) {
-            Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+            NoteEmptyDraw("indirect mesh record of 0 workgroups (read on the CPU)");
             continue;
         }
         DrawMesh(pipeline, params.is_indexed, MeshGroups{.count = groups});
@@ -1302,7 +1447,7 @@ bool RasterizerMetal::DrawMeshTasksFromGpu(DAddr count_addr) {
     }
     if (!ConditionHoldsOnCpu()) {
         // As Draw: a mesh draw's condition is decided on the CPU.
-        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        NoteEmptyDraw("mesh draw counted on the GPU under a condition false on the CPU");
         return true;
     }
     std::optional<u32> slot;
@@ -1936,6 +2081,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         tess_geo ? &geo->kernel.program : nullptr,
         native != nullptr ? &native->fragment : &pipeline.Fragment()};
     prepare_refusal = {};
+    prepare_empty_why = nullptr;
     if (tess != nullptr && tess_draw == nullptr) {
         prepare_refusal = "tessellated draw without its vertex count";
         return false;
@@ -1969,15 +2115,20 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     buffer_cache.SetUniformBuffersState(uniform_masks, &uniform_buffer_sizes);
 
     // Storage buffers, and every texture and image handle, as OpenGL's ConfigureImpl reads them.
-    std::vector<VideoCommon::ImageViewInOut> views;
-    std::vector<VideoCommon::SamplerId> samplers;
+    // EDEN_NX2_METAL_DRAW_SCRATCH: in the storage the draw before used.
+    ScratchList scratch_views{draw_scratch.views};
+    ScratchList scratch_samplers{draw_scratch.samplers};
+    ScratchList scratch_sampler_handles{draw_scratch.sampler_handles};
+    ScratchList scratch_binding_kinds{draw_scratch.binding_kinds};
+    std::vector<VideoCommon::ImageViewInOut>& views = scratch_views.value;
+    std::vector<VideoCommon::SamplerId>& samplers = scratch_samplers.value;
     std::array<size_t, 5> first_view{};
     std::array<size_t, 5> first_sampler{};
     // EDEN_NX2_BINDMEMO: the sampler handles and binding kinds, to look the bindings up in the
     // texture cache's memo.
     const bool use_bind_memo = BindMemo::Enabled();
-    std::vector<u32> sampler_handles;
-    std::vector<u32> binding_kinds;
+    std::vector<u32>& sampler_handles = scratch_sampler_handles.value;
+    std::vector<u32>& binding_kinds = scratch_binding_kinds.value;
     const bool via_header_index = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
     for (size_t index = 0; index < stages.size(); ++index) {
         first_view[index] = views.size();
@@ -2189,7 +2340,8 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
 
     // Each stage's buffer bindings, and texel buffer views (copies of misaligned ranges go
     // before the render pass).
-    std::array<std::vector<Binding>, 5> stage_bindings;
+    ScratchList scratch_stage_bindings{draw_scratch.stage_bindings};
+    std::array<std::vector<Binding>, 5>& stage_bindings = scratch_stage_bindings.value;
     std::array<std::vector<TextureHandle>, 5> texel_views;
     for (size_t index = 0; index < stages.size(); ++index) {
         if (absent(index)) {
@@ -2284,6 +2436,53 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     // A tessellation pipeline's vertex kernel reads the vertex layout as stage-in data; its
     // post-tessellation vertex function reads buffers.
     const RenderPipelineDesc layout_desc = state_desc;
+    if (DrawTraceEnabled() && regs.depth_test_enable != 0 && regs.depth_write_enabled == 0 &&
+        targets.has_depth && targets.width >= 1280 && targets.width > targets.height) {
+        // A colour pass over a depth pre-pass into the scene's targets (EQUAL or LEQUAL, D3D
+        // or GL numbering), once per pipeline.
+        const u32 func = static_cast<u32>(regs.depth_test_func);
+        if ((func == 3 || func == 4 || func == 0x202 || func == 0x203) &&
+            DrawTraceFirst(1, pipeline.Key().Hash())) {
+            const auto& draw_state = maxwell3d->draw_manager.draw_state;
+            const auto& hashes = pipeline.Key().unique_hashes;
+            std::string masks;
+            for (size_t rt = 0; rt < Maxwell::NumRenderTargets; ++rt) {
+                masks += fmt::format("{}{:04x}", rt == 0 ? "" : " ", regs.color_mask[rt].raw);
+            }
+            const auto& transform = regs.viewport_transform[0];
+            LOG_WARNING(
+                Render_Metal,
+                "Metal: draw trace: scene draw {:016x} (vertex {:016x}, control {:016x}, eval "
+                "{:016x}, geometry/mesh {:016x}, pixel {:016x}; {}{}): topology {:#x}, indexed {}, "
+                "vertices {} from {}, indices {} from {}, base vertex {}, instances {} (state {}) "
+                "from {}, mesh groups {}, from GPU memory: indirect {} grid {} mesh {}; depth func "
+                "{:#x} write 0, bias {} {}/{}/{}, mode {:#x} clip {:#x}, viewport z {}+{}; cull {} "
+                "face {:#x} front {:#x}, rasterize {}, alpha test {} func {:#x}, masks (common "
+                "{}) {}, blend per target {} enable0 {}; {}x{}; {}",
+                pipeline.Key().Hash(), hashes[0] != 0 ? hashes[0] : hashes[1], hashes[2],
+                hashes[3], hashes[4], hashes[5],
+                native != nullptr ? "native mesh"
+                : mesh != nullptr ? "emulated mesh"
+                : tess != nullptr ? "tessellated"
+                : geo != nullptr  ? "geometry kernel"
+                                  : "vertex",
+                has_task ? " with task" : "", static_cast<u32>(topology), is_indexed,
+                draw_state.vertex_buffer.count, draw_state.vertex_buffer.first,
+                draw_state.index_buffer.count, draw_state.index_buffer.first,
+                draw_state.base_index, trace_instances, draw_state.instance_count,
+                draw_state.base_instance, mesh_workgroups, indirect_plan.wanted,
+                grid_draw.wanted, mesh_indirect.wanted, func,
+                regs.polygon_offset_fill_enable, regs.depth_bias, regs.slope_scale_depth_bias,
+                regs.depth_bias_clamp, static_cast<u32>(regs.depth_mode),
+                static_cast<u32>(regs.viewport_clip_control.geometry_clip.Value()),
+                transform.translate_z, transform.scale_z, regs.gl_cull_test_enabled,
+                static_cast<u32>(regs.gl_cull_face), static_cast<u32>(regs.gl_front_face),
+                regs.rasterize_enable, regs.alpha_test_enabled,
+                static_cast<u32>(regs.alpha_test_func), regs.color_mask_common, masks,
+                regs.blend_per_target_enabled, regs.blend.enable[0], targets.width,
+                targets.height, Describe(layout_desc));
+        }
+    }
     if (geo != nullptr) {
         // The render pass draws from the reader's buffer: no vertex streams.
         std::ranges::fill(state_desc.attributes, VertexAttributeState{});
@@ -2424,6 +2623,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             if (mesh_workgroups != 0) {
                 prepare_refusal = "mesh emulation kernel not built by Metal";
             }
+            prepare_empty_why = "mesh draw of 0 workgroups or a kernel not built";
             return false;
         }
         namespace SPIRV = Shader::Backend::SPIRV;
@@ -2442,6 +2642,41 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             mesh_buffers.payload = stream(u64{mesh_workgroups} * mesh->payload_stride * 4);
             mesh_buffers.offsets = stream(u64{mesh_workgroups} * 4);
             mesh_buffers.args = stream(SPIRV::MESH_EMULATION_ARGS_WORDS * 4);
+            if (DrawTraceEnabled()) {
+                // Each task pipeline's first 4 draws into a target, 256 at most.
+                static std::vector<std::pair<u64, u32>> traced;
+                static u32 total = 0;
+                if (!task_traces.empty()) {
+                    PollTaskTraces();
+                }
+                const u64 key = pipeline.Key().Hash() ^ (u64{targets.width} << 32) ^ targets.height;
+                auto it = std::ranges::find(traced, key, &std::pair<u64, u32>::first);
+                if (it == traced.end() && traced.size() < 256) {
+                    it = traced.insert(traced.end(), {key, 0U});
+                }
+                if (it != traced.end() && it->second < 4 && total < 256 &&
+                    !mesh_buffers.args.mapped_span.empty() &&
+                    !mesh_buffers.payload.mapped_span.empty()) {
+                    ++it->second;
+                    ++total;
+                    task_traces.push_back(TaskTrace{
+                        .pipeline = pipeline.Key().Hash(),
+                        .task = pipeline.Key().unique_hashes[1],
+                        .mesh = pipeline.Key().unique_hashes[mesh->mesh_stage + 1],
+                        .pixel = pipeline.Key().unique_hashes[5],
+                        .tick = scheduler.CurrentTick(),
+                        .args = reinterpret_cast<const u32*>(mesh_buffers.args.mapped_span.data()),
+                        .payload =
+                            reinterpret_cast<const u32*>(mesh_buffers.payload.mapped_span.data()),
+                        .groups = mesh_workgroups,
+                        .payload_words = mesh->payload_stride,
+                        .depth_func = static_cast<u32>(regs.depth_test_func),
+                        .depth_write = regs.depth_write_enabled,
+                        .width = targets.width,
+                        .height = targets.height,
+                    });
+                }
+            }
         } else {
             mesh_buffers.output = staging_pool.Stream(
                 (std::max)(u64{mesh_workgroups} * mesh->block_words * sizeof(u32), u64{16}), 16);
@@ -2461,7 +2696,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             static std::vector<u64> logged_pipelines;
             const u64 pipeline_hash = pipeline.Key().Hash();
             std::scoped_lock logged_lock{logged_mutex};
-            if (has_task && logged_pipelines.size() < 24 &&
+            if (has_task && logged_pipelines.size() < (DrawTraceEnabled() ? 88U : 24U) &&
                 std::ranges::find(logged_pipelines, pipeline_hash) == logged_pipelines.end()) {
                 logged_pipelines.push_back(pipeline_hash);
                 LOG_WARNING(
@@ -2793,6 +3028,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         const u32 max_primitives = capacity_vertices / plan.input_vertices;
         if (max_primitives == 0) {
             prepare_refusal = {};
+            prepare_empty_why = "tessellated geometry draw without room for a primitive";
             return false;
         }
         const u32 max_groups = max_primitives * plan.invocations;
@@ -2941,6 +3177,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                                                                   groups) * 4;
         if (input_primitives == 0) {
             prepare_refusal = {};
+            prepare_empty_why = "geometry draw of 0 input primitives";
             return false;
         }
         if (total > Geometry::MaxScratchBytes) {
@@ -3343,6 +3580,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         case Maxwell::CullFace::FrontAndBack:
             // Nothing is drawn but points and lines.
             if (TopologyClass(topology) == 2) {
+                prepare_empty_why = "triangles culled front and back";
                 return false;
             }
             break;
@@ -3457,6 +3695,7 @@ void RasterizerMetal::DrawIndirect() {
     ++draws;
     skip_valid = false;
     grid_draw = {};
+    trace_instances = 0;
     SCOPE_EXIT {
         if (CachePathsEnabled()) {
             gpu.TickWork();
@@ -3484,7 +3723,7 @@ void RasterizerMetal::DrawIndirect() {
     const auto& params = maxwell3d->draw_manager.indirect_state;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     if (!ConditionHoldsOnCpu()) {
-        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        NoteEmptyDraw("indirect draw under a condition false on the CPU");
         return;
     }
     if (pipeline->Geo() != nullptr) {
@@ -3746,7 +3985,7 @@ void RasterizerMetal::DrawGeometry(GraphicsPipeline& pipeline, bool is_indexed,
     CountDraw(count, instance_count);
     geometry_input_primitives = 0;
     if ((!after_tess && geo.plan.Primitives(count) == 0) || count == 0 || instance_count == 0) {
-        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        NoteEmptyDraw("geometry draw of 0 primitives or instances");
         return;
     }
     const std::optional<u32> primitive = PrimitiveType(
@@ -3754,7 +3993,7 @@ void RasterizerMetal::DrawGeometry(GraphicsPipeline& pipeline, bool is_indexed,
         : geo.plan.output_topology == 6 ? Maxwell::PrimitiveTopology::Lines
                                         : Maxwell::PrimitiveTopology::Triangles);
     if (!primitive || !ConditionHoldsOnCpu()) {
-        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        NoteEmptyDraw("geometry draw Metal can not draw or under a false condition");
         return;
     }
     xfb_draw = XfbDraw{
@@ -3856,7 +4095,7 @@ void RasterizerMetal::DrawByteCount() {
     const u32 vertices = bytes / stride;
     ++xfb_byte_count_draws;
     if (vertices == 0) {
-        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        NoteEmptyDraw("transform feedback draw of 0 vertices");
         return;
     }
     draw_state.vertex_buffer.first = 0;
@@ -3879,7 +4118,7 @@ void RasterizerMetal::DrawTexture() {
         return;
     }
     if (!ConditionHoldsOnCpu()) {
-        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        NoteEmptyDraw("texture draw under a condition false on the CPU");
         return;
     }
     gpu_memory->FlushCaching();
@@ -4662,7 +4901,7 @@ bool RasterizerMetal::DrawMayBeSkipped() {
 
 void RasterizerMetal::NoteUnprepared() {
     if (prepare_refusal.empty()) {
-        Coverage::Note(Coverage::Work::Draw, Coverage::Path::Empty);
+        NoteEmptyDraw(prepare_empty_why != nullptr ? prepare_empty_why : "PrepareDraw skipped it without a cause");
     } else {
         RefuseDraw(prepare_refusal);
     }

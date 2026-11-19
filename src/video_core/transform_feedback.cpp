@@ -70,7 +70,11 @@ std::pair<std::array<Shader::TransformFeedbackVarying, 256>, u32> MakeTransformF
     for (size_t buffer = 0; buffer < state.layouts.size(); ++buffer) {
         const auto& locations = state.varyings[buffer];
         const auto& layout = state.layouts[buffer];
-        const u32 varying_count = layout.varying_count;
+        // At most the varyings the buffer's table holds: register state left mid-transition
+        // (OoT entering Kokiri Forest) gave a count past it, and the reads ran off the table
+        // into a Metal pipeline builder's stack guard.
+        const u32 varying_count =
+            (std::min)(layout.varying_count, static_cast<u32>(locations.size() * 4));
         u32 highest = 0;
         for (u32 offset = 0; offset < varying_count; ++offset) {
             const auto get_attribute = [&locations](u32 index) -> u32 {

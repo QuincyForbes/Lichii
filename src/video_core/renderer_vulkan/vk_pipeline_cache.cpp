@@ -900,6 +900,48 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                 profile.support_fp16_signed_zero_nan_preserve || device.IsFloat16Supported();
         }
     }
+    // MoltenVK's SPIRV-Cross writes every NoContraction OpFAdd/OpFSub/OpFMul (every guest FADD,
+    // FMUL and FFMA) as a call to a [[clang::optnone]] spvFAdd/spvFMul helper: optnone is also
+    // noinline, so each arithmetic operation became a real call with its arguments spilled, and
+    // nothing (folding, CSE, scheduling) crossed it (13 -> 10 ms on OoT's scene pass on the Metal
+    // backend once inlined, metal_shader_translate.cpp InlinePreciseHelpers).
+    // EDEN_NX2_MVK_PRECISE selects what MoltenVK gets instead:
+    //   unset/"mixed": fragment and compute stages drop NoContraction (Metal may fuse a multiply
+    //     and an add, which only adds precision); vertex, tessellation, geometry and mesh stages
+    //     write each operation as one fma (fma(1, a, b), fma(a, b, +0)): still rounded once,
+    //     bit-exact across programs for depth-equal passes, but plain inlined fma() in MSL.
+    //   "fma": the fma form in every stage (exact everywhere).
+    //   "strip": fragment and compute drop NoContraction, other stages keep the decoration.
+    // EDEN_NX2_MVK_PRECISE_ALL=1 (or EDEN_NX2_MVK_PRECISE=all): decorated everywhere, as before.
+    if (driver_id == VK_DRIVER_ID_MOLTENVK) {
+        enum class PreciseMode { All, Mixed, Fma, Strip };
+        static const PreciseMode precise_mode = [] {
+            if (const char* const all = std::getenv("EDEN_NX2_MVK_PRECISE_ALL");
+                all != nullptr && all[0] == '1') {
+                return PreciseMode::All;
+            }
+            const char* const value = std::getenv("EDEN_NX2_MVK_PRECISE");
+            const std::string_view mode{value != nullptr ? value : ""};
+            if (mode == "all" || mode == "0") {
+                return PreciseMode::All;
+            }
+            if (mode == "fma") {
+                return PreciseMode::Fma;
+            }
+            if (mode == "strip") {
+                return PreciseMode::Strip;
+            }
+            return PreciseMode::Mixed;
+        }();
+        profile.fp_no_contraction_as_fma =
+            precise_mode == PreciseMode::Mixed || precise_mode == PreciseMode::Fma;
+        profile.fp_contraction_in_fragment_compute =
+            precise_mode == PreciseMode::Mixed || precise_mode == PreciseMode::Strip;
+        static constexpr std::array<const char*, 4> mode_names{"all decorated", "mixed", "fma",
+                                                               "strip"};
+        LOG_INFO(Render_Vulkan, "MoltenVK NoContraction (EDEN_NX2_MVK_PRECISE): {}",
+                 mode_names[static_cast<size_t>(precise_mode)]);
+    }
     profile.support_cooperative_hmma =
         device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
     profile.support_cooperative_hmma_16x16x16 =

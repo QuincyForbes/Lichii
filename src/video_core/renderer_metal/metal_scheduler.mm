@@ -418,6 +418,44 @@ kernel void swap_packed(uint3 id [[thread_position_in_grid]],
                  : ushort((v & ~m) | (v & 31u) << p.shift | (v >> p.shift & 31u));
 }
 
+// A buffer copy on an open compute encoder (EDEN_NX2_METAL_COMPUTE_COPY): 16 bytes per thread.
+struct CopyParams {
+    ulong src;
+    ulong dst;
+    ulong size;
+};
+
+kernel void copy_bytes(uint id [[thread_position_in_grid]],
+                       device const uchar* src [[buffer(0)]],
+                       device uchar* dst [[buffer(1)]],
+                       constant CopyParams& p [[buffer(2)]]) {
+    const ulong at = ulong(id) * 16;
+    if (at >= p.size) {
+        return;
+    }
+    const ulong s = p.src + at;
+    const ulong d = p.dst + at;
+    if (at + 16 <= p.size) {
+        if (((s | d) & 15) == 0) {
+            *(device uint4*)(dst + d) = *(device const uint4*)(src + s);
+            return;
+        }
+        if (((s | d) & 3) == 0) {
+            device const uint* from = (device const uint*)(src + s);
+            device uint* to = (device uint*)(dst + d);
+            to[0] = from[0];
+            to[1] = from[1];
+            to[2] = from[2];
+            to[3] = from[3];
+            return;
+        }
+    }
+    const uint n = uint(min(ulong(16), p.size - at));
+    for (uint i = 0; i < n; ++i) {
+        dst[d + i] = src[s + i];
+    }
+}
+
 // A resolve shadow's colour into every sample of its multisampled texture (RestoreSamples).
 fragment float4 restore_samples_float(ClearOut in [[stage_in]],
                                       texture2d_array<float> src [[texture(0)]],
@@ -768,6 +806,54 @@ bool IdleCommitAllEnabled() {
     return enabled;
 }
 
+// EDEN_NX2_METAL_STATIC_LABELS=0: command buffers and render passes get labels formatted with
+// their tick and pass number again (an NSString format per command buffer and per pass on the
+// recording thread); otherwise constant labels (failure logs still name the tick).
+bool StaticLabelsEnabled() {
+    static const bool enabled =
+        SwitchOn("EDEN_NX2_METAL_STATIC_LABELS", "constant command buffer and pass labels");
+    return enabled;
+}
+
+// EDEN_NX2_METAL_SEGMENT_NOTE_CACHE=0: every texture bind of in-order work walks the texture's
+// parents for the buffer under it (NoteSegmentTexture), even when the segment noted it already.
+bool SegmentNoteCacheEnabled() {
+    static const bool enabled =
+        SwitchOn("EDEN_NX2_METAL_SEGMENT_NOTE_CACHE", "texture binds noted once per segment");
+    return enabled;
+}
+
+// EDEN_NX2_METAL_COMPUTE_COPY=0: a buffer copy always goes to a blit encoder, ending the open
+// compute encoder (the segment's or the ahead kernels'). Otherwise a copy of up to
+// EDEN_NX2_METAL_COMPUTE_COPY_MAX bytes (256 KiB) is a dispatch on that open compute encoder,
+// and (unless =1) an ahead copy with no ahead encoder open opens the kernels' compute encoder
+// rather than a blit one, so the ahead command buffer's copies and kernels share one encoder.
+u32 ComputeCopyMode() {
+    static const u32 mode = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_COMPUTE_COPY");
+        const u32 read = value == nullptr ? 2U : value[0] == '0' ? 0U : value[0] == '1' ? 1U : 2U;
+        LOG_INFO(Render_Metal,
+                 "Metal: buffer copies as dispatches on open compute encoders: {} "
+                 "(EDEN_NX2_METAL_COMPUTE_COPY={})",
+                 read == 0 ? "off" : read == 1 ? "on" : "on, ahead ones opening one", read);
+        return read;
+    }();
+    return mode;
+}
+
+bool ComputeCopyEnabled() {
+    return ComputeCopyMode() != 0;
+}
+
+u64 ComputeCopyMax() {
+    static const u64 max_bytes = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_COMPUTE_COPY_MAX");
+        return value != nullptr ? static_cast<u64>(std::strtoull(value, nullptr, 0))
+                                : u64{256 * 1024};
+    }();
+    return max_bytes;
+}
+
 constexpr std::array<const char*, static_cast<size_t>(CommitReason::Count)> CommitReasonNames{
     "other",  "present",   "list_end",  "fence", "fence_deferred", "idle",  "wait", "finish",
     "staging", "draw_budget", "list_copy", "query", "condition",      "split", "ahead",
@@ -814,6 +900,13 @@ struct StageBindings {
 
 /// A buffer slot holding bytes (setBytes): its address stands for a buffer no other equals.
 const char InlineBytes{};
+
+/// A buffer or texture noted in segment `serial` (EDEN_NX2_METAL_SEGMENT_NOTE_CACHE).
+struct SegmentNote {
+    const void* object;
+    u64 serial;
+    bool writes_shared;
+};
 
 enum class Bound {
     Same,   ///< Nothing to set
@@ -946,8 +1039,17 @@ struct Scheduler::Impl {
         }();
         id<MTLCommandBuffer> buffer = nil;
         if (encoder_status) {
-            MTLCommandBufferDescriptor* descriptor = [MTLCommandBufferDescriptor new];
-            descriptor.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+            // One descriptor for all (EDEN_NX2_METAL_STATIC_LABELS): only read by Metal.
+            static MTLCommandBufferDescriptor* const shared_descriptor = [] {
+                MTLCommandBufferDescriptor* const made = [MTLCommandBufferDescriptor new];
+                made.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+                return made;
+            }();
+            MTLCommandBufferDescriptor* descriptor = shared_descriptor;
+            if (!StaticLabelsEnabled()) {
+                descriptor = [MTLCommandBufferDescriptor new];
+                descriptor.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+            }
             buffer = [queue commandBufferWithDescriptor:descriptor];
         } else {
             buffer = [queue commandBuffer];
@@ -959,7 +1061,9 @@ struct Scheduler::Impl {
     id<MTLCommandBuffer> Commands() {
         if (command_buffer == nil) {
             command_buffer =
-                NewCommandBuffer([NSString stringWithFormat:@"Lichii %llu", current_tick]);
+                NewCommandBuffer(StaticLabelsEnabled()
+                                     ? @"Lichii"
+                                     : [NSString stringWithFormat:@"Lichii %llu", current_tick]);
         }
         return command_buffer;
     }
@@ -968,7 +1072,9 @@ struct Scheduler::Impl {
     id<MTLCommandBuffer> AheadBuffer() {
         if (ahead_buffer == nil) {
             ahead_buffer =
-                NewCommandBuffer([NSString stringWithFormat:@"Lichii %llu ahead", current_tick]);
+                NewCommandBuffer(StaticLabelsEnabled()
+                    ? @"Lichii ahead"
+                    : [NSString stringWithFormat:@"Lichii %llu ahead", current_tick]);
         }
         return ahead_buffer;
     }
@@ -999,7 +1105,9 @@ struct Scheduler::Impl {
                 upload_blit = [AheadBuffer() blitCommandEncoder];
             } else {
                 upload_buffer = NewCommandBuffer(
-                    [NSString stringWithFormat:@"Lichii %llu uploads", current_tick]);
+                    StaticLabelsEnabled()
+                        ? @"Lichii uploads"
+                        : [NSString stringWithFormat:@"Lichii %llu uploads", current_tick]);
                 upload_blit = [upload_buffer blitCommandEncoder];
             }
             upload_blit.label = @"Uploads";
@@ -1022,7 +1130,9 @@ struct Scheduler::Impl {
                 target = AheadBuffer();
             } else {
                 kernel_buffer = NewCommandBuffer(
-                    [NSString stringWithFormat:@"Lichii %llu kernels", current_tick]);
+                    StaticLabelsEnabled()
+                        ? @"Lichii kernels"
+                        : [NSString stringWithFormat:@"Lichii %llu kernels", current_tick]);
                 target = kernel_buffer;
             }
             kernel_compute = [target computeCommandEncoder];
@@ -1104,10 +1214,33 @@ struct Scheduler::Impl {
         }
     }
 
+    /// EDEN_NX2_METAL_SEGMENT_NOTE_CACHE: whether the segment noted `object` (a buffer or a
+    /// texture) already as this note would (writing, or as `writes_shared` asks): what a note
+    /// adds stays until NextSegment. Else it is recorded as noted, the caller noting it now. The
+    /// segment's command buffer holds what its work binds: an address names one object.
+    bool NotedInSegment(const void* object, bool writes_shared) {
+        if (!SegmentNoteCacheEnabled()) {
+            return false;
+        }
+        const uintptr_t key = reinterpret_cast<uintptr_t>(object);
+        SegmentNote& note =
+            segment_notes[((key >> 4) ^ (key >> 12)) % segment_notes.size()];
+        if (note.object == object && note.serial == segment_serial) {
+            if (note.writes_shared || !writes_shared) {
+                ++segment_note_skips;
+                return true;
+            }
+            note.writes_shared = true;
+            return false;
+        }
+        note = {object, segment_serial, writes_shared};
+        return false;
+    }
+
     /// EDEN_NX2_METAL_AHEAD_ANY: in-order work of the segment binds `buffer`; `writes_shared`:
     /// it may write it if CPU-visible.
     void NoteSegmentBuffer(const void* buffer, bool writes_shared) {
-        if (buffer == nullptr || !AheadAnyEnabled()) {
+        if (buffer == nullptr || !AheadAnyEnabled() || NotedInSegment(buffer, writes_shared)) {
             return;
         }
         if (AsBuffer(const_cast<void*>(buffer)).storageMode == MTLStorageModeShared) {
@@ -1119,7 +1252,7 @@ struct Scheduler::Impl {
 
     /// The buffer a texture view of a buffer is on.
     void NoteSegmentTexture(const void* texture, bool writes_shared) {
-        if (texture == nullptr || !AheadAnyEnabled()) {
+        if (texture == nullptr || !AheadAnyEnabled() || NotedInSegment(texture, writes_shared)) {
             return;
         }
         const id<MTLBuffer> buffer = RootOf(AsTexture(const_cast<void*>(texture))).buffer;
@@ -1213,6 +1346,70 @@ struct Scheduler::Impl {
                 break;
             }
         }
+    }
+
+    /// EDEN_NX2_METAL_COMPUTE_COPY: a buffer copy as a dispatch on the open compute encoder
+    /// `encoder` (bound as `bound`, its pipeline in `bound_pipeline`), in place of ending it for
+    /// a blit encoder and opening another after the copy. Metal orders the dispatch with the
+    /// encoder's others on the buffers' tracked hazards, as it orders the encoders. False when
+    /// the copy kernel is not there (the caller blits).
+    bool CopyByCompute(id<MTLComputeCommandEncoder> encoder, StageBindings& bound,
+                       const void** bound_pipeline, BufferHandle src, u64 src_offset,
+                       BufferHandle dst, u64 dst_offset, u64 size) {
+        if (copy_kernel == nil) {
+            if (copy_kernel_failed || library == nil) {
+                return false;
+            }
+            NSError* error = nil;
+            const id<MTLFunction> function = [library newFunctionWithName:@"copy_bytes"];
+            copy_kernel = function != nil
+                              ? [device.GetDevice() newComputePipelineStateWithFunction:function
+                                                                                  error:&error]
+                              : nil;
+            if (copy_kernel == nil) {
+                copy_kernel_failed = true;
+                LOG_ERROR(Render_Metal, "Metal: buffer copy kernel failed: {}",
+                          error != nil ? error.localizedDescription.UTF8String : "no function");
+                return false;
+            }
+        }
+        [encoder setComputePipelineState:copy_kernel];
+        [encoder setBuffer:AsBuffer(src) offset:0 atIndex:0];
+        [encoder setBuffer:AsBuffer(dst) offset:0 atIndex:1];
+        const std::array<u64, 3> params{src_offset, dst_offset, size};
+        [encoder setBytes:params.data() length:sizeof(params) atIndex:2];
+        const u64 threads = (size + 15) / 16;
+        [encoder dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((threads + 63) / 64), 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        state_sets += 4;
+        // What the encoder has now: the next kernel sets its own pipeline and these slots.
+        *bound_pipeline = (__bridge const void*)copy_kernel;
+        for (u32 slot = 0; slot < 3; ++slot) {
+            bound.buffers[slot] = &InlineBytes;
+        }
+        if (active_compute == encoder) {
+            // A kernel being bound on it: its pipeline and binds of those slots back.
+            if (compute_bind_pipeline != nullptr) {
+                *bound_pipeline = compute_bind_pipeline;
+                [encoder setComputePipelineState:(__bridge id<MTLComputePipelineState>)
+                                                     compute_bind_pipeline];
+            }
+            for (const ComputeBind& bind : compute_binds) {
+                if (bind.slot >= 3) {
+                    continue;
+                }
+                if (bind.kind == ComputeBind::Kind::Buffer) {
+                    SetBuffer(ShaderStage::Compute, bind.slot, bind.object, bind.offset);
+                } else if (bind.kind == ComputeBind::Kind::Bytes) {
+                    bound.buffers[bind.slot] = &InlineBytes;
+                    ++state_sets;
+                    [encoder setBytes:compute_bind_bytes.data() + bind.offset
+                               length:bind.size
+                              atIndex:bind.slot];
+                }
+            }
+        }
+        return true;
     }
 
     /// The segment's compute encoder, opened when there is none, made the active one.
@@ -1701,7 +1898,9 @@ struct Scheduler::Impl {
             }
             return nil;
         }
-        encoder.label = [NSString stringWithFormat:@"Pass %llu", render_pass_serial + 1];
+        encoder.label = StaticLabelsEnabled()
+                            ? @"Pass"
+                            : [NSString stringWithFormat:@"Pass %llu", render_pass_serial + 1];
         return encoder;
     }
 
@@ -2178,6 +2377,15 @@ struct Scheduler::Impl {
     /// it did something not tracked at all.
     std::unordered_set<const void*> segment_bound;
     bool segment_shared_writes{};
+    /// Buffers and textures noted in the segment, by address
+    /// (EDEN_NX2_METAL_SEGMENT_NOTE_CACHE).
+    std::array<SegmentNote, 512> segment_notes{};
+    u64 segment_note_skips{};
+    /// EDEN_NX2_METAL_COMPUTE_COPY: the copy kernel, and copies recorded as its dispatches.
+    id<MTLComputePipelineState> copy_kernel = nil;
+    bool copy_kernel_failed{};
+    u64 compute_copies_ahead{};
+    u64 compute_copies_in_order{};
     bool segment_opaque{};
     /// The kernel being bound went ahead of a segment with other work: each buffer it binds is
     /// checked; a conflict moves it in order (and every later one of the segment).
@@ -2593,6 +2801,32 @@ void Scheduler::CopyBuffer(BufferHandle src, u64 src_offset, BufferHandle dst, u
     if (!goes_ahead) {
         impl->NoteInOrder(src);
         impl->NoteInOrderWrite(dst);
+    }
+    // EDEN_NX2_METAL_COMPUTE_COPY: on the compute encoder open where the blit would go.
+    if (ComputeCopyEnabled() && size <= ComputeCopyMax() && src != dst) {
+        Impl& state = *impl;
+        if (goes_ahead) {
+            // The ahead command buffer's kernels, open (so no upload blit is): the copy lands
+            // after the kernels recorded before it, as UploadEncoder's would.
+            if (MergeAheadEnabled() && state.upload_blit == nil && state.kernel_compute == nil &&
+                ComputeCopyMode() == 2 && !state.copy_kernel_failed && state.library != nil) {
+                state.KernelEncoder();
+            }
+            if (MergeAheadEnabled() && state.kernel_compute != nil && state.upload_blit == nil &&
+                state.CopyByCompute(state.kernel_compute, state.kernel_bound,
+                                    &state.kernel_pipeline, src, src_offset, dst, dst_offset,
+                                    size)) {
+                ++state.ahead_copies;
+                ++state.compute_copies_ahead;
+                return;
+            }
+        } else if (state.compute != nil && state.render == nil && state.blit == nil &&
+                   state.CopyByCompute(state.compute, state.compute_bound,
+                                       &state.compute_pipeline, src, src_offset, dst, dst_offset,
+                                       size)) {
+            ++state.compute_copies_in_order;
+            return;
+        }
     }
     const id<MTLBlitCommandEncoder> encoder =
         goes_ahead ? impl->UploadEncoder() : impl->BlitEncoder();
@@ -4454,6 +4688,12 @@ std::string Scheduler::TakePassEndLine(double frames) {
                         static_cast<double>(std::exchange(impl->passes_begun[0], 0)) / per,
                         static_cast<double>(std::exchange(impl->passes_begun[1], 0)) / per,
                         static_cast<double>(std::exchange(impl->passes_begun[2], 0)) / per);
+    // EDEN_NX2_METAL_COMPUTE_COPY / EDEN_NX2_METAL_SEGMENT_NOTE_CACHE.
+    line += fmt::format(" (copies as dispatches per frame: ahead={:.1f} in_order={:.1f}; texture "
+                        "notes skipped per frame {:.1f})",
+                        static_cast<double>(std::exchange(impl->compute_copies_ahead, 0)) / per,
+                        static_cast<double>(std::exchange(impl->compute_copies_in_order, 0)) / per,
+                        static_cast<double>(std::exchange(impl->segment_note_skips, 0)) / per);
     return line;
 }
 

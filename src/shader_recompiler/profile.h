@@ -129,6 +129,16 @@ struct Profile {
     u64 min_ssbo_alignment{};
     u32 max_user_clip_distances{};
 
+    /// FP32/FP16 adds and multiplies marked NoContraction are written as fma(1, a, b) and
+    /// fma(a, b, +0) instead of decorated OpFAdd/OpFMul. Each is still rounded once, as
+    /// NoContraction asks, and SPIRV-Cross's MSL backend (MoltenVK) writes a plain fma() for
+    /// them instead of a call to a [[clang::optnone]] spvFAdd/spvFMul helper that blocks every
+    /// optimization around it.
+    bool fp_no_contraction_as_fma{};
+    /// Fragment and compute stages drop NoContraction (Metal may then fuse a multiply and an add,
+    /// which only adds precision); the position-computing stages keep it.
+    bool fp_contraction_in_fragment_compute{};
+
     bool SupportsSubgroupStage(Stage stage) const {
         return (supported_subgroup_stages & (1u << static_cast<u32>(stage))) != 0;
     }

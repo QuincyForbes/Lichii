@@ -260,9 +260,14 @@ void GpuSplit::WaitForSpace(size_t words) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const u64 stats_start = SplitStats::Enabled() ? Common::PerfReport::NowNs() : 0;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (write_position + words - consumed_cache <= RingWords) {
+            if (stats_start != 0) [[unlikely]] {
+                SplitStats::g_ring_full_ns.fetch_add(Common::PerfReport::NowNs() - stats_start,
+                                                     std::memory_order_relaxed);
+            }
             return;
         }
         if (spins < 4096) {
@@ -294,6 +299,46 @@ void GpuSplit::Publish() {
         (++publishes & 0xfff) == 0) [[unlikely]] {
         ReportBatched();
     }
+}
+
+void SplitStats::MaybeReport() {
+    static u64 since_ns = 0;
+    const u64 now = Common::PerfReport::NowNs();
+    if (since_ns == 0) {
+        since_ns = now;
+        return;
+    }
+    if (now - since_ns < 5'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - since_ns) / 1e9;
+    since_ns = now;
+    const auto ms_per_s = [seconds](u64 ns) { return static_cast<double>(ns) / 1e6 / seconds; };
+    std::string sites;
+    u64 total_ns = 0;
+    for (size_t i = 0; i < g_front_wait_ns.size(); ++i) {
+        const u64 ns = g_front_wait_ns[i].exchange(0, std::memory_order_relaxed);
+        const u64 count = g_front_wait_count[i].exchange(0, std::memory_order_relaxed);
+        total_ns += ns;
+        if (count != 0) {
+            sites += fmt::format(" {} {:.1f} ({:.0f}/s),", drain_site_names[i], ms_per_s(ns),
+                                 static_cast<double>(count) / seconds);
+        }
+    }
+    if (!sites.empty()) {
+        sites.pop_back();
+    }
+    const u64 ring_full = g_ring_full_ns.exchange(0, std::memory_order_relaxed);
+    const u64 idle = g_back_idle_ns.exchange(0, std::memory_order_relaxed);
+    const u64 idles = g_back_idle_count.exchange(0, std::memory_order_relaxed);
+    const u64 forwarded = g_e2c_forwarded.exchange(0, std::memory_order_relaxed);
+    const u64 read_front = g_e2c_read_front.exchange(0, std::memory_order_relaxed);
+    LOG_INFO(HW_GPU,
+             "GPU split stalls (ms/s): front waited {:.1f} [{} ], ring full {:.1f} | back idle "
+             "{:.1f} ({:.0f}/s) | oot 0xe2c forwarded {:.0f}/s, read on the front {:.0f}/s",
+             ms_per_s(total_ns), sites, ms_per_s(ring_full), ms_per_s(idle),
+             static_cast<double>(idles) / seconds, static_cast<double>(forwarded) / seconds,
+             static_cast<double>(read_front) / seconds);
 }
 
 void GpuSplit::ReportBatched() {
@@ -335,6 +380,7 @@ void GpuSplit::Drain(DrainSite site) {
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     Common::Nx2Timeline::Span timeline_span{drain_site_names[static_cast<size_t>(site)]};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
+    const u64 stats_start = SplitStats::Enabled() ? Common::PerfReport::NowNs() : 0;
     // Everything consumed is not enough: the back submits deferred work from its idle hook
     // afterwards, and the caller may use the scheduler once this returns (from #494's fix in
     // upstream 23457ccf7b).
@@ -346,6 +392,9 @@ void GpuSplit::Drain(DrainSite site) {
                 wait_target.store(~u64{0}, std::memory_order_relaxed);
                 publish_every = 8;
                 Nx2Profile::AddDrain(site, start);
+                if (stats_start != 0) [[unlikely]] {
+                    SplitStats::AddFrontWait(site, Common::PerfReport::NowNs() - stats_start);
+                }
                 return;
             }
             if (!hook_asked) {
@@ -720,12 +769,16 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
+    const u64 stats_start = SplitStats::Enabled() ? Common::PerfReport::NowNs() : 0;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
             wait_target.store(~u64{0}, std::memory_order_relaxed);
             publish_every = 8;
             Nx2Profile::AddDrain(site, start);
+            if (stats_start != 0) [[unlikely]] {
+                SplitStats::AddFrontWait(site, Common::PerfReport::NowNs() - stats_start);
+            }
             return true;
         }
         Backoff(spins, target);
@@ -1382,9 +1435,24 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
         Common::FrameDeadline::Tick();
+        if (SplitStats::Enabled()) [[unlikely]] {
+            SplitStats::MaybeReport();
+        }
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+            // EDEN_NX2_SPLIT_STATS: the whole idle stretch, however it ends (each exit path
+            // below leaves this block).
+            struct IdleTimer {
+                u64 start = SplitStats::Enabled() ? Common::PerfReport::NowNs() : 0;
+                ~IdleTimer() {
+                    if (start != 0) {
+                        SplitStats::g_back_idle_ns.fetch_add(
+                            Common::PerfReport::NowNs() - start, std::memory_order_relaxed);
+                        SplitStats::g_back_idle_count.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            } idle_timer;
             back_idle.store(true, std::memory_order_relaxed);
             // The front usually sends more within microseconds: spin briefly before sleeping.
             for (u32 spins = 0; spins < 512 && available == read_position &&

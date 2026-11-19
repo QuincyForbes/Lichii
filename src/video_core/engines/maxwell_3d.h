@@ -2236,8 +2236,8 @@ public:
                 case IndexFormat::UnsignedInt:
                     return 4;
                 }
-                UNREACHABLE();
-                return 1;
+                // Not fatal: a garbled register (OoT entering Kokiri Forest) ended the emulator.
+                return 4;
             }
 
             GPUVAddr StartAddress() const {
@@ -3492,8 +3492,8 @@ private:
                               const u32* words, u32 count);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                       u32 count);
-    bool FrontRunOotMacro(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
-                          OotMacros::Id id);
+    bool FrontRunOotMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
+                          u32 method, OotMacros::Id id);
     struct OotContext;
     /// Tells the split a report just sent releases a known payload (GpuSplit::NoteRelease).
     void FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontState& fs, u32 query) const;

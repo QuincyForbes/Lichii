@@ -1348,8 +1348,15 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
                 .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
             };
+            // The graphics stages are also named one by one: a translation layer (MoltenVK's
+            // Metal barrier stages) may map individual bits but not ALL_GRAPHICS.
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                   VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, COMPUTE_TO_GRAPHICS);
+                                   VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT |
+                                       VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                                       VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                                       VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                   0, COMPUTE_TO_GRAPHICS);
         }
         cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
     });
