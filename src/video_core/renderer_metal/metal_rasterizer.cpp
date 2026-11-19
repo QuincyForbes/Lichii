@@ -18,6 +18,8 @@
 
 #include <boost/container/small_vector.hpp>
 
+#include "common/perf_report.h"
+#include "common/perf_sched.h"
 #include "common/alignment.h"
 #include "common/cityhash.h"
 #include "common/frame_deadline.h"
@@ -7002,6 +7004,54 @@ VideoCore::Nx2Debug::GpuReadResult ReadGpuMemory(std::span<Tegra::MemoryManager*
 
 } // Anonymous namespace
 
+namespace {
+// "Perf guest" figures as Vulkan's TickPerfReport prints them (EDEN_NX2_PERF_REPORT): system
+// calls by number, slow-path memory callbacks, clock reads and yields, every 10 s.
+void LogGuestReport() {
+    if (!Common::PerfReport::Enabled()) {
+        return;
+    }
+    static auto last = std::chrono::steady_clock::now();
+    static std::array<u64, Common::PerfReport::Count> before = Common::PerfReport::Read();
+    static std::array<u64, 256> svcs_before{};
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - last).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const auto counters = Common::PerfReport::Read();
+    const auto rate = [&](Common::PerfReport::Counter c) {
+        return static_cast<double>(counters[c] - before[c]) / seconds;
+    };
+    std::array<std::pair<u64, size_t>, 256> rank{};
+    std::array<u64, 256> svcs{};
+    for (size_t i = 0; i < svcs.size(); ++i) {
+        svcs[i] = Common::PerfReport::g_svc_counts[i].load(std::memory_order_relaxed);
+        rank[i] = {svcs[i] - svcs_before[i], i};
+    }
+    std::partial_sort(rank.begin(), rank.begin() + 6, rank.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string svc_text;
+    for (size_t i = 0; i < 6 && rank[i].first != 0; ++i) {
+        svc_text += fmt::format("{}{:#04x} {:.0f}", i == 0 ? " (" : ", ", rank[i].second,
+                                static_cast<double>(rank[i].first) / seconds);
+    }
+    if (!svc_text.empty()) {
+        svc_text += ")";
+    }
+    LOG_INFO(Common_Memory,
+             "Perf guest (Metal): {:.1f} fastmem faults/s | SVCs {:.0f}/s{} | memory callbacks/s: "
+             "reads {:.0f}, writes {:.0f} | clock reads {:.0f}/s | yields to nobody {:.0f}/s",
+             rate(Common::PerfReport::JitFastmemFaults), rate(Common::PerfReport::GuestSvcs),
+             svc_text, rate(Common::PerfReport::GuestSlowReads),
+             rate(Common::PerfReport::GuestSlowWrites), rate(Common::PerfReport::GuestClockReads),
+             rate(Common::PerfReport::GuestFutileYields));
+    before = counters;
+    svcs_before = svcs;
+    last = now;
+}
+} // Anonymous namespace
+
 void RasterizerMetal::TickFrame() {
     VideoCommon::FeatureCensus::Tick();
     if (VideoCore::Nx2Debug::HasRequests()) {
@@ -7049,6 +7099,12 @@ void RasterizerMetal::TickFrame() {
     staging_pool.TickFrame();
     pipeline_cache.TickFrame();
     // The frame threads' deadlines follow the frames presented (EDEN_NX2_APPLE_FRAME_DEADLINE).
+    // As Vulkan's TickFrame: the guest-thread report ("Perf sched:", EDEN_NX2_PERF_REPORT)
+    // and the Apple frame workgroup interval (frame-critical threads scheduled against the
+    // frame deadline) were only driven by the Vulkan rasterizer.
+    Common::PerfSched::TickFrame();
+    Common::TickFrameWorkgroup();
+    LogGuestReport();
     Common::FrameDeadline::SetPeriodNs(static_cast<u64>((std::max)(
         VideoCommon::Nx2Perf::g_guest_frame_interval_ns.load(std::memory_order_relaxed), 0LL)));
     Common::FrameDeadline::NoteFrame();
