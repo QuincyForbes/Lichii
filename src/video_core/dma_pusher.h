@@ -212,7 +212,7 @@ public:
         // Copied during a suspension, or behind one: copy again now, unless still suspended.
         const u64 now = suspensions.load(std::memory_order_acquire);
         if (!entries.submitted_offsets.empty() && (now & 1) == 0) {
-            if (ResnapshotEnabled() && entries.snapshot_suspensions != now) {
+            if (ResnapshotEnabled() && !TrustSubmitted() && entries.snapshot_suspensions != now) {
                 RefreshSnapshot(entries, now);
             } else if (!entries.deferred_entries.empty()) {
                 // Behind a GPU map when submitted: the map has run by now (GPU::MapInOrder).
@@ -279,6 +279,15 @@ public:
     void RefreshSnapshot(CommandList& list, u64 now, size_t first_entry = 0);
     /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.
     void RefreshDeferredEntries(CommandList& list);
+
+    /// Ocarina of Time: command lists always run the words copied when they were submitted
+    /// (except entries behind a pending GPU map, and GPU-written lists). Its lists are complete at
+    /// submit, and it recycles their memory through its own allocator while they are still
+    /// queued (frames ahead): re-reading them after an acquire suspension, or at parse time, ran
+    /// other data as commands (garbled state, missing or broken draws, crashes and stalls).
+    /// Titles that patch lists after submitting them (Hyrule Warriors) keep the refreshes.
+    /// EDEN_NX2_TRUST_SUBMIT=0 off, =1 for every title.
+    static bool TrustSubmitted();
 
     /// EDEN_NX2_RESNAPSHOT=0 turns snapshot refreshes off.
     static bool ResnapshotEnabled() {

@@ -370,7 +370,8 @@ bool DmaPusher::Step() {
     // The current list's entries before this one ran already and are never parsed again, and an
     // entry the acquire suspended inside reads its remaining words from memory anyway
     // (CanUseSubmittedCommands): neither is copied (zortos293/Lichii#805).
-    if (ResnapshotEnabled() && suspensions.load(std::memory_order_relaxed) != suspensions_before) {
+    if (ResnapshotEnabled() && !TrustSubmitted() &&
+        suspensions.load(std::memory_order_relaxed) != suspensions_before) {
         const u64 now = suspensions.load(std::memory_order_acquire);
         // The copy takes the front a while: what it sent before goes to the back first
         // (zortos293/Lichii#1520; EDEN_NX2_RESUME_PUBLISH=0: after the copy, as before).
@@ -511,17 +512,18 @@ bool DmaPusher::Step() {
             NoteReleasedEntry(ReleasedUse::GpuWritten, command_list, dma_pushbuffer_subindex);
         }
         // Resume and GPU-written entries need live words, even after a flush cleared dirty state.
-        const bool submitted = (command_list.snapshot_suspensions & 1) == 0 &&
-                               command_list.snapshot_suspensions ==
-                                   suspensions.load(std::memory_order_acquire) &&
+        const bool trust = TrustSubmitted();
+        const bool submitted = (trust || ((command_list.snapshot_suspensions & 1) == 0 &&
+                                          command_list.snapshot_suspensions ==
+                                              suspensions.load(std::memory_order_acquire))) &&
                                VideoCommon::CanUseSubmittedCommands(
             command_resume_offset != 0,
             dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
                 !std::ranges::binary_search(command_list.deferred_entries,
                                             static_cast<u32>(dma_pushbuffer_subindex)),
             gpu_written,
-            use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
-                                                     header.size * sizeof(u32)));
+            !trust && use_safe &&
+                memory_manager.IsMemoryDirty(dma_state.dma_get, header.size * sizeof(u32)));
         if (released && !has_copy) {
             NoteReleasedEntry(ReleasedUse::ParseSkipped, command_list, dma_pushbuffer_subindex);
             // A method left open would take the next entry's words as its data.
@@ -1340,6 +1342,18 @@ std::span<const CommandHeader> DmaPusher::CheckEntryWords(const CommandListHeade
                     used, count);
     }
     return result;
+}
+
+bool DmaPusher::TrustSubmitted() {
+    static const int mode = [] {
+        const char* const value = std::getenv("EDEN_NX2_TRUST_SUBMIT");
+        return value == nullptr ? -1 : value[0] == '0' ? 0 : 1;
+    }();
+    if (mode >= 0) {
+        return mode == 1;
+    }
+    constexpr u64 OcarinaOfTimeId = 0x0400486024DEC000ULL;
+    return Settings::GetCurrentProgramID() == OcarinaOfTimeId;
 }
 
 void DmaPusher::RefreshDeferredEntries(CommandList& list) {
