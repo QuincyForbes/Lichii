@@ -466,7 +466,7 @@ void Fsr3Upscaler::Upscale(const Inputs& in) {
         CreateResources(in.render_size, in.upscale_size);
     }
     const bool first = first_execution;
-    const bool reset = in.reset || first;
+    const bool reset = in.reset || first || in.frame_time_ms > 250.0f;
     first_execution = false;
 
     const s32 rw = static_cast<s32>(render_extent.width);
@@ -541,8 +541,10 @@ void Fsr3Upscaler::Upscale(const Inputs& in) {
         .work_group_offset = {0, 0},
         .render_size = {render_extent.width, render_extent.height},
     };
+    const f32 clamped_sharpness = std::clamp(in.sharpness, 0.0f, 1.0f);
+    const bool sharpen = in.sharpen && clamped_sharpness > 0.0f;
     RcasConstants rcas{};
-    FSR::FsrRcasCon(rcas.config.data(), 2.0f - 2.0f * std::clamp(in.sharpness, 0.0f, 1.0f));
+    FSR::FsrRcasCon(rcas.config.data(), 2.0f - 2.0f * clamped_sharpness);
 
     const VkDeviceSize alignment = (std::max<VkDeviceSize>)(device.GetUniformBufferAlignment(), 16);
     const VkDeviceSize slot = Common::AlignUp(VkDeviceSize{sizeof(Constants)}, alignment);
@@ -729,14 +731,14 @@ void Fsr3Upscaler::Upscale(const Inputs& in) {
                    tex(frame_info), tex(luma_history[p]), tex(farthest_depth_mip1), current_luma,
                    tex(luma_history[q]), tex(farthest_depth), cb_fsr},
         groups(rw, 8), groups(rh, 8));
-    passes[in.sharpen ? PassAccumulateSharpen : PassAccumulate]->Dispatch(
+    passes[sharpen ? PassAccumulateSharpen : PassAccumulate]->Dispatch(
         scheduler, descriptor_queue,
         std::array{exposure, tex(dilated_reactive_masks), tex(dilated_motion_vectors),
                    tex(internal_upscaled[p]), tex(lanczos_lut), tex(farthest_depth_mip1),
                    current_luma, tex(farthest_depth), color, tex(internal_upscaled[q]),
                    tex(output), tex(new_locks), cb_fsr},
         groups(uw, 8), groups(uh, 8));
-    if (in.sharpen) {
+    if (sharpen) {
         passes[PassRcas]->Dispatch(
             scheduler, descriptor_queue,
             std::array{exposure, tex(internal_upscaled[q]), tex(output), cb_fsr, cb_rcas},

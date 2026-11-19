@@ -189,6 +189,9 @@ void Resolve(Cache& cache, bool compute, bool blacklist, std::span<const u32> ki
         }
     }
     if (misses.empty()) {
+        if (!compute) {
+            cache.ReplaceColorFeedbackViews(views);
+        }
         return;
     }
     // EDEN_NX2_BINDMEMO_PARTIAL: only the missed bindings are resolved, unless one hit's image had
@@ -292,6 +295,9 @@ void Resolve(Cache& cache, bool compute, bool blacklist, std::span<const u32> ki
         cache.RecordBinding(lookup, views[index].index, tsc_indices[index], kind, views[index].id,
                             is_texture ? samplers[texture_index] : VideoCommon::SamplerId{},
                             nullptr, 0, rescaled);
+    }
+    if (resolved && !compute) {
+        cache.ReplaceColorFeedbackViews(views);
     }
 }
 

@@ -370,9 +370,15 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, Id vertex) {
                             ctx.OpBitcast(ctx.F32[1], ctx.Const((std::numeric_limits<u32>::max)())),
                             ctx.f32_zero_value);
     case IR::Attribute::PointSpriteS:
+        if (!ValidId(ctx.point_coord)) {
+            return ctx.f32_zero_value;
+        }
         return ctx.OpLoad(ctx.F32[1],
                           ctx.OpAccessChain(ctx.input_f32, ctx.point_coord, ctx.u32_zero_value));
     case IR::Attribute::PointSpriteT:
+        if (!ValidId(ctx.point_coord)) {
+            return ctx.f32_zero_value;
+        }
         return ctx.OpLoad(ctx.F32[1],
                           ctx.OpAccessChain(ctx.input_f32, ctx.point_coord, ctx.Const(1U)));
     case IR::Attribute::TessellationEvaluationPointU:
@@ -482,9 +488,10 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
 }
 
 namespace {
-// Ocarina of Time on Switch 2: some lighting draws write NaN (from a bad probe/light buffer, see
-// zortos293/Lichii#849 and #867), and bloom spreads it into white glows over the whole screen. A
-// NaN written to a float color target becomes 0 instead, so the glow becomes a small dark spot.
+// Ocarina of Time on Switch 2: some lighting draws write NaN or Inf (from a bad probe/light buffer,
+// see zortos293/Lichii#849 and #867), and bloom/exposure mip downsampling spreads it into
+// full-screen flashes. Non-finite values written to a float color target become 0 instead, checked
+// on the IEEE-754 exponent bits so driver fast-math cannot fold the test away.
 // EDEN_NX2_NAN_GUARD=0 writes colors unchanged.
 bool NanGuardEnabled() {
     static const bool enabled = [] {
@@ -498,7 +505,11 @@ Id GuardNan(EmitContext& ctx, Id value) {
     if (!NanGuardEnabled()) {
         return value;
     }
-    return ctx.OpSelect(ctx.F32[1], ctx.OpIsNan(ctx.U1, value), ctx.Const(0.0f), value);
+    const Id bits{ctx.OpBitcast(ctx.U32[1], value)};
+    const Id exp_mask{ctx.Const(0x7f800000U)};
+    const Id is_non_finite{
+        ctx.OpIEqual(ctx.U1, ctx.OpBitwiseAnd(ctx.U32[1], bits, exp_mask), exp_mask)};
+    return ctx.OpSelect(ctx.F32[1], is_non_finite, ctx.f32_zero_value, value);
 }
 } // Anonymous namespace
 

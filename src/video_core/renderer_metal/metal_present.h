@@ -71,9 +71,11 @@ public:
         Attachment target{};
         u32 format{};
         std::array<u32, 2> size{};
+        std::array<u32, 2> render_size{};
         std::array<f32, 2> jitter{};
         std::array<f32, 2> motion_scale{};
         bool use_history{};
+        bool reset{};
     };
     bool TemporalFilter(const TemporalInputs& inputs);
 

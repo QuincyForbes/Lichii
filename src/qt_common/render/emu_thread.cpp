@@ -89,6 +89,17 @@ void EmuThread::run() {
     }
     emit LoadProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
 
+    if (VideoCommon::ShaderWarm::TakeBuildOnly()) {
+        gpu.WaitForIdle();
+        gpu.ReleaseContext();
+        gpu.Start();
+        QtCommon::system->GetCpuManager().OnGpuReady();
+        QtCommon::system->CoreTiming().SyncPause(false);
+        QtCommon::system->DetachDebugger();
+        QtCommon::system->ShutdownMainProcess();
+        return;
+    }
+
     gpu.ReleaseContext();
     gpu.Start();
 

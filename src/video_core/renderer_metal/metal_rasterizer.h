@@ -78,6 +78,8 @@ struct DisplayTexture {
     u32 height{};
     u32 scaled_width{};
     u32 scaled_height{};
+    bool anti_aliased{};
+    bool already_upscaled{};
 };
 
 /// Takes the GPU's work into the texture and buffer caches. Milestone 2: memory, copies, blits,
@@ -145,12 +147,15 @@ public:
     bool AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
                                const Tegra::Engines::Fermi2D::Surface& dst,
                                const Tegra::Engines::Fermi2D::Config& copy_config) override;
-    bool AccelerateTemporalUpscale(const Tegra::Engines::Fermi2D::Surface& src,
-                                   const Tegra::Engines::Fermi2D::Surface& dst,
-                                   const Tegra::Engines::Fermi2D::Surface& motion_vectors,
-                                   const Tegra::Texture::TICEntry* depth,
-                                   std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,
-                                   bool use_history) override;
+    bool AccelerateTemporalUpscale(
+        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
+        const Tegra::Engines::Fermi2D::Surface& motion_vectors,
+        const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
+        std::array<f32, 2> motion_scale, bool use_history = true,
+        std::optional<std::array<u32, 2>> render_region = std::nullopt) override;
+    std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
+        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
+        std::optional<std::array<u32, 2>> src_region = std::nullopt) override;
     bool AccelerateCameraMotionUpscale(const Tegra::Engines::Fermi2D::Surface& src,
                                        const Tegra::Engines::Fermi2D::Surface& dst) override;
     [[nodiscard]] bool UsesCameraMotionUpscale() const override;
@@ -315,7 +320,8 @@ private:
 
     /// Vulkan's TryOcarinaUpscale: the upscale pass (views: the scene, then the target) replaced
     /// by OcarinaTemporal; false when the game's pass (or the bilinear one) must run.
-    bool TryOcarinaTemporal(u64 shader_hash, std::span<const VideoCommon::ImageViewInOut> views);
+    bool TryOcarinaTemporal(u64 native_key, u64 shader_hash,
+                            std::span<const VideoCommon::ImageViewInOut> views);
 
     /// Counts a replaced or declined upscale pass and logs the summary every 600 (Vulkan's
     /// CountOcarinaUpscale).
@@ -658,10 +664,15 @@ private:
     };
     std::mutex pending_reports_mutex;
     std::unordered_map<DAddr, PendingReport> pending_reports;
+    std::atomic<u32> pending_reports_count{};
     /// Writes the pending report at `address` (the one made with `serial`; 0 = any) once the GPU
     /// has written its slots. False when there is none.
     bool WritePendingReport(DAddr address, u64 serial);
+    /// Drops any pending occlusion reports overlapping `[addr, addr + size)` when overwritten.
+    void InvalidatePendingReports(DAddr addr, u64 size);
     u64 report_serial{};
+    u64 last_vertex_segment{};
+    const Tegra::Engines::Maxwell3D* last_vertex_channel{};
     /// The condition decided on the GPU (EDEN_NX2_METAL_GPU_CONDITION).
     struct GpuCondition {
         bool active{};
@@ -1079,6 +1090,8 @@ private:
     std::optional<u64> oot_effects_frame;
     GPUVAddr oot_effects_address{};
     TextureHandle oot_effects_scene{};
+    std::optional<u64> oot_4k_scene_frame;
+    TextureHandle oot_4k_guest_present{};
 
     /// Vulkan's TrackOcarinaActor: the pose of the recognised Link draw
     /// (EDEN_NX2_METAL_OOT_ACTOR).
@@ -1090,6 +1103,9 @@ private:
     /// After a draw: the fog's draw saves the scene for the effects mask (Vulkan's
     /// SaveEffectsBase call, EDEN_NX2_METAL_OOT_EFFECTS).
     void NoteOcarinaEffectsDraw(u64 fragment_hash);
+
+    /// Notes the guest's final 2560x1440 HUD composite target on frames upscaled to 3840x2160.
+    void NoteOcarina4kDraw(const std::array<u64, 6>& hashes);
 
     /// Before a dispatch: one that writes the scene after the effects marks what they drew
     /// (Vulkan's MarkEffects call). `views` as DispatchCompute fills them.

@@ -45,6 +45,7 @@ struct ShaderRecord {
     ProgramStage stage{};
     std::span<const u8> code;
     std::span<const u8> control;
+    bool maxwell{}; ///< Switch 1 NVN1 Maxwell shader (already Maxwell SPH + ISA).
 };
 
 /// The game's Zstandard dictionaries (Pack/ZsDic.pack.zs), by dictionary ID.
@@ -70,9 +71,10 @@ private:
 /// What the precache builder does with a RomFS file.
 enum class GameFileKind : u8 {
     Other,            ///< Not read
-    ShaderArchive,    ///< *.bfsha, *.sarc, *.bnsh, *.cgsb, *.shn or *.sharcb, raw or zstd (.zs)
-    Effect,           ///< Effect/*.vsetb.byml.zs or *.esetb.byml.zs and *.ptcl (raw or zstd), read
-                      ///< after every shader archive
+    ShaderArchive,    ///< *.bfsha, *.sarc, *.bnsh, *.cgsb, *.shn, *.sharcb, *.blarc or *.pck, raw
+                      ///< or zstd (.zs/.zst)
+    Effect,           ///< Effect/**/*.vsetb.byml.zs, *.esetb.byml.zs and *.ptcl (raw or zstd),
+                      ///< read after every shader archive
     ZstdDictionaries, ///< Pack/ZsDic.pack.zs
 };
 

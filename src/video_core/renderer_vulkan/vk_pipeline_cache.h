@@ -350,7 +350,7 @@ private:
     void QueueVulkanPipelineCacheFlush();
     /// Writes the driver pipeline cache on the serialization thread, unless a write is queued
     /// already (`again_if_busy`: then one more follows it, for a save that must hold the latest
-    /// builds). Callable from any thread.
+    /// builds), or synchronously on this thread where reading the cache during a build crashes.
     void QueueVulkanPipelineCacheSave(bool again_if_busy);
     /// True (and `last` set to now) when a write of the driver cache is due since `last`.
     [[nodiscard]] bool VulkanPipelineCacheSaveDue(

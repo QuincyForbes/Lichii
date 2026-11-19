@@ -176,9 +176,12 @@ VkImageView FSR::Draw(const Device& device, Scheduler& scheduler, size_t image_i
                      input_image_height, output_image_width, output_image_height, viewport_x,
                      viewport_y);
 
-    const float sharpening =
-        static_cast<float>(Settings::values.fsr_sharpening_slider.GetValue()) / 100.0f;
-    FsrRcasCon(rcas_con.data(), sharpening);
+    const int slider = Settings::values.fsr_sharpening_slider.GetValue();
+    const bool run_rcas = slider < 200;
+    if (run_rcas) {
+        const float sharpening = static_cast<float>(slider) / 100.0f;
+        FsrRcasCon(rcas_con.data(), sharpening);
+    }
 
     UploadImages(device, scheduler);
     UpdateDescriptorSets(device, source_image_view, image_index);
@@ -196,6 +199,9 @@ VkImageView FSR::Draw(const Device& device, Scheduler& scheduler, size_t image_i
         cmdbuf.EndRenderPass();
 
         TransitionImageLayout(cmdbuf, easu_image, VK_IMAGE_LAYOUT_GENERAL);
+        if (!run_rcas) {
+            return;
+        }
         TransitionImageLayout(cmdbuf, rcas_image, VK_IMAGE_LAYOUT_GENERAL);
         BeginRenderPass(cmdbuf, renderpass, rcas_framebuffer, extent);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, rcas_pipeline);
@@ -208,7 +214,7 @@ VkImageView FSR::Draw(const Device& device, Scheduler& scheduler, size_t image_i
         TransitionImageLayout(cmdbuf, rcas_image, VK_IMAGE_LAYOUT_GENERAL);
     });
 
-    return *images.image_views[Rcas];
+    return run_rcas ? *images.image_views[Rcas] : *images.image_views[Easu];
 }
 
 } // namespace Vulkan

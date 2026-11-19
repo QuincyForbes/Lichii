@@ -22,12 +22,31 @@ layout(push_constant) uniform PushConstants {
     float clip_width;                 // neighbourhood clip of still pixels, in deviations
     float clip_motion;                // clip of pixels moving a pixel or more per frame
     float kernel_motion;              // kernel distance scale of moving pixels
+    ivec2 render_size;                // the part of the input the game rendered, in pixels
 };
 
 layout(location = 0) in vec2 texcoord;  // 0 to 1 across the output
 layout(location = 0) out vec4 color;
 
 // The blit helper's samplers take unnormalized (texel) coordinates.
+
+bool IsFinite1(float value) {
+    return (floatBitsToUint(value) & 0x7f800000u) != 0x7f800000u;
+}
+
+bool IsFinite2(vec2 value) {
+    const uvec2 exponent = floatBitsToUint(value) & 0x7f800000u;
+    return all(notEqual(exponent, uvec2(0x7f800000u)));
+}
+
+bool IsFinite(vec3 value) {
+    const uvec3 exponent = floatBitsToUint(value) & 0x7f800000u;
+    return all(notEqual(exponent, uvec3(0x7f800000u)));
+}
+
+vec3 SanitizeColor(vec3 c) {
+    return IsFinite(c) ? max(c, vec3(0.0)) : vec3(0.0);
+}
 
 // Blending in a range-compressed space keeps bright pixels from dominating the average.
 vec3 Compress(vec3 c) {
@@ -71,25 +90,31 @@ vec3 SampleHistory(vec2 position) {
     const vec2 texel0 = texel1 - 1.0;
     const vec2 texel3 = texel1 + 2.0;
     const vec2 texel12 = texel1 + w2 / w12;
-    vec3 sum = textureLod(history, vec2(texel12.x, texel0.y), 0.0).rgb * (w12.x * w0.y);
-    sum += textureLod(history, vec2(texel0.x, texel12.y), 0.0).rgb * (w0.x * w12.y);
-    sum += textureLod(history, texel12, 0.0).rgb * (w12.x * w12.y);
-    sum += textureLod(history, vec2(texel3.x, texel12.y), 0.0).rgb * (w3.x * w12.y);
-    sum += textureLod(history, vec2(texel12.x, texel3.y), 0.0).rgb * (w12.x * w3.y);
+    vec3 sum = SanitizeColor(textureLod(history, vec2(texel12.x, texel0.y), 0.0).rgb) * (w12.x * w0.y);
+    sum += SanitizeColor(textureLod(history, vec2(texel0.x, texel12.y), 0.0).rgb) * (w0.x * w12.y);
+    sum += SanitizeColor(textureLod(history, texel12, 0.0).rgb) * (w12.x * w12.y);
+    sum += SanitizeColor(textureLod(history, vec2(texel3.x, texel12.y), 0.0).rgb) * (w3.x * w12.y);
+    sum += SanitizeColor(textureLod(history, vec2(texel12.x, texel3.y), 0.0).rgb) * (w12.x * w3.y);
     const float weight = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
-    return max(sum / weight, vec3(0.0));
+    return SanitizeColor(sum / weight);
 }
 
 void main() {
-    const ivec2 input_size = textureSize(input_color, 0);
+    const ivec2 input_texture_size = textureSize(input_color, 0);
+    const ivec2 input_size = render_size.x > 0 && render_size.y > 0
+                                 ? min(render_size, input_texture_size)
+                                 : input_texture_size;
     if (current_weight < 0.0) {
         const vec2 position = clamp(texcoord * vec2(input_size) + jitter,
                                     vec2(0.5), vec2(input_size) - vec2(0.5));
-        color = vec4(textureLod(input_color, position, 0.0).rgb, 1.0);
+        color = vec4(SanitizeColor(textureLod(input_color, position, 0.0).rgb), 1.0);
         imageStore(next_history, ivec2(gl_FragCoord.xy), color);
         return;
     }
-    const ivec2 motion_size = textureSize(motion_vectors, 0);
+    // A rendered region sits on the same pixel grid in the colour and the motion targets, whatever
+    // their sizes; without one, the motion vectors cover the whole input at their own scale.
+    const bool has_region = input_size != input_texture_size;
+    const ivec2 motion_size = has_region ? input_size : textureSize(motion_vectors, 0);
     // The output pixel's centre in input pixels. Input texel k sampled the scene at k + 0.5 - jitter
     // (the sign measured against consecutive frames).
     const vec2 target = texcoord * vec2(input_size);
@@ -106,6 +131,9 @@ void main() {
                                             vec2(input_size)),
                                       ivec2(0), motion_size - 1);
             const vec2 candidate = texelFetch(motion_vectors, texel, 0).rg;
+            if (!IsFinite2(candidate)) {
+                continue;
+            }
             const float length_squared = dot(candidate, candidate);
             if (length_squared > longest) {
                 longest = length_squared;
@@ -121,7 +149,9 @@ void main() {
     // moving object has just uncovered has no motion of its own but a history of that object.
     const vec2 history_position = previous * vec2(textureSize(history, 0));
     const float moved = smoothstep(0.02, 0.25, length(motion * motion_scale * vec2(textureSize(history, 0))));
-    const float moving = max(moved, texture(history, history_position).a);
+    const float raw_history_alpha = texture(history, history_position).a;
+    const float history_alpha = IsFinite1(raw_history_alpha) ? clamp(raw_history_alpha, 0.0, 1.0) : 0.0;
+    const float moving = max(moved, history_alpha);
     const float kernel = mix(kernel_scale, kernel_motion, moving);
     const float clip = mix(clip_width, clip_motion, moving);
 
@@ -133,7 +163,8 @@ void main() {
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
             const ivec2 texel = clamp(nearest + ivec2(x, y), ivec2(0), input_size - 1);
-            const vec3 sample_color = RgbToYCoCg(Compress(texelFetch(input_color, texel, 0).rgb));
+            const vec3 sample_color =
+                RgbToYCoCg(Compress(SanitizeColor(texelFetch(input_color, texel, 0).rgb)));
             // A Blackman-Harris-like window over the sample's distance to the output pixel.
             const vec2 distance = (vec2(texel) + 0.5 - jitter - target) * kernel;
             const float weight = exp(-2.29 * dot(distance, distance));
@@ -165,11 +196,12 @@ void main() {
                 const ivec2 texel = clamp(nearest + ivec2(x, y), ivec2(0), input_size - 1);
                 const vec2 distance = vec2(texel) + 0.5 - jitter - target;
                 const float wide_weight = exp(-2.29 * dot(distance, distance));
-                wide += RgbToYCoCg(Compress(texelFetch(input_color, texel, 0).rgb)) * wide_weight;
+                wide += RgbToYCoCg(Compress(SanitizeColor(texelFetch(input_color, texel, 0).rgb))) *
+                        wide_weight;
                 wide_total += wide_weight;
             }
         }
-        result = wide / wide_total;
+        result = wide / max(wide_total, 1e-6);
         remembered = 1.0;
     } else {
         const vec3 unclipped = RgbToYCoCg(Compress(SampleHistory(history_position)));
@@ -181,6 +213,6 @@ void main() {
         const vec3 units = abs(unclipped - 0.5 * (low + high)) / extent;
         remembered = max(remembered, smoothstep(1.25, 2.5, max(units.x, max(units.y, units.z))));
     }
-    color = vec4(Expand(YCoCgToRgb(result)), 1.0);
+    color = vec4(SanitizeColor(Expand(YCoCgToRgb(result))), 1.0);
     imageStore(next_history, ivec2(gl_FragCoord.xy), vec4(color.rgb, remembered));
 }

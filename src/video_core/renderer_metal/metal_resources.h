@@ -7,8 +7,9 @@
 #pragma once
 
 #include <array>
-#include <optional>
 #include <functional>
+#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -82,6 +83,9 @@ struct FormatInfo {
 
 /// Device::SupportsMeshShaders for plain C++.
 [[nodiscard]] bool DeviceSupportsMeshShaders(const Device& device);
+
+/// Creates a standalone Metal Device from plain C++ (returns null when no Metal GPU is available).
+[[nodiscard]] std::unique_ptr<Device, void (*)(Device*)> CreateOfflineDevice();
 
 /// Runs work inside an autorelease pool: threads of plain C++ that make Metal objects have none.
 void InAutoreleasePool(const std::function<void()>& work);

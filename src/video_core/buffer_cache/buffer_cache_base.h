@@ -536,8 +536,16 @@ public:
     void PopAsyncFlushes();
     void PopAsyncBuffers();
 
+    /// gpu_written_dest: the destination ranges that took GPU-written bytes, which guest memory
+    /// doesn't hold until they are downloaded
     bool DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount,
-                 bool inline_grid_copy = false);
+                 bool inline_grid_copy = false,
+                 boost::container::small_vector<std::pair<DAddr, size_t>, 4>* gpu_written_dest =
+                     nullptr);
+    bool DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount,
+                 boost::container::small_vector<std::pair<DAddr, size_t>, 4>* gpu_written_dest) {
+        return DMACopy(src_address, dest_address, amount, false, gpu_written_dest);
+    }
 
     bool DMAClear(GPUVAddr src_address, u64 amount, u32 value);
 
@@ -1148,6 +1156,9 @@ private:
     }
 
     [[nodiscard]] bool UboRangeClean(DAddr device_addr, u32 size, u64& page_gen) const noexcept {
+        if (size != 0 && Core::g_collected_write_pages.Any(device_addr, size)) {
+            return false;
+        }
         const u64 cur_gen = UboPageGen(device_addr, size);
         if (page_gen == cur_gen) [[likely]] {
             return true;
@@ -1417,12 +1428,21 @@ private:
     std::array<std::array<UniformBindMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
         uniform_bind_memo{};
 
+    [[nodiscard]] u64 DeviceTranslationGeneration() const noexcept {
+        if constexpr (requires { device_memory.TranslationGeneration(); }) {
+            return device_memory.TranslationGeneration();
+        } else {
+            return 0;
+        }
+    }
+
     /// Direct and indirect pointer-table SSBO address/layout memo per (stage, ssbo_index);
     /// stage NUM_STAGES is compute.
     struct SsboBindMemo {
         const void* channel{};
         size_t as_id{};
         u64 map_serial{};
+        u64 translation_gen{};
         GPUVAddr cbuf_slot_addr{};
         u32 indirect_offset{~0U};
         u8 flags{}; ///< bit 0: valid, bit 1: written, bit 2: native_pointer, bit 3: table_pointer
@@ -1448,6 +1468,7 @@ private:
     struct StorageBindingMemo {
         u64 epoch{}; ///< binding_epoch when stored; 0 never matches
         u64 map_serial{};
+        u64 translation_gen{};
         size_t as_id{};
         const void* channel{};
         DAddr device_addr{};
@@ -1467,6 +1488,7 @@ private:
     struct StorageResolveCache {
         u64 epoch{};
         u64 map_serial{};
+        u64 translation_gen{};
         size_t as_id{};
         const void* channel{};
         u64 enabled{};
@@ -1482,11 +1504,13 @@ private:
 
     void StoreStorageResolve(StorageResolveCache& cache, std::span<const Binding> bindings,
                              u64 enabled, u64 written,
-                             const std::vector<MultiRangeSegment>& pool, u64 start_epoch);
+                             const std::vector<MultiRangeSegment>& pool, u64 start_epoch,
+                             u64 start_map_serial);
 
     struct GeometryMemo {
         u64 epoch{};
         u64 map_serial{};
+        u64 translation_gen{};
         size_t as_id{};
         const void* channel{};
         GPUVAddr begin{};
@@ -1504,6 +1528,7 @@ private:
         GPUVAddr begin{};
         GPUVAddr end{};
         u64 map_serial{~u64{0}};
+        u64 translation_gen{};
         u64 deletions{};
         DAddr device_addr{};
         u32 found_size{}; ///< The size FindBuffer was asked for: the buffer holds at least this
@@ -1516,6 +1541,7 @@ private:
     struct IndirectDrawMemo {
         u64 epoch{};
         u64 map_serial{};
+        u64 translation_gen{};
         size_t as_id{};
         const void* channel{};
         GPUVAddr gpu_begin{};
@@ -1538,7 +1564,7 @@ private:
                                          size_t size, Binding& binding) const noexcept;
 
     void StoreIndirectDraw(IndirectDrawMemo& memo, GPUVAddr gpu_addr, u32 size, DAddr device_addr,
-                           BufferId buffer_id, u64 map_serial);
+                           BufferId buffer_id, u64 map_serial, u64 translation_gen);
 
     /// EDEN_NX2_TABLE_POINTER_TRACE: last table entry and size bound per table pointer slot.
     std::unordered_map<u64, std::pair<GPUVAddr, u32>> traced_table_pointers;

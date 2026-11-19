@@ -236,6 +236,8 @@ void RecommendApple(const Device& device, Profile& p) {
                               : "Off: generated frames cost GPU time a phone needs for the game.");
     Add(p, v.use_reactive_flushing, false,
         "Off: on unified memory the readback is still a fence wait.");
+    Add(p, v.precache_shaders, PrecacheShaders::Off,
+        "Off: memory and battery on mobile favour the explicit Build Shaders action.");
     Add(p, v.moltenvk_driver, MoltenVkDriver::Legacy,
         "Legacy MoltenVK until a device run proves the native mesh shader one.");
     Add(p, v.guest_wait_backoff, true,
@@ -381,6 +383,8 @@ void RecommendDesktop(const Device& device, Profile& p) {
              : "Game's own: Ocarina of Time's upscaler, AMD FSR 3.1 for DLSS calls.");
     Add(p, v.frame_gen, false, "Off: adds input lag; turn it on for a 120 Hz display.");
     Add(p, v.nvdec_emulation, NvdecEmulation::Gpu, "GPU: Ocarina of Time's cutscene videos.");
+    Add(p, v.precache_shaders, PrecacheShaders::Ask,
+        "Ask: prompts on first launch so game shaders can be precompiled ahead of time.");
     if (device.os == Os::MacOS) {
         Add(p, v.use_reactive_flushing, false,
             "Off: on unified memory the readback is still a fence wait.");

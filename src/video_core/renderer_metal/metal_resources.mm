@@ -245,6 +245,15 @@ bool DeviceSupportsMeshShaders(const Device& device) {
     return device.SupportsMeshShaders();
 }
 
+std::unique_ptr<Device, void (*)(Device*)> CreateOfflineDevice() {
+    constexpr auto deleter = +[](Device* ptr) { delete ptr; };
+    try {
+        return {new Device(), deleter};
+    } catch (...) {
+        return {nullptr, deleter};
+    }
+}
+
 void InAutoreleasePool(const std::function<void()>& work) {
     @autoreleasepool {
         work();
@@ -671,9 +680,6 @@ Object CreateLibrary(const Device& device, std::string_view source, std::string&
             } else {
                 options.fastMathEnabled = NO;
             }
-            if (@available(iOS 14.0, macOS 11.0, *)) {
-                options.preserveInvariance = YES;
-            }
         } else if (full_fast_math) {
             options.fastMathEnabled = YES;
         } else if (@available(iOS 18.0, macOS 15.0, *)) {
@@ -683,6 +689,9 @@ Object CreateLibrary(const Device& device, std::string_view source, std::string&
             options.mathMode = MTLMathModeRelaxed;
         } else {
             options.fastMathEnabled = YES;
+        }
+        if (@available(iOS 14.0, macOS 11.0, *)) {
+            options.preserveInvariance = YES;
         }
         NSError* ns_error = nil;
         const id<MTLLibrary> library = [device.GetDevice() newLibraryWithSource:ToNSString(source)

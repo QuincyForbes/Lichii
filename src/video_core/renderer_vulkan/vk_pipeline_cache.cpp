@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bitset>
 #include <chrono>
@@ -35,6 +36,7 @@
 #include "common/nx2_poll.h"
 #include "common/platform_events.h"
 #include "common/scope_exit.h"
+#include "common/settings.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/memory_detect.h"
@@ -69,6 +71,7 @@
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/renderer_vulkan/pipeline_cache_dir.h"
+#include "video_core/renderer_vulkan/pipeline_eviction_policy.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_cooperative_hmma_test.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -349,23 +352,18 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
 
         info.dual_source_blend = key.state.attachment0_dual_source_blend != 0;
 
-        if (device.IsMoltenVK()) {
-            for (size_t i = 0; i < 8; ++i) {
-                const auto format = static_cast<Tegra::RenderTargetFormat>(key.state.color_formats[i]);
-                if (format == Tegra::RenderTargetFormat::NONE) {
-                    info.color_output_types[i] = Shader::AttributeType::Float;
-                    continue;
-                }
-                const auto pixel_format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(format);
-                if (VideoCore::Surface::IsPixelFormatInteger(pixel_format)) {
-                    if (VideoCore::Surface::IsPixelFormatSignedInteger(pixel_format)) {
-                        info.color_output_types[i] = Shader::AttributeType::SignedInt;
-                    } else {
-                        info.color_output_types[i] = Shader::AttributeType::UnsignedInt;
-                    }
+        for (size_t i = 0; i < 8; ++i) {
+            const auto format = static_cast<Tegra::RenderTargetFormat>(key.state.color_formats[i]);
+            const auto pixel_format =
+                VideoCore::Surface::TryPixelFormatFromRenderTargetFormat(format);
+            if (pixel_format && VideoCore::Surface::IsPixelFormatInteger(*pixel_format)) {
+                if (VideoCore::Surface::IsPixelFormatSignedInteger(*pixel_format)) {
+                    info.color_output_types[i] = Shader::AttributeType::SignedInt;
                 } else {
-                    info.color_output_types[i] = Shader::AttributeType::Float;
+                    info.color_output_types[i] = Shader::AttributeType::UnsignedInt;
                 }
+            } else {
+                info.color_output_types[i] = Shader::AttributeType::Float;
             }
         }
         break;
@@ -473,8 +471,30 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
     return FinishShaderModule(device, code, shader_hash, stage_index, spirv_hash);
 }
 
+/// Pathological uber-shaders (> 100,000 SPIR-V words) can consume 10+ GiB of driver RAM when
+/// compiled across speculative precache worker threads; skip them during precache.
+constexpr size_t MaxPrecacheSpirvWords = 100'000;
+thread_local bool t_speculative_precache = false;
+
+struct SpeculativePrecacheScope {
+    SpeculativePrecacheScope() noexcept : previous{t_speculative_precache} {
+        t_speculative_precache = true;
+    }
+    ~SpeculativePrecacheScope() {
+        t_speculative_precache = previous;
+    }
+    bool previous;
+};
+
 vk::ShaderModule FinishShaderModule(const Device& device, std::span<const u32> code,
                                    u64 shader_hash, size_t stage_index, u128* spirv_hash) {
+    if (t_speculative_precache && code.size() > MaxPrecacheSpirvWords) {
+        LOG_WARNING(Render_Vulkan,
+                    "Shader precache: skipping pathological shader {:016x} ({} SPIR-V words > {})",
+                    shader_hash, code.size(), MaxPrecacheSpirvWords);
+        throw Shader::NotImplementedException("SPIR-V exceeds precache word limit ({} words)",
+                                              code.size());
+    }
     if (spirv_hash) {
         // Graphics pipeline libraries are keyed by the SPIR-V the stage was emitted to.
         *spirv_hash = Common::CityHash128(reinterpret_cast<const char*>(code.data()),
@@ -2579,10 +2599,25 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                               ShaderWarm::TakeWarmBeforeStart()) ||
                           build_only;
     std::unordered_set<u64> precached_pipelines;
+    std::unordered_set<u64> slow_precache_hashes;
     if (precache) {
         precached_pipelines = ShaderWarm::ReadPrecachedPipelines(
             ShaderWarm::PrecachedPipelinesPath(title_id),
             {device.GetDriverVersion(), device.GetDeviceID(), CACHE_VERSION});
+        const auto slow_file = ShaderWarm::ComputeWarmPath(title_id).parent_path() / "precache-slow.bin";
+        std::ifstream slow_in(slow_file, std::ios::binary);
+        u32 slow_magic{}, slow_driver{}, slow_device{}, slow_version{};
+        if (slow_in.read(reinterpret_cast<char*>(&slow_magic), sizeof(slow_magic)) &&
+            slow_in.read(reinterpret_cast<char*>(&slow_driver), sizeof(slow_driver)) &&
+            slow_in.read(reinterpret_cast<char*>(&slow_device), sizeof(slow_device)) &&
+            slow_in.read(reinterpret_cast<char*>(&slow_version), sizeof(slow_version)) &&
+            slow_magic == 0x31534C57U && slow_driver == device.GetDriverVersion() &&
+            slow_device == device.GetDeviceID() && slow_version == CACHE_VERSION) {
+            u64 slow_hash{};
+            while (slow_in.read(reinterpret_cast<char*>(&slow_hash), sizeof(slow_hash))) {
+                slow_precache_hashes.insert(slow_hash);
+            }
+        }
     }
     std::vector<PrecacheJob> precache_graphics;
     size_t precache_capture_bytes = 0;
@@ -2590,7 +2625,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto precache_graphics_job = [&](const GraphicsPipelineCacheKey& key,
                                            GraphicsRecords& records) {
         const u64 hash = key.Hash();
-        if (precached_pipelines.contains(hash)) {
+        if (precached_pipelines.contains(hash) || slow_precache_hashes.contains(hash)) {
             ++already_precached;
             return;
         }
@@ -2643,7 +2678,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto queue_compute{[&](const ComputePipelineCacheKey& key,
                                  std::vector<FileEnvironment> candidates) {
         if (build_only) {
-            if (precached_pipelines.contains(key.Hash())) {
+            if (precached_pipelines.contains(key.Hash()) ||
+                slow_precache_hashes.contains(key.Hash())) {
                 ++already_precached;
                 return;
             }
@@ -2794,7 +2830,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             // A boot that builds tens of thousands of pipelines takes minutes: what it built so
             // far is written now and then, so a boot that ends early (a crash, the app killed)
             // does not leave the next one to compile everything again.
-            if (VulkanPipelineCacheSaveDue(state.last_save)) {
+            if (device.CanReadPipelineCacheDuringBuilds() &&
+                VulkanPipelineCacheSaveDue(state.last_save)) {
                 QueueVulkanPipelineCacheSave(false);
             }
             ++state.built;
@@ -2921,7 +2958,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
              UsedPipelinesSaveInterval(device).count() != 0
                  ? fmt::format("{} s after a first use", UsedPipelinesSaveInterval(device).count())
                  : std::string{"as before"});
-    if (background_count != 0 && !stop_loading.stop_requested()) {
+    const auto start_background_prebuild = [&] {
+        if (background_count == 0 || stop_loading.stop_requested()) {
+            return;
+        }
         const size_t threads = BackgroundPipelineThreads();
         LOG_INFO(Render_Vulkan,
                  "Building {} of {} cached graphics pipelines in the background ({} threads), the "
@@ -2980,7 +3020,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 }
                 // These builds fill the driver cache too, but only GPU thread builds queued its
                 // writes: a session stopped before its exit save kept none of them.
-                if (build && VulkanPipelineCacheSaveDue(background_last_save)) {
+                if (build && device.CanReadPipelineCacheDuringBuilds() &&
+                    VulkanPipelineCacheSaveDue(background_last_save)) {
                     QueueVulkanPipelineCacheSave(false);
                 }
                 if (background_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -2993,7 +3034,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                              background_claimed.size());
                     background_claimed.clear();
                     background_active.store(false, std::memory_order_release);
-                    if (!background_stop.load(std::memory_order_relaxed)) {
+                    if (!background_stop.load(std::memory_order_relaxed) &&
+                        device.CanReadPipelineCacheDuringBuilds()) {
                         QueueVulkanPipelineCacheSave(true);
                     }
                 }
@@ -3002,12 +3044,18 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 pipeline.reset();
             });
         }
+    };
+    // Start the background prebuild after the load's driver pipeline cache save and precache when
+    // precaching or where reading the driver cache during a build crashes (Intel Windows).
+    const bool prebuild_with_boot = PrebuildStartsWithBootBuilds(
+        precache, use_vulkan_pipeline_cache && !device.CanReadPipelineCacheDuringBuilds());
+    if (prebuild_with_boot) {
+        start_background_prebuild();
     }
 
     if (use_vulkan_pipeline_cache) {
-        // On the serialization thread: for a cache of tens of thousands of pipelines, reading
-        // the driver data (gigabytes) and writing it can hold the boot at 100% long enough to
-        // look frozen. It follows any write the boot build queued.
+        // On the serialization thread where concurrent reads are safe, or synchronously now with
+        // no build in flight on Intel Windows.
         QueueVulkanPipelineCacheSave(true);
         last_flush = std::chrono::steady_clock::now();
     }
@@ -3021,7 +3069,94 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             PrecacheGraphicsLibraries(title_id, stop_loading, callback);
         }
     }
+    if (!prebuild_with_boot) {
+        start_background_prebuild();
+    }
 }
+
+namespace {
+constexpr u32 PrecacheSlowMagic = 0x31534C57U; // "WLS1"
+constexpr std::chrono::seconds PrecacheSaveInterval{25};
+
+constexpr u64 UnwrapEmissionStamp(u64 value) noexcept {
+    return value;
+}
+
+inline u64 UnwrapEmissionStamp(u64 (*fn)()) {
+    return fn();
+}
+
+/// The precache marker's variant: the build's SPIR-V emission stamp and the settings and device
+/// capabilities that change what the driver gets for a precache build.
+u64 WarmVariant(const Device& device) {
+    const auto& resolution = Settings::values.resolution_info;
+    const std::array<u64, 10> inputs{
+        UnwrapEmissionStamp(VideoCommon::ShaderWarm::EmissionStamp),
+        resolution.active ? 1ULL : 0ULL,
+        resolution.up_scale,
+        resolution.down_shift,
+        Settings::values.disable_shader_loop_safety_checks.GetValue() ? 1ULL : 0ULL,
+        Settings::values.fix_bloom_effects.GetValue() ? 1ULL : 0ULL,
+        Settings::values.renderer_debug.GetValue() ? 1ULL : 0ULL,
+        device.IsExtDescriptorBufferSupported() ? 1ULL : 0ULL,
+        device.IsExtGraphicsPipelineLibrarySupported() ? 1ULL : 0ULL,
+        device.IsExtMeshShaderSupported() ? 1ULL : 0ULL,
+    };
+    return Common::CityHash64(reinterpret_cast<const char*>(inputs.data()), sizeof(inputs));
+}
+
+std::filesystem::path PrecacheSlowPath(u64 title_id) {
+    return VideoCommon::ShaderWarm::ComputeWarmPath(title_id).parent_path() / "precache-slow.bin";
+}
+
+std::unordered_set<u64> ReadPrecacheSlowHashes(const std::filesystem::path& path, u32 driver,
+                                               u32 device_id, u32 cache_version) {
+    std::unordered_set<u64> hashes;
+    std::ifstream in(path, std::ios::binary);
+    u32 magic{}, stored_driver{}, stored_device{}, stored_version{};
+    if (!in.read(reinterpret_cast<char*>(&magic), sizeof(magic)) ||
+        !in.read(reinterpret_cast<char*>(&stored_driver), sizeof(stored_driver)) ||
+        !in.read(reinterpret_cast<char*>(&stored_device), sizeof(stored_device)) ||
+        !in.read(reinterpret_cast<char*>(&stored_version), sizeof(stored_version)) ||
+        magic != PrecacheSlowMagic || stored_driver != driver || stored_device != device_id ||
+        stored_version != cache_version) {
+        return hashes;
+    }
+    u64 hash{};
+    while (in.read(reinterpret_cast<char*>(&hash), sizeof(hash))) {
+        hashes.insert(hash);
+    }
+    return hashes;
+}
+
+void WritePrecacheSlowHashes(const std::filesystem::path& path, u32 driver, u32 device_id,
+                             u32 cache_version, const std::unordered_set<u64>& hashes) {
+    if (hashes.empty()) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::filesystem::path tmp = path;
+    tmp += ".tmp";
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return;
+    }
+    const u32 magic = PrecacheSlowMagic;
+    out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    out.write(reinterpret_cast<const char*>(&driver), sizeof(driver));
+    out.write(reinterpret_cast<const char*>(&device_id), sizeof(device_id));
+    out.write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
+    std::vector<u64> sorted(hashes.begin(), hashes.end());
+    std::ranges::sort(sorted);
+    out.write(reinterpret_cast<const char*>(sorted.data()),
+              static_cast<std::streamsize>(sorted.size() * sizeof(u64)));
+    out.close();
+    if (out) {
+        std::filesystem::rename(tmp, path, ec);
+    }
+}
+} // Anonymous namespace
 
 bool PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
                                     std::unordered_set<u64> precached, size_t already_built,
@@ -3030,10 +3165,14 @@ bool PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
     namespace ShaderWarm = VideoCommon::ShaderWarm;
     const size_t graphics_jobs = jobs.size();
     const std::filesystem::path warm_file = ShaderWarm::ComputeWarmPath(title_id);
+    const std::filesystem::path slow_file = PrecacheSlowPath(title_id);
+    std::unordered_set<u64> slow_hashes = ReadPrecacheSlowHashes(
+        slow_file, device.GetDriverVersion(), device.GetDeviceID(), CACHE_VERSION);
     const std::string path = Common::FS::PathToUTF8String(warm_file);
+    const u64 variant = WarmVariant(device);
     const auto stamp = [&](u64 entries) {
         return ShaderWarm::CurrentWarmStamp(warm_file, entries, device.GetDriverVersion(),
-                                            device.GetDeviceID(), CACHE_VERSION);
+                                            device.GetDeviceID(), CACHE_VERSION, variant);
     };
     // Compute programs of the precache file, unless a matching marker says they were built.
     size_t file_entries = 0;
@@ -3074,11 +3213,15 @@ bool PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
                 ComputePipelineCacheKey key;
                 file.read(reinterpret_cast<char*>(&key), sizeof(key));
                 ++file_entries;
-                // Programs already in the disk cache were built above; leave them out.
-                if (compute_cache.contains(key) || precached.contains(key.Hash())) {
+                // Programs already in the disk cache or marked slow/hung were skipped; leave them out.
+                const u64 compute_hash = key.Hash();
+                if (compute_cache.contains(key) || precached.contains(compute_hash) ||
+                    slow_hashes.contains(compute_hash)) {
                     continue;
                 }
                 jobs.push_back({
+                    .hash = compute_hash,
+                    .record = false,
                     .label = fmt::format("precache file compute s5:{:016x}", key.unique_hash),
                     .build = [this, key, env = std::move(env)]() mutable {
                         static const GuessMissing guess{};
@@ -3155,6 +3298,7 @@ bool PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
                 Common::SetCurrentThreadName("VkShaderPrecache");
                 // Someone waits for these (a loading screen or Build Shaders).
                 [[maybe_unused]] BootBuildQos qos;
+                const SpeculativePrecacheScope speculative_scope;
                 while (!run->cancel.load(std::memory_order_relaxed)) {
                     const size_t index = run->next.fetch_add(1);
                     if (index >= run->jobs.size()) {
@@ -3230,6 +3374,12 @@ bool PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
             run->done.fetch_add(1);
         }
         ++given_up;
+        if (const u64 hung_hash = run->jobs[index].hash; hung_hash != 0) {
+            if (slow_hashes.insert(hung_hash).second) {
+                WritePrecacheSlowHashes(slow_file, device.GetDriverVersion(), device.GetDeviceID(),
+                                        CACHE_VERSION, slow_hashes);
+            }
+        }
         LOG_ERROR(Render_Vulkan, "{}: gave up on {} after {} s, its thread is left to it", what,
                   run->jobs[index].label, seconds);
         return true;
@@ -3260,6 +3410,7 @@ bool PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
         }
     };
     auto last_record = std::chrono::steady_clock::now();
+    size_t last_saved_built = 0;
     for (;;) {
         status(true);
         if (stop_loading.stop_requested() || ShaderWarm::TakeSkipWarm()) {
@@ -3300,10 +3451,16 @@ bool PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
         if (active == 0) {
             break;
         }
-        if (std::chrono::steady_clock::now() - last_record > std::chrono::seconds{30}) {
-            // An app closed during a long run keeps what it built.
+        if (std::chrono::steady_clock::now() - last_record > PrecacheSaveInterval) {
+            // An app skipped or closed during a long run keeps both precached hashes and driver
+            // pipeline cache progress.
             last_record = std::chrono::steady_clock::now();
             record_built();
+            const size_t built_now = run->built.load(std::memory_order_relaxed);
+            if (device.CanReadPipelineCacheDuringBuilds() && built_now > last_saved_built) {
+                last_saved_built = built_now;
+                QueueVulkanPipelineCacheSave(false);
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds{100});
     }
@@ -3341,9 +3498,10 @@ bool PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
         }
     }
     record_built();
-    if (!stop_loading.stop_requested() && total_built != 0) {
-        // Without this, the builds reach the file only at the next boot, game change or clean
-        // close, and are lost if the app ends otherwise.
+    if (total_built != 0 &&
+        (device.CanReadPipelineCacheDuringBuilds() ||
+         precache_threads_left->load(std::memory_order_acquire) == 0)) {
+        // Persist progress even when skipped or stopped early so compiled pipelines are never lost.
         QueueVulkanPipelineCacheSave(true);
     }
     LOG_INFO(Render_Vulkan,
@@ -3365,20 +3523,24 @@ static_assert(offsetof(GraphicsPipelineCacheKey, state) +
 void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop_loading,
                                               const VideoCore::DiskResourceLoadCallback& callback) {
     namespace ShaderWarm = VideoCommon::ShaderWarm;
-    if (!ShaderWarm::GraphicsPrecacheRequested() ||
-        !device.IsExtGraphicsPipelineLibrarySupported()) {
+    const char* const graphics_env = std::getenv("EDEN_NX2_GRAPHICS_PRECACHE");
+    const bool graphics_disabled = graphics_env != nullptr && graphics_env[0] == '0';
+    if (graphics_disabled || !device.IsExtGraphicsPipelineLibrarySupported()) {
         return;
     }
     const std::filesystem::path warm_file = ShaderWarm::GraphicsWarmPath(title_id);
     const std::string path = Common::FS::PathToUTF8String(warm_file);
     std::error_code ec;
     if (!std::filesystem::exists(warm_file, ec)) {
-        LOG_INFO(Render_Vulkan, "Shader precache: no graphics file at {}", path);
+        if (ShaderWarm::GraphicsPrecacheRequested()) {
+            LOG_INFO(Render_Vulkan, "Shader precache: no graphics file at {}", path);
+        }
         return;
     }
+    const u64 variant = WarmVariant(device);
     const auto stamp = [&](u64 entries) {
         return ShaderWarm::CurrentWarmStamp(warm_file, entries, device.GetDriverVersion(),
-                                            device.GetDeviceID(), CACHE_VERSION);
+                                            device.GetDeviceID(), CACHE_VERSION, variant);
     };
     const auto current = stamp(0);
     const auto marker = ShaderWarm::ReadWarmMarker(warm_file);
@@ -3386,24 +3548,33 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
         LOG_INFO(Render_Vulkan, "Shader precache: graphics programs already done for this driver");
         return;
     }
+    const std::filesystem::path slow_file = PrecacheSlowPath(title_id);
+    std::unordered_set<u64> slow_hashes = ReadPrecacheSlowHashes(
+        slow_file, device.GetDriverVersion(), device.GetDeviceID(), CACHE_VERSION);
     // Streamed: the file can be over a gigabyte; threads take the next entry under the lock.
-    struct Reader {
+    struct SharedState {
         std::mutex mutex;
         std::ifstream file;
         std::streampos end{};
         bool failed{};
         size_t read{};
+        size_t skipped_slow{};
         std::streamoff position{};
+        std::unordered_set<u64> slow_Snapshot;
+        std::atomic<size_t> built{};
+        std::atomic<size_t> failed_builds{};
+        std::atomic<bool> cancel{false};
     };
-    Reader reader;
+    auto shared = std::make_shared<SharedState>();
+    shared->slow_Snapshot = slow_hashes;
     try {
-        reader.file.open(warm_file, std::ios::binary | std::ios::ate);
-        reader.file.exceptions(std::ifstream::failbit);
-        reader.end = reader.file.tellg();
-        reader.file.seekg(0, std::ios::beg);
+        shared->file.open(warm_file, std::ios::binary | std::ios::ate);
+        shared->file.exceptions(std::ifstream::failbit);
+        shared->end = shared->file.tellg();
+        shared->file.seekg(0, std::ios::beg);
         std::array<char, 8> magic{};
         u32 version{};
-        reader.file.read(magic.data(), magic.size())
+        shared->file.read(magic.data(), magic.size())
             .read(reinterpret_cast<char*>(&version), sizeof(version));
         constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
         if (magic != expected_magic || version != CACHE_VERSION) {
@@ -3411,7 +3582,7 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
                         CACHE_VERSION);
             return;
         }
-        reader.position = reader.file.tellg();
+        shared->position = shared->file.tellg();
     } catch (const std::exception& e) {
         LOG_WARNING(Render_Vulkan, "Shader precache: opening {} failed: {}", path, e.what());
         return;
@@ -3419,50 +3590,86 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
     const size_t known_total = static_cast<size_t>(ShaderWarm::ReadWarmCount(warm_file));
     const auto begin = std::chrono::steady_clock::now();
     const size_t num_threads = std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 64);
-    std::atomic<size_t> built{};
-    std::atomic<size_t> failed{};
-    std::atomic<bool> cancel{false};
-    std::atomic<size_t> running{num_threads};
+    const auto now_ns = [] {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
+    struct Slot {
+        enum : u8 { Running, Exited, Left };
+        std::atomic<u8> state{Running};
+        std::atomic<u64> active_hash{0};
+        std::atomic<u64> active_shader{0};
+        std::atomic<s64> since{};
+        bool reported{};
+    };
     bool skipped = false;
+    size_t given_up = 0;
     LOG_INFO(Render_Vulkan,
              "Shader precache: {} graphics programs ({} MB) to build as libraries on {} threads",
-             known_total, static_cast<long long>(reader.end) / (1024 * 1024), num_threads);
-    {
-        std::vector<std::jthread> threads;
-        for (size_t thread = 0; thread < num_threads; ++thread) {
-            threads.emplace_back([this, &reader, &built, &failed, &cancel, &running] {
+             known_total, static_cast<long long>(shared->end) / (1024 * 1024), num_threads);
+    std::vector<std::pair<std::thread, std::shared_ptr<Slot>>> threads;
+    const auto spawn = [&] {
+        auto slot = std::make_shared<Slot>();
+        threads.emplace_back(
+            std::thread{[this, shared, slot, left = precache_threads_left, now_ns] {
                 Common::SetCurrentThreadName("VkShaderPrecache");
                 Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
                 static const GuessMissing guess{};
                 GraphicsPipelineLibraryCache::SetNoRetainOnThisThread(true);
+                const SpeculativePrecacheScope speculative_scope;
                 ShaderPools pools;
-                while (!cancel.load(std::memory_order_relaxed)) {
+                while (!shared->cancel.load(std::memory_order_relaxed)) {
                     FileEnvironment env;
                     GraphicsPipelineCacheKey key{};
+                    u64 key_hash{};
                     {
-                        std::scoped_lock lock{reader.mutex};
-                        if (reader.failed || reader.file.tellg() == reader.end) {
+                        std::scoped_lock lock{shared->mutex};
+                        bool got_entry = false;
+                        while (!shared->failed && shared->file.tellg() != shared->end) {
+                            try {
+                                u32 num_envs{};
+                                shared->file.read(reinterpret_cast<char*>(&num_envs),
+                                                  sizeof(num_envs));
+                                if (num_envs != 1) {
+                                    throw std::runtime_error("unexpected entry");
+                                }
+                                env.Deserialize(shared->file);
+                                shared->file.read(reinterpret_cast<char*>(&key), sizeof(key));
+                                ++shared->read;
+                                shared->position = shared->file.tellg();
+                            } catch (const std::exception& e) {
+                                LOG_WARNING(Render_Vulkan,
+                                            "Shader precache: graphics entry {} unreadable ({}), "
+                                            "skipping the rest",
+                                            shared->read + 1, e.what());
+                                shared->failed = true;
+                                break;
+                            }
+                            key_hash = key.Hash();
+                            if (shared->slow_Snapshot.contains(key_hash)) {
+                                ++shared->skipped_slow;
+                                continue;
+                            }
+                            got_entry = true;
                             break;
                         }
-                        try {
-                            u32 num_envs{};
-                            reader.file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
-                            if (num_envs != 1) {
-                                throw std::runtime_error("unexpected entry");
-                            }
-                            env.Deserialize(reader.file);
-                            reader.file.read(reinterpret_cast<char*>(&key), sizeof(key));
-                            ++reader.read;
-                            reader.position = reader.file.tellg();
-                        } catch (const std::exception& e) {
-                            LOG_WARNING(Render_Vulkan,
-                                        "Shader precache: graphics entry {} unreadable ({}), "
-                                        "skipping the rest",
-                                        reader.read + 1, e.what());
-                            reader.failed = true;
+                        if (!got_entry) {
                             break;
                         }
                     }
+                    u64 stage_hash = 0;
+                    for (const u64 h : key.unique_hashes) {
+                        if (h != 0) {
+                            stage_hash = h;
+                            break;
+                        }
+                    }
+                    slot->since.store(now_ns(), std::memory_order_relaxed);
+                    slot->active_shader.store(stage_hash, std::memory_order_relaxed);
+                    slot->active_hash.store(key_hash != 0 ? key_hash : 1ULL,
+                                            std::memory_order_release);
+                    slot->reported = false;
                     env.SetGuessMissing(&guess);
                     bool ok = false;
                     try {
@@ -3471,50 +3678,164 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
                     } catch (const std::exception& e) {
                         LOG_DEBUG(Render_Vulkan, "Shader precache: {}", e.what());
                     }
-                    (ok ? built : failed).fetch_add(1);
-                }
-                running.fetch_sub(1);
-            });
-        }
-        while (running != 0) {
-            if (stop_loading.stop_requested() || ShaderWarm::TakeSkipWarm()) {
-                cancel = true;
-                skipped = true;
-                break;
-            }
-            if (callback) {
-                const size_t done = built + failed;
-                // The builder's recorded count, or else an estimate from the bytes read.
-                size_t total = known_total;
-                if (total == 0) {
-                    std::scoped_lock lock{reader.mutex};
-                    const std::streamoff header = 12;
-                    const std::streamoff end = reader.end;
-                    if (reader.position > header) {
-                        total = static_cast<size_t>(static_cast<double>(reader.read) *
-                                                    static_cast<double>(end - header) /
-                                                    static_cast<double>(reader.position - header));
+                    slot->active_hash.store(0, std::memory_order_release);
+                    if (slot->state.load() == Slot::Left) {
+                        break;
                     }
+                    (ok ? shared->built : shared->failed_builds).fetch_add(1);
                 }
-                callback(VideoCore::LoadCallbackStage::Warm, done, std::max(total, done));
+                u8 running_state = Slot::Running;
+                if (!slot->state.compare_exchange_strong(running_state, Slot::Exited)) {
+                    left->fetch_sub(1);
+                }
+            }},
+            slot);
+    };
+    for (size_t thread = 0; thread < num_threads; ++thread) {
+        spawn();
+    }
+    const auto give_up = [&](Slot& slot, u64 key_hash, u64 shader_hash, s64 seconds) {
+        u8 running_state = Slot::Running;
+        precache_threads_left->fetch_add(1);
+        if (!slot.state.compare_exchange_strong(running_state, Slot::Left)) {
+            precache_threads_left->fetch_sub(1);
+            return false;
+        }
+        shared->failed_builds.fetch_add(1);
+        ++given_up;
+        if (key_hash != 0 && slow_hashes.insert(key_hash).second) {
+            {
+                std::scoped_lock lock{shared->mutex};
+                shared->slow_Snapshot.insert(key_hash);
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+            WritePrecacheSlowHashes(slow_file, device.GetDriverVersion(), device.GetDeviceID(),
+                                    CACHE_VERSION, slow_hashes);
+        }
+        LOG_ERROR(Render_Vulkan,
+                  "Shader precache: gave up on graphics library {:016x} after {} s, its thread is "
+                  "left to it",
+                  shader_hash, seconds);
+        return true;
+    };
+    auto last_save = std::chrono::steady_clock::now();
+    size_t last_saved_built = 0;
+    for (;;) {
+        if (stop_loading.stop_requested() || ShaderWarm::TakeSkipWarm()) {
+            shared->cancel = true;
+            skipped = true;
+            break;
+        }
+        const s64 now = now_ns();
+        size_t active = 0;
+        for (size_t thread = 0; thread < threads.size(); ++thread) {
+            Slot& slot = *threads[thread].second;
+            if (slot.state.load() != Slot::Running) {
+                continue;
+            }
+            ++active;
+            const u64 key_hash = slot.active_hash.load(std::memory_order_acquire);
+            if (key_hash == 0) {
+                continue;
+            }
+            const u64 shader_hash = slot.active_shader.load(std::memory_order_relaxed);
+            const auto busy = std::chrono::nanoseconds{now - slot.since.load()};
+            const s64 seconds = std::chrono::duration_cast<std::chrono::seconds>(busy).count();
+            if (busy > PrecacheSlowBuild && !slot.reported) {
+                slot.reported = true;
+                LOG_WARNING(Render_Vulkan,
+                            "Shader precache: graphics library {:016x} still building after {} s",
+                            shader_hash, seconds);
+            }
+            if (busy > PrecacheGiveUp() && give_up(slot, key_hash, shader_hash, seconds)) {
+                --active;
+                if (given_up < num_threads) {
+                    spawn();
+                    ++active;
+                } else {
+                    shared->cancel = true;
+                }
+            }
+        }
+        if (active == 0) {
+            break;
+        }
+        if (callback) {
+            const size_t done = shared->built.load() + shared->failed_builds.load();
+            size_t total = known_total;
+            if (total == 0) {
+                std::scoped_lock lock{shared->mutex};
+                const std::streamoff header = 12;
+                const std::streamoff end = shared->end;
+                if (shared->position > header) {
+                    total = static_cast<size_t>(static_cast<double>(shared->read) *
+                                                static_cast<double>(end - header) /
+                                                static_cast<double>(shared->position - header));
+                }
+            }
+            callback(VideoCore::LoadCallbackStage::Warm, done, std::max(total, done));
+        }
+        if (std::chrono::steady_clock::now() - last_save > PrecacheSaveInterval) {
+            last_save = std::chrono::steady_clock::now();
+            const size_t built_now = shared->built.load(std::memory_order_relaxed);
+            if (device.CanReadPipelineCacheDuringBuilds() && built_now > last_saved_built) {
+                last_saved_built = built_now;
+                QueueVulkanPipelineCacheSave(false);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    }
+    shared->cancel = true;
+    for (int wait = 0; wait < 300; ++wait) {
+        if (std::ranges::none_of(threads, [](const auto& entry) {
+                return entry.second->state.load() == Slot::Running;
+            })) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    for (auto& [thread, slot] : threads) {
+        const u64 key_hash = slot->active_hash.load();
+        if (slot->state.load() == Slot::Running && key_hash != 0) {
+            give_up(*slot, key_hash, slot->active_shader.load(),
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::nanoseconds{now_ns() - slot->since.load()})
+                        .count());
+        }
+        if (slot->state.load() == Slot::Left) {
+            thread.detach();
+        } else {
+            thread.join();
         }
     }
-    if (!skipped && !reader.failed && reader.end == std::streampos{reader.position}) {
-        if (const auto stamp_done = stamp(reader.read)) {
+    size_t entries_read = 0;
+    bool finished_all = false;
+    {
+        std::scoped_lock lock{shared->mutex};
+        entries_read = shared->read;
+        finished_all =
+            !skipped && !shared->failed && given_up == 0 && shared->end == std::streampos{shared->position};
+    }
+    if (finished_all) {
+        if (const auto stamp_done = stamp(entries_read)) {
             ShaderWarm::WriteWarmMarker(warm_file, *stamp_done);
         }
     }
+    const size_t total_built = shared->built.load();
+    if (total_built != 0 &&
+        (device.CanReadPipelineCacheDuringBuilds() ||
+         precache_threads_left->load(std::memory_order_acquire) == 0)) {
+        QueueVulkanPipelineCacheSave(true);
+    }
     LOG_INFO(Render_Vulkan,
-             "Shader precache: graphics libraries {}, {} built, {} failed, {:.1f} s",
+             "Shader precache: graphics libraries {}, {} built, {} failed ({} given up), {:.1f} s",
              stop_loading.stop_requested() ? "stopped" : (skipped ? "skipped" : "finished"),
-             built.load(), failed.load(),
+             total_built, shared->failed_builds.load(), given_up,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
 }
 
 void PipelineCache::QueueVulkanPipelineCacheFlush() {
-    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
+    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty() ||
+        !device.CanReadPipelineCacheDuringBuilds()) {
         return;
     }
     if (++pipelines_since_flush < VULKAN_CACHE_FLUSH_PIPELINES) {
@@ -3551,6 +3872,18 @@ bool PipelineCache::VulkanPipelineCacheSaveDue(std::chrono::steady_clock::time_p
 
 void PipelineCache::QueueVulkanPipelineCacheSave(bool again_if_busy) {
     if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
+        return;
+    }
+    if (!device.CanReadPipelineCacheDuringBuilds()) {
+        if (precache_threads_left->load(std::memory_order_acquire) != 0) {
+            return;
+        }
+        SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
+                                     CACHE_VERSION);
+        size_t size = 0;
+        vulkan_pipeline_cache.Read(&size, nullptr);
+        last_cache_size.store(size, std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan, "Driver pipeline cache saved synchronously, {} bytes", size);
         return;
     }
     if (flush_in_flight.exchange(true, std::memory_order_acq_rel)) {
@@ -4858,7 +5191,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 continue;
             }
             const Shader::IR::Program& program{programs[index]};
-            if (program.stage == Shader::Stage::Task || program.stage == Shader::Stage::Mesh) {
+            if ((program.stage == Shader::Stage::Task || program.stage == Shader::Stage::Mesh) &&
+                (!libraries_only || !device.IsExtMeshShaderSupported())) {
                 return false;
             }
             const bool fragment = index + 1 == Maxwell::MaxShaderProgram;
@@ -5595,6 +5929,13 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         }
     }
     std::vector<u32> code{EmitSPIRV(local_compute_profile, program)};
+    if (t_speculative_precache && code.size() > MaxPrecacheSpirvWords) {
+        LOG_WARNING(Render_Vulkan,
+                    "Shader precache: skipping pathological compute shader {:016x} ({} SPIR-V "
+                    "words > {})",
+                    key.unique_hash, code.size(), MaxPrecacheSpirvWords);
+        return {.failure = "SPIR-V exceeds precache word limit"};
+    }
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 

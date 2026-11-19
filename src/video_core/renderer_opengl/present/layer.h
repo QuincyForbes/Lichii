@@ -39,11 +39,11 @@ class RasterizerOpenGL;
 /// Structure used for storing information about the textures for the Switch screen
 struct TextureInfo {
     OGLTexture resource;
-    GLsizei width;
-    GLsizei height;
-    GLenum gl_format;
-    GLenum gl_type;
-    Service::android::PixelFormat pixel_format;
+    GLsizei width = 0;
+    GLsizei height = 0;
+    GLenum gl_format = 0;
+    GLenum gl_type = 0;
+    Service::android::PixelFormat pixel_format{};
 };
 
 struct ScreenRectVertex;
@@ -66,8 +66,8 @@ private:
     FramebufferTextureInfo PrepareRenderTarget(const Tegra::FramebufferConfig& framebuffer);
     void ConfigureFramebufferTexture(const Tegra::FramebufferConfig& framebuffer);
 
-    void CreateFXAA();
-    void CreateSMAA();
+    void CreateFXAA(u32 width, u32 height);
+    void CreateSMAA(u32 width, u32 height);
 
 private:
     RasterizerOpenGL& rasterizer;
@@ -82,6 +82,8 @@ private:
 
     std::optional<FSR> fsr;
     std::variant<std::monostate, FXAA, SMAA> anti_alias;
+    u32 anti_alias_width = 0;
+    u32 anti_alias_height = 0;
 };
 
 } // namespace OpenGL

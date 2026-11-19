@@ -31,6 +31,7 @@
 #include "video_core/renderer_vulkan/present/smaa.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
+#include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/textures/decoders.h"
 
 namespace Vulkan {
@@ -67,11 +68,12 @@ VkFormat GetFormat(const Tegra::FramebufferConfig& framebuffer) {
 
 } // Anonymous namespace
 
-Layer::Layer(const Device& device, MemoryAllocator& memory_allocator_, Scheduler& scheduler_, Tegra::MaxwellDeviceMemoryManager& device_memory_, size_t image_count_, VkExtent2D output_size_, VkDescriptorSetLayout layout, const PresentFilters& filters_)
+Layer::Layer(const Device& device, MemoryAllocator& memory_allocator_, Scheduler& scheduler_, Tegra::MaxwellDeviceMemoryManager& device_memory_, size_t image_count_, VkExtent2D output_size_, VkDescriptorSetLayout layout, const PresentFilters& filters_, PresentManager* present_manager_)
     : memory_allocator(memory_allocator_)
     , scheduler(scheduler_)
     , device_memory(device_memory_)
     , filters(filters_)
+    , present_manager(present_manager_)
     , image_count(image_count_)
     , output_size(output_size_)
     , descriptor_set_layout(layout)
@@ -124,6 +126,7 @@ void Layer::EnsureImageCount(const Device& device, size_t image_index) {
         ReleaseRawImages();
     }
     anti_alias.emplace<std::monostate>();
+    anti_alias_extent = {};
 #ifdef HAS_RESHADE
     post_process.reset();
     post_process_generation = 0;
@@ -138,7 +141,18 @@ void Layer::NoteSubmittedTick(size_t image_index) {
     resource_ticks[image_index] = scheduler.CurrentTick();
 }
 
+void Layer::WaitIdle() {
+    if (present_manager) {
+        present_manager->WaitPresent();
+    }
+    for (const u64 tick : resource_ticks) {
+        scheduler.Wait(tick);
+    }
+    scheduler.WaitWorker();
+}
+
 Layer::~Layer() {
+    WaitIdle();
     ReleaseRawImages();
 }
 
@@ -167,15 +181,25 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
         raw_width = framebuffer.width;
         raw_height = framebuffer.height;
         pixel_format = framebuffer.pixel_format;
-        anti_alias.emplace<std::monostate>();
         if (!raw_images.empty()) {
             ReleaseRawImages();
         }
     }
     EnsureImageCount(device, image_index);
-    SetAntiAliasPass(device);
+    const VkExtent2D render_extent{
+        .width = scaled_width,
+        .height = scaled_height,
+    };
+    const bool already_upscaled = texture_info && texture_info->already_upscaled;
+    // FXAA or SMAA on top of NVIDIA DLSS's image only blurs it.
+    const bool anti_aliased = already_upscaled || (texture_info && texture_info->anti_aliased);
+    if (!anti_aliased) {
+        SetAntiAliasPass(device, render_extent);
+    } else if (filters.get_anti_aliasing() == Settings::AntiAliasing::None) {
+        SetAntiAliasPass(device, render_extent);
+    }
 #ifdef HAS_RESHADE
-    SetPostProcessPass(device, is_applet);
+    SetPostProcessPass(device, is_applet, render_extent);
 #endif
 
     if (image_index >= resource_ticks.size()) {
@@ -198,9 +222,6 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
     VkImageView source_image_view =
         texture_info ? texture_info->image_view : *raw_image_views[image_index];
 
-    const bool already_upscaled = texture_info && texture_info->already_upscaled;
-    // FXAA or SMAA on top of NVIDIA DLSS's image only blurs it.
-    const bool anti_aliased = already_upscaled || (texture_info && texture_info->anti_aliased);
     if (!anti_aliased) {
         if (auto* fxaa = std::get_if<FXAA>(&anti_alias)) {
             fxaa->Draw(device, scheduler, image_index, &source_image, &source_image_view);
@@ -216,10 +237,6 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
 #endif
 
     auto crop_rect = Tegra::NormalizeCrop(framebuffer, texture_width, texture_height);
-    const VkExtent2D render_extent{
-        .width = scaled_width,
-        .height = scaled_height,
-    };
 
     if (!already_upscaled) {
         if (auto* fsr = std::get_if<FSR>(&sr_filter)) {
@@ -238,10 +255,12 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
         }
 #ifdef LICHII_METALFX
         else if (auto* metalfx = std::get_if<MetalFxSpatial>(&sr_filter)) {
-            if (const auto upscaled =
-                    metalfx->Draw(scheduler, source_image, render_extent, crop_rect)) {
-                source_image_view = *upscaled;
-                crop_rect = {0, 0, 1, 1};
+            if (!is_applet) {
+                if (const auto upscaled =
+                        metalfx->Draw(scheduler, source_image, render_extent, crop_rect)) {
+                    source_image_view = *upscaled;
+                    crop_rect = {0, 0, 1, 1};
+                }
             }
         }
 #endif
@@ -302,23 +321,36 @@ void Layer::RefreshResources(const Device& device, const Tegra::FramebufferConfi
     raw_width = framebuffer.width;
     raw_height = framebuffer.height;
     pixel_format = framebuffer.pixel_format;
-    anti_alias.emplace<std::monostate>();
 
     ReleaseRawImages();
     CreateStagingBuffer(device, framebuffer);
     CreateRawImages(device, framebuffer);
 }
 
-void Layer::SetAntiAliasPass(const Device& device) {
-    if (!std::holds_alternative<std::monostate>(anti_alias) && anti_alias_setting == filters.get_anti_aliasing())
+void Layer::SetAntiAliasPass(const Device& device, VkExtent2D render_area) {
+    const auto wanted = filters.get_anti_aliasing();
+    const bool active = !std::holds_alternative<std::monostate>(anti_alias);
+    if (wanted == Settings::AntiAliasing::None || render_area.width == 0 ||
+        render_area.height == 0) {
+        if (active) {
+            WaitIdle();
+            anti_alias.emplace<std::monostate>();
+        }
+        anti_alias_setting = wanted;
+        anti_alias_extent = {};
         return;
+    }
+    if (active && anti_alias_setting == wanted && anti_alias_extent.width == render_area.width &&
+        anti_alias_extent.height == render_area.height) {
+        return;
+    }
+    if (active) {
+        WaitIdle();
+        anti_alias.emplace<std::monostate>();
+    }
 
-    anti_alias_setting = filters.get_anti_aliasing();
-
-    const VkExtent2D render_area{
-        .width = Settings::values.resolution_info.ScaleUp(raw_width),
-        .height = Settings::values.resolution_info.ScaleUp(raw_height),
-    };
+    anti_alias_setting = wanted;
+    anti_alias_extent = render_area;
 
     switch (anti_alias_setting) {
     case Settings::AntiAliasing::Fxaa:
@@ -334,15 +366,14 @@ void Layer::SetAntiAliasPass(const Device& device) {
 }
 
 #ifdef HAS_RESHADE
-void Layer::SetPostProcessPass(const Device& device, bool is_applet) {
-    if (is_applet) {
-        post_process.reset();
+void Layer::SetPostProcessPass(const Device& device, bool is_applet, VkExtent2D render_area) {
+    if (is_applet || render_area.width == 0 || render_area.height == 0) {
+        if (post_process.has_value()) {
+            WaitIdle();
+            post_process.reset();
+        }
         return;
     }
-    const VkExtent2D render_area{
-        .width = Settings::values.resolution_info.ScaleUp(raw_width),
-        .height = Settings::values.resolution_info.ScaleUp(raw_height),
-    };
 
     const u64 generation = VideoCore::FxChain::Instance().Snapshot().generation;
     const bool enabled = Settings::values.post_shader_enabled.GetValue();
@@ -353,8 +384,12 @@ void Layer::SetPostProcessPass(const Device& device, bool is_applet) {
         return;
     }
 
-    for (const u64 tick : resource_ticks) {
-        scheduler.Wait(tick);
+    if (post_process.has_value()) {
+        WaitIdle();
+    } else {
+        for (const u64 tick : resource_ticks) {
+            scheduler.Wait(tick);
+        }
     }
 
     post_process_generation = generation;
@@ -377,6 +412,9 @@ void Layer::SetPostProcessPass(const Device& device, bool is_applet) {
 void Layer::ReleaseRawImages() {
     for (const u64 tick : resource_ticks) {
         scheduler.Wait(tick);
+    }
+    if (!raw_images.empty()) {
+        scheduler.WaitWorker();
     }
     raw_image_views.clear();
     raw_images.clear();

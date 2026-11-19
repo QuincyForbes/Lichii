@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -37,10 +38,26 @@ public:
     PipelineArchive& operator=(const PipelineArchive&) = delete;
 
     /// Opens the archive file (an empty archive when it is missing or Metal can't read it).
-    /// Closed unless EDEN_NX2_METAL_ARCHIVE=1.
-    bool Open(const Device& device, const std::filesystem::path& path);
+    /// Closed when EDEN_NX2_METAL_ARCHIVE=0. With `read_only`, misses do not recompile into the
+    /// archive (avoiding exclusive writer lock stalls during live gameplay).
+    bool Open(const Device& device, const std::filesystem::path& path, bool read_only = false);
 
     [[nodiscard]] bool IsOpen() const noexcept;
+
+    [[nodiscard]] bool HasEntries() const noexcept {
+        return has_entries.load(std::memory_order_relaxed);
+    }
+
+    void SetReadOnly(bool read_only_) noexcept {
+        read_only.store(read_only_, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool IsReadOnly() const noexcept {
+        return read_only.load(std::memory_order_relaxed);
+    }
+
+    /// Waits for all queued DeferAdd jobs to finish.
+    void FlushAdds();
 
     /// Writes the archive when pipelines were added since it was opened or last saved.
     void Save();
@@ -77,6 +94,8 @@ private:
     Counts recent{};
     Counts total{};
     bool dirty{};
+    std::atomic_bool read_only{false};
+    std::atomic_bool has_entries{false};
 };
 
 } // namespace Metal

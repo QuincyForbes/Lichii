@@ -8,6 +8,8 @@
 #pragma once
 
 #include <array>
+#include <chrono>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -16,6 +18,8 @@
 #include "common/common_types.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/ocarina_motion.h"
+#include "video_core/ocarina_upscale.h"
+#include "video_core/renderer_metal/metal_fsr3_upscaler.h"
 #include "video_core/renderer_metal/metal_object.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
 #include "video_core/renderer_metal/metal_temporal.h"
@@ -35,7 +39,11 @@ public:
 
     /// Whether a compute program is one of the game's upscale passes the bilinear pass takes:
     /// a known shader sampling one texture into one written storage image, nothing else written.
-    [[nodiscard]] static bool IsBilinearPass(u64 shader_hash, const Shader::Info& info);
+    [[nodiscard]] static bool IsBilinearPass(u64 native_key, u64 shader_hash,
+                                             const Shader::Info& info);
+    [[nodiscard]] static bool IsBilinearPass(u64 shader_hash, const Shader::Info& info) {
+        return IsBilinearPass(0, shader_hash, info);
+    }
 
     /// Encodes the pass: `extent` of `color` (color_size) squared into all of `target`
     /// (target_size). False when it can't run (the game's pass runs instead).
@@ -134,12 +142,14 @@ public:
         TextureHandle target; ///< The game's target (B10G11R11, storage)
         std::array<u32, 2> extent;
         std::array<u32, 2> target_size;
+        /// Upscaler evaluation extent (defaults to target_size; 3840x2160 for 4K HUD composite).
+        std::array<u32, 2> output_size{};
         VideoCommon::OcarinaMatrix current;
         VideoCommon::OcarinaMatrix previous;
         u64 frame;
         /// Link's mesh and poses, null without them (dialogue, cutscenes, first person).
         const OcarinaActorMesh* actor{};
-        /// The scene draws' viewport offset this frame (render pixels; EDEN_NX2_DLSS_JITTER).
+        /// The scene draws' viewport offset this frame (render pixels; FSR or EDEN_NX2_DLSS_JITTER).
         std::array<f32, 2> jitter{};
     };
 
@@ -152,29 +162,55 @@ public:
     /// EDEN_NX2_OOT_TEMPORAL_HANDHELD (as on Vulkan; on unless 0): the scaled passes to 1920x1080.
     [[nodiscard]] static bool HandheldEnabled();
 
+    /// EDEN_NX2_METAL_OOT_4K: 4K scene upscale + HUD composite on docked 1440p (default on macOS).
+    [[nodiscard]] static bool Present4kEnabled();
+
     /// EDEN_NX2_METAL_OOT_ACTOR=0: Link's pixels get the camera's motion only (O09).
     [[nodiscard]] static bool ActorEnabled();
 
     /// EDEN_NX2_METAL_OOT_EFFECTS=0: no reactive mask for the glows and particles (O10).
     [[nodiscard]] static bool EffectsEnabled();
 
+    /// Resolves the Ocarina temporal backend (Dlss = MetalFX, Fsr = FSR 3.1, or Native).
+    [[nodiscard]] static VideoCommon::OcarinaUpscaleBackend ResolveBackend(
+        const Device& device, bool metalfx_failed = false, bool fsr_failed = false);
+
     /// Vulkan's TrackOcarinaActor match: the vertex program that skins Link.
     static constexpr u64 ActorVertexShader = 0x28c6e527634f814aULL;
     /// The fog's fragment program: the glows and particles come right after it.
     static constexpr u64 FogFragmentShader = 0x3ddfb1d7a854c849ULL;
 
-    /// A pass Vulkan's DLSS / MetalFX path replaces (CanReplaceOcarinaUpscale without the passes
-    /// only FSR 3.1 takes) with one sampled texture and one written image.
-    [[nodiscard]] static bool IsTemporalPass(u64 shader_hash, const Shader::Info& info);
+    /// A pass Ocarina's temporal upscalers can replace, with one sampled texture and one written
+    /// storage image.
+    [[nodiscard]] static bool IsTemporalPass(u64 native_key, u64 shader_hash,
+                                             const Shader::Info& info);
+    [[nodiscard]] static bool IsTemporalPass(u64 shader_hash, const Shader::Info& info) {
+        return IsTemporalPass(0, shader_hash, info);
+    }
 
     /// The passes that scale to 2560x1440 (Vulkan's upscale_4k set).
     [[nodiscard]] static bool IsScaledPass(u64 shader_hash);
 
-    /// Whether this GPU runs MetalFX temporal upscaling and it has not failed this session.
+    /// Active backend for this session (Native when disabled or all backends failed).
+    [[nodiscard]] VideoCommon::OcarinaUpscaleBackend Backend();
+
+    /// Whether a temporal upscaler (MetalFX or FSR 3.1) is available and has not failed.
     [[nodiscard]] bool Available();
+
+    /// Whether every eligible temporal backend failed this session.
+    [[nodiscard]] bool EvaluationFailed() const noexcept {
+        return failed;
+    }
 
     /// Encodes the replacement; false (with `reason`) when the game's pass must run instead.
     bool Record(const Frame& frame, const char*& reason);
+
+    /// Copies the downsampled 2560x1440 scene (in sRGB) before the game draws its HUD over it.
+    void SaveSceneReference(TextureHandle guest_scene);
+
+    /// Composites the 3840x2160 upscaled scene with the game's 2560x1440 HUD composite; null on
+    /// failure.
+    [[nodiscard]] TextureHandle Composite4k(TextureHandle native_composite, u64 frame);
 
     /// Link's pose for the overlay: his mesh, this frame's and the last frame's camera.
     struct ActorMotion {
@@ -276,18 +312,34 @@ private:
     const Device& device;
     Scheduler& scheduler;
     TemporalUpscaler upscaler;
+    std::unique_ptr<Fsr3Upscaler> fsr3;
     Pass motion_pass;
     Pass color_pass;
     Pass output_pass;
+    Pass effects_base_pass;
     Pass effects_mark_pass;
     Pass effects_bias_pass;
+    Pass reference_pass;
+    Pass composite_pass;
     Object sampler;
+    Object point_sampler;
     Object motion;
     Object color;
+    Object native_scene;
+    Object composite;
+    TextureHandle last_upscaled{};
+    std::optional<u64> composited_frame;
+    bool composite_failed{};
     std::array<u32, 2> size{};
+    std::array<u32, 2> last_render_size{};
+    std::array<u32, 2> last_output_size{};
+    VideoCommon::OcarinaUpscaleBackend last_backend{VideoCommon::OcarinaUpscaleBackend::Native};
+    std::optional<std::chrono::steady_clock::time_point> last_evaluation;
     std::optional<u64> last_frame;
     VideoCommon::OcarinaMatrix last_view_projection{};
     std::optional<bool> supported;
+    bool metalfx_failed{};
+    bool fsr3_failed{};
     bool prepared{};
     bool failed{};
     u64 passes{};

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <type_traits>
 
 #include "common/logging.h"
 #include "common/settings.h"
@@ -21,6 +22,7 @@
 #include "video_core/host_shaders/ocarina_dlss_4k_composite_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_4k_reference_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_bias_comp_spv.h"
+#include "video_core/host_shaders/ocarina_dlss_effects_base_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_effects_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #ifdef EGLANTINE_STREAMLINE
@@ -779,6 +781,8 @@ struct OcarinaUpscaler::Impl {
     OcarinaColorPass output_pass;
     std::array<std::unique_ptr<OcarinaFrameSlot>, 4> slots;
     std::optional<u64> last_frame;
+    VkExtent2D last_render_extent{};
+    VkExtent2D last_output_extent{};
     Matrix last_view_projection{};
     vk::Image native_scene;
     vk::ImageView native_scene_view;
@@ -875,7 +879,7 @@ void OcarinaUpscaler::SaveEffectsBase(VkImageView scene, VkExtent2D extent, u64 
     auto& state = *impl;
     if (!state.effects_base_pass) {
         state.effects_base_pass = std::make_unique<OcarinaEffectsPass<1>>(
-            state.device, state.scheduler, state.pool, OCARINA_DLSS_COLOR_COMP_SPV);
+            state.device, state.scheduler, state.pool, OCARINA_DLSS_EFFECTS_BASE_COMP_SPV);
         state.effects_mark_pass = std::make_unique<OcarinaEffectsPass<2>>(
             state.device, state.scheduler, state.pool, OCARINA_DLSS_EFFECTS_COMP_SPV);
         state.effects_bias_pass = std::make_unique<OcarinaEffectsPass<3>>(
@@ -1003,7 +1007,13 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
         bias_image = *effects.bias;
     }
 
-    const bool reset = !state.last_frame || frame != *state.last_frame + 1 ||
+    const bool frame_gap =
+        !state.last_frame || frame <= *state.last_frame || frame - *state.last_frame > 1;
+    const bool extent_changed = extent.width != state.last_render_extent.width ||
+                                extent.height != state.last_render_extent.height ||
+                                output_extent.width != state.last_output_extent.width ||
+                                output_extent.height != state.last_output_extent.height;
+    const bool reset = frame_gap || extent_changed ||
                        !std::ranges::equal(previous, state.last_view_projection,
                                            [](f32 a, f32 b) { return std::abs(a - b) < 0.001f; });
 #ifdef LICHII_OCARINA_LIVE_UPSCALE
@@ -1039,29 +1049,34 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
 #endif
     bool used_fsr4 = false;
     if (state.UsesFsr4()) {
-        constexpr VkExtent2D handheld_capacity{1440, 810};
+        constexpr VkExtent2D handheld_capacity{1920, 1080};
         const bool handheld_drs = target_extent.width == 1920 && target_extent.height == 1080 &&
-                                  extent.width <= handheld_capacity.width &&
-                                  extent.height <= handheld_capacity.height;
+                                  extent.width < handheld_capacity.width &&
+                                  extent.height < handheld_capacity.height;
         const auto now = std::chrono::steady_clock::now();
         const f32 elapsed = state.last_evaluation
             ? std::chrono::duration<f32, std::milli>(now - *state.last_evaluation).count() : 16.67f;
-        const f32 sharpness = FSR::RcasSharpnessFromStops(
-            static_cast<f32>(Settings::values.fsr_sharpening_slider.GetValue()) / 100.0f);
+        const int slider = Settings::values.fsr_sharpening_slider.GetValue();
+        const f32 sharpness = FSR::RcasSharpnessFromStops(static_cast<f32>(slider) / 100.0f);
+        const bool sharpen = slider < 200 && sharpness > 0.0f;
+        const std::optional<Fsr4Upscaler::Image> mask_image =
+            bias_image ? std::optional{Fsr4Upscaler::Image{
+                             bias_image, BIAS_FORMAT, COLOR_RANGE, VK_IMAGE_ASPECT_COLOR_BIT}}
+                       : std::nullopt;
         used_fsr4 = state.fsr4->Upscale({
             .color = {*resources.color, LIVE_COLOR_FORMAT, COLOR_RANGE, VK_IMAGE_ASPECT_COLOR_BIT},
             .depth = {depth_image, VK_FORMAT_D32_SFLOAT, DEPTH_RANGE, VK_IMAGE_ASPECT_DEPTH_BIT,
                       depth_extent},
             .motion_vectors = {*resources.motion, MOTION_FORMAT, COLOR_RANGE,
                                VK_IMAGE_ASPECT_COLOR_BIT},
-            .reactive = bias_image ? std::optional{Fsr4Upscaler::Image{
-                bias_image, BIAS_FORMAT, COLOR_RANGE, VK_IMAGE_ASPECT_COLOR_BIT}} : std::nullopt,
+            .reactive = mask_image,
+            .transparency_and_composition = mask_image,
             .render_size = extent,
             .upscale_size = output_extent,
             .max_render_size = handheld_drs ? std::optional{handheld_capacity} : std::nullopt,
             .frame_time_ms = elapsed,
             .reset = reset || elapsed > 250.0f,
-            .sharpen = sharpness > 0.0f,
+            .sharpen = sharpen,
             .sharpness = sharpness,
             .vertical_fov = 2.0f * std::atan(1.0f / projection_y),
             .jitter = jitter,
@@ -1083,8 +1098,9 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
         const auto now = std::chrono::steady_clock::now();
         const f32 elapsed = state.last_evaluation
             ? std::chrono::duration<f32, std::milli>(now - *state.last_evaluation).count() : 16.67f;
-        const f32 sharpness = FSR::RcasSharpnessFromStops(
-            static_cast<f32>(Settings::values.fsr_sharpening_slider.GetValue()) / 100.0f);
+        const int slider = Settings::values.fsr_sharpening_slider.GetValue();
+        const f32 sharpness = FSR::RcasSharpnessFromStops(static_cast<f32>(slider) / 100.0f);
+        const bool sharpen = slider < 200 && sharpness > 0.0f;
         // Taking over from FSR 4: FSR 3.1 has no history of the frames FSR 4 drew.
         const bool fsr_reset = reset || elapsed > 250.0f || state.fsr4_frame_view != VK_NULL_HANDLE;
         state.fsr->Upscale({
@@ -1097,7 +1113,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
             .motion_vector_scale = {1.0f, 1.0f},
             .frame_time_ms = elapsed,
             .reset = fsr_reset,
-            .sharpen = sharpness > 0.0f,
+            .sharpen = sharpen,
             .sharpness = sharpness,
             .reactive_mask = bias_view,
             .transparency_mask = bias_view,
@@ -1128,23 +1144,104 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
     }
     state.scheduler.InvalidateState();
     state.last_frame = frame;
+    state.last_render_extent = extent;
+    state.last_output_extent = output_extent;
     state.last_view_projection = current;
     return true;
 }
 
+namespace {
+
+constexpr bool IsOcarinaUnpaddedRenderScale(Settings::OotResolution r) noexcept {
+    return r != Settings::OotResolution::Game && r != Settings::OotResolution::Percent87 &&
+           r != Settings::OotResolution::Percent150 && r != Settings::OotResolution::Percent200 &&
+           r != Settings::OotResolution::Percent300;
+}
+
+constexpr bool IsOcarinaUnpaddedRenderScale(Settings::DlssQuality q) noexcept {
+    return q != Settings::DlssQuality::Balanced;
+}
+
+constexpr bool IsOcarinaUnpaddedRenderScale(Settings::OcarinaDlssMode m) noexcept {
+    return m != Settings::OcarinaDlssMode::Balanced;
+}
+
+namespace OcarinaScaleSettings {
+using namespace Settings;
+template <typename... Args>
+auto Try(int, Args... args) -> decltype(AppliedOcarinaRenderScale(args...)) {
+    return AppliedOcarinaRenderScale(args...);
+}
+inline std::nullopt_t Try(long) noexcept {
+    return std::nullopt;
+}
+} // namespace OcarinaScaleSettings
+
+namespace OcarinaScaleVideo {
+using namespace VideoCommon;
+template <typename... Args>
+auto Try(int, Args... args) -> decltype(AppliedOcarinaRenderScale(args...)) {
+    return AppliedOcarinaRenderScale(args...);
+}
+inline std::nullopt_t Try(long) noexcept {
+    return std::nullopt;
+}
+} // namespace OcarinaScaleVideo
+
+bool HasAppliedOcarinaFsrRenderScale() {
+    if constexpr (!std::is_same_v<decltype(OcarinaScaleSettings::Try(0)), std::nullopt_t>) {
+        if (const auto scale = OcarinaScaleSettings::Try(0)) {
+            return IsOcarinaUnpaddedRenderScale(*scale);
+        }
+    }
+    if constexpr (!std::is_same_v<decltype(OcarinaScaleVideo::Try(0)), std::nullopt_t>) {
+        if (const auto scale = OcarinaScaleVideo::Try(0)) {
+            return IsOcarinaUnpaddedRenderScale(*scale);
+        }
+    }
+    return false;
+}
+
+} // namespace
+
 VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device) {
     const char* value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+    const std::string_view override_val = value ? value : "";
+    bool fsr_enabled = Settings::OcarinaFsrChosen();
     bool dlss_enabled = false;
     bool dlss_available = false;
+    // Balanced's scene is padded, which only DLSS takes.
+    const bool render_scaled = HasAppliedOcarinaFsrRenderScale();
 #ifdef EGLANTINE_STREAMLINE
     dlss_enabled = Settings::NvidiaDlssChosen();
     dlss_available = Streamline::IsDlssAvailable();
 #elif defined(LICHII_OCARINA_LIVE_UPSCALE)
-    dlss_enabled = Settings::MetalFxTemporalChosen();
     dlss_available = MetalFxTemporalUpscaler::IsSupported(device);
+    switch (Settings::values.upscaler.GetValue()) {
+    case Settings::Upscaler::Auto:
+        if (device.IsMoltenVK()) {
+            dlss_enabled = true;
+            fsr_enabled = true;
+        }
+        break;
+    case Settings::Upscaler::MetalFx:
+    case Settings::Upscaler::Dlss:
+        dlss_enabled = true;
+        fsr_enabled = true;
+        break;
+    case Settings::Upscaler::Fsr3:
+    case Settings::Upscaler::Fsr4:
+        dlss_enabled = false;
+        fsr_enabled = true;
+        break;
+    case Settings::Upscaler::Game:
+        dlss_enabled = false;
+        fsr_enabled = false;
+        break;
+    }
 #endif
     const auto backend = VideoCommon::SelectOcarinaUpscaler(
-        Settings::OcarinaFsrChosen(), dlss_enabled, dlss_available, value ? value : "");
+        fsr_enabled, dlss_enabled, dlss_available, render_scaled, override_val);
     if (backend == VideoCommon::OcarinaUpscaleBackend::Fsr && !Fsr3Upscaler::IsSupported(device)) {
         return VideoCommon::OcarinaUpscaleBackend::Native;
     }

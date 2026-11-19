@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "common/settings.h"
 #include "video_core/fsr.h"
 #include "video_core/host_shaders/ffx_a_h.h"
@@ -19,7 +21,8 @@ using namespace FSR;
 
 using FsrConstants = std::array<u32, 4 * 4>;
 
-FSR::FSR(u32 output_width_, u32 output_height_) : width(output_width_), height(output_height_) {
+FSR::FSR(u32 output_width_, u32 output_height_)
+    : width(std::max(output_width_, 1u)), height(std::max(output_height_, 1u)) {
     std::string fsr_source{HostShaders::OPENGL_FIDELITYFX_FSR_FRAG};
     ReplaceInclude(fsr_source, "ffx_a.h", HostShaders::FFX_A_H);
     ReplaceInclude(fsr_source, "ffx_fsr1.h", HostShaders::FFX_FSR1_H);
@@ -49,7 +52,7 @@ FSR::FSR(u32 output_width_, u32 output_height_) : width(output_width_), height(o
 FSR::~FSR() = default;
 
 GLuint FSR::Draw(ProgramManager& program_manager, GLuint texture, u32 input_image_width,
-                 u32 input_image_height, const Common::Rectangle<f32>& crop_rect) {
+                 u32 input_image_height, const Common::Rectangle<f32>& crop_rect, bool softened) {
     const f32 input_width = static_cast<f32>(input_image_width);
     const f32 input_height = static_cast<f32>(input_image_height);
     const f32 output_width = static_cast<f32>(width);
@@ -60,19 +63,13 @@ GLuint FSR::Draw(ProgramManager& program_manager, GLuint texture, u32 input_imag
     const f32 viewport_y = crop_rect.top * input_height;
 
     FsrConstants easu_con{};
-    FsrConstants rcas_con{};
 
     FsrEasuConOffset(easu_con.data() + 0, easu_con.data() + 4, easu_con.data() + 8,
                      easu_con.data() + 12, viewport_width, viewport_height, input_width,
                      input_height, output_width, output_height, viewport_x, viewport_y);
 
-    const float sharpening =
-        static_cast<float>(Settings::values.fsr_sharpening_slider.GetValue()) / 100.0f;
-
-    FsrRcasCon(rcas_con.data(), sharpening);
-
-    glProgramUniform4uiv(easu_frag.handle, 0, sizeof(easu_con), easu_con.data());
-    glProgramUniform4uiv(rcas_frag.handle, 0, sizeof(rcas_con), rcas_con.data());
+    glProgramUniform4uiv(easu_frag.handle, 0, static_cast<GLsizei>(easu_con.size() / 4),
+                         easu_con.data());
 
     glFrontFace(GL_CW);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer.handle);
@@ -82,6 +79,20 @@ GLuint FSR::Draw(ProgramManager& program_manager, GLuint texture, u32 input_imag
     glBindTextureUnit(0, texture);
     glBindSampler(0, sampler.handle);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    const int slider = Settings::values.fsr_sharpening_slider.GetValue();
+    if (slider >= 200) {
+        return easu_tex.handle;
+    }
+
+    // fsr_sharpening_slider is a reversed slider storing attenuation stops * 100 (0 = 100%
+    // sharpening / 0 stops, 200 = 0% sharpening / off), matching Vulkan's FSR::Draw.
+    const float sharpening =
+        static_cast<float>(slider) / 100.0f + (softened ? 0.321928f : 0.0f);
+    FsrConstants rcas_con{};
+    FsrRcasCon(rcas_con.data(), sharpening);
+    glProgramUniform4uiv(rcas_frag.handle, 0, static_cast<GLsizei>(rcas_con.size() / 4),
+                         rcas_con.data());
 
     glNamedFramebufferTexture(framebuffer.handle, GL_COLOR_ATTACHMENT0, rcas_tex.handle, 0);
     program_manager.BindPresentPrograms(vert.handle, rcas_frag.handle);

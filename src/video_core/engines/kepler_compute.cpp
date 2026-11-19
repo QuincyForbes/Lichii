@@ -1031,23 +1031,29 @@ constexpr u32 DLSS_NETWORK_CLEAN_EVALUATIONS = 8;
 /// goes bad does so within its first few evaluations), and fail to be dropped.
 constexpr u32 DLSS_NETWORK_GOOD_CHECKS = 30;
 constexpr u32 DLSS_NETWORK_BAD_CHECKS = 10;
+/// Drops for mismatched output after which the network stays dropped: one that keeps going bad
+/// would switch between it and the replacement upscale.
+constexpr u32 DLSS_NETWORK_MAX_DROPS = 3;
 /// A check fails when more than this percentage of its blocks is mismatched (working networks:
 /// at most 0.2% on Fortune's Weave's title and Kunlun Base; frozen ones: 6-10%), or when any output
 /// sample is NaN or infinite.
 constexpr u32 DLSS_CHECK_MISMATCH_PERCENT = 3;
 } // Anonymous namespace
 
+/// Track captured network passes and return whether native dispatch should be skipped.
+/// Spatial-only chains still dispatch natively and replace the display output afterward.
 bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     using namespace VideoCommon::FireEmblemUpscale;
     const auto passes = CapturedPasses(program_id);
     if (!passes) {
         return false;
     }
-    if (passes->spatial_only && (native_key == passes->prepass || native_key == passes->output)) {
+    if (passes->spatial_only && (passes->IsPrepass(native_key) || native_key == passes->output)) {
         TraceDlssContract(native_key, false);
     }
-    if (native_key == passes->prepass) {
+    if (passes->IsPrepass(native_key)) {
         dlss_chain.spatial_only = passes->spatial_only;
+        dlss_chain.render_region = passes->render_region;
         CaptureFireEmblemJitter();
         dlss_chain.active = true;
         dlss_chain.rejected = 0;
@@ -1065,16 +1071,21 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     const auto blocker = GameDlssBlocker();
     const bool replacement = dlss_chain.failure != VideoCore::GameDlssReason::None ||
                              blocker != VideoCore::GameDlssReason::None;
+    // While the network recovers from mismatched output, its output pass runs, so the recheck in
+    // FinishDlssEvaluation (after the dispatch) sees this frame's network output; the replacement
+    // upscale then draws over it.
+    const bool recheck_after_dispatch =
+        dlss_chain.failure == VideoCore::GameDlssReason::OutputMismatch &&
+        blocker == VideoCore::GameDlssReason::None && !DlssNetworkDroppedForGood();
     if (dlss_chain.output_pass) {
-        return replacement && FinishDlssEvaluation();
+        return replacement && !recheck_after_dispatch && FinishDlssEvaluation();
     }
     // While the network can't be shown at all (turned off or replaced on request, resolution
     // scaling, no support), its own passes are skipped like a network dropped for good: the
     // replacement draws over their result anyway, and a pass that can't run (tensor operations
     // unavailable) would drop the prepass's jitter, motion vectors and depth the replacement needs.
-    return (blocker != VideoCore::GameDlssReason::None ||
-            dlss_chain.failure != VideoCore::GameDlssReason::None) &&
-           native_key != passes->prepass &&
+    return (blocker != VideoCore::GameDlssReason::None || DlssNetworkDroppedForGood()) &&
+           !passes->IsPrepass(native_key) &&
            dlss_chain.programs.contains(native_key);
 }
 
@@ -1110,10 +1121,21 @@ VideoCore::GameDlssReason KeplerCompute::GameDlssBlocker() const {
     return GameDlssReason::None;
 }
 
+bool KeplerCompute::DlssNetworkDroppedForGood() const {
+    using VideoCore::GameDlssReason;
+    return dlss_chain.failure != GameDlssReason::None &&
+           (dlss_chain.failure != GameDlssReason::OutputMismatch ||
+            dlss_chain.drops >= DLSS_NETWORK_MAX_DROPS);
+}
+
 // Checks the network's output against its input (on the GPU; the result arrives a few frames
-// later) and drops the network for the session after DLSS_NETWORK_BAD_CHECKS failed checks in a
-// row: a network that produces NaN, freezes on an old image or draws garbage would otherwise stay
-// on screen.
+// later) and drops the network after DLSS_NETWORK_BAD_CHECKS failed checks in a row: a network
+// that produces NaN, freezes on an old image or draws garbage would otherwise stay on screen.
+// Output with NaN drops it for the session. Mismatched output can be a moment the check misjudges
+// or the network gets over (The Duskbloods' was dropped minutes into play, and the replacement
+// upscale drew the rest of the session): the network keeps running behind the replacement upscale
+// and is shown again once DLSS_NETWORK_GOOD_CHECKS checks in a row pass, until it has been dropped
+// DLSS_NETWORK_MAX_DROPS times.
 void KeplerCompute::CheckDlssNetwork() {
     dlss_chain.checked = rasterizer->CanProbeGameDlssOutput();
     if (!dlss_chain.checked) {
@@ -1170,28 +1192,63 @@ void KeplerCompute::CheckDlssNetwork() {
     if (!input || !output) {
         return;
     }
-    const auto probe = rasterizer->ProbeGameDlssOutput(*input, *output);
+    // A dynamic resolution network renders a region of its input and upscales that region to the
+    // whole output: compare only the region (all of the input would mismatch the output wherever
+    // the region leaves stale pixels, and drop a working network).
+    std::optional<std::array<u32, 2>> input_region;
+    if (dlss_chain.render_region) {
+        using namespace VideoCommon::FireEmblemUpscale;
+        if (cbuf.size.Value() < RenderLastColumnOffset + 4 ||
+            !memory_manager.IsFullyMappedRange(cbuf_address, RenderLastColumnOffset + 4)) {
+            return;
+        }
+        const u32 width = memory_manager.Read<u32>(cbuf_address + RenderLastColumnOffset) + 1;
+        const u32 height = memory_manager.Read<u32>(cbuf_address + RenderLastRowOffset) + 1;
+        if (width == 0 || height == 0 || width > input->width || height > input->height) {
+            return;
+        }
+        input_region = std::array{width, height};
+    }
+    const auto probe = rasterizer->ProbeGameDlssOutput(*input, *output, input_region);
     if (!probe) {
         return;
     }
     const bool invalid = probe->invalid_samples != 0;
     const bool mismatched = probe->mismatched * 100 > probe->blocks * DLSS_CHECK_MISMATCH_PERCENT;
+    using VideoCore::GameDlssReason;
     if (!invalid && !mismatched) {
         ++dlss_chain.good_checks;
         dlss_chain.bad_checks = 0;
+        if (dlss_chain.failure == GameDlssReason::OutputMismatch &&
+            dlss_chain.good_checks >= DLSS_NETWORK_GOOD_CHECKS) {
+            dlss_chain.failure = GameDlssReason::None;
+            LOG_INFO(HW_GPU, "Game DLSS network: its output checks out again in {} checks in a row",
+                     dlss_chain.good_checks);
+        }
         return;
     }
     dlss_chain.good_checks = 0;
     if (++dlss_chain.bad_checks < DLSS_NETWORK_BAD_CHECKS) {
         return;
     }
-    dlss_chain.failure = invalid ? VideoCore::GameDlssReason::InvalidOutput
-                                 : VideoCore::GameDlssReason::OutputMismatch;
+    if (dlss_chain.failure == GameDlssReason::OutputMismatch && !invalid) {
+        // Still mismatched while it runs behind the replacement upscale.
+        return;
+    }
+    dlss_chain.failure =
+        invalid ? GameDlssReason::InvalidOutput : GameDlssReason::OutputMismatch;
+    if (!invalid) {
+        ++dlss_chain.drops;
+    }
     LOG_WARNING(HW_GPU,
                 "Game DLSS network: {} in {} checks in a row (last: {}/{} blocks mismatched, worst "
-                "{:.3f}, {} invalid samples); the replacement upscale draws the output from now on",
+                "{:.3f}, gain {:.3f}, {} invalid samples); the replacement upscale draws the output "
+                "{}",
                 VideoCore::GameDlssReasonText(dlss_chain.failure), dlss_chain.bad_checks,
-                probe->mismatched, probe->blocks, probe->worst, probe->invalid_samples);
+                probe->mismatched, probe->blocks, probe->worst, probe->gain,
+                probe->invalid_samples,
+                DlssNetworkDroppedForGood() ? "from now on"
+                                            : "until the network's output checks out again");
 }
 
 // Logs what draws the game's DLSS evaluation, when that changes.
@@ -1256,9 +1313,12 @@ bool KeplerCompute::FinishDlssEvaluation() {
     const GameDlssReason blocker = GameDlssBlocker();
     const bool can_show =
         blocker == GameDlssReason::None && dlss_chain.failure == GameDlssReason::None;
-    // Checked before the replacement upscale draws over the output. Checks start over whenever
-    // the network can't run.
-    if (complete && can_show) {
+    // Checked before the replacement upscale draws over the output, also while the network runs
+    // behind it after mismatched output. Checks start over whenever the network can't run.
+    const bool recheck = blocker == GameDlssReason::None &&
+                         dlss_chain.failure == GameDlssReason::OutputMismatch &&
+                         !DlssNetworkDroppedForGood();
+    if (complete && (can_show || recheck)) {
         CheckDlssNetwork();
     } else {
         dlss_chain.good_checks = 0;
@@ -1631,17 +1691,23 @@ void KeplerCompute::RememberDlssMotionVectors() {
         return GetTICEntry(tic_index);
     };
     const auto color = image(0x278), motion = image(0x290);
+    // A game that renders a region of its targets (The Duskbloods) draws it on the same pixel grid
+    // in targets of other sizes: in handheld mode its motion and depth are 1536x864 against a
+    // 1920x1080 colour. The upscale checks the region fits them.
+    const auto same_grid = [&](const Texture::TICEntry& other) {
+        return dlss_chain.render_region ||
+               (other.Width() == color->Width() && other.Height() == color->Height());
+    };
     if (!color || !motion || color->format != Texture::TextureFormat::B10G11R11 ||
         motion->format != Texture::TextureFormat::R16G16 || motion->Address() == 0 ||
-        motion->Width() != color->Width() || motion->Height() != color->Height() ||
-        !motion->IsBlockLinear())
+        !same_grid(*motion) || !motion->IsBlockLinear())
         return;
     dlss_motion_vectors = *motion;
     dlss_motion_color = color->Address();
-    const auto depth = cbuf.size.Value() >= 0x29c ? image(0x298) : std::nullopt;
+    const u32 depth_offset = dlss_chain.render_region ? 0x288 : 0x298;
+    const auto depth = cbuf.size.Value() >= 0x29c ? image(depth_offset) : std::nullopt;
     if (depth && depth->format == Texture::TextureFormat::Z32 && depth->Address() != 0 &&
-        depth->Width() == color->Width() && depth->Height() == color->Height() &&
-        depth->IsBlockLinear()) {
+        same_grid(*depth) && depth->IsBlockLinear()) {
         dlss_depth = *depth;
     } else {
         dlss_depth.reset();
@@ -1727,6 +1793,82 @@ void KeplerCompute::TraceDlssContract(u64 native_key, bool warn_unvalidated) {
     }
 }
 
+// Scales the region the game rendered up to the output, in place of the network's output pass.
+bool KeplerCompute::ScaleDlssRenderRegion(
+    GPUVAddr constants, const std::optional<Texture::TICEntry>& input,
+    const std::optional<Texture::TICEntry>& output,
+    const std::optional<VideoCommon::FireEmblemUpscale::JitterSample>& jitter,
+    const std::optional<Texture::TICEntry>& motion,
+    const std::optional<Texture::TICEntry>& depth, bool allow_history) {
+    using namespace VideoCommon::FireEmblemUpscale;
+    static const bool spatial_requested = [] {
+        const char* const option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+        return option && std::string_view{option} == "spatial";
+    }();
+    if (!input || !output || !PlainImage(*input) || !PlainImage(*output) ||
+        input->format != Texture::TextureFormat::B10G11R11 ||
+        output->format != Texture::TextureFormat::B10G11R11 ||
+        input->Address() == output->Address() ||
+        launch_description.const_buffer_config[0].size.Value() < RenderLastColumnOffset + 4 ||
+        !memory_manager.IsFullyMappedRange(constants, RenderLastColumnOffset + 4)) {
+        return false;
+    }
+    const u32 width = memory_manager.Read<u32>(constants + RenderLastColumnOffset) + 1;
+    const u32 height = memory_manager.Read<u32>(constants + RenderLastRowOffset) + 1;
+    if (width == 0 || height == 0 || width > input->Width() || height > input->Height()) {
+        return false;
+    }
+    const auto surface = [](const Texture::TICEntry& tic) {
+        Fermi2D::Surface result{};
+        result.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+        result.linear = Fermi2D::MemoryLayout::BlockLinear;
+        result.block_width.Assign(tic.block_width);
+        result.block_height.Assign(tic.block_height);
+        result.block_depth.Assign(tic.block_depth);
+        result.depth = 1;
+        result.width = tic.Width();
+        result.height = tic.Height();
+        result.addr_upper = static_cast<u32>(tic.Address() >> 32);
+        result.addr_lower = static_cast<u32>(tic.Address());
+        return result;
+    };
+    // Without this evaluation's jitter or usable motion vectors (a rejected pass clears them), the
+    // region is still scaled, without history, rather than leaving the network's output.
+    bool use_history = allow_history && !spatial_requested && jitter && motion &&
+                       width <= motion->Width() && height <= motion->Height() &&
+                       (!depth || (width <= depth->Width() && height <= depth->Height()));
+    const auto upscale = [&](bool history) {
+        Fermi2D::Surface motion_surface{};
+        if (history) {
+            motion_surface = surface(*motion);
+            motion_surface.format = Tegra::RenderTargetFormat::R16G16_FLOAT;
+        }
+        // The game's motion vectors point from the previous position to the current one (a
+        // rightward pan gives negative x while the scene moves left), the reverse of what the
+        // upscale expects.
+        const std::array<f32, 2> motion_scale =
+            history ? std::array{-1.0f, -1.0f} : std::array{0.0f, 0.0f};
+        return rasterizer->AccelerateTemporalUpscale(
+            surface(*input), surface(*output), motion_surface,
+            history && depth ? &*depth : nullptr,
+            jitter ? jitter->offset : std::array{0.0f, 0.0f}, motion_scale, history,
+            std::array{width, height});
+    };
+    bool done = upscale(use_history);
+    if (!done && use_history) {
+        use_history = false;
+        done = upscale(false);
+    }
+    static u32 last_width{};
+    if (width != last_width) {
+        last_width = width;
+        LOG_INFO(HW_GPU, "DLSS replacement: {} region {}x{} of {}x{} to {}x{}",
+                 done ? "scaled" : "could not scale", width, height, input->Width(),
+                 input->Height(), output->Width(), output->Height());
+    }
+    return done;
+}
+
 bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     using namespace VideoCommon::FireEmblemUpscale;
     // Temporal by default: a spatial upscale of the jittered input crawls from frame to frame.
@@ -1735,13 +1877,15 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
         const char* const option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
         return option && std::string_view{option} == "spatial";
     }();
-    const size_t game_index = dlss_chain.spatial_only ? 1 : 0;
-    const char* const game = dlss_chain.spatial_only ? "Star Fox" : "Fire Emblem";
+    const size_t game_index = dlss_chain.render_region ? 2 : (dlss_chain.spatial_only ? 1 : 0);
+    const char* const game = dlss_chain.render_region
+                                 ? "The Duskbloods"
+                                 : (dlss_chain.spatial_only ? "Star Fox" : "Fire Emblem");
     const auto jitter = fe_upscale_jitter.Take();
     const auto motion = std::exchange(dlss_motion_vectors, std::nullopt);
     const auto depth = std::exchange(dlss_depth, std::nullopt);
-    if (!jitter) {
-        static std::array<bool, 2> reported{};
+    if (!dlss_chain.render_region && !jitter) {
+        static std::array<bool, 3> reported{};
         if (!reported[game_index]) {
             reported[game_index] = true;
             LOG_WARNING(HW_GPU, "{} replacement lacks this frame's jitter; retaining native dispatch",
@@ -1765,6 +1909,9 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     };
     const auto input = image(OutputColorInputOffset);
     const auto output = image(OutputColorOffset);
+    if (dlss_chain.render_region) {
+        return ScaleDlssRenderRegion(address, input, output, jitter, motion, depth, allow_history);
+    }
     if (!input || !output || !ValidPair(*input, *output, dlss_chain.spatial_only) ||
         jitter->color != input->Address() || jitter->width != input->Width() ||
         jitter->height != input->Height()) {
@@ -1804,7 +1951,7 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
         use_history = false;
         done = upscale(false);
     }
-    static std::array<u32, 2> logged{};
+    static std::array<u32, 3> logged{};
     if (logged[game_index]++ < 8) {
         LOG_INFO(HW_GPU, "{} DLSS replacement: {} temporal={} input={:#x} {}x{} output={:#x} {}x{} jitter={},{}",
                  game, done ? "applied" : "unavailable; retaining native dispatch", use_history,

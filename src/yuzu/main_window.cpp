@@ -48,6 +48,7 @@
 #include "yuzu/game/game_list.h"
 #include "yuzu/nup_dialogs.h"
 #include "yuzu/shader_warm_dialog.h"
+#include "video_core/render_probe.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #ifdef YUZU_ENABLE_MCP
 #include <atomic>
@@ -2641,6 +2642,9 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         boot_in_progress = false;
         LOG_INFO(Frontend, "Launch finished: elapsed_ms={} running={}", boot_timer.elapsed(),
                  emulation_running);
+        if (!emulation_running) {
+            VideoCommon::ShaderWarm::RequestBuildOnly(false);
+        }
         if (!emulation_running && !close_pending) {
             game_list->SetScanEnabled(true);
             game_list->PopulateAsync(UISettings::values.game_dirs);
@@ -2731,7 +2735,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     speed_limit_before_hotkeys.reset();
     Settings::LogSettings();
 
-    if (UISettings::values.select_user_on_boot && !user_flag_cmd_line) {
+    if (UISettings::values.select_user_on_boot && !user_flag_cmd_line &&
+        !VideoCommon::ShaderWarm::BuildOnlyRequested()) {
         const Core::Frontend::ProfileSelectParameters parameters{
             .mode = Service::AM::Frontend::UiMode::UserSelector,
             .invalid_uid_list = {},
@@ -2793,6 +2798,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
 
     // Create and start the emulation thread
     QtCommon::emu_thread = std::make_unique<EmuThread>();
+    connect(QtCommon::emu_thread.get(), &QThread::finished, this, &MainWindow::OnEmulationStopped,
+            Qt::QueuedConnection);
     emit EmulationStarting();
     QtCommon::emu_thread->start();
 
@@ -2885,17 +2892,22 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     loading_screen->Prepare(QtCommon::system->GetAppLoader());
     loading_screen->show();
 
+    const bool build_only_boot = VideoCommon::ShaderWarm::BuildOnlyRequested();
     emulation_running = true;
-    if (ui->action_Fullscreen->isChecked()) {
-        ShowFullscreen();
-    } else {
-        if (Settings::IsDockedMode()) {
-            ResetWindowSize1080();
+    if (!build_only_boot) {
+        if (ui->action_Fullscreen->isChecked()) {
+            ShowFullscreen();
         } else {
-            ResetWindowSize720();
+            if (Settings::IsDockedMode()) {
+                ResetWindowSize1080();
+            } else {
+                ResetWindowSize720();
+            }
         }
+        OnStartGame();
+    } else {
+        UpdateMenuState();
     }
-    OnStartGame();
 }
 
 void MainWindow::BootGameFromList(const QString& filename, StartGameType with_config) {
@@ -3037,6 +3049,11 @@ void MainWindow::OnEmulationStopped() {
         return;
     }
     UndoSessionSpeedChanges();
+    play_time_manager->Stop();
+    AllowOSSleep();
+    VideoCore::Probe::StoreScene(0, 0, 0, 0, nullptr);
+    last_upscaler_status_key.reset();
+    last_status_scaling_filter.reset();
     shutdown_timer.stop();
     emu_terminate_timer.stop();
     if (QtCommon::emu_thread) {
@@ -4031,6 +4048,9 @@ void MainWindow::OnStopGame() {
 }
 
 bool MainWindow::ConfirmShutdownGame() {
+    if (VideoCommon::ShaderWarm::BuildOnlyRequested()) {
+        return true;
+    }
     if (UISettings::values.confirm_before_stopping.GetValue() == ConfirmStop::Ask_Always) {
         if (QtCommon::system->GetExitLocked()) {
             if (!ConfirmForceLockedExit()) {
@@ -4742,6 +4762,7 @@ void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_
 
     if (result != QDialog::Accepted && !UISettings::values.configuration_applied) {
         Settings::RestoreGlobalState(QtCommon::system->IsPoweredOn());
+        UpdateStatusButtons();
         return;
     } else if (result == QDialog::Accepted) {
         dialog.ApplyConfiguration();
@@ -4757,6 +4778,7 @@ void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_
     const bool is_powered_on = QtCommon::system->IsPoweredOn();
     Settings::RestoreGlobalState(is_powered_on);
     QtCommon::system->HIDCore().ReloadInputDevices();
+    UpdateStatusButtons();
 
     UISettings::values.configuration_applied = false;
 
@@ -5150,12 +5172,12 @@ void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& 
         shader_warm_dialog->close();
     }
     if (QtCommon::emu_thread != nullptr) {
-        QMessageBox::information(this, tr("Precache Shaders"),
+        QMessageBox::information(this, tr("Build Shader Cache"),
                                  tr("Close the running game first."));
         return;
     }
     if (nup_running && game_path == nup_source_path) {
-        QMessageBox::information(this, tr("Precache Shaders"),
+        QMessageBox::information(this, tr("Build Shader Cache"),
                                  tr("This game is being converted. Try again when it is done."));
         return;
     }
@@ -5165,9 +5187,24 @@ void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& 
     if (std::error_code ec; std::filesystem::is_directory(path, ec)) {
         path /= "main";
     }
-    shader_warm_dialog =
-        new ShaderWarmDialog(*QtCommon::system, path, program_id, GameTitleName(game_path), this);
+    shader_warm_dialog = new ShaderWarmDialog(*QtCommon::system, path, program_id,
+                                              GameTitleName(game_path), this, true);
     connect(shader_warm_dialog, &QDialog::finished, shader_warm_dialog, &QObject::deleteLater);
+    connect(shader_warm_dialog, &ShaderWarmDialog::BuildFinished, this,
+            [this, game_path, dialog = shader_warm_dialog](bool ok) {
+                if (!ok || !dialog || !dialog->NeedsBootGpuCompile()) {
+                    return;
+                }
+                if (QtCommon::emu_thread != nullptr || emulation_running || boot_in_progress ||
+                    close_pending) {
+                    return;
+                }
+                dialog->accept();
+                VideoCommon::ShaderWarm::RequestBuildOnly(true);
+                VideoCommon::ShaderWarm::RequestWarmBeforeStart(true);
+                BootGame(QString::fromStdString(game_path), ApplicationAppletParameters(),
+                         StartGameType::Normal, false);
+            });
     shader_warm_dialog->show();
     shader_warm_dialog->Start();
 }
@@ -5178,6 +5215,10 @@ void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& 
 /// game files first. A stopped or failed build starts the game without precaching.
 void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path& game_path) {
     namespace ShaderWarm = VideoCommon::ShaderWarm;
+    if (ShaderWarm::BuildOnlyRequested()) {
+        ShaderWarm::RequestWarmBeforeStart(Settings::values.use_disk_shader_cache.GetValue());
+        return;
+    }
     ShaderWarm::RequestWarmBeforeStart(false);
     const auto mode = Settings::values.precache_shaders.GetValue();
     // The precache runs where the disk shader cache loads.
@@ -5191,8 +5232,9 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         return;
     }
     if (mode == Settings::PrecacheShaders::Ask) {
-        QMessageBox box(QMessageBox::Question, tr("Precache Shaders"),
-                        tr("The shaders of this game are not precached yet. Precache them now?\n\n"
+        QMessageBox box(QMessageBox::Question, tr("Build Shader Cache"),
+                        tr("The shaders of this game are not precompiled yet. Build the shader "
+                           "cache now?\n\n"
                            "The game starts when they are done. The first time, the game files "
                            "are read and their shaders are built on every CPU thread, with the "
                            "shaders earlier play sessions saved, which takes a few minutes. Later "
@@ -5200,20 +5242,48 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
                            "loading screen has a Skip button.\n\n"
                            "You can change this in Configure, Graphics, Advanced."),
                         QMessageBox::NoButton, this);
-        QPushButton* const precache = box.addButton(tr("Precache now"), QMessageBox::AcceptRole);
+        auto* const remember = new QCheckBox(tr("Remember my choice for all games"), &box);
+        box.setCheckBox(remember);
+        QPushButton* const precache = box.addButton(tr("Build now"), QMessageBox::AcceptRole);
         box.addButton(tr("Start without"), QMessageBox::RejectRole);
         box.setDefaultButton(precache);
         box.exec();
         const bool now = box.clickedButton() == precache;
-        LOG_INFO(Frontend, "Shader precache before the game starts: {}", now ? "yes" : "no");
+        if (remember->isChecked()) {
+            const bool was_global = Settings::values.precache_shaders.UsingGlobal();
+            const auto chosen =
+                now ? Settings::PrecacheShaders::Always : Settings::PrecacheShaders::Off;
+            Settings::values.precache_shaders.SetGlobal(true);
+            Settings::values.precache_shaders.SetValue(chosen);
+            const bool players_were_global = Settings::values.players.UsingGlobal();
+            Settings::values.players.SetGlobal(true);
+            OnSaveConfig();
+            Settings::values.players.SetGlobal(players_were_global);
+            if (!was_global) {
+                Settings::values.precache_shaders.SetGlobal(false);
+                Settings::values.precache_shaders.SetValue(chosen);
+            }
+        }
+        LOG_INFO(Frontend, "Shader precache before the game starts: {} (remember={})",
+                 now ? "yes" : "no", remember->isChecked());
         if (!now) {
             return;
         }
     }
     std::error_code ec;
-    if (!std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec)) {
-        ShaderWarmDialog dialog(*QtCommon::system, game_path, title_id,
-                                GameTitleName(Common::FS::PathToUTF8String(game_path)), this);
+    const auto compute_warm = ShaderWarm::ComputeWarmPath(title_id);
+    const bool warm_missing =
+        ShaderWarm::WarmFilesStale(compute_warm).has_value() ||
+        (ShaderWarm::GraphicsPrecacheRequested() &&
+         ShaderWarm::WarmFilesStale(ShaderWarm::GraphicsWarmPath(title_id)).has_value());
+    if (warm_missing) {
+        auto extract_path = game_path;
+        if (std::filesystem::is_directory(extract_path, ec)) {
+            extract_path /= "main";
+        }
+        ShaderWarmDialog dialog(*QtCommon::system, extract_path, title_id,
+                                GameTitleName(Common::FS::PathToUTF8String(game_path)), this,
+                                false);
         connect(&dialog, &ShaderWarmDialog::BuildFinished, &dialog, [&dialog](bool ok) {
             if (ok) {
                 dialog.accept();
@@ -5221,7 +5291,7 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         });
         dialog.Start();
         dialog.exec();
-        if (!std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec)) {
+        if (!std::filesystem::exists(compute_warm, ec)) {
             return;
         }
     }
@@ -5234,21 +5304,21 @@ void MainWindow::OnGameListDeleteShaderWarm(u64 program_id) {
         shader_warm_dialog->TitleId() == program_id) {
         // The builder writes this title's files: deleting them under it would lose the result or
         // fail it. Other titles' files are in their own folders.
-        QMessageBox::information(this, tr("Delete Shader Precache"),
-                                 tr("Shaders are being precached. Try again when it is done."));
+        QMessageBox::information(this, tr("Delete Precompiled Shader Cache"),
+                                 tr("Shaders are being built. Try again when it is done."));
         shader_warm_dialog->raise();
         shader_warm_dialog->activateWindow();
         return;
     }
-    if (QMessageBox::question(this, tr("Delete Shader Precache"),
-                              tr("Delete the shader precache files of this game? They are built "
-                                 "again the next time the game is precached."),
+    if (QMessageBox::question(this, tr("Delete Precompiled Shader Cache"),
+                              tr("Delete the precompiled shader cache files of this game? They can "
+                                 "be rebuilt at any time."),
                               QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) {
         return;
     }
     std::string error;
     if (!DeleteShaderWarmFiles(program_id, error)) {
-        QMessageBox::critical(this, tr("Delete Shader Precache"),
+        QMessageBox::critical(this, tr("Delete Precompiled Shader Cache"),
                               tr("The files could not be deleted: %1")
                                   .arg(QString::fromStdString(error)));
     }
@@ -5843,66 +5913,116 @@ void MainWindow::UpdateStatusBar() {
     res_scale_label->setText(
         tr("Scale: %1x", "%1 is the resolution scaling factor").arg(res_scale));
 
-    QString upscaler_text;
-    QString upscaler_tooltip;
-    if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan) {
-        switch (Settings::values.upscaler.GetValue()) {
+    const auto active_filter = Settings::values.scaling_filter.GetValue();
+    if (last_status_scaling_filter != active_filter) {
+        last_status_scaling_filter = active_filter;
+        UpdateFilterText();
+    }
+
+    const auto backend = Settings::values.renderer_backend.GetValue();
+    const auto upscaler_setting = Settings::values.upscaler.GetValue();
+    const char* const probed_scene =
+        VideoCore::Probe::scene_upscaler.load(std::memory_order_relaxed);
+    UpscalerStatusKey status_key{
+        .backend = backend,
+        .upscaler = upscaler_setting,
+        .filter = active_filter,
+        .probed_scene = probed_scene,
+    };
 #ifdef EGLANTINE_STREAMLINE
-        case Settings::Upscaler::Dlss: {
-            const auto dlss = Vulkan::Streamline::GetSessionStatus();
-            if (dlss.available && dlss.frames > 0) {
-                upscaler_text = QStringLiteral("DLSS");
-                if (!dlss.mode_name.empty()) {
-                    upscaler_text +=
-                        QLatin1Char(' ') + QString::fromStdString(dlss.mode_name).toUpper();
-                }
-                if (!dlss.preset_name.empty()) {
-                    upscaler_text +=
-                        QLatin1Char(' ') + QString::fromStdString(dlss.preset_name).toUpper();
-                }
-                upscaler_tooltip =
-                    tr("%1 (%2) active — %3 frames upscaled. Screen filter runs after it.")
-                        .arg(UiText::ChoiceLabel("upscaler", "Dlss"),
-                             dlss.version.empty() ? QStringLiteral("Streamline")
-                                                  : QString::fromStdString(dlss.version))
-                        .arg(dlss.frames);
-            }
-            break;
-        }
+    if (backend == Settings::RendererBackend::Vulkan &&
+        upscaler_setting == Settings::Upscaler::Dlss) {
+        const auto dlss = Vulkan::Streamline::GetSessionStatus();
+        status_key.dlss_active = dlss.available && dlss.frames > 0;
+        status_key.mode_name = dlss.mode_name;
+        status_key.preset_name = dlss.preset_name;
+        status_key.version = dlss.version;
+    }
 #endif
 #if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
-        case Settings::Upscaler::Fsr4: {
-            const auto fsr4 = Vulkan::FfxRuntime::GetSessionStatus();
-            if (fsr4.available && fsr4.frames > 0) {
-                const QString ver = QString::fromStdString(fsr4.version);
-                upscaler_text = ver.startsWith(QStringLiteral("4."))
-                                    ? QStringLiteral("FSR %1").arg(ver)
-                                    : QStringLiteral("FSR 4");
-                upscaler_tooltip =
-                    tr("%1 active — %2 frames upscaled. Screen filter runs after it.")
-                        .arg(UiText::ChoiceLabel("upscaler", "Fsr4"))
-                        .arg(fsr4.frames);
-            }
-            break;
-        }
-#endif
-        default:
-            break;
-        }
+    if (backend == Settings::RendererBackend::Vulkan &&
+        upscaler_setting == Settings::Upscaler::Fsr4) {
+        const auto fsr4 = Vulkan::FfxRuntime::GetSessionStatus();
+        status_key.fsr4_active = fsr4.available && fsr4.frames > 0;
+        status_key.version = fsr4.version;
     }
-    if (upscaler_text.isEmpty()) {
-        if (upscaler_status_label->isVisible()) {
-            upscaler_status_label->clear();
-            upscaler_status_label->setToolTip(QString{});
-            upscaler_status_label->setVisible(false);
+#endif
+
+    if (last_upscaler_status_key != status_key) {
+        last_upscaler_status_key = status_key;
+        QString upscaler_text;
+        QString upscaler_tooltip;
+        const QString filter_label = UiText::ChoiceLabel(
+            Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
+            static_cast<u32>(active_filter));
+        const std::string_view scene_sv = probed_scene != nullptr ? probed_scene : "";
+
+        if (status_key.dlss_active) {
+            upscaler_text = QStringLiteral("DLSS");
+            if (!status_key.mode_name.empty()) {
+                upscaler_text +=
+                    QLatin1Char(' ') + QString::fromStdString(status_key.mode_name).toUpper();
+            }
+            if (!status_key.preset_name.empty()) {
+                upscaler_text +=
+                    QLatin1Char(' ') + QString::fromStdString(status_key.preset_name).toUpper();
+            }
+            upscaler_tooltip =
+                tr("%1 (%2) active — window filter: %3.")
+                    .arg(UiText::ChoiceLabel("upscaler", "Dlss"),
+                         status_key.version.empty() ? QStringLiteral("Streamline")
+                                                    : QString::fromStdString(status_key.version),
+                         filter_label);
+        } else if (status_key.fsr4_active) {
+            const QString ver = QString::fromStdString(status_key.version);
+            upscaler_text = ver.startsWith(QStringLiteral("4."))
+                                ? QStringLiteral("FSR %1").arg(ver)
+                                : QStringLiteral("FSR 4");
+            upscaler_tooltip = tr("%1 active — window filter: %2.")
+                                   .arg(UiText::ChoiceLabel("upscaler", "Fsr4"), filter_label);
+        } else if (backend == Settings::RendererBackend::Vulkan ||
+                   backend == Settings::RendererBackend::Metal) {
+            if (scene_sv == "DLSS") {
+                upscaler_text = QStringLiteral("DLSS");
+            } else if (scene_sv == "FSR 4") {
+                upscaler_text = QStringLiteral("FSR 4");
+            } else if (scene_sv == "FSR 3.1") {
+                upscaler_text = QStringLiteral("FSR 3.1");
+            } else if (scene_sv.starts_with("Metal")) {
+                upscaler_text = UiText::ChoiceLabel(
+                    Settings::EnumMetadata<Settings::FrameGenType>::Index(),
+                    static_cast<u32>(Settings::FrameGenType::MetalFx));
+            } else if (upscaler_setting == Settings::Upscaler::MetalFx) {
+#if defined(__APPLE__)
+                upscaler_text = UiText::ChoiceLabel(
+                    Settings::EnumMetadata<Settings::FrameGenType>::Index(),
+                    static_cast<u32>(Settings::FrameGenType::MetalFx));
+#endif
+            } else if (upscaler_setting == Settings::Upscaler::Fsr3) {
+                upscaler_text = QStringLiteral("FSR 3.1");
+            }
+            if (!upscaler_text.isEmpty()) {
+                upscaler_tooltip =
+                    tr("%1 active — window filter: %2.").arg(upscaler_text, filter_label);
+            }
         }
-    } else {
-        if (upscaler_status_label->text() != upscaler_text) {
-            upscaler_status_label->setText(upscaler_text);
-        }
-        upscaler_status_label->setToolTip(upscaler_tooltip);
-        if (!upscaler_status_label->isVisible()) {
-            upscaler_status_label->setVisible(true);
+
+        if (upscaler_text.isEmpty()) {
+            if (upscaler_status_label->isVisible()) {
+                upscaler_status_label->clear();
+                upscaler_status_label->setToolTip(QString{});
+                upscaler_status_label->setVisible(false);
+            }
+        } else {
+            if (upscaler_status_label->text() != upscaler_text) {
+                upscaler_status_label->setText(upscaler_text);
+            }
+            if (upscaler_status_label->toolTip() != upscaler_tooltip) {
+                upscaler_status_label->setToolTip(upscaler_tooltip);
+            }
+            if (!upscaler_status_label->isVisible()) {
+                upscaler_status_label->setVisible(true);
+            }
         }
     }
 

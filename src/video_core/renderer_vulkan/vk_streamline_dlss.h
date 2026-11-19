@@ -6,8 +6,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <optional>
 
 #include "common/common_types.h"
@@ -28,6 +30,7 @@ public:
         VkFormat format;
         VkImageSubresourceRange range;     ///< The view's level and layer, with the view's aspect.
         VkImageAspectFlags barrier_aspect; ///< Every aspect of the image's format.
+        VkExtent2D extent{};               ///< Backing image dimensions (render_size when zero).
     };
 
     struct Inputs {
@@ -36,6 +39,7 @@ public:
         Image motion_vectors; ///< Motion to the previous frame at the render size.
         VkExtent2D render_size;
         VkExtent2D upscale_size;
+        std::optional<VkExtent2D> max_render_size;
         /// This frame's sample offset in render pixels, as the game hands its own DLSS.
         std::array<f32, 2> jitter;
         /// Turns a motion vector into render pixels (the render size for UV offsets).
@@ -103,6 +107,7 @@ private:
     u32 current_preset{~0u};
     u32 evaluated_mode{};
     u32 evaluated_preset{};
+    std::optional<std::chrono::steady_clock::time_point> last_evaluation;
     vk::Image output_image;
     vk::ImageView output_view;
     vk::Sampler point_sampler;

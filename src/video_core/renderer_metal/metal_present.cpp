@@ -340,7 +340,7 @@ bool PresentPasses::Draw(const Pass& pass) {
         ClearPass clear{};
         clear.color[0] = pass.target;
         clear.clear_color[0] = true;
-        clear.color_value[0] = {0.0, 0.0, 0.0, 1.0};
+        clear.color_value[0] = {0.0, 0.0, 0.0, pass.strip ? 1.0 : 0.0};
         clear.width = pass.size[0];
         clear.height = pass.size[1];
         scheduler.Clear(clear);
@@ -497,48 +497,58 @@ PresentPasses::Source PresentPasses::Upscale(const Source& source,
     const f32 input_width = static_cast<f32>(source.render[0]);
     const f32 input_height = static_cast<f32>(source.render[1]);
     const auto& crop = source.crop;
-    if (filter == Filter::Fsr) {
-        // Vulkan's FSR::Draw: EASU at the output size, then RCAS at the sharpness setting.
+    if (filter == Filter::Fsr || filter == Filter::Fsr3) {
+        // Vulkan's FSR / FSR3 ("AMD FSR 1 Soft"): EASU at the output size, then RCAS unless
+        // sharpening is at 0 % (slider >= 200). FSR3 softens RCAS by +0.5 stops.
         const TextureHandle easu_output = Make(easu, output, Fmt::RGBA16Float);
-        const TextureHandle rcas_output = Make(rcas, output, Fmt::RGBA16Float);
-        if (easu_output == nullptr || rcas_output == nullptr) {
+        if (easu_output == nullptr) {
             return source;
         }
         std::array<u32, 16> easu_constants{};
-        std::array<u32, 16> rcas_constants{};
         FSR::FsrEasuConOffset(easu_constants.data(), easu_constants.data() + 4,
                               easu_constants.data() + 8, easu_constants.data() + 12,
                               (crop[2] - crop[0]) * input_width,
                               (crop[3] - crop[1]) * input_height, input_width, input_height,
                               static_cast<f32>(output[0]), static_cast<f32>(output[1]),
                               crop[0] * input_width, crop[1] * input_height);
-        FSR::FsrRcasCon(rcas_constants.data(),
-                        static_cast<f32>(Settings::values.fsr_sharpening_slider.GetValue()) /
-                            100.0f);
         const std::array<TextureHandle, 1> easu_inputs{source.texture};
+        if (!Draw({.vertex = Shader::FsrVertex,
+                   .fragment = Shader::Easu,
+                   .inputs = easu_inputs,
+                   .target = {.texture = easu_output},
+                   .format = Fmt::RGBA16Float,
+                   .size = output,
+                   .push_constants = Bytes(easu_constants)})) {
+            return source;
+        }
+        const int slider = Settings::values.fsr_sharpening_slider.GetValue();
+        if (slider >= 200) {
+            return {.texture = easu_output, .size = output, .render = output, .crop = {0, 0, 1, 1}};
+        }
+        const TextureHandle rcas_output = Make(rcas, output, Fmt::RGBA16Float);
+        if (rcas_output == nullptr) {
+            return {.texture = easu_output, .size = output, .render = output, .crop = {0, 0, 1, 1}};
+        }
+        const f32 stops =
+            static_cast<f32>(slider) / 100.0f + (filter == Filter::Fsr3 ? 0.5f : 0.0f);
+        std::array<u32, 16> rcas_constants{};
+        FSR::FsrRcasCon(rcas_constants.data(), stops);
         const std::array<TextureHandle, 1> rcas_inputs{easu_output};
-        const bool drawn =
-            Draw({.vertex = Shader::FsrVertex,
-                  .fragment = Shader::Easu,
-                  .inputs = easu_inputs,
-                  .target = {.texture = easu_output},
-                  .format = Fmt::RGBA16Float,
-                  .size = output,
-                  .push_constants = Bytes(easu_constants)}) &&
-            Draw({.vertex = Shader::FsrVertex,
-                  .fragment = Shader::Rcas,
-                  .inputs = rcas_inputs,
-                  .target = {.texture = rcas_output},
-                  .format = Fmt::RGBA16Float,
-                  .size = output,
-                  .push_constants = Bytes(rcas_constants)});
-        if (!drawn) {
+        if (!Draw({.vertex = Shader::FsrVertex,
+                   .fragment = Shader::Rcas,
+                   .inputs = rcas_inputs,
+                   .target = {.texture = rcas_output},
+                   .format = Fmt::RGBA16Float,
+                   .size = output,
+                   .push_constants = Bytes(rcas_constants)})) {
             return source;
         }
         return {.texture = rcas_output, .size = output, .render = output, .crop = {0, 0, 1, 1}};
     }
     if (filter == Filter::Sgsr || filter == Filter::SgsrEdge) {
-        // Vulkan's SGSR::Draw.
+        // Vulkan's SGSR::Draw. MSL pads sgsr1_shader.vert / sgsr1_shader_mobile.frag's constant
+        // struct to 40 B and sgsr1_shader_mobile_edge_direction.frag's (float4[1] + 2*float2 +
+        // float) to 48 B, with identical field offsets 0..35; pass 48 zero-padded bytes for all.
         const TextureHandle sgsr_output = Make(sgsr, output, Fmt::RGBA16Float);
         if (sgsr_output == nullptr) {
             return source;
@@ -549,15 +559,19 @@ PresentPasses::Source PresentPasses::Upscale(const Source& source,
         const f32 edge_sharpness =
             EdgeSharpnessMax -
             static_cast<f32>(Settings::values.fsr_sharpening_slider.GetValue()) / 200.0f;
-        const std::array<f32, 9> constants{1.0f / input_width,
-                                           1.0f / input_height,
-                                           input_width,
-                                           input_height,
-                                           crop_width / input_width,
-                                           crop_height / input_height,
-                                           (std::min)(crop[0], crop[2]),
-                                           (std::min)(crop[1], crop[3]),
-                                           edge_sharpness};
+        const std::array<f32, 12> constants{1.0f / input_width,
+                                            1.0f / input_height,
+                                            input_width,
+                                            input_height,
+                                            crop_width / input_width,
+                                            crop_height / input_height,
+                                            (std::min)(crop[0], crop[2]),
+                                            (std::min)(crop[1], crop[3]),
+                                            edge_sharpness,
+                                            0.0f,
+                                            0.0f,
+                                            0.0f};
+        static_assert(sizeof(constants) == 48);
         const std::array<TextureHandle, 1> inputs{source.texture};
         if (!Draw({.vertex = Shader::SgsrVertex,
                    .fragment = filter == Filter::SgsrEdge ? Shader::SgsrEdge : Shader::Sgsr,
@@ -620,8 +634,11 @@ bool PresentPasses::TemporalFilter(const TemporalInputs& inputs) {
     }
     // At half-float precision, as on Vulkan: in the output's format a frame's small share of the
     // blend rounded away.
-    bool reset = false;
+    bool reset = inputs.reset;
     if (!history[0] || !history[1] || history_size != inputs.size) {
+        if (history[0] || history[1]) {
+            scheduler.Finish();
+        }
         for (Object& image : history) {
             image = CreateTexture(device, {.kind = TextureKind::e2D,
                                            .format = Fmt::RGBA16Float,
@@ -650,6 +667,9 @@ bool PresentPasses::TemporalFilter(const TemporalInputs& inputs) {
     static const f32 clip_width = tuned("EDEN_NX2_TEMPORAL_CLIP", 1.5f);
     static const f32 clip_motion = tuned("EDEN_NX2_TEMPORAL_CLIP_MOTION", 1.0f);
     static const f32 kernel_motion = tuned("EDEN_NX2_TEMPORAL_KERNEL_MOTION", 1.0f);
+    const std::array<u32, 2> effective_render =
+        inputs.render_size[0] != 0 && inputs.render_size[1] != 0 ? inputs.render_size
+                                                                 : inputs.size;
     // full_screen_triangle.vert's scale and offset, then temporal_upscale.frag's constants.
     struct UpscaleConstants {
         std::array<f32, 2> tex_scale;
@@ -662,8 +682,9 @@ bool PresentPasses::TemporalFilter(const TemporalInputs& inputs) {
         f32 clip_motion;
         f32 kernel_motion;
         f32 padding;
+        std::array<s32, 2> render_size;
     };
-    static_assert(sizeof(UpscaleConstants) == 56);
+    static_assert(sizeof(UpscaleConstants) == 64);
     const UpscaleConstants upscale{
         .tex_scale = {1.0f, 1.0f},
         .tex_offset = {0.0f, 0.0f},
@@ -675,6 +696,8 @@ bool PresentPasses::TemporalFilter(const TemporalInputs& inputs) {
         .clip_motion = clip_motion,
         .kernel_motion = kernel_motion,
         .padding = 0.0f,
+        .render_size = {static_cast<s32>(effective_render[0]),
+                        static_cast<s32>(effective_render[1])},
     };
     const size_t read = history_current;
     const size_t write = read ^ 1;

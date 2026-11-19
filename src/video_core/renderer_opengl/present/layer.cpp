@@ -48,10 +48,11 @@ GLuint Layer::ConfigureDraw(std::array<GLfloat, 3 * 2>& out_matrix,
     GLuint texture = info.display_texture;
 
     auto anti_aliasing = filters.get_anti_aliasing();
-    if (anti_aliasing != Settings::AntiAliasing::None) {
+    if (anti_aliasing != Settings::AntiAliasing::None && info.scaled_width > 0 &&
+        info.scaled_height > 0) {
         glEnablei(GL_SCISSOR_TEST, 0);
-        auto viewport_width = Settings::values.resolution_info.ScaleUp(framebuffer_texture.width);
-        auto viewport_height = Settings::values.resolution_info.ScaleUp(framebuffer_texture.height);
+        const u32 viewport_width = info.scaled_width;
+        const u32 viewport_height = info.scaled_height;
 
         glScissorIndexed(0, 0, 0, viewport_width, viewport_height);
         glViewportIndexedf(0, 0.0f, 0.0f, static_cast<GLfloat>(viewport_width),
@@ -59,12 +60,12 @@ GLuint Layer::ConfigureDraw(std::array<GLfloat, 3 * 2>& out_matrix,
 
         switch (anti_aliasing) {
         case Settings::AntiAliasing::Fxaa:
-            CreateFXAA();
+            CreateFXAA(viewport_width, viewport_height);
             texture = std::get<FXAA>(anti_alias).Draw(program_manager, info.display_texture);
             break;
         case Settings::AntiAliasing::Smaa:
         default:
-            CreateSMAA();
+            CreateSMAA(viewport_width, viewport_height);
             texture = std::get<SMAA>(anti_alias).Draw(program_manager, info.display_texture);
             break;
         }
@@ -72,16 +73,23 @@ GLuint Layer::ConfigureDraw(std::array<GLfloat, 3 * 2>& out_matrix,
 
     glDisablei(GL_SCISSOR_TEST, 0);
 
-    // MetalFX Spatial is Vulkan on Apple only; elsewhere it falls back to FSR 1, as on Vulkan.
+    // Spatial super-resolution filters not natively separate in OpenGL (FSR 3 softened spatial,
+    // SGSR, MetalFX Spatial) route cleanly through FSR 1 EASU/RCAS.
     const auto scaling_filter = filters.get_scaling_filter();
-    if (scaling_filter == Settings::ScalingFilter::Fsr ||
-        scaling_filter == Settings::ScalingFilter::Fsr3 ||
-        scaling_filter == Settings::ScalingFilter::MetalFxSpatial) {
+    if ((scaling_filter == Settings::ScalingFilter::Fsr ||
+         scaling_filter == Settings::ScalingFilter::Fsr3 ||
+         scaling_filter == Settings::ScalingFilter::Sgsr ||
+         scaling_filter == Settings::ScalingFilter::SgsrEdge ||
+         scaling_filter == Settings::ScalingFilter::MetalFxSpatial) &&
+        layout.screen.GetWidth() > 0 && layout.screen.GetHeight() > 0 && info.scaled_width > 0 &&
+        info.scaled_height > 0) {
         if (!fsr || fsr->NeedsRecreation(layout.screen)) {
             fsr.emplace(layout.screen.GetWidth(), layout.screen.GetHeight());
         }
 
-        texture = fsr->Draw(program_manager, texture, info.scaled_width, info.scaled_height, crop);
+        const bool softened = scaling_filter == Settings::ScalingFilter::Fsr3;
+        texture = fsr->Draw(program_manager, texture, info.scaled_width, info.scaled_height, crop,
+                            softened);
         crop = {0, 0, 1, 1};
     }
 
@@ -215,21 +223,25 @@ void Layer::ConfigureFramebufferTexture(const Tegra::FramebufferConfig& framebuf
                        framebuffer_texture.width, framebuffer_texture.height);
 
     anti_alias.emplace<std::monostate>();
+    anti_alias_width = 0;
+    anti_alias_height = 0;
 }
 
-void Layer::CreateFXAA() {
-    if (!std::holds_alternative<FXAA>(anti_alias)) {
-        anti_alias.emplace<FXAA>(
-            Settings::values.resolution_info.ScaleUp(framebuffer_texture.width),
-            Settings::values.resolution_info.ScaleUp(framebuffer_texture.height));
+void Layer::CreateFXAA(u32 width, u32 height) {
+    if (!std::holds_alternative<FXAA>(anti_alias) || anti_alias_width != width ||
+        anti_alias_height != height) {
+        anti_alias_width = width;
+        anti_alias_height = height;
+        anti_alias.emplace<FXAA>(width, height);
     }
 }
 
-void Layer::CreateSMAA() {
-    if (!std::holds_alternative<SMAA>(anti_alias)) {
-        anti_alias.emplace<SMAA>(
-            Settings::values.resolution_info.ScaleUp(framebuffer_texture.width),
-            Settings::values.resolution_info.ScaleUp(framebuffer_texture.height));
+void Layer::CreateSMAA(u32 width, u32 height) {
+    if (!std::holds_alternative<SMAA>(anti_alias) || anti_alias_width != width ||
+        anti_alias_height != height) {
+        anti_alias_width = width;
+        anti_alias_height = height;
+        anti_alias.emplace<SMAA>(width, height);
     }
 }
 

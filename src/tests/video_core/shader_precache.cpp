@@ -91,9 +91,79 @@ TEST_CASE("ShaderPrecache: the marker matches only the same file and driver", "[
     REQUIRE_FALSE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1235, 0x2206, 53)));
     REQUIRE_FALSE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2207, 53)));
     REQUIRE_FALSE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 54)));
+    // Another variant (an update that changed the SPIR-V) builds the programs again.
+    REQUIRE_FALSE(
+        marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53, 0x77)));
+
+    // Built again with the same contents: still done.
+    WriteBytes(warm, "precache");
+    REQUIRE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53)));
+
+    // The same size with other contents: only the content hash tells them apart.
+    WriteBytes(warm, "precachf");
+    REQUIRE_FALSE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53)));
 
     WriteBytes(warm, "a rebuilt precache");
     REQUIRE_FALSE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53)));
+}
+
+TEST_CASE("ShaderPrecache: a rebuild with the same contents keeps the marker", "[video_core]") {
+    TempDir dir;
+    const auto warm = dir.path / "warm-compute.bin";
+    const auto rebuilt = dir.path / "warm-compute.tmp";
+    WriteBytes(warm, "precache");
+    REQUIRE(ShaderWarm::WriteWarmMarker(
+        warm, *ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53)));
+
+    WriteBytes(rebuilt, "precache");
+    ShaderWarm::DropStaleWarmMarker(warm, rebuilt);
+    REQUIRE(ShaderWarm::ReadWarmMarker(warm).has_value());
+
+    WriteBytes(rebuilt, "a rebuilt precache");
+    ShaderWarm::DropStaleWarmMarker(warm, rebuilt);
+    REQUIRE_FALSE(std::filesystem::exists(ShaderWarm::WarmMarkerPath(warm)));
+
+    // No marker left and nothing to replace the file with: nothing to do.
+    ShaderWarm::DropStaleWarmMarker(warm, dir.path / "missing.tmp");
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
+}
+
+TEST_CASE("ShaderPrecache: the marker matches only the same variant", "[video_core]") {
+    TempDir dir;
+    const auto warm = dir.path / "warm-compute.bin";
+    WriteBytes(warm, "precache");
+    const u64 variant = 0xfedcba9876543210ULL;
+    const auto stamp = ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53, variant);
+    REQUIRE(stamp.has_value());
+    REQUIRE(ShaderWarm::WriteWarmMarker(warm, *stamp));
+
+    const auto marker = ShaderWarm::ReadWarmMarker(warm);
+    REQUIRE(marker.has_value());
+    REQUIRE(marker->variant == variant);
+    REQUIRE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 0, 0x1234, 0x2206, 53, variant)));
+    REQUIRE_FALSE(
+        marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53, variant + 1)));
+    REQUIRE_FALSE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53)));
+    REQUIRE(ShaderWarm::EmissionStamp() != 0);
+}
+
+TEST_CASE("ShaderPrecache: a marker of an older format is not read", "[video_core]") {
+    TempDir dir;
+    const auto warm = dir.path / "warm-compute.bin";
+    WriteBytes(warm, "precache");
+    // Size, last-write time, entries, driver, device and cache version, then the line end.
+    WriteBytes(ShaderWarm::WarmMarkerPath(warm), "8 133981234567890000 12 4660 8710 53\n");
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
+    // The same with a variant but no format tag.
+    WriteBytes(ShaderWarm::WarmMarkerPath(warm),
+               "8 133981234567890000 12 4660 8710 53 18364758544493064720\n");
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
+    // Tagged v2 but cut short.
+    WriteBytes(ShaderWarm::WarmMarkerPath(warm), "v2 8 1234 12 4660 8710 53\n");
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
+
+    REQUIRE(ShaderWarm::WriteWarmMarker(warm, *ShaderWarm::CurrentWarmStamp(warm, 12, 1, 2, 3)));
+    REQUIRE(ShaderWarm::ReadWarmMarker(warm).has_value());
 }
 
 TEST_CASE("ShaderPrecache: precached pipelines are kept per driver", "[video_core]") {
@@ -225,23 +295,65 @@ TEST_CASE("ShaderPrecache: every container the archive walker reads is discovere
                              "Pack/Shaders.release.sarc", "Shader/Loose.bnsh",
                              "Shader/Loose.bnsh.zs", "Shader/Bundle.cgsb", "Shader/Bundle.cgsb.zs",
                              "Shader/Program.shn", "Shader/Program.shn.zs", "Shader/Archive.sharcb",
-                             "Shader/Archive.sharcb.zs", "Shader/UPPER.BNSH", "Effect/Fx.bfsha.zs"}) {
+                             "Shader/Archive.sharcb.zs", "Shader/UPPER.BNSH", "Effect/Fx.bfsha.zs",
+                             "Layout2Shader/Menu.blarc.zs", "Layout/Hud.blarc",
+                             "Lib/agl_ndsr.pck.zs", "Lib/agl_ndsr.pck"}) {
         INFO(path);
         REQUIRE(ClassifyGameFile(path) == GameFileKind::ShaderArchive);
     }
     REQUIRE(ClassifyGameFile("Effect/Fx.nin_ounce_nvn2.vsetb.byml.zs") == GameFileKind::Effect);
     REQUIRE(ClassifyGameFile("Effect/static.Nin_Ounce_NVN2.esetb.byml.zs") == GameFileKind::Effect);
+    REQUIRE(ClassifyGameFile("Effect/Sub/Fx.vsetb.byml.zs") == GameFileKind::Effect);
+    REQUIRE(ClassifyGameFile("Effect/Sub/Deep/Fx.esetb.byml.zs") == GameFileKind::Effect);
     REQUIRE(ClassifyGameFile("Effect/Particle/Magic.ptcl.zst") == GameFileKind::Effect);
     REQUIRE(ClassifyGameFile("Effect/Particle/Magic.ptcl") == GameFileKind::Effect);
     REQUIRE(ClassifyGameFile("Pack/ZsDic.pack.zs") == GameFileKind::ZstdDictionaries);
     for (const char* path :
-         {"Effect/Sub/Fx.vsetb.byml.zs", "Model/Fx.vsetb.byml.zs", "Effect/Fx.vsetb.byml",
-          "Effect/Sub/Fx.esetb.byml.zs",
+         {"Model/Fx.vsetb.byml.zs", "Effect/Fx.vsetb.byml",
           "Model/Tex.bntx.zs", "Model/Mesh.bfres.zs", "Asset/assets_a000.dat",
           "Bin/Nvn2-upper_left.ndsr", "Shader/notes.shn.txt", "Shader/bnsh"}) {
         INFO(path);
         REQUIRE(ClassifyGameFile(path) == GameFileKind::Other);
     }
+}
+
+TEST_CASE("ShaderPrecache: graphics precache is enabled by default and Maxwell programs roundtrip",
+          "[video_core]") {
+    if (std::getenv("EDEN_NX2_GRAPHICS_PRECACHE") == nullptr) {
+        REQUIRE(ShaderWarm::GraphicsPrecacheRequested());
+    }
+
+    // Build a synthetic Switch 1 NVN1 Maxwell vertex shader (0x30 NVN header + 0x50 SPH +
+    // scheduling word + EXIT + SELF_BRANCH_A).
+    std::vector<u8> maxwell_vs(0x80 + 3 * sizeof(u64), 0);
+    const u32 nvn_gfx_magic = 0x12345678U;
+    std::memcpy(maxwell_vs.data(), &nvn_gfx_magic, sizeof(u32));
+    const u32 sph_vertex = 1U << 10;
+    std::memcpy(maxwell_vs.data() + 0x30, &sph_vertex, sizeof(u32));
+    const u64 exit_inst = 0xE30000000007000FULL;
+    const u64 self_branch = 0xE2400FFFFF87000FULL;
+    std::memcpy(maxwell_vs.data() + 0x88, &exit_inst, sizeof(u64));
+    std::memcpy(maxwell_vs.data() + 0x90, &self_branch, sizeof(u64));
+
+    ShaderWarm::LoweredCode prepared;
+    REQUIRE_FALSE(ShaderWarm::PrepareMaxwellProgram(maxwell_vs, true, prepared).has_value());
+    REQUIRE(prepared.maxwell);
+    REQUIRE(prepared.stage_hash != 0);
+    REQUIRE(prepared.texture_buffer == 2);
+
+    const auto env_bytes = ShaderWarm::GraphicsEnv(0, prepared, maxwell_vs);
+    TempDir dir;
+    const auto file = dir.path / "maxwell_gfx.bin";
+    WriteBytes(file,
+               std::string_view{reinterpret_cast<const char*>(env_bytes.data()), env_bytes.size()});
+    std::ifstream in(file, std::ios::binary);
+    in.exceptions(std::ifstream::failbit);
+    VideoCommon::FileEnvironment env;
+    env.Deserialize(in);
+    REQUIRE((env.ShaderStage() == Shader::Stage::VertexA ||
+             env.ShaderStage() == Shader::Stage::VertexB));
+    REQUIRE(env.StartAddress() == 0x30);
+    REQUIRE(env.ReadInstruction(0x88) == exit_inst);
 }
 
 TEST_CASE("ShaderPrecache: a particle effect without shader programs is not an error",

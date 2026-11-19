@@ -426,24 +426,30 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     if (failed) {
         return false;
     }
-    const bool extent_changed = !output_image || in.render_size.width != render_extent.width ||
-                                in.render_size.height != render_extent.height ||
-                                in.upscale_size.width != upscale_extent.width ||
+    const bool output_changed = !output_image || in.upscale_size.width != upscale_extent.width ||
                                 in.upscale_size.height != upscale_extent.height;
+    const bool render_changed = in.render_size.width != render_extent.width ||
+                                in.render_size.height != render_extent.height;
+    const bool extent_changed = output_changed || render_changed;
+    const auto now = std::chrono::steady_clock::now();
+    const bool frame_gap =
+        !last_evaluation ||
+        std::chrono::duration<f32, std::milli>(now - *last_evaluation).count() > 250.0f;
+    last_evaluation = now;
     const Settings::DlssQuality requested = Settings::values.nvidia_dlss_quality.GetValue();
     const sl::DLSSPreset preset = Preset();
     bool options_changed = extent_changed || in.hdr != hdr_input ||
                            requested != quality_mode ||
                            static_cast<u32>(preset) != current_preset;
-    bool reset = in.reset || options_changed;
-    if (options_changed && !extent_changed) {
+    bool reset = in.reset || options_changed || frame_gap;
+    if (options_changed && !output_changed) {
         scheduler.Finish();
     }
-    if (extent_changed) {
+    if (output_changed) {
         CreateOutput(in.upscale_size);
-        render_extent = in.render_size;
         upscale_extent = in.upscale_size;
     }
+    render_extent = in.render_size;
     hdr_input = in.hdr;
     quality_mode = requested;
     current_preset = static_cast<u32>(preset);
@@ -540,16 +546,26 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             MakeUpscalerInputToReadBarrier(in.motion_vectors),
         };
 
+        const auto image_extent = [&](const Image& img, VkExtent2D fallback = {}) {
+            if (img.extent.width != 0 && img.extent.height != 0) {
+                return img.extent;
+            }
+            if (fallback.width != 0 && fallback.height != 0) {
+                return fallback;
+            }
+            return in.render_size;
+        };
         sl::Resource color = Resource(in.color.image, in.color.view, in.color.format,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
-                                      VK_IMAGE_USAGE_SAMPLED_BIT);
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                      image_extent(in.color), VK_IMAGE_USAGE_SAMPLED_BIT);
         sl::Resource depth = Resource(in.depth.image, in.depth.view, in.depth.format,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                      in.depth_size.width != 0 ? in.depth_size : in.render_size,
+                                      image_extent(in.depth, in.depth_size),
                                       VK_IMAGE_USAGE_SAMPLED_BIT);
         sl::Resource motion = Resource(in.motion_vectors.image, in.motion_vectors.view,
                                        in.motion_vectors.format,
-                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
+                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                       image_extent(in.motion_vectors),
                                        VK_IMAGE_USAGE_SAMPLED_BIT);
         sl::Resource output =
             Resource(output_image_handle, output_view_handle, UPSCALER_OUTPUT_FORMAT,
@@ -577,7 +593,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
         if (in.bias_current_color) {
             const auto& image = *in.bias_current_color;
             bias = Resource(image.image, image.view, image.format,
-                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, image_extent(image),
                             VK_IMAGE_USAGE_SAMPLED_BIT);
             bias_tag.emplace(&*bias, sl::kBufferTypeBiasCurrentColorHint,
                              sl::ResourceLifecycle::eValidUntilEvaluate, &render_area);

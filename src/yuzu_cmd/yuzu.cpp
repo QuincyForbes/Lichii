@@ -1589,17 +1589,62 @@ static SDL_AppResult LoadGame(SdlState* state, Core::LaunchParams& lp,
     }
 
     if (Settings::values.use_disk_shader_cache.GetValue() && !stop.stop_requested()) {
+        const u64 title_id = state->system.GetApplicationProcessProgramID();
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         lichii_platform_note_shader_progress(LICHII_SHADER_PREPARE, 0, 0);
 #endif
-        state->system.Renderer().ReadRasterizer()->LoadDiskResources(
-            state->system.GetApplicationProcessProgramID(), stop,
-            []([[maybe_unused]] VideoCore::LoadCallbackStage stage,
-               [[maybe_unused]] size_t value, [[maybe_unused]] size_t total) {
+        if (VideoCommon::ShaderWarm::BuildOnlyRequested()) {
+            auto reason = VideoCommon::ShaderWarm::WarmFilesStale(
+                VideoCommon::ShaderWarm::ComputeWarmPath(title_id));
+            if (!reason && VideoCommon::ShaderWarm::GraphicsPrecacheRequested()) {
+                reason = VideoCommon::ShaderWarm::WarmFilesStale(
+                    VideoCommon::ShaderWarm::GraphicsWarmPath(title_id));
+            }
+            if (reason && title_id != 0 && !lp.filepath.empty()) {
+                std::filesystem::path game_path = Common::FS::ToU8String(lp.filepath);
+                if (std::error_code ec; std::filesystem::is_directory(game_path, ec)) {
+                    game_path /= "main";
+                }
+                LOG_INFO(Frontend, "Build Shaders for {:016X}: {}, extracting warm files", title_id,
+                         *reason);
+                auto last_log = std::chrono::steady_clock::time_point{};
+                std::string last_stage;
+                const auto warm_res = VideoCommon::ShaderWarm::BuildWarmFiles(
+                    state->system, game_path, title_id,
+                    [&last_log, &last_stage](const VideoCommon::ShaderWarm::Progress& p) {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-                lichii_platform_note_shader_progress(static_cast<int>(stage), value, total);
+                        lichii_platform_note_shader_progress(LICHII_SHADER_PREPARE, p.done,
+                                                             p.total);
 #endif
-            });
+                        const auto now = std::chrono::steady_clock::now();
+                        if (p.stage != last_stage ||
+                            now - last_log >= std::chrono::seconds{2}) {
+                            last_stage = p.stage;
+                            last_log = now;
+                            LOG_INFO(Frontend, "Build Shaders: {} ({}/{})", p.stage, p.done,
+                                     p.total);
+                        }
+                    },
+                    stop);
+                if (!warm_res.ok && !stop.stop_requested()) {
+                    LOG_WARNING(Frontend, "Build Shaders: warm extraction failed: {}",
+                                warm_res.error);
+                }
+            }
+            VideoCommon::ShaderWarm::RequestWarmBeforeStart(true);
+        } else {
+            VideoCommon::ShaderWarm::RefreshWarmFiles(state->system, title_id, stop);
+        }
+        if (!stop.stop_requested()) {
+            state->system.Renderer().ReadRasterizer()->LoadDiskResources(
+                title_id, stop,
+                []([[maybe_unused]] VideoCore::LoadCallbackStage stage,
+                   [[maybe_unused]] size_t value, [[maybe_unused]] size_t total) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+                    lichii_platform_note_shader_progress(static_cast<int>(stage), value, total);
+#endif
+                });
+        }
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         lichii_platform_note_shader_progress(LICHII_SHADER_COMPLETE, 0, 0);
 #endif

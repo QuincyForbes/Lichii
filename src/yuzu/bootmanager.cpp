@@ -971,9 +971,18 @@ QStringList GRenderWindow::GetUnsupportedGLExtensions() const {
 void GRenderWindow::showEvent(QShowEvent* event) {
     QWidget::showEvent(event);
 
-    // windowHandle() is not initialized until the Window is shown, so we connect it here.
-    connect(windowHandle(), &QWindow::screenChanged, this, &GRenderWindow::OnFramebufferSizeChanged,
-            Qt::UniqueConnection);
+    // windowHandle() is null when GRenderWindow is a child widget in single-window mode; fall back
+    // to the enclosing top-level window's QWindow so Retina/DPI screen changes still update the
+    // framebuffer layout.
+    QWindow* handle = windowHandle();
+    if (handle == nullptr && window() != nullptr) {
+        handle = window()->windowHandle();
+    }
+    if (handle != nullptr) {
+        connect(handle, &QWindow::screenChanged, this, &GRenderWindow::OnFramebufferSizeChanged,
+                Qt::UniqueConnection);
+    }
+    OnFramebufferSizeChanged();
 }
 
 bool GRenderWindow::eventFilter(QObject* object, QEvent* event) {

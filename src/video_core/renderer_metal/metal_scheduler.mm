@@ -1146,11 +1146,41 @@ bool MergeClear(ClearPass& pending, const ClearPass& clear) {
     if (pending.width != clear.width || pending.height != clear.height) {
         return false;
     }
-    for (size_t index = 0; index < clear.color.size(); ++index) {
-        if (clear.clear_color[index] && pending.clear_color[index] &&
-            pending.color[index] != clear.color[index]) {
+    NSUInteger samples = 0;
+    const auto check_samples = [&](const Attachment& att) {
+        const id<MTLTexture> tex = AsTexture(att.texture);
+        if (tex == nil) {
+            return true;
+        }
+        const NSUInteger tex_samples = tex.sampleCount;
+        if (samples == 0) {
+            samples = tex_samples;
+            return true;
+        }
+        return samples == tex_samples;
+    };
+    for (size_t index = 0; index < pending.color.size(); ++index) {
+        if (pending.clear_color[index] && !check_samples(pending.color[index])) {
             return false;
         }
+    }
+    if ((pending.clear_depth && !check_samples(pending.depth)) ||
+        (pending.clear_stencil && !check_samples(pending.stencil))) {
+        return false;
+    }
+    for (size_t index = 0; index < clear.color.size(); ++index) {
+        if (clear.clear_color[index]) {
+            if (!check_samples(clear.color[index])) {
+                return false;
+            }
+            if (pending.clear_color[index] && pending.color[index] != clear.color[index]) {
+                return false;
+            }
+        }
+    }
+    if ((clear.clear_depth && !check_samples(clear.depth)) ||
+        (clear.clear_stencil && !check_samples(clear.stencil))) {
+        return false;
     }
     // One depth-stencil texture a pass.
     const Attachment* texture = nullptr;
@@ -1916,12 +1946,16 @@ struct Scheduler::Impl {
             return;
         }
         NoteTextureTouched(texture);
-        if (kernel_checked) {
-            const id<MTLTexture> root_tex = RootOf(AsTexture(texture));
-            const void* const raw_root = (__bridge const void*)root_tex;
-            const id<MTLBuffer> backing = root_tex != nil ? root_tex.buffer : nil;
-            if (segment_written_textures.contains(raw_root) || PendingClearOn(texture) ||
-                (backing != nil && CheckedConflict((__bridge const void*)backing))) {
+        if (active_compute != nil && active_compute != compute) {
+            if (kernel_checked) {
+                const id<MTLTexture> root_tex = RootOf(AsTexture(texture));
+                const void* const raw_root = (__bridge const void*)root_tex;
+                const id<MTLBuffer> backing = root_tex != nil ? root_tex.buffer : nil;
+                if (segment_written_textures.contains(raw_root) || PendingClearOn(texture) ||
+                    (backing != nil && CheckedConflict((__bridge const void*)backing))) {
+                    LeaveChecked(texture);
+                }
+            } else if (PendingClearOn(texture)) {
                 LeaveChecked(texture);
             }
         }
@@ -2506,7 +2540,8 @@ struct Scheduler::Impl {
                 return false;
             }
         }
-        return !has_unconsumed || (AheadEnabled() && MergeAheadEnabled() && !ahead_blocked);
+        return !has_unconsumed ||
+               (AheadEnabled() && MergeAheadEnabled() && !ahead_blocked && !segment_opaque);
     }
 
     /// The clear that waits for a render pass gets one of its own: work that may read or write
@@ -3040,16 +3075,16 @@ struct Scheduler::Impl {
         if (pipeline == nil) {
             return false;
         }
+        [render setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
         if (visibility_slot != -1) {
-            [render setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
             visibility_slot = -1;
+            ++visibility_serial;
         }
         [render setRenderPipelineState:pipeline];
         if (render_targets.has_depth || render_targets.has_stencil) {
             const id<MTLDepthStencilState> ds_state =
                 ClearDepthState(clear_pass.clear_depth, clear_pass.clear_stencil, 0xFF);
             [render setDepthStencilState:ds_state];
-            render_state.depth_stencil = (__bridge void*)ds_state;
             if (clear_pass.clear_stencil) {
                 [render setStencilReferenceValue:clear_pass.stencil_value];
             }
@@ -3092,6 +3127,7 @@ struct Scheduler::Impl {
         written_color |= color_clear_mask;
         written_depth = written_depth || clear_pass.clear_depth;
         written_stencil = written_stencil || clear_pass.clear_stencil;
+        render_state = {};
         render_state_valid = false;
         ++inpass_clears;
         return true;
@@ -3266,6 +3302,7 @@ struct Scheduler::Impl {
     u64 render_pass_serial{};
     /// The open render encoder's counting slot (-1: not counting).
     s64 visibility_slot{-1};
+    u64 visibility_serial{1};
     id<MTLLibrary> library = nil;
     id<MTLSamplerState> nearest = nil;
     id<MTLSamplerState> linear = nil;
@@ -3715,11 +3752,11 @@ u64 Scheduler::SegmentSerial() const noexcept {
 }
 
 bool Scheduler::CanUploadAhead() const noexcept {
-    return AheadEnabled() && !impl->ahead_blocked;
+    return AheadEnabled() && !impl->ahead_blocked && !impl->segment_opaque;
 }
 
 bool Scheduler::CanUploadTextureAhead(TextureHandle texture) const noexcept {
-    if (texture == nullptr || impl->render == nil || !CanUploadAhead() ||
+    if (texture == nullptr || impl->render == nil || impl->segment_opaque || !CanUploadAhead() ||
         impl->PendingClearOn(texture)) {
         return false;
     }
@@ -4829,6 +4866,7 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
         impl->render_state = {};
         impl->render_state_valid = false;
         ++impl->render_pass_serial;
+        ++impl->visibility_serial;
     }
 }
 
@@ -4853,6 +4891,9 @@ void Scheduler::SetVisibility(std::optional<u32> slot) {
     const s64 wanted = slot ? static_cast<s64>(*slot) : -1;
     if (impl->render == nil || wanted == impl->visibility_slot) {
         return;
+    }
+    if (impl->visibility_slot != -1) {
+        ++impl->visibility_serial;
     }
     impl->visibility_slot = wanted;
     if (slot) {
@@ -4901,6 +4942,10 @@ u64 Scheduler::StoresDropped() const noexcept {
 
 u64 Scheduler::RenderPassSerial() const noexcept {
     return impl->render_pass_serial;
+}
+
+u64 Scheduler::VisibilitySerial() const noexcept {
+    return impl->visibility_serial;
 }
 
 void Scheduler::SetDrawState(const DrawState& state) {

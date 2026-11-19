@@ -302,6 +302,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// Records the layers a GPU remap of [gpu_addr, +size) touches.
     void MarkLayersRemapped(Image& image, GPUVAddr gpu_addr, size_t size);
 
+    /// What a CPU write of [cpu_addr, +size) does to an image over it.
+    void MarkImageWritten(ImageId image_id, Image& image, DAddr cpu_addr, size_t size,
+                          bool& invalidate_prepared);
+
     /// SparseTiles images: notes a written range, uploaded with the next refresh.
     void MarkRangeWritten(Image& image, ImageId image_id, DAddr cpu_addr, size_t size);
 
@@ -556,6 +560,9 @@ public:
     /// @param is_clear True when the render targets are being used for clears
     void UpdateRenderTargets(bool is_clear);
 
+    /// Marks colour target 0 as GPU-modified for a DrawTexture blit.
+    void DrawTexture();
+
     /// Find a framebuffer with the currently bound render targets
     /// UpdateRenderTargets should be called before this
     Framebuffer* GetFramebuffer();
@@ -580,7 +587,19 @@ public:
     [[nodiscard]] DrawTargets ClassifyDrawTargets();
 
     /// Mark images in a range as modified from the CPU
-    void WriteMemory(DAddr cpu_addr, size_t size);
+    void WriteMemory(DAddr cpu_addr, size_t size, bool keep_gpu_written = false);
+
+    /// WriteMemory keeping GPU-written images over every device range a GPU address range maps to
+    void WriteGpuMemory(GPUVAddr gpu_addr, size_t size);
+
+    /// Whether GPU-written images cover any device range a GPU address range maps to
+    bool IsGpuMemoryGpuModified(GPUVAddr gpu_addr, size_t size);
+
+    /// After a DMA copy of [src_addr, +size) to [dest_addr, +size) in guest memory: marks the
+    /// images over the destination whose contents guest memory now holds. gpu_written_dest are
+    /// the destination ranges that took buffer cache GPU writes, which guest memory lacks.
+    void WriteDmaCopy(GPUVAddr src_addr, GPUVAddr dest_addr, size_t size,
+                      std::span<const std::pair<DAddr, size_t>> gpu_written_dest);
 
     /// Guest memory was written (a batch of CPU writes, an invalidation, a GPU-side write).
     /// Texture and sampler pool entries checked earlier in the frame are read again: the guest
@@ -612,7 +631,8 @@ public:
                          const Tegra::Engines::Fermi2D::Surface& src,
                          const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                          const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale, bool use_history);
+                         std::array<f32, 2> motion_scale, bool use_history,
+                         std::optional<std::array<u32, 2>> render_region = std::nullopt);
 
     /// NVIDIA DLSS (DLAA or Super Resolution) on src into dst with the scene depth at
     /// depth_address and motion from the camera (see the runtime's UpscaleWithCameraMotion).
@@ -628,7 +648,8 @@ public:
     /// Health check of a game's DLSS network output (dst) against its input (src); see the
     /// runtime's ProbeGameDlssOutput. Returns an earlier check's result when one is ready.
     std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
-        const Tegra::Engines::Fermi2D::Surface& dst, const Tegra::Engines::Fermi2D::Surface& src);
+        const Tegra::Engines::Fermi2D::Surface& dst, const Tegra::Engines::Fermi2D::Surface& src,
+        std::optional<std::array<u32, 2>> src_region = std::nullopt);
 
     /// Try to find a cached image view in the given CPU address
     [[nodiscard]] std::pair<ImageView*, bool> TryFindFramebufferImageView(
@@ -981,13 +1002,33 @@ private:
         }
     }
 
+    void NotifyFeedbackBarrier() {
+        if constexpr (requires { runtime.FeedbackBarrier(); }) {
+            runtime.FeedbackBarrier();
+        } else if constexpr (requires { runtime.BarrierFeedbackLoop(); }) {
+            runtime.BarrierFeedbackLoop();
+        }
+    }
+
     [[nodiscard]] bool IsColorTargetWritten(size_t index) const noexcept {
         if (maxwell3d == nullptr) {
             return false;
         }
+        if (index == 0 && maxwell3d->draw_manager.draw_texture_state.active) {
+            return true;
+        }
         const auto& regs = maxwell3d->regs;
-        return regs.rasterize_enable != 0 && index < regs.rt_control.count && index < NUM_RT &&
-               regs.color_mask[regs.color_mask_common ? 0 : index].raw != 0;
+        if (regs.rasterize_enable == 0 || index >= NUM_RT ||
+            regs.color_mask[regs.color_mask_common ? 0 : index].raw == 0) {
+            return false;
+        }
+        const u32 rt_count = (std::min<u32>)(regs.rt_control.count, NUM_RT);
+        for (u32 slot = 0; slot < rt_count; ++slot) {
+            if (regs.rt_control.Map(slot) == index) {
+                return true;
+            }
+        }
+        return false;
     }
 
     template <typename Func>
@@ -997,7 +1038,13 @@ private:
         }
         const auto& regs = maxwell3d->regs;
         const u32 rt_count = (std::min<u32>)(regs.rt_control.count, NUM_RT);
-        for (u32 index = 0; index < rt_count; ++index) {
+        u32 visited = 0;
+        for (u32 slot = 0; slot < rt_count; ++slot) {
+            const u32 index = regs.rt_control.Map(slot);
+            if (index >= NUM_RT || (visited & (1u << index)) != 0) {
+                continue;
+            }
+            visited |= 1u << index;
             if (regs.color_mask[regs.color_mask_common ? 0 : index].raw == 0) {
                 continue;
             }
@@ -1143,7 +1190,9 @@ private:
     }
     u64 last_feedback_texture_serial = 0; ///< Hash of the views of the last check
     bool last_feedback_loop_result = false;
+    u8 last_feedback_color_mask = 0;
     bool feedback_depth_dirty = true;
+    u8 feedback_color_dirty = 0xFF;
     FramebufferId last_framebuffer_id{};
     u64 last_framebuffer_serial = 0;
 

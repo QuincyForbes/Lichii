@@ -50,11 +50,8 @@ vec2 edgeDirection(vec4 left, vec4 right) {
 }
 
 void main() {
-    vec4 color;
-    if(OperationMode == 1)
-        color.xyz = textureLod(ps0, in_TEXCOORD0.xy, 0.0).xyz;
-    else
-        color.xyzw = textureLod(ps0, in_TEXCOORD0.xy, 0.0).xyzw;
+    vec4 tex = textureLod(ps0, in_TEXCOORD0.xy, 0.0);
+    vec4 color = tex;
 
     if ( OperationMode!=4) {
         vec2 imgCoord = ((in_TEXCOORD0.xy*ViewportInfo[0].zw)+vec2(-0.5,0.5));
@@ -111,6 +108,6 @@ void main() {
             color.z = clamp((color.z+deltaY),0.0,1.0);
         }
     }
-    color.w = 1.0;  //assume alpha channel is not used
+    color.w = tex.w;
     out_Target0.xyzw = color;
 }

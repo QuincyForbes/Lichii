@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <span>
 
 #include "common/assert.h"
@@ -39,6 +40,7 @@
 #include "core/loader/loader.h"
 #include "core/loader/nso.h"
 #include "core/memory/cheat_engine.h"
+#include "video_core/ocarina_upscale.h"
 
 namespace FileSys {
 namespace {
@@ -80,9 +82,12 @@ struct BuiltinPatch {
     // chosen_by, or an always-on fix) and is not listed in Add-Ons.
     bool (*chosen)() = nullptr;
     std::string_view chosen_by{};
+    std::optional<Settings::DlssQuality> applied_scale{};
 };
 
 constexpr std::string_view ENABLED_PREFIX = "enabled:";
+constexpr u64 OOT_TITLE_ID = 0x0400486024DEC000;
+constexpr std::string_view MAX_RESOLUTION_NAME = "Max Resolution (built-in)";
 
 bool IsListed(const std::vector<std::string>& list, std::string_view name) {
     return std::ranges::find(list, name) != list.end();
@@ -121,10 +126,81 @@ bool OotNoNdsrEnabled() {
     return enabled;
 }
 
-// MetalFX temporal upscaling (Apple) replaces the output pass this removes, and skips its
-// dispatch itself.
-bool MetalFxReplacesNdsr() {
-    return Settings::MetalFxTemporalChosen();
+// Temporal upscaling intercepts the output pass this removes, and skips its dispatch itself.
+bool TemporalUpscalerReplacesNdsr() {
+    switch (Settings::values.upscaler.GetValue()) {
+    case Settings::Upscaler::Auto:
+    case Settings::Upscaler::Fsr3:
+    case Settings::Upscaler::Fsr4:
+    case Settings::Upscaler::Dlss:
+    case Settings::Upscaler::MetalFx:
+        return true;
+    case Settings::Upscaler::Game:
+        return false;
+    }
+    return false;
+}
+
+bool IsMaxResolutionAddonDisabled() {
+    const auto it = Settings::values.disabled_addons.find(OOT_TITLE_ID);
+    return it != Settings::values.disabled_addons.end() &&
+           IsListed(it->second, MAX_RESOLUTION_NAME);
+}
+
+std::optional<Settings::DlssQuality> DesiredOcarinaQualityScale() {
+    if (IsMaxResolutionAddonDisabled() || !Settings::IsDockedMode()) {
+        return std::nullopt;
+    }
+    bool scale_from_quality = Settings::AmdFsr4Chosen();
+#ifdef EGLANTINE_STREAMLINE
+    scale_from_quality |= Settings::NvidiaDlssChosen();
+#endif
+    if (!scale_from_quality) {
+        return std::nullopt;
+    }
+    const auto quality = Settings::values.nvidia_dlss_quality.GetValue();
+    if (quality == Settings::DlssQuality::Balanced ||
+        quality == Settings::DlssQuality::Performance ||
+        quality == Settings::DlssQuality::UltraPerformance) {
+        return quality;
+    }
+    return std::nullopt;
+}
+
+bool ShouldRecordAppliedRenderScale() {
+    if (!Settings::IsDockedMode()) {
+        return false;
+    }
+#ifdef EGLANTINE_STREAMLINE
+    if (Settings::NvidiaDlssChosen()) {
+        return true;
+    }
+#endif
+    return Settings::OcarinaFsrChosen() || Settings::MetalFxTemporalChosen();
+}
+
+template <typename Q = Settings::DlssQuality, typename M = Settings::OcarinaDlssMode>
+void SyncSettingsAppliedScale(std::optional<Q> quality) {
+    if constexpr (requires { SetAppliedOcarinaRenderScale(quality); }) {
+        SetAppliedOcarinaRenderScale(quality);
+    } else if constexpr (requires(std::optional<M> m) { SetAppliedOcarinaRenderScale(m); }) {
+        std::optional<M> mode;
+        if (quality) {
+            if (*quality == Q::Balanced) {
+                mode = M::Balanced;
+            } else if (*quality == Q::Performance) {
+                mode = M::Performance;
+            } else if (*quality == Q::UltraPerformance) {
+                mode = M::UltraPerformance;
+            }
+        }
+        SetAppliedOcarinaRenderScale(mode);
+    }
+}
+
+void RecordAppliedOcarinaRenderScale(std::optional<Settings::DlssQuality> quality) {
+    VideoCommon::SetAppliedOcarinaRenderScale(quality);
+    SyncSettingsAppliedScale(quality);
 }
 
 // A third of the docked 2560x1440 is not a whole size: the game pads the scene to 854x480 and
@@ -147,7 +223,8 @@ Settings::OotResolution OotResolution() {
                                     OotResolution::Percent33};
         return WholeSized(scales[v[0] - '1']);
     }
-    auto resolution = Settings::OcarinaGameResolution(Settings::values.oot_resolution.GetValue());
+    const auto raw_resolution = Settings::values.oot_resolution.GetValue();
+    auto resolution = Settings::OcarinaGameResolution(raw_resolution);
     if (const char* v = std::getenv("EDEN_NX2_OOT_MAX_RESOLUTION"); v != nullptr && v[0] != 0) {
         if (v[0] == '0' && resolution == OotResolution::Full) {
             resolution = OotResolution::Game;
@@ -155,8 +232,24 @@ Settings::OotResolution OotResolution() {
             resolution = OotResolution::Full;
         }
     }
-    return WholeSized(Settings::OcarinaUpscaledResolution(
+    resolution = WholeSized(Settings::OcarinaUpscaledResolution(
         resolution, Settings::values.upscaler.GetValue(), Settings::IsDockedMode()));
+    if (resolution == OotResolution::Full &&
+        (raw_resolution == OotResolution::Full || raw_resolution == OotResolution::Game)) {
+        if (const auto scale = DesiredOcarinaQualityScale()) {
+            switch (*scale) {
+            case Settings::DlssQuality::Balanced:
+                return OotResolution::Percent87;
+            case Settings::DlssQuality::Performance:
+                return OotResolution::Percent75;
+            case Settings::DlssQuality::UltraPerformance:
+                return OotResolution::Percent50;
+            default:
+                break;
+            }
+        }
+    }
+    return resolution;
 }
 
 template <Settings::OotResolution Resolution>
@@ -506,6 +599,7 @@ constexpr std::array BUILTIN_PATCHES{
         .game = OOT_GAME,
         .chosen = OotResolutionIs<Settings::OotResolution::Percent87>,
         .chosen_by = "oot_resolution",
+        .applied_scale = Settings::DlssQuality::Balanced,
     },
     BuiltinPatch{
         .name = "Render scale 75% (built-in)",
@@ -517,6 +611,7 @@ constexpr std::array BUILTIN_PATCHES{
         .game = OOT_GAME,
         .chosen = OotResolutionIs<Settings::OotResolution::Percent75>,
         .chosen_by = "oot_resolution",
+        .applied_scale = Settings::DlssQuality::Performance,
     },
     BuiltinPatch{
         .name = "Render scale 56% (built-in)",
@@ -539,6 +634,7 @@ constexpr std::array BUILTIN_PATCHES{
         .game = OOT_GAME,
         .chosen = OotResolutionIs<Settings::OotResolution::Percent50>,
         .chosen_by = "oot_resolution",
+        .applied_scale = Settings::DlssQuality::UltraPerformance,
     },
     BuiltinPatch{
         .name = "Render scale 40% (built-in)",
@@ -550,6 +646,7 @@ constexpr std::array BUILTIN_PATCHES{
         .game = OOT_GAME,
         .chosen = OotResolutionIs<Settings::OotResolution::Percent40>,
         .chosen_by = "oot_resolution",
+        .applied_scale = Settings::DlssQuality::UltraPerformance,
     },
     BuiltinPatch{
         .name = "Render scale 33% (built-in)",
@@ -561,6 +658,7 @@ constexpr std::array BUILTIN_PATCHES{
         .game = OOT_GAME,
         .chosen = OotResolutionIs<Settings::OotResolution::Percent33>,
         .chosen_by = "oot_resolution",
+        .applied_scale = Settings::DlssQuality::UltraPerformance,
     },
     // Dark's routine with a tail that also lowers the step above 60 fps, so the game keeps real
     // speed at 30 and 60 fps and up to any frame rate limit (Settings oot_frame_rate).
@@ -611,7 +709,7 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = OOT_NO_NDSR_RECORDS,
         .default_on = OotNoNdsrEnabled,
-        .blocked = MetalFxReplacesNdsr,
+        .blocked = TemporalUpscalerReplacesNdsr,
         .kind = BuiltinPatchKind::Image,
         .game = OOT_GAME,
         .description = "Removes the game's own anti-aliasing and sharpening network.",
@@ -1143,6 +1241,9 @@ std::vector<VirtualFile> PatchManager::CollectPatches(const std::vector<VirtualD
 }
 
 std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::string& name) const {
+    if (name == "main") {
+        RecordAppliedOcarinaRenderScale(std::nullopt);
+    }
     if (nso.size() < sizeof(Loader::NSOHeader)) {
         return nso;
     }
@@ -1320,6 +1421,9 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         }
         if (!patch.replaces.empty()) {
             replaced.push_back(patch.replaces);
+        }
+        if (patch.applied_scale && ShouldRecordAppliedRenderScale()) {
+            RecordAppliedOcarinaRenderScale(patch.applied_scale);
         }
     }
 

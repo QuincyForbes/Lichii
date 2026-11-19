@@ -108,6 +108,7 @@ public:
         Ref ref{};
         u64 tick{};
         u32 size{}; ///< 0: nothing copied
+        u32 allocated{};
         std::array<u8, MaxBytes> bytes{};
     };
 
@@ -116,6 +117,7 @@ public:
     void Reset() noexcept {
         for (Copy& copy : copies) {
             copy.size = 0;
+            copy.allocated = 0;
             copy.tick = 0;
             copy.address = 0;
             copy.verified_serial = 0;
@@ -128,6 +130,7 @@ public:
         mru.fill(0);
         for (ComputeSlot& slot : compute_slots) {
             slot.size = 0;
+            slot.allocated = 0;
             slot.tick = 0;
         }
     }
@@ -409,18 +412,23 @@ template <class Runtime, class DeviceMemory>
     }
     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
     typename Reuse::ComputeSlot& slot = reuse.compute_slots[index];
+    u32 needed = size;
+    if constexpr (requires { runtime.StreamUniformAllocationSize(size); }) {
+        needed = runtime.StreamUniformAllocationSize(size);
+    }
     u8* const scratch = reuse.scratch.data();
     device_memory.ReadBlockUnsafe(device_addr, scratch, size);
 
     const bool same_bytes =
         slot.size == size && std::memcmp(slot.bytes.data(), scratch, size) == 0;
-    if (same_bytes && slot.tick == runtime.CurrentTick()) {
+    if (same_bytes && slot.tick == runtime.CurrentTick() && slot.allocated >= needed) {
         runtime.RebindStreamUniform(slot.ref, size);
         return true;
     }
     const std::span<u8> span = runtime.BindMappedUniformBuffer(0, binding_index, size);
     std::memcpy(span.data(), scratch, size);
     slot.ref = runtime.LastStreamUniformRef();
+    slot.allocated = needed;
     slot.tick = runtime.CurrentTick();
     if (!same_bytes) {
         slot.size = size;

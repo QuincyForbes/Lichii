@@ -507,6 +507,10 @@ public:
     /// Changes whenever BeginRendering opens a new render encoder.
     [[nodiscard]] u64 RenderPassSerial() const noexcept;
 
+    /// Changes whenever a render encoder opens or stops counting into its current visibility slot,
+    /// so later draws never re-bind and zero a slot that already accumulated samples.
+    [[nodiscard]] u64 VisibilitySerial() const noexcept;
+
     /// The state of the next draws on the open render encoder.
     void SetDrawState(const DrawState& state);
 

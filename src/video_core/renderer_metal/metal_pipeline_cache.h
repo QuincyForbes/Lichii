@@ -50,6 +50,20 @@ class Device;
 /// A pipeline build handed to the builder threads (metal_build_job.h).
 using PipelineBuildJob = BuildJob<PipelineTranslator>;
 
+struct OfflineWarmSummary {
+    bool ok{};
+    size_t built{};
+    size_t skipped{};
+    size_t failed{};
+    std::string error;
+};
+
+/// Offline ahead-of-time compilation of extracted `warm-compute.bin` and `warm-graphics.bin` into
+/// `metal_stages.v1.bin` and `metal_pipelines.bin` (`MTLBinaryArchive`), without booting the game.
+OfflineWarmSummary CompileWarmShadersOffline(
+    u64 title_id, std::stop_token stop,
+    const std::function<void(size_t done, size_t total, std::string_view stage)>& on_progress = {});
+
 /// EDEN_NX2_METAL_REDUCTION_VARIANTS (default on; 0: every program samples through the sampler
 /// reduction rewrite as before): the vertex, pixel and compute programs with the rewrite are
 /// built without it, and with it only for the draws and dispatches whose samplers need it.
@@ -325,7 +339,7 @@ public:
     /// translation errors).
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
 
-    [[nodiscard]] ComputePipeline* CurrentComputePipeline();
+    [[nodiscard]] ComputePipeline* CurrentComputePipeline(u64* out_native_key = nullptr);
 
     /// The programs of the last graphics lookup (the feature census).
     [[nodiscard]] const std::array<u64, 6>& LookupHashes() const noexcept {
@@ -341,11 +355,19 @@ public:
                            const VideoCore::DiskResourceLoadCallback& callback);
 
     /// Shader precache: queues the compute programs of the title's precache file (built from the
-    /// game files by the frontend) that are not built yet. Returns the marker to write once they
-    /// are built, empty when there is nothing to do.
+    /// game files by the frontend). When `only_if_unmarked` is false, loads entries even when the
+    /// `.done` marker already matches so Boot 2+ populates `compute_cache` from `metal_stages.v1.bin`
+    /// and `metal_pipelines.bin`.
     std::optional<VideoCommon::ShaderWarm::WarmStamp> QueuePrecacheFile(
         u64 title_id, u32 apple_family,
-        const std::function<void(const ComputePipelineKey&, VideoCommon::FileEnvironment)>& queue);
+        const std::function<void(const ComputePipelineKey&, VideoCommon::FileEnvironment)>& queue,
+        bool only_if_unmarked = true);
+
+    /// Warms `warm-compute.bin` and `warm-graphics.bin` during precache / BuildOnly launches,
+    /// reporting `LoadCallbackStage::Warm` and `ShaderWarm::SetBuildStatus`.
+    void RunWarmPrecache(u64 title_id, u32 apple_family, bool mesh_shaders, size_t num_workers,
+                         std::stop_token stop_loading,
+                         const VideoCore::DiskResourceLoadCallback& callback);
 
     /// Once a frame: the used pipelines list is written within EDEN_NX2_USED_PIPELINES_SAVE_S
     /// (default 10) of a pipeline's first use and when the app leaves the foreground, the archive
@@ -488,9 +510,13 @@ private:
 
     const Device& device;
 
+    VideoCommon::StageCache stage_cache;
+    StageMslCache msl_cache;
     PipelineTranslator translator;
     GraphicsPipelineKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
+    const Tegra::Engines::Maxwell3D* last_rasterize_channel{};
+    u32 last_rasterize_enable{~0U};
     ::Common::unordered_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
     ::Common::unordered_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_cache;
 

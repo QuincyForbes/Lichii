@@ -248,6 +248,10 @@ class DescriptorLayoutBuilder {
 public:
     DescriptorLayoutBuilder(const Device& device_) : device{&device_} {}
 
+    void SetUsesMesh() noexcept {
+        uses_mesh = true;
+    }
+
     /// Whether the layout exceeds the core descriptor limits, which only sets from an
     /// update-after-bind pool may do: they count against the larger limits of such pools.
     bool UsesUpdateAfterBindPool() const {

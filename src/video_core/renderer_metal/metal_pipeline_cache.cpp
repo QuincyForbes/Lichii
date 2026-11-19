@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -28,6 +30,7 @@
 #include "common/settings.h"
 #include "common/thread_worker.h"
 #include "video_core/async_translate.h"
+#include "video_core/dirty_flags.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
@@ -37,6 +40,7 @@
 #include "video_core/renderer_metal/metal_resources.h"
 #include "video_core/renderer_metal/metal_switches.h"
 #include "video_core/renderer_metal/metal_work_policy.h"
+#include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/shader_environment.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "video_core/shader_warm/warm_records.h"
@@ -733,7 +737,8 @@ void* ComputePipeline::ReducingState(const Device& device) {
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory,
                              const Device& device_)
     : VideoCommon::ShaderCache{device_memory}, device{device_},
-      translator{TranslateForIos, DeviceAppleFamily(device_), DeviceSupportsMeshShaders(device_)} {
+      translator{TranslateForIos, DeviceAppleFamily(device_), DeviceSupportsMeshShaders(device_),
+                 &stage_cache, &msl_cache} {
     // A suspended app may be killed without notice (iOS): the archive is written when it leaves
     // the foreground, and the used list at the GPU thread's next frame.
     background_listener = Common::PlatformEvents::AddBackgroundListener([this] {
@@ -742,16 +747,20 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory,
             std::this_thread::sleep_for(std::chrono::milliseconds{10});
         }
         files.Wait();
+        msl_cache.Save();
         archive.Save();
     });
     if (const u32 threads = AsyncPipelineThreads(); threads != 0) {
         // Background QoS: a draw that waits for a build runs it itself or lends it its own.
         const u32 apple_family = DeviceAppleFamily(device);
         const bool supports_mesh_shaders = DeviceSupportsMeshShaders(device);
+        VideoCommon::StageCache* const shared_stage_cache = &stage_cache;
+        StageMslCache* const shared_msl_cache = &msl_cache;
         builders = std::make_unique<Common::StatefulThreadWorker<PipelineTranslator>>(
             threads, "MetalPipelineBuilder",
-            [apple_family, supports_mesh_shaders] {
-                return PipelineTranslator{TranslateForIos, apple_family, supports_mesh_shaders};
+            [apple_family, supports_mesh_shaders, shared_stage_cache, shared_msl_cache] {
+                return PipelineTranslator{TranslateForIos, apple_family, supports_mesh_shaders,
+                                          shared_stage_cache, shared_msl_cache};
             },
             Common::ThreadPlacement::Background);
         LOG_INFO(Render_Metal, "Metal: pipelines first seen in a run are built on {} threads "
@@ -762,15 +771,30 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory,
 
 PipelineCache::~PipelineCache() {
     Common::PlatformEvents::RemoveBackgroundListener(background_listener);
+    builders.reset();
     files.SaveUsed();
+    msl_cache.Save();
 }
+
+namespace {
+[[nodiscard]] bool GameplayArchiveReadOnly() {
+    static const bool read_only = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_ARCHIVE");
+        // Populate during live gameplay only when explicitly requested with EDEN_NX2_METAL_ARCHIVE=1.
+        return value == nullptr || value[0] != '1';
+    }();
+    return read_only;
+}
+} // Anonymous namespace
 
 void PipelineCache::OpenArchive(u64 title_id) {
     if (title_id == 0) {
         return;
     }
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
-    archive.Open(device, shader_dir / fmt::format("{:016x}", title_id) / "metal_pipelines.bin");
+    const auto title_dir = shader_dir / fmt::format("{:016x}", title_id);
+    msl_cache.Open(title_dir / "metal_stages.v1.bin", VideoCommon::ShaderWarm::EmissionStamp());
+    archive.Open(device, title_dir / "metal_pipelines.bin", GameplayArchiveReadOnly());
 }
 
 void PipelineCache::TickFrame() {
@@ -789,6 +813,7 @@ void PipelineCache::TickFrame() {
     }
     if (now - archive_saved > std::chrono::minutes{1}) {
         archive_saved = now;
+        msl_cache.Save();
         archive.Save();
     }
     ++frame_count;
@@ -871,34 +896,300 @@ void PipelineCache::EvictUnusedPipelines() {
 }
 
 namespace {
-/// What a Metal precache marker records in place of a Vulkan driver: "MTL" and the Apple GPU
-/// family (the Metal binary archive itself notices a new OS or GPU and rebuilds what it holds).
-/// Vulkan's markers never match it, so switching backends precaches once more for the other one.
+[[nodiscard]] u64 MetalWarmVariant(u32 apple_family, bool mesh_shaders) {
+    const auto& resolution = Settings::values.resolution_info;
+    const std::array<u64, 8> inputs{
+        VideoCommon::ShaderWarm::EmissionStamp(),
+        u64{apple_family},
+        mesh_shaders ? 1ULL : 0ULL,
+        TranslateForIos ? 1ULL : 0ULL,
+        ReductionVariantsEnabled() ? 1ULL : 0ULL,
+        resolution.active ? 1ULL : 0ULL,
+        resolution.up_scale,
+        resolution.down_shift,
+    };
+    return Common::CityHash64(reinterpret_cast<const char*>(inputs.data()), sizeof(inputs));
+}
+
+/// What a Metal precache marker records in place of a Vulkan driver: "MTL", the Apple GPU
+/// family and the emission/settings variant. Vulkan's markers never match it, so switching
+/// backends precaches once more for the other one.
 [[nodiscard]] std::optional<VideoCommon::ShaderWarm::WarmStamp> MetalWarmStamp(
-    const std::filesystem::path& warm_file, u64 entries, u32 apple_family) {
-    return VideoCommon::ShaderWarm::CurrentWarmStamp(warm_file, entries, 0x4D544C00U,
-                                                     apple_family,
-                                                     VideoCommon::ShaderWarm::WarmCacheVersion);
+    const std::filesystem::path& warm_file, u64 entries, u32 apple_family, bool mesh_shaders) {
+    return VideoCommon::ShaderWarm::CurrentWarmStamp(
+        warm_file, entries, 0x4D544C00U, apple_family, VideoCommon::ShaderWarm::WarmCacheVersion,
+        MetalWarmVariant(apple_family, mesh_shaders));
+}
+
+struct WarmGraphicsRecordKey {
+    std::array<u64, 6> unique_hashes;
+    Vulkan::FixedPipelineState state;
+};
+static_assert(sizeof(WarmGraphicsRecordKey) == VideoCommon::ShaderWarm::GraphicsKeySize);
+
+[[nodiscard]] std::pair<GraphicsPipelineKey, size_t> MetalKeyFromWarmKey(
+    const WarmGraphicsRecordKey& raw) {
+    using Regs = Tegra::Engines::Maxwell3D::Regs;
+    const size_t slot = raw.unique_hashes[1] != 0 ? 1 : (raw.unique_hashes[5] != 0 ? 5 : 0);
+    Regs regs{};
+    const Vulkan::FixedPipelineState& state = raw.state;
+    regs.mandated_early_z = state.early_z.Value();
+    regs.depth_mode = state.ndc_minus_one_to_one != 0 ? Regs::DepthMode::MinusOneToOne
+                                                      : Regs::DepthMode::ZeroToOne;
+    regs.window_origin.mode.Assign(state.y_negate != 0 ? Regs::WindowOrigin::Mode::LowerLeft
+                                                       : Regs::WindowOrigin::Mode::UpperLeft);
+    if (state.attachment0_dual_source_blend != 0) {
+        regs.blend.enable[0] = 1;
+        regs.blend.color_source = Regs::Blend::Factor::Source1Color_GL;
+    }
+    regs.alpha_test_enabled = 1;
+    regs.alpha_test_func =
+        Vulkan::FixedPipelineState::UnpackComparisonOp(state.alpha_test_func.Value());
+    regs.alpha_test_ref = std::bit_cast<f32>(state.alpha_test_ref);
+    for (size_t i = 0; i < state.color_formats.size(); ++i) {
+        regs.rt[i].format = static_cast<Tegra::RenderTargetFormat>(state.color_formats[i]);
+    }
+    regs.point_size = std::bit_cast<f32>(state.point_size);
+    if (state.dynamic_state.logic_op_enable != 0) {
+        regs.logic_op.enable = 1;
+        regs.logic_op.op =
+            Vulkan::FixedPipelineState::UnpackLogicOp(state.dynamic_state.logic_op.Value());
+    }
+    if (state.viewport_swizzles[0] != 0) {
+        regs.viewport_scale_offset_enabled = 1;
+        regs.viewport_transform[0].swizzle.raw = state.viewport_swizzles[0];
+    }
+    GraphicsPipelineKey key{};
+    key.unique_hashes = raw.unique_hashes;
+    PipelineTranslator::RefreshKey(key, regs, PointFillTopology(regs, state.topology.Value()));
+    if (slot == 1) {
+        if (state.dynamic_vertex_input != 0) {
+            key.attribute_types = state.attribute_types;
+        } else {
+            u64 types = 0;
+            for (size_t i = 0; i < state.attributes.size(); ++i) {
+                const auto& attr = state.attributes[i];
+                u64 type = 0;
+                if (attr.enabled != 0) {
+                    switch (attr.Type()) {
+                    case Regs::VertexAttribute::Type::UnusedEnumDoNotUseBecauseItWillGoAway:
+                        break;
+                    case Regs::VertexAttribute::Type::SInt:
+                        type = 2;
+                        break;
+                    case Regs::VertexAttribute::Type::UInt:
+                        type = 3;
+                        break;
+                    default:
+                        type = 1;
+                        break;
+                    }
+                }
+                types |= type << (i * 2);
+            }
+            key.attribute_types =
+                types != 0 ? types : VideoCommon::ShaderWarm::DefaultAttributeTypes;
+        }
+    }
+    return {key, slot};
+}
+
+struct WarmGraphicsResult {
+    size_t entries{};
+    size_t built{};
+    size_t skipped{};
+    size_t failed{};
+    bool cancelled{};
+    bool read_error{};
+};
+
+WarmGraphicsResult WarmGraphicsStages(
+    const std::filesystem::path& warm_file, const Device& device, u32 apple_family,
+    bool mesh_shaders, size_t num_workers, VideoCommon::StageCache* shared_stage_cache,
+    StageMslCache& msl_cache, std::stop_token stop, bool check_skip_button,
+    const std::function<void(size_t done, size_t total, size_t built_count, size_t failed_count,
+                             size_t skipped_count, u64 elapsed_ms)>& on_tick) {
+    namespace ShaderWarm = VideoCommon::ShaderWarm;
+    WarmGraphicsResult out{};
+    const std::string path = Common::FS::PathToUTF8String(warm_file);
+    struct Reader {
+        std::mutex mutex;
+        std::ifstream file;
+        std::streampos end{};
+        bool failed{};
+        size_t read{};
+        std::streamoff position{};
+        std::unordered_set<u64> seen_keys;
+    } reader;
+    try {
+        reader.file.open(warm_file, std::ios::binary | std::ios::ate);
+        reader.file.exceptions(std::ifstream::failbit);
+        reader.end = reader.file.tellg();
+        reader.file.seekg(0, std::ios::beg);
+        std::array<char, 8> magic{};
+        u32 version{};
+        reader.file.read(magic.data(), magic.size())
+            .read(reinterpret_cast<char*>(&version), sizeof(version));
+        constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
+        if (magic != expected_magic || version != ShaderWarm::WarmCacheVersion) {
+            LOG_WARNING(Render_Metal, "Metal shader precache: {} is not a version {} file", path,
+                        ShaderWarm::WarmCacheVersion);
+            out.read_error = true;
+            return out;
+        }
+        reader.position = reader.file.tellg();
+    } catch (const std::exception& e) {
+        LOG_WARNING(Render_Metal, "Metal shader precache: opening {} failed: {}", path, e.what());
+        out.read_error = true;
+        return out;
+    }
+
+    const size_t known_total = static_cast<size_t>(ShaderWarm::ReadWarmCount(warm_file));
+    const auto begin = std::chrono::steady_clock::now();
+    const size_t workers_count = (std::max)(num_workers, size_t{1});
+    std::atomic<size_t> built{};
+    std::atomic<size_t> skipped{};
+    std::atomic<size_t> failed{};
+    std::atomic<bool> cancel{false};
+    std::atomic<size_t> running{workers_count};
+    LOG_INFO(Render_Metal,
+             "Metal shader precache: {} graphics programs ({} MB) to warm on {} threads",
+             known_total, static_cast<long long>(reader.end) / (1024 * 1024), workers_count);
+    {
+        std::vector<std::thread> threads;
+        threads.reserve(workers_count);
+        for (size_t i = 0; i < workers_count; ++i) {
+            threads.emplace_back([&] {
+                static const VideoCommon::GuessMissing guess{};
+                PipelineTranslator translator{TranslateForIos, apple_family, mesh_shaders,
+                                              shared_stage_cache, &msl_cache};
+                while (!cancel.load(std::memory_order_relaxed)) {
+                    VideoCommon::FileEnvironment env;
+                    WarmGraphicsRecordKey raw_key{};
+                    bool duplicate = false;
+                    GraphicsPipelineKey metal_key{};
+                    size_t slot = 0;
+                    {
+                        std::scoped_lock lock{reader.mutex};
+                        if (reader.failed || reader.file.tellg() == reader.end) {
+                            break;
+                        }
+                        try {
+                            u32 num_envs{};
+                            reader.file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+                            if (num_envs != 1) {
+                                throw std::runtime_error("unexpected entry");
+                            }
+                            env.Deserialize(reader.file);
+                            reader.file.read(reinterpret_cast<char*>(&raw_key), sizeof(raw_key));
+                            ++reader.read;
+                            reader.position = reader.file.tellg();
+                            std::tie(metal_key, slot) = MetalKeyFromWarmKey(raw_key);
+                            if (slot != 0) {
+                                duplicate = !reader.seen_keys.insert(metal_key.Hash()).second;
+                            }
+                        } catch (const std::exception& e) {
+                            LOG_WARNING(Render_Metal,
+                                        "Metal shader precache: graphics entry {} unreadable ({})",
+                                        reader.read + 1, e.what());
+                            reader.failed = true;
+                            break;
+                        }
+                    }
+                    if (slot == 0) {
+                        failed.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                    if (duplicate) {
+                        skipped.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                    env.SetGuessMissing(&guess);
+                    bool ok = false;
+                    InAutoreleasePool([&] {
+                        std::optional<StageProgram> program =
+                            translator.WarmSingleStage(metal_key, slot, env);
+                        if (!program) {
+                            return;
+                        }
+                        std::string error;
+                        BuildProgramLibrary(device, *program, error, true);
+                        ok = static_cast<bool>(program->library);
+                    });
+                    (ok ? built : failed).fetch_add(1, std::memory_order_relaxed);
+                }
+                running.fetch_sub(1, std::memory_order_relaxed);
+            });
+        }
+        while (running.load(std::memory_order_relaxed) != 0) {
+            if (stop.stop_requested() || (check_skip_button && ShaderWarm::TakeSkipWarm())) {
+                cancel.store(true, std::memory_order_relaxed);
+                out.cancelled = true;
+                break;
+            }
+            if (on_tick) {
+                const size_t b = built.load(std::memory_order_relaxed);
+                const size_t s = skipped.load(std::memory_order_relaxed);
+                const size_t f = failed.load(std::memory_order_relaxed);
+                const size_t done = b + s + f;
+                size_t total = known_total;
+                if (total == 0) {
+                    std::scoped_lock lock{reader.mutex};
+                    const std::streamoff header = 12;
+                    const std::streamoff end = reader.end;
+                    if (reader.position > header) {
+                        total = static_cast<size_t>(static_cast<double>(reader.read) *
+                                                    static_cast<double>(end - header) /
+                                                    static_cast<double>(reader.position - header));
+                    }
+                }
+                const u64 elapsed_ms = static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - begin)
+                        .count());
+                on_tick(done, (std::max)(total, done), b, f, s, elapsed_ms);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        }
+        for (std::thread& thread : threads) {
+            thread.join();
+        }
+    }
+    out.entries = reader.read;
+    out.built = built.load(std::memory_order_relaxed);
+    out.skipped = skipped.load(std::memory_order_relaxed);
+    out.failed = failed.load(std::memory_order_relaxed);
+    out.read_error = reader.failed || reader.end != std::streampos{reader.position};
+    return out;
 }
 } // Anonymous namespace
 
 std::optional<VideoCommon::ShaderWarm::WarmStamp> PipelineCache::QueuePrecacheFile(
     u64 title_id, u32 apple_family,
-    const std::function<void(const ComputePipelineKey&, VideoCommon::FileEnvironment)>& queue) {
+    const std::function<void(const ComputePipelineKey&, VideoCommon::FileEnvironment)>& queue,
+    bool only_if_unmarked) {
     namespace ShaderWarm = VideoCommon::ShaderWarm;
     const std::filesystem::path warm_file = ShaderWarm::ComputeWarmPath(title_id);
     const std::string path = Common::FS::PathToUTF8String(warm_file);
     std::error_code ec;
     if (!std::filesystem::exists(warm_file, ec)) {
-        LOG_INFO(Render_Metal, "Metal shader precache: no precache file at {} (Build Shader "
-                               "Precache in the game's menu makes one)",
-                 path);
+        if (only_if_unmarked) {
+            LOG_INFO(Render_Metal, "Metal shader precache: no precache file at {} (Build Shader "
+                                   "Precache in the game's menu makes one)",
+                     path);
+        }
         return std::nullopt;
     }
-    const auto current = MetalWarmStamp(warm_file, 0, apple_family);
+    const bool mesh_shaders = DeviceSupportsMeshShaders(device);
+    const auto current = MetalWarmStamp(warm_file, 0, apple_family, mesh_shaders);
     const auto marker = ShaderWarm::ReadWarmMarker(warm_file);
-    if (current && marker && marker->Matches(*current)) {
+    const bool caches_present = (!archive.IsOpen() || archive.HasEntries()) && msl_cache.Size() != 0;
+    const bool marked = current && marker && marker->Matches(*current) && caches_present;
+    if (only_if_unmarked && marked) {
         LOG_INFO(Render_Metal, "Metal shader precache: compute programs already built");
+        return std::nullopt;
+    }
+    if (!only_if_unmarked && !marked) {
         return std::nullopt;
     }
     // Its own reader, as Vulkan's: the disk cache loader deletes a file it rejects.
@@ -946,9 +1237,208 @@ std::optional<VideoCommon::ShaderWarm::WarmStamp> PipelineCache::QueuePrecacheFi
         LOG_WARNING(Render_Metal, "Metal shader precache: reading {} failed: {}", path, e.what());
         return std::nullopt;
     }
-    LOG_INFO(Render_Metal, "Metal shader precache: {} compute programs in {}, {} new to build",
-             entries, path, queued);
-    return MetalWarmStamp(warm_file, entries, apple_family);
+    LOG_INFO(Render_Metal, "Metal shader precache: {} compute programs in {}, {} queued{}",
+             entries, path, queued, only_if_unmarked ? " to precache" : " from warm archive");
+    return MetalWarmStamp(warm_file, entries, apple_family, mesh_shaders);
+}
+
+void PipelineCache::RunWarmPrecache(u64 title_id, u32 apple_family, bool mesh_shaders,
+                                    size_t num_workers, std::stop_token stop_loading,
+                                    const VideoCore::DiskResourceLoadCallback& callback) {
+    namespace ShaderWarm = VideoCommon::ShaderWarm;
+    const bool restore_read_only = archive.IsReadOnly();
+    archive.SetReadOnly(false);
+    const auto restore_archive = [this, restore_read_only] {
+        msl_cache.Save();
+        archive.Save();
+        archive.SetReadOnly(restore_read_only);
+    };
+
+    struct ComputeJob {
+        ComputePipelineKey key;
+        VideoCommon::FileEnvironment env;
+    };
+    std::vector<ComputeJob> compute_jobs;
+    const auto compute_stamp = QueuePrecacheFile(
+        title_id, apple_family,
+        [&](const ComputePipelineKey& key, VideoCommon::FileEnvironment env) {
+            compute_jobs.push_back({key, std::move(env)});
+        },
+        true);
+
+    bool skipped_warm = false;
+    if (!compute_jobs.empty()) {
+        const auto start = std::chrono::steady_clock::now();
+        const size_t total = compute_jobs.size();
+        std::atomic<size_t> next_index{0};
+        std::atomic<size_t> built{0};
+        std::atomic<size_t> failed{0};
+        std::atomic<bool> cancel{false};
+        std::atomic<size_t> running{num_workers};
+        std::mutex cache_mutex;
+        ShaderWarm::SetBuildStatus({.total = total, .threads = num_workers, .running = true});
+        if (callback) {
+            callback(VideoCore::LoadCallbackStage::Warm, 0, total);
+        }
+        {
+            std::vector<std::thread> threads;
+            threads.reserve(num_workers);
+            for (size_t w = 0; w < num_workers; ++w) {
+                threads.emplace_back([&] {
+                    PipelineTranslator worker{TranslateForIos, apple_family, mesh_shaders,
+                                              &stage_cache, &msl_cache};
+                    for (;;) {
+                        if (cancel.load(std::memory_order_relaxed)) {
+                            break;
+                        }
+                        const size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
+                        if (idx >= total) {
+                            break;
+                        }
+                        ComputeJob& job = compute_jobs[idx];
+                        std::unique_ptr<ComputePipeline> pipeline;
+                        bool state_ok = false;
+                        InAutoreleasePool([&] {
+                            std::optional<StageProgram> program =
+                                worker.Compute(job.key.unique_hash, job.env);
+                            if (!program) {
+                                return;
+                            }
+                            pipeline =
+                                std::make_unique<ComputePipeline>(job.key, std::move(*program));
+                            pipeline->SetArchive(&archive);
+                            state_ok = pipeline->State(device) != nullptr;
+                        });
+                        if (pipeline && state_ok) {
+                            std::scoped_lock lock{cache_mutex};
+                            compute_cache.insert_or_assign(job.key, std::move(pipeline));
+                            built.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            failed.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    running.fetch_sub(1, std::memory_order_relaxed);
+                });
+            }
+            while (running.load(std::memory_order_relaxed) != 0) {
+                if (stop_loading.stop_requested() || ShaderWarm::TakeSkipWarm()) {
+                    cancel.store(true, std::memory_order_relaxed);
+                    skipped_warm = true;
+                    break;
+                }
+                const size_t b = built.load(std::memory_order_relaxed);
+                const size_t f = failed.load(std::memory_order_relaxed);
+                const size_t done = b + f;
+                const u64 elapsed_ms = static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count());
+                ShaderWarm::SetBuildStatus({
+                    .total = total,
+                    .done = done,
+                    .built = b,
+                    .failed = f,
+                    .threads = num_workers,
+                    .elapsed_ms = elapsed_ms,
+                    .running = true,
+                });
+                if (callback) {
+                    callback(VideoCore::LoadCallbackStage::Warm, done, total);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds{50});
+            }
+            for (std::thread& thread : threads) {
+                thread.join();
+            }
+        }
+        const size_t b = built.load(std::memory_order_relaxed);
+        const size_t f = failed.load(std::memory_order_relaxed);
+        const u64 elapsed_ms = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count());
+        ShaderWarm::SetBuildStatus({
+            .total = total,
+            .done = b + f,
+            .built = b,
+            .failed = f,
+            .threads = num_workers,
+            .elapsed_ms = elapsed_ms,
+            .running = false,
+        });
+        if (!skipped_warm && !stop_loading.stop_requested() && compute_stamp) {
+            restore_archive();
+            archive.SetReadOnly(false);
+            static_cast<void>(ShaderWarm::WriteWarmMarker(ShaderWarm::ComputeWarmPath(title_id),
+                                                          *compute_stamp));
+        }
+        LOG_INFO(Render_Metal,
+                 "Metal shader precache: compute {} ({} built, {} failed in {:.1f} s)",
+                 stop_loading.stop_requested() ? "stopped" : (skipped_warm ? "skipped" : "done"),
+                 b, f, elapsed_ms / 1000.0);
+    } else if (compute_stamp && !stop_loading.stop_requested()) {
+        // Every entry in warm-compute.bin was already built in the session records above.
+        restore_archive();
+        archive.SetReadOnly(false);
+        static_cast<void>(
+            ShaderWarm::WriteWarmMarker(ShaderWarm::ComputeWarmPath(title_id), *compute_stamp));
+    }
+
+    std::error_code ec;
+    const std::filesystem::path graphics_warm = ShaderWarm::GraphicsWarmPath(title_id);
+    if (!skipped_warm && !stop_loading.stop_requested() &&
+        std::filesystem::exists(graphics_warm, ec)) {
+        const auto current = MetalWarmStamp(graphics_warm, 0, apple_family, mesh_shaders);
+        const auto marker = ShaderWarm::ReadWarmMarker(graphics_warm);
+        if (current && marker && marker->Matches(*current) && msl_cache.Size() != 0) {
+            LOG_INFO(Render_Metal, "Metal shader precache: graphics stages already built");
+        } else {
+            const WarmGraphicsResult graphics_res = WarmGraphicsStages(
+                graphics_warm, device, apple_family, mesh_shaders, num_workers, &stage_cache,
+                msl_cache, stop_loading, true,
+                [&](size_t done, size_t total, size_t b, size_t f, size_t s, u64 elapsed_ms) {
+                    ShaderWarm::SetBuildStatus({
+                        .total = total,
+                        .done = done,
+                        .built = b,
+                        .failed = f,
+                        .skipped = s,
+                        .threads = num_workers,
+                        .elapsed_ms = elapsed_ms,
+                        .running = true,
+                    });
+                    if (callback) {
+                        callback(VideoCore::LoadCallbackStage::Warm, done, total);
+                    }
+                });
+            ShaderWarm::SetBuildStatus({
+                .total = graphics_res.entries,
+                .done = graphics_res.built + graphics_res.failed + graphics_res.skipped,
+                .built = graphics_res.built,
+                .failed = graphics_res.failed,
+                .skipped = graphics_res.skipped,
+                .threads = num_workers,
+                .running = false,
+            });
+            if (!graphics_res.cancelled && !graphics_res.read_error &&
+                !stop_loading.stop_requested()) {
+                msl_cache.Save();
+                if (const auto done_stamp =
+                        MetalWarmStamp(graphics_warm, graphics_res.entries, apple_family,
+                                       mesh_shaders)) {
+                    static_cast<void>(ShaderWarm::WriteWarmMarker(graphics_warm, *done_stamp));
+                }
+            }
+            LOG_INFO(Render_Metal,
+                     "Metal shader precache: graphics stages {} ({} built, {} skipped, {} failed)",
+                     stop_loading.stop_requested()
+                         ? "stopped"
+                         : (graphics_res.cancelled ? "skipped" : "done"),
+                     graphics_res.built, graphics_res.skipped, graphics_res.failed);
+        }
+    }
+
+    restore_archive();
 }
 
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
@@ -970,15 +1460,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                   "nothing is built ahead in this run");
     }
     // Shader precache (precache_shaders Always, Ask answered yes, or a Build Shaders launch):
-    // every recorded pipeline is built, not only those of the recent sessions, and the compute
-    // programs found in the game files (the precache file the frontend builds) too, so the game
-    // does not stop to compile them when it first uses them. The Metal binary archive keeps what
-    // was built, so later boots load it.
+    // every recorded pipeline is built, not only those of the recent sessions, and the compute &
+    // graphics programs found in the game files too.
     namespace ShaderWarm = VideoCommon::ShaderWarm;
     const bool precache =
         build && (ShaderWarm::PrecacheBeforeStart(Settings::values.precache_shaders.GetValue(),
                                                   ShaderWarm::TakeWarmBeforeStart()) ||
                   ShaderWarm::BuildOnlyRequested());
+    const bool restore_read_only = archive.IsReadOnly();
+    if (precache) {
+        archive.SetReadOnly(false);
+    }
     std::unordered_map<GraphicsPipelineKey, std::vector<RenderPipelineDesc>> states;
     if (build) {
         for (const PipelineFiles::StateRecord& record : files.LoadStates()) {
@@ -996,15 +1488,18 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         bool has_loaded{};
     } state;
     size_t unlisted = 0;
-    std::optional<ShaderWarm::WarmStamp> precache_stamp;
     const size_t num_workers = (std::max)(std::thread::hardware_concurrency(), 2U) - 1;
     const u32 apple_family = DeviceAppleFamily(device);
     const bool mesh_shaders = DeviceSupportsMeshShaders(device);
     const auto start = std::chrono::steady_clock::now();
     {
+        VideoCommon::StageCache* const shared_stage_cache = &stage_cache;
+        StageMslCache* const shared_msl_cache = &msl_cache;
         Common::StatefulThreadWorker<PipelineTranslator> workers{
-            build ? num_workers : 0, "MetalPipelines", [apple_family, mesh_shaders] {
-                return PipelineTranslator{TranslateForIos, apple_family, mesh_shaders};
+            build ? num_workers : 0, "MetalPipelines",
+            [apple_family, mesh_shaders, shared_stage_cache, shared_msl_cache] {
+                return PipelineTranslator{TranslateForIos, apple_family, mesh_shaders,
+                                          shared_stage_cache, shared_msl_cache};
             }};
         const auto finish = [&state, &callback] {
             ++state.built;
@@ -1090,7 +1585,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                         key, std::move(translated->vertex), std::move(translated->fragment),
                         std::move(translated->mesh), std::move(translated->tessellation),
                         std::move(translated->native_mesh), std::move(translated->xfb),
-                std::move(translated->geometry));
+                        std::move(translated->geometry));
                     pipeline->SetArchive(&archive);
                     if (!pipeline->BuildFunctions(device)) {
                         return;
@@ -1128,8 +1623,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         };
         VideoCommon::LoadPipelines(stop_loading, files.Records(), PipelineFiles::RecordsVersion,
                                    load_compute, load_graphics);
-        if (precache) {
-            precache_stamp = QueuePrecacheFile(title_id, apple_family, queue_compute);
+        if (build) {
+            // Boot 2+ (or after offline compilation): when warm-compute.bin already has a valid
+            // `.done` marker, populate `compute_cache` in memory from `metal_stages.v1.bin` and
+            // `metal_pipelines.bin` so compute programs never evaporate on subsequent boots.
+            static_cast<void>(QueuePrecacheFile(title_id, apple_family, queue_compute, false));
         }
         {
             std::scoped_lock lock{state.mutex};
@@ -1143,12 +1641,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     if (!build) {
         return;
     }
-    files.EndBoot();
-    if (precache_stamp && !stop_loading.stop_requested()) {
-        // Done for this GPU: the next precache boot skips the file until it or the GPU changes.
-        static_cast<void>(ShaderWarm::WriteWarmMarker(ShaderWarm::ComputeWarmPath(title_id),
-                                                      *precache_stamp));
+    if (precache && !stop_loading.stop_requested()) {
+        RunWarmPrecache(title_id, apple_family, mesh_shaders, num_workers, stop_loading, callback);
+    } else {
+        msl_cache.Save();
     }
+    archive.SetReadOnly(restore_read_only);
+    files.EndBoot();
     const PipelineArchive::Counts counts = archive.Totals();
     LOG_INFO(Render_Metal,
              "Metal: boot pipelines: {} of {} built ({} graphics with {} render states, {} "
@@ -1167,6 +1666,12 @@ std::array<u64, 3> PipelineCache::TakeCounts() noexcept {
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     building = false;
+    if (maxwell3d != last_rasterize_channel ||
+        maxwell3d->regs.rasterize_enable != last_rasterize_enable) {
+        maxwell3d->dirty.flags[VideoCommon::Dirty::Shaders] = true;
+        last_rasterize_channel = maxwell3d;
+        last_rasterize_enable = maxwell3d->regs.rasterize_enable;
+    }
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
         refusal = "shader programs not in guest memory";
@@ -1211,11 +1716,17 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     return current_pipeline;
 }
 
-ComputePipeline* PipelineCache::CurrentComputePipeline() {
+ComputePipeline* PipelineCache::CurrentComputePipeline(u64* out_native_key) {
+    if (out_native_key != nullptr) {
+        *out_native_key = 0;
+    }
     const VideoCommon::ShaderInfo* const shader = ComputeShader();
     if (shader == nullptr) {
         refusal = "shader programs not in guest memory";
         return nullptr;
+    }
+    if (out_native_key != nullptr && shader->lowered_native) {
+        *out_native_key = shader->lowered_native->native_program_key;
     }
     const auto& qmd = kepler_compute->launch_description;
     const ComputePipelineKey key{
@@ -1556,6 +2067,196 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
         });
     }
     return std::make_unique<ComputePipeline>(key, std::move(*program));
+}
+
+OfflineWarmSummary CompileWarmShadersOffline(
+    u64 title_id, std::stop_token stop,
+    const std::function<void(size_t done, size_t total, std::string_view stage)>& on_progress) {
+    namespace ShaderWarm = VideoCommon::ShaderWarm;
+    OfflineWarmSummary summary{};
+    if (title_id == 0) {
+        summary.error = "Invalid title ID";
+        return summary;
+    }
+    auto device_holder = CreateOfflineDevice();
+    if (!device_holder) {
+        summary.error = "No Metal device available";
+        return summary;
+    }
+    const Device& device = *device_holder;
+    const u32 apple_family = DeviceAppleFamily(device);
+    const bool mesh_shaders = DeviceSupportsMeshShaders(device);
+    const size_t num_workers = (std::max)(std::thread::hardware_concurrency(), 2U) - 1;
+
+    const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
+    const auto title_dir = shader_dir / fmt::format("{:016x}", title_id);
+    VideoCommon::StageCache stage_cache;
+    StageMslCache msl_cache;
+    msl_cache.Open(title_dir / "metal_stages.v1.bin", ShaderWarm::EmissionStamp());
+    PipelineArchive archive;
+    static_cast<void>(archive.Open(device, title_dir / "metal_pipelines.bin", false));
+
+    std::error_code ec;
+    const std::filesystem::path compute_warm = ShaderWarm::ComputeWarmPath(title_id);
+    if (std::filesystem::exists(compute_warm, ec) && !stop.stop_requested()) {
+        const auto current = MetalWarmStamp(compute_warm, 0, apple_family, mesh_shaders);
+        const auto marker = ShaderWarm::ReadWarmMarker(compute_warm);
+        const bool caches_present =
+            (!archive.IsOpen() || archive.HasEntries()) && msl_cache.Size() != 0;
+        if (current && marker && marker->Matches(*current) && caches_present) {
+            summary.skipped += marker->entries;
+        } else {
+            struct ComputeJob {
+                ComputePipelineKey key;
+                VideoCommon::FileEnvironment env;
+            };
+            std::vector<ComputeJob> jobs;
+            std::unordered_set<ComputePipelineKey> seen;
+            bool read_ok = false;
+            size_t entries = 0;
+            try {
+                std::ifstream file(compute_warm, std::ios::binary | std::ios::ate);
+                file.exceptions(std::ifstream::failbit);
+                const auto end = file.tellg();
+                file.seekg(0, std::ios::beg);
+                std::array<char, 8> magic{};
+                u32 version{};
+                file.read(magic.data(), magic.size())
+                    .read(reinterpret_cast<char*>(&version), sizeof(version));
+                constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c',
+                                                             'h'};
+                if (magic == expected_magic && version == ShaderWarm::WarmCacheVersion) {
+                    static const VideoCommon::GuessMissing guess{};
+                    while (file.tellg() != end) {
+                        u32 num_envs{};
+                        file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+                        VideoCommon::FileEnvironment env;
+                        env.Deserialize(file);
+                        if (num_envs != 1 || env.ShaderStage() != Shader::Stage::Compute) {
+                            throw std::runtime_error("unexpected compute warm entry");
+                        }
+                        ComputePipelineKey key{};
+                        file.read(reinterpret_cast<char*>(&key), sizeof(key));
+                        ++entries;
+                        if (!seen.insert(key).second) {
+                            ++summary.skipped;
+                            continue;
+                        }
+                        env.SetGuessMissing(&guess);
+                        jobs.push_back({key, std::move(env)});
+                    }
+                    read_ok = true;
+                }
+            } catch (const std::exception& e) {
+                summary.error = e.what();
+                return summary;
+            }
+            if (read_ok && !jobs.empty()) {
+                const size_t total = jobs.size();
+                std::atomic<size_t> next_index{0};
+                std::atomic<size_t> built{0};
+                std::atomic<size_t> failed{0};
+                std::atomic<size_t> running{num_workers};
+                if (on_progress) {
+                    on_progress(0, total, "Compiling Metal compute shaders");
+                }
+                {
+                    std::vector<std::thread> threads;
+                    threads.reserve(num_workers);
+                    for (size_t w = 0; w < num_workers; ++w) {
+                        threads.emplace_back([&] {
+                            PipelineTranslator worker{TranslateForIos, apple_family, mesh_shaders,
+                                                      &stage_cache, &msl_cache};
+                            for (;;) {
+                                if (stop.stop_requested()) {
+                                    break;
+                                }
+                                const size_t idx =
+                                    next_index.fetch_add(1, std::memory_order_relaxed);
+                                if (idx >= total) {
+                                    break;
+                                }
+                                ComputeJob& job = jobs[idx];
+                                bool ok = false;
+                                InAutoreleasePool([&] {
+                                    std::optional<StageProgram> program =
+                                        worker.Compute(job.key.unique_hash, job.env);
+                                    if (!program) {
+                                        return;
+                                    }
+                                    ComputePipeline pipeline{job.key, std::move(*program)};
+                                    pipeline.SetArchive(&archive);
+                                    ok = pipeline.State(device) != nullptr;
+                                });
+                                (ok ? built : failed).fetch_add(1, std::memory_order_relaxed);
+                            }
+                            running.fetch_sub(1, std::memory_order_relaxed);
+                        });
+                    }
+                    while (running.load(std::memory_order_relaxed) != 0) {
+                        if (stop.stop_requested()) {
+                            break;
+                        }
+                        if (on_progress) {
+                            const size_t done = built.load(std::memory_order_relaxed) +
+                                                failed.load(std::memory_order_relaxed);
+                            on_progress(done, total, "Compiling Metal compute shaders");
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+                    }
+                    for (std::thread& thread : threads) {
+                        thread.join();
+                    }
+                }
+                summary.built += built.load(std::memory_order_relaxed);
+                summary.failed += failed.load(std::memory_order_relaxed);
+                msl_cache.Save();
+                archive.Save();
+                if (!stop.stop_requested()) {
+                    if (const auto done_stamp =
+                            MetalWarmStamp(compute_warm, entries, apple_family, mesh_shaders)) {
+                        static_cast<void>(ShaderWarm::WriteWarmMarker(compute_warm, *done_stamp));
+                    }
+                }
+            }
+        }
+    }
+
+    const std::filesystem::path graphics_warm = ShaderWarm::GraphicsWarmPath(title_id);
+    if (std::filesystem::exists(graphics_warm, ec) && !stop.stop_requested()) {
+        const auto current = MetalWarmStamp(graphics_warm, 0, apple_family, mesh_shaders);
+        const auto marker = ShaderWarm::ReadWarmMarker(graphics_warm);
+        if (current && marker && marker->Matches(*current) && msl_cache.Size() != 0) {
+            summary.skipped += marker->entries;
+        } else {
+            const WarmGraphicsResult graphics_res = WarmGraphicsStages(
+                graphics_warm, device, apple_family, mesh_shaders, num_workers, &stage_cache,
+                msl_cache, stop, false,
+                [&](size_t done, size_t total, size_t, size_t, size_t, u64) {
+                    if (on_progress) {
+                        on_progress(done, total, "Compiling Metal graphics stages");
+                    }
+                });
+            summary.built += graphics_res.built;
+            summary.skipped += graphics_res.skipped;
+            summary.failed += graphics_res.failed;
+            msl_cache.Save();
+            if (!graphics_res.cancelled && !graphics_res.read_error && !stop.stop_requested()) {
+                if (const auto done_stamp = MetalWarmStamp(graphics_warm, graphics_res.entries,
+                                                           apple_family, mesh_shaders)) {
+                    static_cast<void>(ShaderWarm::WriteWarmMarker(graphics_warm, *done_stamp));
+                }
+            }
+        }
+    }
+
+    msl_cache.Save();
+    archive.Save();
+    summary.ok = !stop.stop_requested();
+    if (!summary.ok && summary.error.empty()) {
+        summary.error = "Stopped";
+    }
+    return summary;
 }
 
 } // namespace Metal

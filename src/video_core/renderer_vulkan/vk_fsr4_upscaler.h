@@ -48,6 +48,7 @@ public:
         Image depth;          ///< Device depth in the profile's convention at the render size.
         Image motion_vectors; ///< Motion to the previous frame.
         std::optional<Image> reactive;
+        std::optional<Image> transparency_and_composition;
         VkExtent2D render_size;
         VkExtent2D upscale_size;
         std::optional<VkExtent2D> max_render_size;
@@ -105,6 +106,7 @@ private:
     std::string provider_name;
     void* context{}; ///< ffxContext
     VkExtent2D context_render_capacity{};
+    VkExtent2D last_render_size{};
     VkExtent2D upscale_extent{};
     bool context_dynamic_resolution{};
     vk::Image output_image;

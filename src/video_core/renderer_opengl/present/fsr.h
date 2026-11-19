@@ -20,7 +20,8 @@ public:
     ~FSR();
 
     GLuint Draw(ProgramManager& program_manager, GLuint texture, u32 input_image_width,
-                u32 input_image_height, const Common::Rectangle<f32>& crop_rect);
+                u32 input_image_height, const Common::Rectangle<f32>& crop_rect,
+                bool softened = false);
 
     bool NeedsRecreation(const Common::Rectangle<u32>& screen);
 

@@ -27,8 +27,10 @@ struct PipelineArchive::Impl {
 
     std::mutex add_mutex;
     std::condition_variable add_cv;
+    std::condition_variable idle_cv;
     std::deque<std::function<bool()>> adds;
     std::thread add_thread;
+    bool adding = false;
     bool stop = false;
 };
 
@@ -52,6 +54,9 @@ PipelineArchive::~PipelineArchive() {
 }
 
 void PipelineArchive::DeferAdd(std::function<bool()> add) {
+    if (read_only.load(std::memory_order_relaxed)) {
+        return;
+    }
     {
         std::scoped_lock lock{impl->add_mutex};
         if (impl->stop) {
@@ -66,17 +71,23 @@ void PipelineArchive::DeferAdd(std::function<bool()> add) {
                     std::function<bool()> next;
                     {
                         std::unique_lock thread_lock{impl->add_mutex};
+                        impl->adding = false;
+                        if (impl->adds.empty()) {
+                            impl->idle_cv.notify_all();
+                        }
                         impl->add_cv.wait(thread_lock,
                                           [this] { return impl->stop || !impl->adds.empty(); });
                         if (impl->adds.empty()) {
+                            impl->idle_cv.notify_all();
                             return;
                         }
                         next = std::move(impl->adds.front());
                         impl->adds.pop_front();
+                        impl->adding = true;
                     }
                     bool added = false;
                     @autoreleasepool {
-                        std::unique_lock adding{build_mutex};
+                        std::unique_lock adding_lock{build_mutex};
                         added = next();
                     }
                     NoteAdded(added);
@@ -87,21 +98,23 @@ void PipelineArchive::DeferAdd(std::function<bool()> add) {
     impl->add_cv.notify_one();
 }
 
-bool PipelineArchive::Open(const Device& device, const std::filesystem::path& path) {
+void PipelineArchive::FlushAdds() {
+    std::unique_lock lock{impl->add_mutex};
+    impl->idle_cv.wait(lock, [this] { return impl->adds.empty() && !impl->adding; });
+}
+
+bool PipelineArchive::Open(const Device& device, const std::filesystem::path& path,
+                           bool read_only_mode) {
     static const bool enabled = [] {
-        // Off unless EDEN_NX2_METAL_ARCHIVE=1: adding a pipeline compiles it a second time under
-        // the archive's exclusive lock, which every builder's lookup waits on. In an OoT lab run
-        // with a cold cache that kept pipelines 20 s (up to 121 s) from ready at 0.2 fps, against
-        // gameplay within seconds without the archive; the archive saved ~5 s a boot, and macOS
-        // already caches compiled functions for the process.
         const char* const value = std::getenv("EDEN_NX2_METAL_ARCHIVE");
-        return value != nullptr && value[0] == '1';
+        return value == nullptr || value[0] != '0';
     }();
     if (!enabled) {
-        LOG_INFO(Render_Metal, "Metal: pipeline archive off (EDEN_NX2_METAL_ARCHIVE=1 turns it on)");
+        LOG_INFO(Render_Metal, "Metal: pipeline archive off (EDEN_NX2_METAL_ARCHIVE=0)");
         return false;
     }
     Save();
+    read_only.store(read_only_mode, std::memory_order_relaxed);
     std::scoped_lock lock{mutex};
     @autoreleasepool {
         impl->path = path.string();
@@ -143,6 +156,7 @@ bool PipelineArchive::Open(const Device& device, const std::filesystem::path& pa
             return false;
         }
         impl->archive = archive;
+        has_entries.store(loaded, std::memory_order_relaxed);
         recent = {};
         total = {};
         dirty = false;
@@ -153,8 +167,9 @@ bool PipelineArchive::Open(const Device& device, const std::filesystem::path& pa
         if (ec) {
             size = 0;
         }
-        LOG_INFO(Render_Metal, "Metal: pipeline archive {} {} ({} KiB, {:.1f} ms)", impl->path,
-                 loaded ? "loaded" : "started", size >> 10, ms);
+        LOG_INFO(Render_Metal, "Metal: pipeline archive {} {} ({} KiB, {:.1f} ms{})", impl->path,
+                 loaded ? "loaded" : "started", size >> 10, ms,
+                 read_only_mode ? ", read-only" : "");
     }
     return true;
 }
@@ -164,6 +179,7 @@ bool PipelineArchive::IsOpen() const noexcept {
 }
 
 void PipelineArchive::Save() {
+    FlushAdds();
     std::scoped_lock lock{mutex};
     if (impl->archive == nil || !dirty) {
         return;
@@ -194,6 +210,10 @@ void PipelineArchive::Save() {
 }
 
 void* PipelineArchive::Handle() const noexcept {
+    if (read_only.load(std::memory_order_relaxed) &&
+        !has_entries.load(std::memory_order_relaxed)) {
+        return nullptr;
+    }
     return (__bridge void*)impl->archive;
 }
 
@@ -210,7 +230,10 @@ void PipelineArchive::NoteAdded(bool added) noexcept {
     for (Counts* const counts : {&recent, &total}) {
         (added ? counts->added : counts->add_failures) += 1;
     }
-    dirty = dirty || added;
+    if (added) {
+        dirty = true;
+        has_entries.store(true, std::memory_order_relaxed);
+    }
 }
 
 PipelineArchive::Counts PipelineArchive::TakeCounts() noexcept {
@@ -219,6 +242,7 @@ PipelineArchive::Counts PipelineArchive::TakeCounts() noexcept {
 }
 
 PipelineArchive::Counts PipelineArchive::Totals() const noexcept {
+    const_cast<PipelineArchive*>(this)->FlushAdds();
     std::scoped_lock lock{mutex};
     return total;
 }

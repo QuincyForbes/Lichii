@@ -69,6 +69,10 @@ public:
         return scheduler.IsFree(tick);
     }
 
+    [[nodiscard]] u64 PoolFrame() const noexcept {
+        return pool_frame;
+    }
+
     [[nodiscard]] u64 PooledImageBytes() const noexcept {
         return pooled_texture_bytes;
     }
@@ -84,6 +88,10 @@ public:
 
     [[nodiscard]] bool CanReportMemoryUsage() const noexcept {
         return true;
+    }
+
+    [[nodiscard]] u32 GetMaxScaledExtent() const noexcept {
+        return 16384;
     }
 
     /// Resolution scaling takes single-sampled 2D render targets Metal can blit (no stencil-only
@@ -121,13 +129,13 @@ public:
                                  const std::array<f32, 16>& reprojection,
                                  std::array<f32, 2> jitter, bool reset);
 
-    /// MetalFX temporal upscaling in place of the game's DLSS (the MetalFX Temporal scaling
-    /// filter), else Vulkan's temporal stand-in (EDEN_NX2_METAL_TEMPORAL_STANDIN); false leaves
-    /// the game's own upscaler.
+    /// MetalFX or FSR 3.1 temporal upscaling in place of the game's DLSS, else Vulkan's temporal
+    /// stand-in (EDEN_NX2_METAL_TEMPORAL_STANDIN); false leaves the game's own upscaler.
     bool TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& input_color,
                          ImageView& motion_vectors, ImageView* depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale, bool use_history);
+                         std::array<f32, 2> motion_scale, bool use_history,
+                         std::optional<std::array<u32, 2>> render_region = std::nullopt);
 
     /// Frames the temporal stand-in drew since the last call.
     [[nodiscard]] u64 TakeStandInFrames() noexcept {
@@ -136,8 +144,9 @@ public:
 
     [[nodiscard]] bool WantsTemporalUpscaleDepth() const;
 
-    [[nodiscard]] std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(ImageView&,
-                                                                              ImageView&) {
+    [[nodiscard]] std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
+        ImageView&, ImageView&, std::optional<std::array<u32, 2>> src_region = std::nullopt) {
+        (void)src_region;
         return std::nullopt;
     }
 
@@ -151,7 +160,7 @@ public:
 
     void InsertUploadMemoryBarrier() {}
 
-    void TransitionImageLayout(Image&) {}
+    void TransitionImageLayout(Image& image);
 
     [[nodiscard]] bool HasBrokenTextureViewFormats() const noexcept {
         return false;
@@ -182,14 +191,29 @@ public:
     std::unique_ptr<CameraMotionPass> camera_motion_pass;
     bool temporal_unsupported{};
     std::optional<std::chrono::steady_clock::time_point> temporal_last_evaluation;
+    std::optional<u64> temporal_last_frame;
+    std::array<u32, 2> temporal_last_render{};
+    std::array<u32, 2> temporal_last_output{};
     std::unique_ptr<PresentPasses> present_passes;
     std::unique_ptr<Fsr3Upscaler> fsr3;
     bool fsr3_unsupported{};
     std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
+    std::optional<u64> fsr3_last_frame;
+    std::array<u32, 2> fsr3_last_render{};
+    std::array<u32, 2> fsr3_last_output{};
     bool standin_failed{};
+    std::optional<u64> standin_last_frame;
+    std::array<u32, 2> standin_last_render{};
     u64 standin_frames{};
+    f32 temporal_lod_bias{};
+    u64 temporal_lod_frame{};
+    bool ocarina_upscaler_failed{};
 
 private:
+    void ZeroTexture(TextureHandle tex, const TextureDesc& tex_desc,
+                     VideoCore::Surface::PixelFormat guest_format);
+    void NoteTemporalLodBias(std::array<u32, 2> render_size,
+                             std::array<u32, 2> output_size) noexcept;
     static bool TemporalStandInEnabled();
     bool MetalFxTemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst,
                                 ImageView& input_color, ImageView& motion_vectors,
@@ -344,6 +368,18 @@ public:
         return from_pool;
     }
 
+    [[nodiscard]] bool TakePoolZeroNeeded() noexcept {
+        return std::exchange(needs_pool_zero, false);
+    }
+
+    [[nodiscard]] TextureHandle BaseHandle() const noexcept {
+        return texture.Get();
+    }
+
+    [[nodiscard]] const TextureDesc& BaseDesc() const noexcept {
+        return desc;
+    }
+
     void ReleaseToPool();
 
     u64 allocation_tick{};
@@ -391,6 +427,7 @@ private:
     u64 scaled_bytes{};
     bool rescaled{};
     bool from_pool{};
+    bool needs_pool_zero{};
 };
 
 class ImageView : public VideoCommon::ImageViewBase {
@@ -515,7 +552,7 @@ public:
 
 private:
     struct Variant {
-        u8 key{};
+        u16 key{};
         Object state;
     };
 

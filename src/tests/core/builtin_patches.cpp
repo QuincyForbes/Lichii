@@ -27,6 +27,7 @@
 #include "core/file_sys/vfs/vfs_vector.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/nso.h"
+#include "video_core/ocarina_upscale.h"
 
 namespace {
 
@@ -694,5 +695,71 @@ TEST_CASE("LayeredFS mods apply to an unpacked RomFS tree", "[patch_manager]") {
         Settings::values.disabled_addons[OcarinaTitleId] = {"Smaller"};
         REQUIRE(manager.CreateLayeredRomFS(UnpackedRomFS(), FileSys::ContentRecordType::Program) ==
                 nullptr);
+    }
+}
+
+TEST_CASE("Built-in DLSS render scale follows the NVIDIA DLSS quality", "[patch_manager]") {
+#ifdef EGLANTINE_STREAMLINE
+    constexpr bool DlssBuild = true;
+#else
+    constexpr bool DlssBuild = false;
+#endif
+    constexpr size_t ScaleOffset = sizeof(Loader::NSOHeader) + 0x806420;
+    constexpr u32 ScaleOne = 0x52A7F009;
+    const auto prev_upscaler = Settings::values.upscaler.GetValue();
+    const auto prev_quality = Settings::values.nvidia_dlss_quality.GetValue();
+    const auto prev_console = Settings::values.use_docked_mode.GetValue();
+    const auto prev_oot_res = Settings::values.oot_resolution.GetValue();
+    struct SettingsGuard {
+        Settings::Upscaler upscaler;
+        Settings::DlssQuality quality;
+        Settings::ConsoleMode console;
+        Settings::OotResolution oot_res;
+        ~SettingsGuard() {
+            Settings::values.upscaler.SetValue(upscaler);
+            Settings::values.nvidia_dlss_quality.SetValue(quality);
+            Settings::values.use_docked_mode.SetValue(console);
+            Settings::values.oot_resolution.SetValue(oot_res);
+            VideoCommon::SetAppliedOcarinaRenderScale(std::nullopt);
+        }
+    } guard{prev_upscaler, prev_quality, prev_console, prev_oot_res};
+
+    PatchManagerTestContext context;
+    auto nso = MakeMain(OcarinaBuildId, TbzInstruction);
+    nso.resize(ScaleOffset + sizeof(u32));
+    std::memcpy(nso.data() + ScaleOffset, &ScaleOne, sizeof(ScaleOne));
+    const auto scale = [&] { return WordAt(context.Manager().PatchNSO(nso, "main"), ScaleOffset); };
+
+    Settings::values.oot_resolution.SetValue(Settings::OotResolution::Full);
+    Settings::values.upscaler.SetValue(Settings::Upscaler::Dlss);
+    Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Docked);
+    using Quality = Settings::DlssQuality;
+    for (const auto& [quality, word] : std::array<std::pair<Quality, u32>, 6>{{
+             {Quality::Auto, ScaleOne},
+             {Quality::Dlaa, ScaleOne},
+             {Quality::Quality, ScaleOne},
+             {Quality::Balanced, 0x52A7EBE9},
+             {Quality::Performance, 0x52A7E809},
+             {Quality::UltraPerformance, 0x52A7E009},
+         }}) {
+        Settings::values.nvidia_dlss_quality.SetValue(quality);
+        CHECK(scale() == (DlssBuild ? word : ScaleOne));
+        CHECK(VideoCommon::AppliedOcarinaRenderScale() ==
+              (DlssBuild && word != ScaleOne ? std::optional{quality} : std::nullopt));
+    }
+
+    Settings::values.nvidia_dlss_quality.SetValue(Quality::Performance);
+    Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
+    CHECK(scale() == ScaleOne);
+    Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Docked);
+    Settings::values.upscaler.SetValue(Settings::Upscaler::Auto);
+    CHECK(scale() == ScaleOne);
+    Settings::values.upscaler.SetValue(Settings::Upscaler::Dlss);
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
+    CHECK(scale() == ScaleOne);
+    CHECK_FALSE(VideoCommon::AppliedOcarinaRenderScale().has_value());
+
+    for (const auto& patch : context.Manager().GetPatches()) {
+        CHECK(patch.name.find("render scale") == std::string::npos);
     }
 }

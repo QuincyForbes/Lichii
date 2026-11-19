@@ -248,6 +248,17 @@ public:
 
     void NoteRenderPassStores() {
         render_pass_has_stores = true;
+        storage_writes_unordered = true;
+    }
+
+    /// A draw wrote storage since the last memory barrier after all graphics stages: a host
+    /// indirect draw reading GPU-written arguments needs one first (ReadyIndirectRecord).
+    bool StorageWritesUnordered() const {
+        return storage_writes_unordered;
+    }
+
+    void NoteStorageWritesOrdered() {
+        storage_writes_unordered = false;
     }
 
     bool RenderPassHasStores() const {
@@ -739,6 +750,7 @@ private:
     std::unique_ptr<MasterSemaphore> master_semaphore;
     FragmentBarrierState fragment_barrier;
     bool render_pass_has_stores{};
+    bool storage_writes_unordered{};
     bool render_pass_depth_written{};
     bool render_pass_used_xfb{};
     bool compute_writes_pending{};

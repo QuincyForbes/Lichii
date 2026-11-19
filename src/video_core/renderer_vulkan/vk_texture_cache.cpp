@@ -1861,11 +1861,9 @@ bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
     if (force_standin) {
         return false;
     }
-#ifdef EGLANTINE_STREAMLINE
-    if (Streamline::IsDlssAvailable() && !dlss_unsupported) {
+    if (UsesNvidiaDlss()) {
         return true;
     }
-#endif
 #ifdef LICHII_METALFX
     if (Settings::MetalFxTemporalChosen() && !metalfx_unsupported) {
         return true;
@@ -1879,24 +1877,29 @@ bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
 
 bool TextureCacheRuntime::UsesNvidiaDlss() const {
 #ifdef EGLANTINE_STREAMLINE
-    static const bool force_fsr = [] {
+    static const std::string_view replacement = [] {
         const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "fsr";
+        return value ? std::string_view{value} : std::string_view{};
     }();
-    return !force_fsr && !dlss_unsupported && Streamline::IsDlssAvailable();
+    if (replacement == "fsr" || replacement == "standin" || replacement == "native") {
+        return false;
+    }
+    const bool wanted = Settings::NvidiaDlssChosen() || replacement == "dlss";
+    return wanted && !dlss_unsupported && Streamline::IsDlssAvailable();
 #else
     return false;
 #endif
 }
 
 std::optional<VideoCore::GameDlssProbe> TextureCacheRuntime::ProbeGameDlssOutput(
-    ImageView& input, ImageView& output) {
+    ImageView& input, ImageView& output, std::optional<std::array<u32, 2>> input_region) {
     if (!dlss_network_probe) {
         dlss_network_probe = std::make_unique<DlssNetworkProbe>(
             device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator);
     }
     return dlss_network_probe->Probe(input.Handle(Shader::TextureType::Color2D),
-                                     output.Handle(Shader::TextureType::Color2D));
+                                     output.Handle(Shader::TextureType::Color2D),
+                                     input_region.value_or(std::array<u32, 2>{}));
 }
 
 bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
@@ -2029,6 +2032,13 @@ bool TextureCacheRuntime::UpscaleWithFsr4(Framebuffer* dst_framebuffer, ImageVie
         fsr4_unsupported = true;
         return false;
     }
+    const auto view_host_extent = [&](const ImageView& view) -> VkExtent2D {
+        const Image* const backing = view.BackingImage();
+        if (backing && backing->IsRescaled()) {
+            return {resolution.ScaleUp(view.size.width), resolution.ScaleUp(view.size.height)};
+        }
+        return {view.size.width, view.size.height};
+    };
     const auto image = [&](ImageView& view, VkImageAspectFlags aspect) {
         return Fsr4Upscaler::Image{
             .image = view.ImageHandle(),
@@ -2042,10 +2052,19 @@ bool TextureCacheRuntime::UpscaleWithFsr4(Framebuffer* dst_framebuffer, ImageVie
                 .layerCount = 1,
             },
             .barrier_aspect = ImageAspectMask(view.format),
-            .extent = {view.size.width, view.size.height},
+            .extent = view_host_extent(view),
         };
     };
     const VkExtent2D extent = dst_framebuffer->RenderArea();
+    const VkExtent2D color_extent = view_host_extent(input_color);
+    const bool dynamic_region =
+        color_extent.width > render_size[0] || color_extent.height > render_size[1];
+    const std::optional<VkExtent2D> max_render_size =
+        dynamic_region
+            ? std::optional{VkExtent2D{std::clamp(color_extent.width, render_size[0], extent.width),
+                                       std::clamp(color_extent.height, render_size[1],
+                                                  extent.height)}}
+            : std::nullopt;
     bool upscaled = false;
     try {
         upscaled = fsr4_upscaler->Upscale({
@@ -2054,6 +2073,7 @@ bool TextureCacheRuntime::UpscaleWithFsr4(Framebuffer* dst_framebuffer, ImageVie
             .motion_vectors = image(motion_vectors, VK_IMAGE_ASPECT_COLOR_BIT),
             .render_size = {render_size[0], render_size[1]},
             .upscale_size = extent,
+            .max_render_size = max_render_size,
             .frame_time_ms = frame_time_ms,
             .reset = reset,
             .sharpen = sharpen,
@@ -2120,12 +2140,7 @@ void TextureCacheRuntime::DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkIma
 
 #ifdef EGLANTINE_STREAMLINE
 StreamlineDlssUpscaler* TextureCacheRuntime::DlssUpscaler() {
-    // EDEN_NX2_DLSS_REPLACEMENT=fsr keeps FSR 3.1 for A/B runs.
-    static const bool force_fsr = [] {
-        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "fsr";
-    }();
-    if (force_fsr || dlss_unsupported) {
+    if (!UsesNvidiaDlss()) {
         return nullptr;
     }
     if (!dlss_upscaler) {
@@ -2147,8 +2162,15 @@ StreamlineDlssUpscaler* TextureCacheRuntime::DlssUpscaler() {
 }
 
 namespace {
-StreamlineDlssUpscaler::Image DlssImage(const Device& device, ImageView& view, VkImageView handle,
+StreamlineDlssUpscaler::Image DlssImage(const Device& device,
+                                        const Settings::ResolutionScalingInfo& resolution,
+                                        ImageView& view, VkImageView handle,
                                         VkImageAspectFlags aspect) {
+    const Image* const backing = view.BackingImage();
+    const VkExtent2D extent =
+        backing && backing->IsRescaled()
+            ? VkExtent2D{resolution.ScaleUp(view.size.width), resolution.ScaleUp(view.size.height)}
+            : VkExtent2D{view.size.width, view.size.height};
     return StreamlineDlssUpscaler::Image{
         .view = handle,
         .image = view.ImageHandle(),
@@ -2162,6 +2184,7 @@ StreamlineDlssUpscaler::Image DlssImage(const Device& device, ImageView& view, V
             .layerCount = 1,
         },
         .barrier_aspect = ImageAspectMask(view.format),
+        .extent = extent,
     };
 }
 } // Anonymous namespace
@@ -2175,23 +2198,32 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
         return false;
     }
     const auto image = [&](ImageView& view, VkImageView handle, VkImageAspectFlags aspect) {
-        return DlssImage(device, view, handle, aspect);
+        return DlssImage(device, resolution, view, handle, aspect);
     };
     const bool native_resolution =
         Settings::values.nvidia_dlss_quality.GetValue() == Settings::DlssQuality::Dlaa;
     const VkExtent2D extent = native_resolution ? VkExtent2D{render_size[0], render_size[1]}
                                                 : dst_framebuffer->RenderArea();
+    const auto color_img =
+        image(input_color, input_color.Handle(Shader::TextureType::Color2D), VK_IMAGE_ASPECT_COLOR_BIT);
+    const bool dynamic_region =
+        color_img.extent.width > render_size[0] || color_img.extent.height > render_size[1];
+    const std::optional<VkExtent2D> max_render_size =
+        dynamic_region ? std::optional{VkExtent2D{
+                             std::clamp(color_img.extent.width, render_size[0], extent.width),
+                             std::clamp(color_img.extent.height, render_size[1], extent.height)}}
+                       : std::nullopt;
     bool upscaled{};
     try {
         upscaled = dlss_upscaler->Upscale({
-            .color = image(input_color, input_color.Handle(Shader::TextureType::Color2D),
-                           VK_IMAGE_ASPECT_COLOR_BIT),
+            .color = color_img,
             .depth = image(depth, depth.DepthView(), VK_IMAGE_ASPECT_DEPTH_BIT),
             .motion_vectors = image(motion_vectors,
                                     motion_vectors.Handle(Shader::TextureType::Color2D),
                                     VK_IMAGE_ASPECT_COLOR_BIT),
             .render_size = {render_size[0], render_size[1]},
             .upscale_size = extent,
+            .max_render_size = max_render_size,
             .jitter = jitter,
             .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
                                     motion_scale[1] * static_cast<f32>(render_size[1])},
@@ -2323,10 +2355,11 @@ bool TextureCacheRuntime::UpscaleWithCameraMotion(Framebuffer* dst_framebuffer,
     bool upscaled{};
     try {
         upscaled = dlss_upscaler->Upscale({
-            .color = DlssImage(device, input_color,
+            .color = DlssImage(device, resolution, input_color,
                                input_color.Handle(Shader::TextureType::Color2D),
                                VK_IMAGE_ASPECT_COLOR_BIT),
-            .depth = DlssImage(device, depth, depth.DepthView(), VK_IMAGE_ASPECT_DEPTH_BIT),
+            .depth = DlssImage(device, resolution, depth, depth.DepthView(),
+                               VK_IMAGE_ASPECT_DEPTH_BIT),
             .motion_vectors = motion_vectors,
             .render_size = render_extent,
             .upscale_size = upscale_extent,
@@ -2371,15 +2404,19 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
         return view.Samples() == VK_SAMPLE_COUNT_1_BIT && view.range.base.level == 0 &&
                view.range.base.layer == 0;
     };
-    const auto fits = [&](const ImageView& view, std::array<u32, 2> requested) {
+    // A view's size in host pixels, after resolution scaling.
+    const auto host_extent = [&](const ImageView& view) -> std::optional<std::array<u32, 2>> {
         const Image* image = view.BackingImage();
         if (!image) {
-            return false;
+            return std::nullopt;
         }
-        const std::array<u32, 2> extent = image->IsRescaled()
+        return image->IsRescaled()
             ? std::array{resolution.ScaleUp(view.size.width), resolution.ScaleUp(view.size.height)}
             : std::array{view.size.width, view.size.height};
-        return VideoCommon::DlssContract::FitsExtent(requested, extent);
+    };
+    const auto fits = [&](const ImageView& view, std::array<u32, 2> requested) {
+        const auto view_extent = host_extent(view);
+        return view_extent && VideoCommon::DlssContract::FitsExtent(requested, *view_extent);
     };
     const VkExtent2D output_extent = dst_framebuffer->RenderArea();
     if (!plain(dst) || !plain(input_color) || !fits(input_color, render_size) ||
@@ -2391,16 +2428,20 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                                                  jitter, motion_scale)) {
         return false;
     }
+    // When the game renders only a region of the input (render_size smaller than the input), its
+    // motion and depth targets may be of another size: they only have to hold that region.
+    const bool whole_input = host_extent(input_color) == render_size;
+    const auto same_size = [&](const ImageView& view) {
+        return !whole_input ||
+               (input_color.size.width == view.size.width && input_color.size.height == view.size.height);
+    };
     if (use_history && (!plain(motion_vectors) || !fits(motion_vectors, render_size) ||
                         motion_vectors.format != PixelFormat::R16G16_FLOAT ||
-                        input_color.size.width != motion_vectors.size.width ||
-                        input_color.size.height != motion_vectors.size.height)) {
+                        !same_size(motion_vectors))) {
         return false;
     }
     if (use_history && depth && (!plain(*depth) || !fits(*depth, render_size) ||
-                                depth->format != PixelFormat::D32_FLOAT ||
-                                input_color.size.width != depth->size.width ||
-                                input_color.size.height != depth->size.height)) {
+                                depth->format != PixelFormat::D32_FLOAT || !same_size(*depth))) {
         return false;
     }
     if (use_history && depth && UpscaleWithFsr3(dst_framebuffer, input_color, motion_vectors, *depth, render_size,
@@ -2530,7 +2571,7 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                                       *temporal_history.views[read_index],
                                       *temporal_history.views[write_index], dst_region, jitter,
                                       motion_scale, !use_history ? -1.0f : reset ? 1.0f : current_weight, kernel_scale,
-                                      clip_width, clip_motion, kernel_motion);
+                                      clip_width, clip_motion, kernel_motion, render_size);
     // RCAS on the output, set by the FSR sharpness slider (stops as FSR takes them, 0% = stored 200
     // turns it off). It reads the unsharpened result just stored, which stays the history.
     // EDEN_NX2_TEMPORAL_SHARPEN=<stops>|off overrides the slider.
@@ -3144,6 +3185,11 @@ u64 TextureCacheRuntime::GetDeviceMemoryBudget() const {
 
 u64 TextureCacheRuntime::GetDeviceMemorySlack() const {
     return device.GetDeviceMemorySlack();
+}
+
+u32 TextureCacheRuntime::GetMaxScaledExtent() const noexcept {
+    return (std::min)({device.GetMaxImageDimension2D(), device.GetMaxFramebufferWidth(),
+                       device.GetMaxFramebufferHeight()});
 }
 
 bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
@@ -5406,12 +5452,19 @@ void CustomBorderColorBudget::Release() noexcept {
 f32 TextureCacheRuntime::OcarinaFsrLodBias() {
     if (!ocarina_fsr_lod_bias) {
         const bool ocarina = Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
-        ocarina_fsr_lod_bias =
-            ocarina ? VideoCommon::OcarinaFsrLodBias(
-                          ResolveOcarinaUpscaler(device),
-                          Settings::OcarinaDlssModeFor(
-                              Settings::values.oot_resolution.GetValue()))
-                    : 0.0f;
+        f32 bias = 0.0f;
+        if (ocarina) {
+            const auto backend = ResolveOcarinaUpscaler(device);
+            const auto effective_res = Settings::OcarinaUpscaledResolution(
+                Settings::values.oot_resolution.GetValue(), Settings::values.upscaler.GetValue(),
+                Settings::IsDockedMode());
+            const auto mode = Settings::OcarinaDlssModeFor(effective_res);
+            bias = VideoCommon::OcarinaFsrLodBias(backend, mode);
+            if (bias == 0.0f && backend == VideoCommon::OcarinaUpscaleBackend::Dlss) {
+                bias = VideoCommon::OcarinaDlssLodBias(mode);
+            }
+        }
+        ocarina_fsr_lod_bias = bias;
     }
     return *ocarina_fsr_lod_bias;
 }
@@ -5536,14 +5589,14 @@ Sampler::VariantKey Sampler::MakeKey(const ImageView& image_view, bool is_depth)
     // Vulkan leaves it undefined and AMD returns the 0/1 compare result (Ocarina forest fog
     // composite read alpha 0 -> black screen). Use a variant without comparison.
     key.drop_compare = has_depth_comparison && !is_depth;
-    // The negative LOD bias is for the game's textures. Images the GPU wrote (render targets:
-    // bloom and blur chains, reflections, fog) keep the game's own bias, or they'd read a mip
-    // too sharp. So does every image in handheld mode (the console mode can change in-session),
-    // and after the upscaler failed this session (the game's pass runs again).
+    // The negative LOD bias is for the game's textures in both docked and handheld modes while a
+    // temporal upscaler is active. Images the GPU wrote (render targets: bloom and blur chains,
+    // reflections, fog) keep the game's own bias, and so does every image after the upscaler
+    // failed this session (the game's pass runs again).
     if (added_lod_bias != 0.0f) {
         const Image* const image = image_view.BackingImage();
         key.drop_lod_bias = !VideoCommon::KeepOcarinaFsrLodBias(
-            Settings::IsDockedMode(), *ocarina_fsr_failed,
+            true, *ocarina_fsr_failed,
             image != nullptr && True(image->flags & ImageFlagBits::GpuModified));
     }
     if (needs_swizzle_mapping && !key.drop_custom_border && !image_view.HasIdentitySwizzle()) {

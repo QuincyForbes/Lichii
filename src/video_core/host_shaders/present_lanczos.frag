@@ -5,44 +5,56 @@
 
 #version 460 core
 
-layout (location = 0) in vec2 frag_tex_coord;
-layout (location = 0) out vec4 color;
-layout (binding = 0) uniform sampler2D color_texture;
+layout(location = 0) in vec2 frag_tex_coord;
+layout(location = 0) out vec4 color;
+layout(binding = 0) uniform sampler2D color_texture;
 
-#define PI 3.1415926535897932384626433
+const float PI = 3.14159265358979323846;
+
 float sinc(float x) {
-    return x == 0.0f ? 1.0f : sin(PI * x) / (PI * x);
+    float px = PI * x;
+    return abs(x) < 1e-5 ? 1.0 : sin(px) / px;
 }
-float lanczos(vec2 v, float a) {
-    float d = length(v);
-    return sinc(d) / sinc(d / a);
+
+float lanczos(float x, float a) {
+    if (abs(x) >= a) {
+        return 0.0;
+    }
+    return sinc(x) * sinc(x / a);
 }
+
 vec4 textureLanczos(sampler2D textureSampler, vec2 p) {
-    vec3 c_sum = vec3(0.0f);
-    float w_sum = 0.0f;
+    const float a = 3.0;
     vec2 res = vec2(textureSize(textureSampler, 0));
-    vec2 cc = floor(p * res) / res;
-    // kernel size = (2r + 1)^2
-    const int r = 3; //radius (1 = 3 steps)
-#define LANCZOS_LOOP_STEP(x, y) \
-    { \
-        vec2 kp = 0.5f * (vec2(x, y) / res); /* 0.5 = half-pixel level resampling */ \
-        vec2 uv = cc + kp; \
-        float w = lanczos(kp, float(r)); \
-        c_sum += w * texture(textureSampler, p + kp).rgb; \
-        w_sum += w; \
+    vec2 inv_res = 1.0 / res;
+    vec2 min_uv = 0.5 * inv_res;
+    vec2 max_uv = (res - 0.5) * inv_res;
+
+    vec2 coord = p * res - 0.5;
+    vec2 center = floor(coord);
+
+    float wx[6];
+    float wy[6];
+    float x_uv[6];
+    float y_uv[6];
+    for (int i = 0; i < 6; ++i) {
+        float offset = float(i - 2);
+        wx[i] = lanczos(coord.x - (center.x + offset), a);
+        wy[i] = lanczos(coord.y - (center.y + offset), a);
+        x_uv[i] = clamp((center.x + offset + 0.5) * inv_res.x, min_uv.x, max_uv.x);
+        y_uv[i] = clamp((center.y + offset + 0.5) * inv_res.y, min_uv.y, max_uv.y);
     }
 
-    for (int y = -r; y <= r; ++y) {
-        LANCZOS_LOOP_STEP(-3, y);
-        LANCZOS_LOOP_STEP(-2, y);
-        LANCZOS_LOOP_STEP(-1, y);
-        LANCZOS_LOOP_STEP(-0, y);
-        LANCZOS_LOOP_STEP(+1, y);
-        LANCZOS_LOOP_STEP(+2, y);
-        LANCZOS_LOOP_STEP(+3, y);
+    vec4 c_sum = vec4(0.0);
+    float w_sum = 0.0;
+    for (int iy = 0; iy < 6; ++iy) {
+        for (int ix = 0; ix < 6; ++ix) {
+            float w = wx[ix] * wy[iy];
+            c_sum += w * texture(textureSampler, vec2(x_uv[ix], y_uv[iy]));
+            w_sum += w;
+        }
     }
-    return vec4(c_sum / w_sum, 1.0f);
+    return c_sum / max(w_sum, 1e-6);
 }
 
 void main() {

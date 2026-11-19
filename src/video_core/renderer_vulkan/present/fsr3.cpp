@@ -186,18 +186,21 @@ VkImageView FSR3::Draw(const Device& device, Scheduler& scheduler, size_t image_
                      input_image_height, output_image_width, output_image_height, viewport_x,
                      viewport_y);
 
-    // FSR 3 uses a slightly reduced default sharpening compared to FSR 1
-    // to avoid over-sharpening on temporally accumulated detail.
-    const float sharpening =
-        static_cast<float>(Settings::values.fsr_sharpening_slider.GetValue()) / 100.0f * 0.8f;
-    FsrRcasCon(rcas_con.data(), sharpening);
+    // "AMD FSR 1 Soft" adds +0.5 stops of RCAS attenuation so sharpening is softer than FSR 1,
+    // and skips RCAS altogether at 0% (slider >= 200).
+    const int slider = Settings::values.fsr_sharpening_slider.GetValue();
+    const bool run_rcas = slider < 200;
+    if (run_rcas) {
+        const float sharpening = static_cast<float>(slider) / 100.0f + 0.5f;
+        FsrRcasCon(rcas_con.data(), sharpening);
+    }
 
     UploadImages(device, scheduler);
     UpdateDescriptorSets(device, source_image_view, image_index);
 
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        // ΓöÇΓöÇ Pass 1: EASU (edge-adaptive spatial upsampling) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+        // Pass 1: EASU (edge-adaptive spatial upsampling)
         TransitionImageLayout(cmdbuf, source_image, VK_IMAGE_LAYOUT_GENERAL);
         TransitionImageLayout(cmdbuf, easu_image, VK_IMAGE_LAYOUT_GENERAL);
         BeginRenderPass(cmdbuf, renderpass, easu_framebuffer, extent);
@@ -208,8 +211,11 @@ VkImageView FSR3::Draw(const Device& device, Scheduler& scheduler, size_t image_
         cmdbuf.Draw(3, 1, 0, 0);
         cmdbuf.EndRenderPass();
 
-        // ΓöÇΓöÇ Pass 2: RCAS (robust contrast-adaptive sharpening) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         TransitionImageLayout(cmdbuf, easu_image, VK_IMAGE_LAYOUT_GENERAL);
+        if (!run_rcas) {
+            return;
+        }
+        // Pass 2: RCAS (robust contrast-adaptive sharpening)
         TransitionImageLayout(cmdbuf, rcas_image, VK_IMAGE_LAYOUT_GENERAL);
         BeginRenderPass(cmdbuf, renderpass, rcas_framebuffer, extent);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, rcas_pipeline);
@@ -223,7 +229,7 @@ VkImageView FSR3::Draw(const Device& device, Scheduler& scheduler, size_t image_
     });
 
     ++m_frame_counter;
-    return *images.image_views[Rcas];
+    return run_rcas ? *images.image_views[Rcas] : *images.image_views[Easu];
 }
 
 } // namespace Vulkan

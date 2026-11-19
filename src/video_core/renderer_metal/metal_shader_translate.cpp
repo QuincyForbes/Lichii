@@ -1386,7 +1386,9 @@ void FlipMeshPositionY(std::string& source) {
     if (per_vertex_end == std::string::npos) {
         return;
     }
-    const size_t pos_attr = source.find("[[position]]", per_vertex);
+    const size_t plain_pos = source.find("[[position]]", per_vertex);
+    const size_t inv_pos = source.find("[[position, invariant]]", per_vertex);
+    const size_t pos_attr = (std::min)(plain_pos, inv_pos);
     if (pos_attr == std::string::npos || pos_attr > per_vertex_end) {
         return;
     }

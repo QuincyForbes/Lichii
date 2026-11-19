@@ -50,6 +50,7 @@ namespace Vulkan {
 class AntiAliasPass;
 class Device;
 class MemoryAllocator;
+class PresentManager;
 struct PresentPushConstants;
 class RasterizerVulkan;
 class Scheduler;
@@ -59,7 +60,7 @@ public:
     explicit Layer(const Device& device, MemoryAllocator& memory_allocator, Scheduler& scheduler,
                    Tegra::MaxwellDeviceMemoryManager& device_memory, size_t image_count,
                    VkExtent2D output_size, VkDescriptorSetLayout layout,
-                   const PresentFilters& filters);
+                   const PresentFilters& filters, PresentManager* present_manager = nullptr);
     ~Layer();
 
     void ConfigureDraw(const Device& device, PresentPushConstants* out_push_constants,
@@ -79,10 +80,11 @@ private:
     void CreateRawImages(const Device& device, const Tegra::FramebufferConfig& framebuffer);
 
     void RefreshResources(const Device& device, const Tegra::FramebufferConfig& framebuffer);
-    void SetAntiAliasPass(const Device& device);
+    void SetAntiAliasPass(const Device& device, VkExtent2D render_area);
 #ifdef HAS_RESHADE
-    void SetPostProcessPass(const Device& device, bool is_applet);
+    void SetPostProcessPass(const Device& device, bool is_applet, VkExtent2D render_area);
 #endif
+    void WaitIdle();
     void ReleaseRawImages();
 
     u64 CalculateBufferSize(const Tegra::FramebufferConfig& framebuffer) const;
@@ -98,6 +100,7 @@ private:
     Scheduler& scheduler;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
     const PresentFilters& filters;
+    PresentManager* present_manager{};
     size_t image_count{};
     VkExtent2D output_size{};
     VkDescriptorSetLayout descriptor_set_layout{};
@@ -112,6 +115,7 @@ private:
     Service::android::PixelFormat pixel_format{};
 
     Settings::AntiAliasing anti_alias_setting{};
+    VkExtent2D anti_alias_extent{};
     std::variant<std::monostate, FXAA, SMAA> anti_alias{};
     std::variant<std::monostate, SGSR, FSR, FSR3
 #ifdef LICHII_METALFX

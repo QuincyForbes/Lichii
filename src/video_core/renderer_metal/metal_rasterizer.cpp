@@ -309,17 +309,38 @@ AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_c
     : buffer_cache{buffer_cache_}, texture_cache{texture_cache_}, scheduler{scheduler_} {}
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
-    std::scoped_lock lock{buffer_cache.mutex};
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    boost::container::small_vector<std::pair<DAddr, size_t>, 4> gpu_written_dest;
+    const auto do_copy = [&]<typename BC = BufferCache>(BC& bc) {
+        if constexpr (requires {
+                          bc.DMACopy(src_address, dest_address, amount, false, &gpu_written_dest);
+                      }) {
+            return bc.DMACopy(src_address, dest_address, amount, false, &gpu_written_dest);
+        } else {
+            return bc.DMACopy(src_address, dest_address, amount);
+        }
+    };
+    bool copied = false;
     if (!ListCopiesEnabled()) {
-        return buffer_cache.DMACopy(src_address, dest_address, amount);
+        copied = do_copy(buffer_cache);
+    } else {
+        // As Vulkan's: command list pages the copy writes are copied for the split's front.
+        buffer_cache.Nx2CollectListCopies(true);
+        copied = do_copy(buffer_cache);
+        if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
+            scheduler.Flush(CommitReason::ListCopy);
+        }
+        buffer_cache.Nx2CollectListCopies(false);
     }
-    // As Vulkan's: command list pages the copy writes are copied for the split's front.
-    buffer_cache.Nx2CollectListCopies(true);
-    const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
-        scheduler.Flush(CommitReason::ListCopy);
+    if (copied) {
+        [&]<typename TC = TextureCache>(TC& tc) {
+            if constexpr (requires {
+                              tc.WriteDmaCopy(src_address, dest_address, amount, gpu_written_dest);
+                          }) {
+                tc.WriteDmaCopy(src_address, dest_address, amount, gpu_written_dest);
+            }
+        }(texture_cache);
     }
-    buffer_cache.Nx2CollectListCopies(false);
     return copied;
 }
 
@@ -979,6 +1000,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     TrackOcarinaActor(pipeline->Key().unique_hashes[1], is_indexed);
     // After the draw is encoded: the fog's draw saves the scene for the effects mask.
     SCOPE_EXIT {
+        NoteOcarina4kDraw(pipeline->Key().unique_hashes);
         NoteOcarinaEffectsDraw(pipeline->Key().unique_hashes[5]);
     };
 
@@ -1663,6 +1685,7 @@ bool RasterizerMetal::DrawMeshTasksFromGpu(DAddr count_addr) {
     if (!MeshFromGpuEnabled() || !maxwell3d->regs.IsMeshEnabled()) {
         return false;
     }
+    skip_valid = false;
     gpu_memory->FlushCaching();
     FlushWork();
     GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
@@ -2421,7 +2444,14 @@ void RasterizerMetal::CollectStageDescriptors(
         }
         return Tegra::Texture::TexturePair(read_handle_word(addr), via_header_index);
     };
-    const auto add_image_views = [&](const auto& desc, bool blacklist) {
+    const auto add_image_views = [&](const auto& desc, bool is_written) {
+        const auto make_view = [&]<typename ViewT = VideoCommon::ImageViewInOut>(u32 index) {
+            ViewT out{.index = index, .blacklist = is_written};
+            if constexpr (requires(ViewT& v) { v.is_written = is_written; }) {
+                out.is_written = is_written;
+            }
+            return out;
+        };
         if (desc.handle_program != ~0U && desc.count > 1) {
             ensure_handle_addrs();
             batch_handles.resize(desc.count);
@@ -2433,19 +2463,23 @@ void RasterizerMetal::CollectStageDescriptors(
             for (u32 element = 0; element < desc.count; ++element) {
                 const auto handle =
                     Tegra::Texture::TexturePair(batch_handles[element], via_header_index);
-                views.push_back({.index = handle.first, .blacklist = blacklist});
+                views.push_back(make_view(handle.first));
             }
             return;
         }
         for (u32 element = 0; element < desc.count; ++element) {
-            views.push_back({.index = read_handle(desc, element).first, .blacklist = blacklist});
+            views.push_back(make_view(read_handle(desc, element).first));
         }
     };
     for (const auto& desc : info.texture_buffer_descriptors) {
         add_image_views(desc, false);
     }
     for (const auto& desc : info.image_buffer_descriptors) {
-        add_image_views(desc, false);
+        bool is_written = false;
+        if constexpr (requires { desc.is_written; }) {
+            is_written = desc.is_written;
+        }
+        add_image_views(desc, is_written);
     }
     for (const auto& desc : info.texture_descriptors) {
         if (desc.handle_program != ~0U && desc.count > 1) {
@@ -2491,7 +2525,7 @@ void RasterizerMetal::ResolveStageBindings(bool compute, bool blacklist,
                                            std::span<const u32> sampler_handles,
                                            std::span<VideoCommon::SamplerId> samplers) {
     if (!binding_kinds.empty() && binding_kinds.size() == views.size()) {
-        BindMemo::Resolve(texture_cache, compute, true, binding_kinds, views, sampler_handles,
+        BindMemo::Resolve(texture_cache, compute, blacklist, binding_kinds, views, sampler_handles,
                           samplers, bind_memo_counts);
         return;
     }
@@ -2810,6 +2844,14 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             }
         }
     } else {
+        if (draw_segment != last_vertex_segment || maxwell3d != last_vertex_channel) {
+            auto& dirty_flags = maxwell3d->dirty.flags;
+            for (u32 vb = 0; vb < VideoCommon::NUM_VERTEX_BUFFERS; ++vb) {
+                dirty_flags[VideoCommon::Dirty::VertexBuffer0 + vb] = true;
+            }
+            last_vertex_segment = draw_segment;
+            last_vertex_channel = maxwell3d;
+        }
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
@@ -4581,6 +4623,12 @@ void RasterizerMetal::DrawIndirect() {
         };
     }
     gpu_memory->FlushCaching();
+    if (params.include_count && !indirect_plan.wanted) {
+        if (const std::optional<DAddr> count_addr =
+                gpu_memory->GpuToCpuAddress(params.count_start_address)) {
+            FlushRegion(*count_addr, sizeof(u32), VideoCommon::CacheType::BufferCache);
+        }
+    }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     // Written texel buffers read through aligned copies go back once the work is encoded.
     SCOPE_EXIT {
@@ -4838,6 +4886,10 @@ void RasterizerMetal::DrawGeometryIndirect(GraphicsPipeline& pipeline) {
     const u64 stride = params.stride != 0 ? params.stride : u64{words} * sizeof(u32);
     u32 num_draws = static_cast<u32>(params.max_draw_counts);
     if (params.include_count) {
+        if (const std::optional<DAddr> count_addr =
+                gpu_memory->GpuToCpuAddress(params.count_start_address)) {
+            FlushRegion(*count_addr, sizeof(u32), VideoCommon::CacheType::BufferCache);
+        }
         num_draws = (std::min)(num_draws, gpu_memory->Read<u32>(params.count_start_address));
     }
     for (u32 draw = 0; draw < num_draws; ++draw) {
@@ -4956,7 +5008,19 @@ bool NetworkBypassEnabled() {
 } // Anonymous namespace
 
 VideoCommon::OotNetwork::BypassState* RasterizerMetal::OotNetworkBypass() {
-    return NetworkBypassEnabled() ? &oot_network_bypass : nullptr;
+    if (!NetworkBypassEnabled()) {
+        return nullptr;
+    }
+    // Temporal upscaling replaces the same output pass and takes precedence until it fails.
+    if (OcarinaTemporalEnabled() && !ocarina_temporal.EvaluationFailed()) {
+        static bool logged = false;
+        if (!std::exchange(logged, true)) {
+            LOG_INFO(Render_Metal,
+                     "Ocarina of Time: No sharpening is off while temporal upscaling is on");
+        }
+        return nullptr;
+    }
+    return &oot_network_bypass;
 }
 
 void RasterizerMetal::TrackOotTonemappedImage() {
@@ -4986,29 +5050,19 @@ bool RasterizerMetal::OcarinaTemporalEnabled() {
         Settings::GetCurrentProgramID() != VideoCommon::OotNetwork::ProgramId) {
         return false;
     }
-    static const std::string replacement = [] {
-        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return std::string{value != nullptr ? value : ""};
-    }();
-    // MetalFX takes Vulkan's Dlss backend on Apple; FSR 3.1 has no Metal path (the game's pass,
-    // or the bilinear one, runs).
-    return VideoCommon::SelectOcarinaUpscaler(Settings::OcarinaFsrChosen(),
-                                              Settings::MetalFxTemporalChosen(), true,
-                                              replacement) ==
-               VideoCommon::OcarinaUpscaleBackend::Dlss &&
-           ocarina_temporal.Available();
+    return ocarina_temporal.Available();
 }
 
 void RasterizerMetal::UpdateOcarinaJitter() {
     std::array<f32, 2> want{};
-    // As Vulkan: only while MetalFX replaced the previous frame's upscale (a frame the game
-    // upscales itself would show the offset as a shake), and only for draws that depth-test
+    // As Vulkan: only while temporal upscaling replaced the previous frame's upscale (a frame the
+    // game upscales itself would show the offset as a shake), and only for draws that depth-test
     // against the scene depth at the scene size, so a depth pre-pass and the colour passes move
     // together and shadow maps, half-size and full-screen passes stay put.
     const auto& regs = maxwell3d->regs;
     if (oot_temporal_frame && *oot_temporal_frame + 1 >= oot_frame && regs.depth_test_enable &&
         oot_motion.extent[0] != 0 && VulkanSwitchesEnabled() &&
-        VideoCommon::OcarinaJitterEnabled(VideoCommon::OcarinaUpscaleBackend::Dlss)) {
+        VideoCommon::OcarinaJitterEnabled(ocarina_temporal.Backend())) {
         const auto& targets = texture_cache.GetRenderTargets();
         if (targets.depth_buffer_id) {
             const ImageView& depth = texture_cache.GetImageView(targets.depth_buffer_id);
@@ -5329,13 +5383,13 @@ std::optional<Tegra::Texture::TICEntry> RasterizerMetal::ReadComputeTic(u32 inde
     return entry;
 }
 
-bool RasterizerMetal::TryOcarinaTemporal(u64 shader_hash,
+bool RasterizerMetal::TryOcarinaTemporal(u64 native_key, u64 shader_hash,
                                          std::span<const VideoCommon::ImageViewInOut> views) {
     // Logs why the game's own upscale draws when the reason changes and every 120th repeat.
     const auto fail = [this](const char* reason) {
         CountOcarinaTemporal(false, reason);
         if (reason != oot_decline || ++oot_decline_repeats % 120 == 0) {
-            LOG_INFO(Render_Metal, "Ocarina MetalFX: the game's upscale draws frame {} ({})",
+            LOG_INFO(Render_Metal, "Ocarina temporal: the game's upscale draws frame {} ({})",
                      oot_frame, reason);
         }
         if (reason != oot_decline) {
@@ -5372,24 +5426,38 @@ bool RasterizerMetal::TryOcarinaTemporal(u64 shader_hash,
     ImageView& color = texture_cache.GetImageView(views[0].id);
     ImageView& target = texture_cache.GetImageView(views[1].id);
     const auto extent = oot_motion.extent;
-    bool upscale_4k = OcarinaTemporal::IsScaledPass(shader_hash);
-    bool handheld_scaled = false;
-    const bool sixteen_by_nine =
-        std::abs(static_cast<int>(extent[0] * 9) - static_cast<int>(extent[1] * 16)) <= 32;
-    // Handheld the scaled passes write 1920x1080 from the lower scales (50 %: 960x540, 2x).
-    if (upscale_4k && OcarinaTemporal::HandheldEnabled() && target.size.width == 1920 &&
-        target.size.height == 1080 && shader_hash != OcarinaTemporal::Ocarina1440pShader &&
-        extent[0] < 1920 && sixteen_by_nine) {
-        upscale_4k = false;
-        handheld_scaled = true;
+    using enum VideoCommon::OcarinaUpscalePass;
+    const auto pass = VideoCommon::FindOcarinaUpscalePass(native_key, shader_hash);
+    if (pass == None) {
+        return fail("unrecognised upscale pass");
     }
-    // 4K: any 16:9 scene up to 2560x1440; the 3/4 pass: a third larger.
+    const bool target_1440p = target.size.width == 2560 && target.size.height == 1440;
+    const bool target_1080p = target.size.width == 1920 && target.size.height == 1080;
+    const auto effective_res = Settings::OcarinaUpscaledResolution(
+        Settings::values.oot_resolution.GetValue(), Settings::values.upscaler.GetValue(),
+        Settings::IsDockedMode());
+    const bool performance_scale =
+        Settings::OcarinaDlssModeFor(effective_res) == Settings::OcarinaDlssMode::Performance;
+    const bool pass_1440p = target_1440p && (pass == OneToOne || pass == Scaled ||
+                                             (pass == ThreeQuarter && performance_scale));
+    const bool native_size = pass == OneToOne && !target_1440p;
+    if (!target_1440p && target_1080p && !OcarinaTemporal::HandheldEnabled()) {
+        return fail("handheld temporal upscale disabled");
+    }
+    const bool native_resolution =
+        ocarina_temporal.Backend() == VideoCommon::OcarinaUpscaleBackend::Dlss &&
+        Settings::values.nvidia_dlss_quality.GetValue() == Settings::DlssQuality::Dlaa;
+    const bool upscale_4k = pass_1440p && !native_resolution;
+    const bool scaled_scene =
+        extent[0] <= target.size.width && extent[1] <= target.size.height &&
+        std::abs(static_cast<int>(extent[0] * 9) - static_cast<int>(extent[1] * 16)) <= 32;
     const bool valid_extents =
-        handheld_scaled ? true
-        : upscale_4k    ? extent[0] <= 2560 && sixteen_by_nine && target.size.width == 2560 &&
-                           target.size.height == 1440
-                        : target.size.width == extent[0] * 4 / 3 &&
-                           target.size.height == extent[1] * 4 / 3;
+        pass_1440p || pass == Scaled
+            ? scaled_scene
+            : (native_size
+                   ? target.size.width == extent[0] && target.size.height == extent[1]
+                   : target.size.width == extent[0] * 4 / 3 &&
+                         target.size.height == extent[1] * 4 / 3);
     if (!valid_extents || texture_cache.IsRescaling(color) || texture_cache.IsRescaling(target) ||
         color.Samples() != 1 || target.Samples() != 1 ||
         color.range != VideoCommon::SubresourceRange{} ||
@@ -5400,6 +5468,18 @@ bool RasterizerMetal::TryOcarinaTemporal(u64 shader_hash,
         color.ImageHandle() == target.ImageHandle() || depth.ImageHandle() == target.ImageHandle()) {
         return fail("unexpected upscale images");
     }
+    const TextureHandle target_storage =
+        target.StorageHandle(Shader::TextureType::Color2D, Shader::ImageFormat::Typeless);
+    const bool present_4k = upscale_4k && OcarinaTemporal::Present4kEnabled();
+    const TextureHandle scene_reference =
+        present_4k ? target.Handle(Shader::TextureType::Color2D) : nullptr;
+    if (target_storage == nullptr || (present_4k && scene_reference == nullptr)) {
+        return fail("no upscale target view");
+    }
+    const std::array<u32, 2> target_extent{target.size.width, target.size.height};
+    const std::array<u32, 2> output_extent = native_resolution ? extent
+                                             : present_4k      ? std::array<u32, 2>{3840, 2160}
+                                                               : target_extent;
     // Without Link's pose the motion comes from the camera alone.
     OcarinaActorMesh actor{};
     const bool has_actor = OcarinaTemporal::ActorEnabled() && ReadOcarinaActor(actor);
@@ -5408,9 +5488,10 @@ bool RasterizerMetal::TryOcarinaTemporal(u64 shader_hash,
             {
                 .color = color.Handle(Shader::TextureType::Color2D),
                 .depth = depth.Handle(Shader::TextureType::Color2D),
-                .target = target.Handle(Shader::TextureType::Color2D),
+                .target = target_storage,
                 .extent = extent,
-                .target_size = {target.size.width, target.size.height},
+                .target_size = target_extent,
+                .output_size = output_extent,
                 .current = oot_motion.current,
                 .previous = oot_motion.previous,
                 .frame = oot_frame,
@@ -5419,10 +5500,18 @@ bool RasterizerMetal::TryOcarinaTemporal(u64 shader_hash,
                                                         : std::array<f32, 2>{},
             },
             reason)) {
-        return fail(reason != nullptr ? reason : "MetalFX declined the frame");
+        if (ocarina_temporal.EvaluationFailed()) {
+            texture_cache_runtime.ocarina_upscaler_failed = true;
+        }
+        return fail(reason != nullptr ? reason : "temporal upscaler declined the frame");
+    }
+    if (present_4k) {
+        ocarina_temporal.SaveSceneReference(scene_reference);
+        oot_4k_scene_frame = oot_frame;
+        oot_4k_guest_present = nullptr;
     }
     oot_temporal_frame = oot_frame;
-    oot_jitter_phases = VideoCommon::OcarinaJitterPhases(extent[0], target.size.width);
+    oot_jitter_phases = VideoCommon::OcarinaJitterPhases(extent[0], output_extent[0]);
     CountOcarinaTemporal(true);
     oot_decline = nullptr;
     return true;
@@ -5580,6 +5669,27 @@ bool RasterizerMetal::ReadOcarinaActor(OcarinaActorMesh& mesh) {
         .previous_bones = before.bones,
     };
     return true;
+}
+
+void RasterizerMetal::NoteOcarina4kDraw(const std::array<u64, 6>& hashes) {
+    if (oot_4k_scene_frame != oot_frame) {
+        return;
+    }
+    constexpr u64 final_vertex = 0x16aff33d999f993fULL;
+    constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
+    if (hashes[5] != final_fragment || std::ranges::find(hashes, final_vertex) == hashes.end()) {
+        return;
+    }
+    const auto target_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
+    if (!target_id) {
+        return;
+    }
+    const ImageView& target = texture_cache.GetImageView(target_id);
+    if (target.size.width == 2560 && target.size.height == 1440 &&
+        (target.format == VideoCore::Surface::PixelFormat::A8B8G8R8_SRGB ||
+         target.format == VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM)) {
+        oot_4k_guest_present = target.ImageHandle();
+    }
 }
 
 void RasterizerMetal::NoteOcarinaEffectsDraw(u64 fragment_hash) {
@@ -5951,7 +6061,8 @@ void RasterizerMetal::DispatchCompute() {
     }
     gpu_memory->FlushCaching();
     FlushWork();
-    ComputePipeline* const pipeline = pipeline_cache.CurrentComputePipeline();
+    u64 native_key{};
+    ComputePipeline* const pipeline = pipeline_cache.CurrentComputePipeline(&native_key);
     if (pipeline != nullptr && VideoCommon::FeatureCensus::Enabled()) {
         VideoCommon::FeatureCensus::NoteDispatch(
             pipeline->Key().unique_hash, kepler_compute->GetIndirectComputeAddress().has_value());
@@ -5993,7 +6104,7 @@ void RasterizerMetal::DispatchCompute() {
     // Ocarina's anti-aliasing through the camera-motion upscale (EDEN_NX2_METAL_OOT_CAMERA_MOTION),
     // as Vulkan's DispatchCompute does with NVIDIA DLSS. The hash is the program's lowered one.
     if (kepler_compute->IsNativeMode() && CameraMotionUpscaleEnabled() &&
-        kepler_compute->ProcessOcarinaUpscale(Settings::GetCurrentProgramID(), 0,
+        kepler_compute->ProcessOcarinaUpscale(Settings::GetCurrentProgramID(), native_key,
                                               pipeline->Key().unique_hash)) {
         Coverage::Note(Coverage::Work::Dispatch, Coverage::Path::Replaced);
         return;
@@ -6061,22 +6172,26 @@ void RasterizerMetal::DispatchCompute() {
                          views, sampler_handles, samplers);
     MakePlaceholders();
     PrepareSampleGrids(info, views);
-    if (pipeline->Key().unique_hash == OcarinaTemporal::DepthReader) {
+    if (native_key == VideoCommon::OcarinaDepthReaderKey ||
+        pipeline->Key().unique_hash == VideoCommon::OcarinaDepthReaderShader) {
         TrackOcarinaDepth();
     }
     if (!kepler_compute->GetIndirectComputeAddress()) {
         MarkOcarinaEffects(info, views);
     }
-    // The upscale pass through MetalFX temporal upscaling when it is the chosen upscaler, as
-    // Vulkan's TryOcarinaUpscale; declined, the bilinear pass or the game's own runs.
+    // The upscale pass through MetalFX or FSR 3.1 temporal upscaling when it is the chosen
+    // upscaler, as Vulkan's TryOcarinaUpscale; declined, the bilinear pass or the game's own runs.
     if (!kepler_compute->GetIndirectComputeAddress() &&
-        OcarinaTemporal::IsTemporalPass(pipeline->Key().unique_hash, info) &&
+        OcarinaTemporal::IsTemporalPass(native_key, pipeline->Key().unique_hash, info) &&
         OcarinaTemporalEnabled()) {
-        if (TryOcarinaTemporal(pipeline->Key().unique_hash, views)) {
+        if (TryOcarinaTemporal(native_key, pipeline->Key().unique_hash, views)) {
             const ImageView& color = texture_cache.GetImageView(views[0].id);
             const ImageView& target = texture_cache.GetImageView(views[1].id);
+            const char* const backend_name =
+                ocarina_temporal.Backend() == VideoCommon::OcarinaUpscaleBackend::Fsr ? "FSR 3.1"
+                                                                                      : "MetalFX";
             VideoCore::Probe::StoreScene(color.size.width, color.size.height, target.size.width,
-                                         target.size.height, "MetalFX");
+                                         target.size.height, backend_name);
             texture_cache.MarkModification(target.image_id);
             Coverage::Note(Coverage::Work::Dispatch, Coverage::Path::Replaced);
             return;
@@ -6087,11 +6202,13 @@ void RasterizerMetal::DispatchCompute() {
     if (OcarinaUpscale::BilinearEnabled() &&
         Settings::GetCurrentProgramID() == VideoCommon::OotNetwork::ProgramId &&
         !kepler_compute->GetIndirectComputeAddress() &&
-        OcarinaUpscale::IsBilinearPass(pipeline->Key().unique_hash, info)) {
+        OcarinaUpscale::IsBilinearPass(native_key, pipeline->Key().unique_hash, info)) {
         using VideoCore::Surface::PixelFormat;
         ImageView& color = texture_cache.GetImageView(views[0].id);
         ImageView& target = texture_cache.GetImageView(views[1].id);
-        if (color.format == PixelFormat::E5B9G9R9_FLOAT &&
+        const TextureHandle target_storage =
+            target.StorageHandle(Shader::TextureType::Color2D, Shader::ImageFormat::Typeless);
+        if (target_storage != nullptr && color.format == PixelFormat::E5B9G9R9_FLOAT &&
             target.format == PixelFormat::B10G11R11_FLOAT && color.Samples() <= 1 &&
             target.Samples() <= 1 && !texture_cache.IsRescaling(color) &&
             !texture_cache.IsRescaling(target) && color.range == VideoCommon::SubresourceRange{} &&
@@ -6100,8 +6217,7 @@ void RasterizerMetal::DispatchCompute() {
             color.ImageHandle() != target.ImageHandle() &&
             ocarina.Bilinear(color.Handle(Shader::TextureType::Color2D),
                              {color.size.width, color.size.height},
-                             {color.size.width, color.size.height},
-                             target.Handle(Shader::TextureType::Color2D),
+                             {color.size.width, color.size.height}, target_storage,
                              {target.size.width, target.size.height})) {
             VideoCore::Probe::StoreScene(color.size.width, color.size.height, target.size.width,
                                          target.size.height, "Bilinear");
@@ -6551,14 +6667,16 @@ u32 RasterizerMetal::AllocateVisibilitySlot() {
 void RasterizerMetal::CountOcclusion() {
     const bool zpass = maxwell3d->regs.zpass_pixel_count_enable != 0;
     if (!zpass && !count_pixels) {
+        occlusion_pass = ~u64{0};
         scheduler.SetVisibility(std::nullopt);
         return;
     }
-    // A slot per render pass of the counting segment: results are summed at the query. The pixel
+    // A slot per visibility run of the counting segment: results are summed at the query. The pixel
     // program invocation counter (once a report asks for it) reads the same slots.
-    if (occlusion_pass != scheduler.RenderPassSerial()) {
+    const u64 vis_serial = scheduler.VisibilitySerial();
+    if (occlusion_pass != vis_serial) {
         visibility_slot = AllocateVisibilitySlot();
-        occlusion_pass = scheduler.RenderPassSerial();
+        occlusion_pass = vis_serial;
         slot_in_occlusion = slot_in_pixels = false;
     }
     if (zpass && !slot_in_occlusion) {
@@ -6648,6 +6766,8 @@ void RasterizerMetal::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                                                        .wide = wide,
                                                        .tick = scheduler.CurrentTick(),
                                                        .serial = serial});
+        pending_reports_count.store(static_cast<u32>(pending_reports.size()),
+                                    std::memory_order_relaxed);
     }
     // Later draws count into a new slot: the report must not see their samples (a render pass
     // goes on past the report when no fence ends its command buffer).
@@ -6696,8 +6816,24 @@ bool RasterizerMetal::WritePendingReport(DAddr address, u64 serial) {
     if (const auto it = pending_reports.find(address);
         it != pending_reports.end() && it->second.serial == report.serial) {
         pending_reports.erase(it);
+        pending_reports_count.store(static_cast<u32>(pending_reports.size()),
+                                    std::memory_order_relaxed);
     }
     return true;
+}
+
+void RasterizerMetal::InvalidatePendingReports(DAddr addr, u64 size) {
+    if (addr == 0 || size == 0 || pending_reports_count.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    std::scoped_lock lock{pending_reports_mutex};
+    std::erase_if(pending_reports, [addr, size](const auto& item) {
+        const DAddr report_addr = item.first;
+        const u64 report_bytes = item.second.wide ? 16ULL : 4ULL;
+        return report_addr < addr + size && addr < report_addr + report_bytes;
+    });
+    pending_reports_count.store(static_cast<u32>(pending_reports.size()),
+                                std::memory_order_relaxed);
 }
 
 bool RasterizerMetal::HasPendingQueries(DAddr addr, u64 size) {
@@ -6780,7 +6916,9 @@ void RasterizerMetal::QueryFallback(GPUVAddr gpu_addr, VideoCommon::QueryType ty
         value = CounterValue(type, subreport).value_or(1U);
     }
     const bool wide = True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
+    InvalidatePendingReports(*address, wide ? 16ULL : 4ULL);
     std::function<void()> func([this, report_addr = *address, wide, value] {
+        InvalidatePendingReports(report_addr, wide ? 16ULL : 4ULL);
         WriteQueryResult(report_addr, wide, value);
     });
     if (True(flags & VideoCommon::QueryPropertiesFlags::IsAFence)) {
@@ -6980,6 +7118,9 @@ void RasterizerMetal::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheT
         buffer_cache.WriteMemory(addr, size);
         InvalidateConvertedIndicesAddr(addr, size);
     }
+    if (True(which & VideoCommon::CacheType::QueryCache)) {
+        InvalidatePendingReports(addr, size);
+    }
     if (True(which & VideoCommon::CacheType::ShaderCache)) {
         pipeline_cache.InvalidateRegion(addr, size);
     }
@@ -6993,6 +7134,11 @@ void RasterizerMetal::InnerInvalidation(
     }
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
+    }
+    if (pending_reports_count.load(std::memory_order_relaxed) != 0) {
+        for (const auto& [addr, size] : sequences) {
+            InvalidatePendingReports(addr, size);
+        }
     }
     // Each lock once for the batch; the texture and shader caches only where they ever held
     // something (page_filter).
@@ -7023,6 +7169,7 @@ void RasterizerMetal::InnerInvalidation(
 }
 
 bool RasterizerMetal::OnCPUWrite(DAddr addr, u64 size) {
+    InvalidatePendingReports(addr, size);
     texture_cache.NoteGuestWrite();
     if (!CachePathsEnabled()) {
         {
@@ -7106,6 +7253,11 @@ bool RasterizerMetal::OnCPUWrite(DAddr addr, u64 size) {
 }
 
 void RasterizerMetal::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    if (pending_reports_count.load(std::memory_order_relaxed) != 0) {
+        for (const auto& [addr, size] : ranges) {
+            InvalidatePendingReports(addr, size);
+        }
+    }
     texture_cache.NoteGuestWrite();
     if (!CachePathsEnabled()) {
         RasterizerInterface::OnCacheInvalidations(ranges);
@@ -7155,6 +7307,7 @@ bool RasterizerMetal::TryCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return true;
     }
+    InvalidatePendingReports(addr, size);
     {
         // WriteMemory downloads GPU-written bytes elsewhere on the written pages, which only
         // the GPU thread may do: those pages are left to the fallback.
@@ -7185,6 +7338,7 @@ void RasterizerMetal::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
     }
+    InvalidatePendingReports(addr, size);
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
@@ -7202,6 +7356,7 @@ void RasterizerMetal::InvalidateGPUCache() {
 }
 
 void RasterizerMetal::UnmapMemory(DAddr addr, u64 size) {
+    InvalidatePendingReports(addr, size);
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.UnmapMemory(addr, size);
@@ -7844,10 +7999,36 @@ bool RasterizerMetal::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surfa
 bool RasterizerMetal::AccelerateTemporalUpscale(
     const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
     const Tegra::Engines::Fermi2D::Surface& motion_vectors, const Tegra::Texture::TICEntry* depth,
-    std::array<f32, 2> jitter, std::array<f32, 2> motion_scale, bool use_history) {
+    std::array<f32, 2> jitter, std::array<f32, 2> motion_scale, bool use_history,
+    std::optional<std::array<u32, 2>> render_region) {
     std::scoped_lock lock{texture_cache.mutex};
-    return texture_cache.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale,
-                                          use_history);
+    return [&]<typename TC = TextureCache>(TC& tc) {
+        if constexpr (requires {
+                          tc.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale,
+                                             use_history, render_region);
+                      }) {
+            return tc.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale,
+                                      use_history, render_region);
+        } else {
+            (void)render_region;
+            return tc.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale,
+                                      use_history);
+        }
+    }(texture_cache);
+}
+
+std::optional<VideoCore::GameDlssProbe> RasterizerMetal::ProbeGameDlssOutput(
+    const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
+    std::optional<std::array<u32, 2>> src_region) {
+    std::scoped_lock lock{texture_cache.mutex};
+    return [&]<typename TC = TextureCache>(TC& tc) {
+        if constexpr (requires { tc.ProbeGameDlssOutput(dst, src, src_region); }) {
+            return tc.ProbeGameDlssOutput(dst, src, src_region);
+        } else {
+            (void)src_region;
+            return tc.ProbeGameDlssOutput(dst, src);
+        }
+    }(texture_cache);
 }
 
 Tegra::Engines::AccelerateDMAInterface& RasterizerMetal::AccessAccelerateDMA() {
@@ -7913,6 +8094,7 @@ void RasterizerMetal::InlineToMemory(GPUVAddr address, size_t copy_size,
         gpu_memory->WriteBlock(address, memory.data(), copy_size);
         return;
     }
+    InvalidatePendingReports(*cpu_addr, copy_size);
     if (!CachePathsEnabled()) {
         gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
         {
@@ -8099,9 +8281,24 @@ std::optional<DisplayTexture> RasterizerMetal::AccelerateDisplay(
         .texture = image_view->Handle(Shader::TextureType::Color2D),
         .width = image_view->size.width,
         .height = image_view->size.height,
+        .anti_aliased =
+            oot_temporal_frame == oot_frame && !ocarina_temporal.EvaluationFailed(),
     };
     texture.scaled_width = scaled ? resolution.ScaleUp(texture.width) : texture.width;
     texture.scaled_height = scaled ? resolution.ScaleUp(texture.height) : texture.height;
+    if (oot_4k_scene_frame == oot_frame && image_view->ImageHandle() != nullptr &&
+        image_view->ImageHandle() == oot_4k_guest_present && texture.texture != nullptr &&
+        texture.width == 2560 && texture.height == 1440 && !scaled &&
+        image_view->format == VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM &&
+        !ocarina_temporal.EvaluationFailed() && !frame_dump.Capturing()) {
+        if (const TextureHandle composited =
+                ocarina_temporal.Composite4k(texture.texture, oot_frame)) {
+            texture.texture = composited;
+            texture.scaled_width = 3840;
+            texture.scaled_height = 2160;
+            texture.already_upscaled = true;
+        }
+    }
     if (texture.texture == nullptr) {
         return std::nullopt;
     }

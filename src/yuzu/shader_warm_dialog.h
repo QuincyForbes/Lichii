@@ -16,6 +16,7 @@ class System;
 }
 
 namespace VideoCommon::ShaderWarm {
+struct GpuWarmSummary;
 struct Progress;
 struct Result;
 } // namespace VideoCommon::ShaderWarm
@@ -38,12 +39,18 @@ class ShaderWarmDialog : public QDialog {
 
 public:
     explicit ShaderWarmDialog(Core::System& system, std::filesystem::path game_path, u64 title_id,
-                              const QString& game_name, QWidget* parent = nullptr);
+                              const QString& game_name, QWidget* parent = nullptr,
+                              bool compile_gpu = true);
     ~ShaderWarmDialog() override;
 
     void Start();
     bool IsRunning() const {
         return running;
+    }
+    /// True when offline GPU compilation is unsupported (e.g. Vulkan) and a BuildOnly boot is
+    /// needed to compile GPU pipelines into the driver/pipeline cache.
+    bool NeedsBootGpuCompile() const {
+        return needs_boot_gpu_compile;
     }
     /// The title whose precache file this dialog builds.
     u64 TitleId() const {
@@ -60,11 +67,14 @@ protected:
 private:
     void RequestStop();
     void OnProgress(const QString& stage, qulonglong done, qulonglong total);
-    void OnFinished(const VideoCommon::ShaderWarm::Result& result, bool stopped);
+    void OnFinished(const VideoCommon::ShaderWarm::Result& result,
+                    const VideoCommon::ShaderWarm::GpuWarmSummary& gpu_summary, bool stopped);
 
     Core::System& system;
     std::filesystem::path game_path;
     u64 title_id;
+    bool compile_gpu{true};
+    bool needs_boot_gpu_compile{};
 
     QLabel* stage_label{};
     QProgressBar* progress_bar{};

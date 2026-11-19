@@ -680,6 +680,7 @@ std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo&
     const Id output_f32{module.TypePointer(spv::StorageClass::Output, f32_type)};
     const Id position{module.AddGlobalVariable(output_vec4, spv::StorageClass::Output)};
     module.Decorate(position, spv::Decoration::BuiltIn, spv::BuiltIn::Position);
+    module.Decorate(position, spv::Decoration::Invariant);
     interfaces.push_back(position);
     // A point list needs a size per vertex.
     const u32 corners{mesh.PrimitiveVertices()};

@@ -25,8 +25,9 @@ namespace VideoCommon::ShaderWarm {
 constexpr u32 WarmCacheVersion = VideoCommon::VulkanPipelineCacheVersion;
 /// What the builder finds in the game files, recorded in the precache's count file. A file built by
 /// an older builder is stale (WarmFilesStale). 2: Mario Kart World's .esetb effects.
-/// 3: .ptcl particle effects (Fire Emblem).
-constexpr u32 WarmBuilderVersion = 3;
+/// 3: .ptcl particle effects (Fire Emblem). 4: nested Effect/**, .blarc, .pck, DLC/AOC, compact
+/// deduplicated graphics and Switch 1 Maxwell BNSH/BAHS.
+constexpr u32 WarmBuilderVersion = 4;
 /// Other runtime cache versions with the same record layout, newest first (zortos293/Lichii
 /// builds write 53 and 54; 52 to 54 are identical). Their records still give the draw state
 /// guesses when this version has no cache yet.
@@ -55,12 +56,23 @@ using GraphicsKey = std::array<u8, GraphicsKeySize>;
 
 using ComputeKey = std::array<u8, 24>;
 
-/// A program lowered and laid out like LowerNativeCode (video_core/shader_environment.cpp).
+/// A program lowered and laid out like LowerNativeCode (video_core/shader_environment.cpp), or
+/// extracted directly from a Switch 1 Maxwell shader container.
 struct LoweredCode {
     std::vector<u8> code;
     /// Constant buffer the program's bound textures read, ~0U when it names none.
     u32 texture_buffer{~0U};
+    /// Program stage hash when precomputed (Switch 1 Maxwell or lowered Switch 2).
+    u64 stage_hash{};
+    /// True when `code` is a Switch 1 Maxwell program (no Ampere address map).
+    bool maxwell{};
 };
+
+/// Fast pre-lowering check returning the byte end of the captured instruction stream inside
+/// `program` (excluding trailing padding and bank 1 constants), or nullopt when `program` cannot
+/// be captured/lowered.
+std::optional<size_t> CaptureProgramPrefixSize(std::span<const u8> program, bool graphics,
+                                               bool maxwell = false);
 
 /// Lowers one extracted program like `shader-sweep <program> --capture-extent --lower-only
 /// --override-out` (graphics: the 128-byte header is skipped) and builds the runtime code
@@ -74,6 +86,10 @@ inline std::optional<std::string> LowerProgram(std::span<const u8> program, Lowe
     return LowerProgram(program, false, out);
 }
 
+/// Extracts a Switch 1 NVN1 Maxwell program directly (no Ampere->Maxwell lowering needed).
+std::optional<std::string> PrepareMaxwellProgram(std::span<const u8> program, bool graphics,
+                                                 LoweredCode& out);
+
 /// NativeShaderHash: CityHash64(code) ^ 0x4f554e4345000002.
 u64 StageHash(std::span<const u8> code);
 
@@ -81,15 +97,27 @@ struct ComputeControl {
     std::array<u32, 3> workgroup{};
     u32 shared_memory{};
     u32 local_memory{};
+
+    bool operator==(const ComputeControl&) const = default;
 };
 
-/// Workgroup (control bytes 88, 92, 96), shared memory (byte 100 rounded up to 256) and local
-/// memory (byte 104). Empty when the control is too short.
-std::optional<ComputeControl> ReadComputeControl(std::span<const u8> control);
+/// Workgroup (NVN2 control bytes 88, 92, 96; NVN1 bytes 0x748..0x750), shared memory (rounded up
+/// to 256) and local memory. Empty when the control is too short.
+std::optional<ComputeControl> ReadComputeControl(std::span<const u8> control,
+                                                 bool maxwell = false);
+
+/// Extracts constant buffer bank 1 (up to 256 bytes) from `program` / `control`.
+std::span<const u8> ExtractBank1(std::span<const u8> program, std::span<const u8> control,
+                                 bool maxwell);
 
 /// One compute entry (env count, env, code, compute trailer, key); `key` gets the 24-byte key.
 std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& control,
                              ComputeKey& key);
+
+/// Env record of a single-stage graphics entry (stage 0 vertex or 4 fragment), without the
+/// leading env count and the key, using explicit `sph` (80 bytes) and `bank1` (<= 256 bytes).
+std::vector<u8> GraphicsEnvFromParts(u32 stage, const LoweredCode& lowered,
+                                     std::span<const u8> sph, std::span<const u8> bank1);
 
 /// Env record of a single-stage graphics entry (stage 0 vertex or 4 fragment), without the
 /// leading env count and the key. `program` is the extracted allocation (header + code).

@@ -5,6 +5,8 @@
 #include <cmath>
 #include <map>
 #include <numeric>
+#include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -232,63 +234,179 @@ const QColor DisplayedColor{74, 222, 128};
 const QColor WarningColor{255, 159, 10};
 const QColor BuildingColor{255, 214, 10};
 
-// What draws the picture, by the names Settings gives it.
-QString UpscalerLabel() {
-    const u32 upscaler_enum = Settings::EnumMetadata<Settings::Upscaler>::Index();
-    switch (Settings::values.upscaler.GetValue()) {
-    case Settings::Upscaler::MetalFx:
-        return UiText::ChoiceLabel(upscaler_enum, static_cast<u32>(Settings::Upscaler::MetalFx));
-    case Settings::Upscaler::Game:
-        return UiText::Text("overlay.game_dlss");
-    case Settings::Upscaler::Dlss: {
-        const QString dlss_name =
-            UiText::ChoiceLabel(upscaler_enum, static_cast<u32>(Settings::Upscaler::Dlss));
+// Live upscaler and window scaling filter labels, cached across frames so unchanged state causes
+// zero QString churn.
+struct OverlayScalingTelemetry {
+    struct Key {
+        Settings::RendererBackend backend{};
+        Settings::Upscaler upscaler{};
+        Settings::ScalingFilter filter{};
+        f32 res_scale{1.0f};
+        const char* probed_scene{};
+        bool dlss_available{};
+        bool dlss_active{};
+        bool fsr4_available{};
+        bool fsr4_active{};
+        std::string mode_name;
+        std::string preset_name;
+        bool operator==(const Key&) const = default;
+    };
+
+    std::optional<Key> last_key;
+    QString scale_line;
+    QString filter_label;
+    QString scene_upscaler_label;
+};
+
+const OverlayScalingTelemetry& QueryScalingTelemetry(f32 res_scale) {
+    static OverlayScalingTelemetry cache;
+    const auto backend = Settings::values.renderer_backend.GetValue();
+    const auto upscaler_setting = Settings::values.upscaler.GetValue();
+    const auto filter_setting = Settings::values.scaling_filter.GetValue();
+    const char* const probed_scene =
+        VideoCore::Probe::scene_upscaler.load(std::memory_order_relaxed);
+
+    OverlayScalingTelemetry::Key key{
+        .backend = backend,
+        .upscaler = upscaler_setting,
+        .filter = filter_setting,
+        .res_scale = res_scale,
+        .probed_scene = probed_scene,
+    };
 #ifdef EGLANTINE_STREAMLINE
-        if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan) {
-            // What NVIDIA DLSS does in this game, not just the setting.
-            const auto dlss = Vulkan::Streamline::GetSessionStatus();
-            if (dlss.available && dlss.frames > 0) {
-                QString label = dlss_name;
-                if (!dlss.mode_name.empty()) {
-                    label += QLatin1Char(' ') + QString::fromStdString(dlss.mode_name);
-                }
-                if (!dlss.preset_name.empty()) {
-                    label += QLatin1Char(' ') + QString::fromStdString(dlss.preset_name);
-                }
-                return label;
-            }
-            return dlss.available ? UiText::Text("overlay.dlss_idle").arg(dlss_name)
-                                  : UiText::Text("overlay.dlss_off").arg(dlss_name);
-        }
-        return UiText::Text("overlay.dlss_off").arg(dlss_name);
-#else
-        return dlss_name;
-#endif
+    if (backend == Settings::RendererBackend::Vulkan &&
+        upscaler_setting == Settings::Upscaler::Dlss) {
+        const auto dlss = Vulkan::Streamline::GetSessionStatus();
+        key.dlss_available = dlss.available;
+        key.dlss_active = dlss.available && dlss.frames > 0;
+        key.mode_name = dlss.mode_name;
+        key.preset_name = dlss.preset_name;
     }
-    case Settings::Upscaler::Fsr4: {
-        const QString fsr4_name =
-            UiText::ChoiceLabel(upscaler_enum, static_cast<u32>(Settings::Upscaler::Fsr4));
+#endif
 #if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
-        if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan) {
-            const auto fsr4 = Vulkan::FfxRuntime::GetSessionStatus();
-            if (fsr4.available && fsr4.frames > 0) {
-                return fsr4_name;
-            }
-            return fsr4.available ? UiText::Text("overlay.dlss_idle").arg(fsr4_name)
-                                  : UiText::Text("overlay.dlss_off").arg(fsr4_name);
-        }
-        return UiText::Text("overlay.dlss_off").arg(fsr4_name);
-#else
-        return fsr4_name;
-#endif
+    if (backend == Settings::RendererBackend::Vulkan &&
+        upscaler_setting == Settings::Upscaler::Fsr4) {
+        const auto fsr4 = Vulkan::FfxRuntime::GetSessionStatus();
+        key.fsr4_available = fsr4.available;
+        key.fsr4_active = fsr4.available && fsr4.frames > 0;
     }
-    case Settings::Upscaler::Fsr3:
-        return UiText::ChoiceLabel(upscaler_enum, static_cast<u32>(Settings::Upscaler::Fsr3));
-    case Settings::Upscaler::Auto:
+#endif
+
+    if (cache.last_key == key) {
+        return cache;
+    }
+    cache.last_key = key;
+
+    auto effective_filter = filter_setting;
+#ifndef LICHII_METALFX
+    if (effective_filter == Settings::ScalingFilter::MetalFxSpatial) {
+        effective_filter = Settings::ScalingFilter::Fsr;
+    }
+#endif
+    cache.filter_label = UiText::ChoiceLabel(
+        Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
+        static_cast<u32>(effective_filter));
+
+    const QString metalfx_name =
+        UiText::ChoiceLabel(Settings::EnumMetadata<Settings::FrameGenType>::Index(),
+                            static_cast<u32>(Settings::FrameGenType::MetalFx));
+    const std::string_view scene_sv = probed_scene != nullptr ? probed_scene : "";
+    cache.scene_upscaler_label.clear();
+    if (scene_sv == "DLSS") {
+        cache.scene_upscaler_label = QStringLiteral("DLSS");
+    } else if (scene_sv == "FSR 4") {
+        cache.scene_upscaler_label = QStringLiteral("FSR 4");
+    } else if (scene_sv == "FSR 3.1") {
+        cache.scene_upscaler_label = QStringLiteral("FSR 3.1");
+    } else if (scene_sv.starts_with("Metal")) {
+        cache.scene_upscaler_label = metalfx_name;
+    }
+
+    [[maybe_unused]] const u32 upscaler_enum = Settings::EnumMetadata<Settings::Upscaler>::Index();
+    QString upscaler_label;
+    switch (upscaler_setting) {
+    case Settings::Upscaler::MetalFx:
+#if defined(__APPLE__)
+        if (backend == Settings::RendererBackend::Metal ||
+            backend == Settings::RendererBackend::Vulkan) {
+            upscaler_label = !cache.scene_upscaler_label.isEmpty()
+                                 ? cache.scene_upscaler_label
+                                 : metalfx_name;
+            break;
+        }
+#endif
+        upscaler_label = UiText::Text("overlay.dlss_off")
+                             .arg(UiText::ChoiceLabel(
+                                 upscaler_enum, static_cast<u32>(Settings::Upscaler::MetalFx)));
+        break;
+    case Settings::Upscaler::Game:
+        upscaler_label = UiText::Text("overlay.game_dlss");
+        break;
+    case Settings::Upscaler::Dlss: {
+        const QString dlss_name = QStringLiteral("DLSS");
+#ifdef EGLANTINE_STREAMLINE
+        if (backend == Settings::RendererBackend::Vulkan) {
+            if (key.dlss_active) {
+                upscaler_label = dlss_name;
+                if (!key.mode_name.empty()) {
+                    upscaler_label += QLatin1Char(' ') + QString::fromStdString(key.mode_name);
+                }
+                if (!key.preset_name.empty()) {
+                    upscaler_label += QLatin1Char(' ') + QString::fromStdString(key.preset_name);
+                }
+            } else if (!cache.scene_upscaler_label.isEmpty()) {
+                upscaler_label = cache.scene_upscaler_label;
+            } else {
+                upscaler_label = key.dlss_available
+                                     ? UiText::Text("overlay.dlss_idle").arg(dlss_name)
+                                     : UiText::Text("overlay.dlss_off").arg(dlss_name);
+            }
+            break;
+        }
+#endif
+        upscaler_label = !cache.scene_upscaler_label.isEmpty()
+                             ? cache.scene_upscaler_label
+                             : UiText::Text("overlay.dlss_off").arg(dlss_name);
         break;
     }
-    return UiText::ChoiceLabel(Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
-                               static_cast<u32>(Settings::values.scaling_filter.GetValue()));
+    case Settings::Upscaler::Fsr4: {
+        const QString fsr4_name = QStringLiteral("FSR 4");
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
+        if (backend == Settings::RendererBackend::Vulkan) {
+            if (key.fsr4_active) {
+                upscaler_label = fsr4_name;
+            } else if (!cache.scene_upscaler_label.isEmpty()) {
+                upscaler_label = cache.scene_upscaler_label;
+            } else {
+                upscaler_label = key.fsr4_available
+                                     ? UiText::Text("overlay.dlss_idle").arg(fsr4_name)
+                                     : UiText::Text("overlay.dlss_off").arg(fsr4_name);
+            }
+            break;
+        }
+#endif
+        upscaler_label = !cache.scene_upscaler_label.isEmpty()
+                             ? cache.scene_upscaler_label
+                             : UiText::Text("overlay.dlss_off").arg(fsr4_name);
+        break;
+    }
+    case Settings::Upscaler::Fsr3:
+        upscaler_label = QStringLiteral("FSR 3.1");
+        break;
+    case Settings::Upscaler::Auto:
+        upscaler_label = cache.scene_upscaler_label;
+        break;
+    }
+
+    QString line = UiText::Text("overlay.scale").arg(res_scale, 0, 'g', 2);
+    if (!upscaler_label.isEmpty()) {
+        line += QStringLiteral(" · ") + upscaler_label;
+    }
+    if (!cache.filter_label.isEmpty()) {
+        line += QStringLiteral(" · ") + cache.filter_label;
+    }
+    cache.scale_line = std::move(line);
+    return cache;
 }
 
 } // namespace
@@ -520,9 +638,8 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
     setLine(m_frameGen, UiText::Text("overlay.frame_gen").arg(frame_gen));
 
     const f32 res_scale = Settings::values.resolution_info.up_factor;
-    const QString upscaler = UpscalerLabel();
-    const QString scale = UiText::Text("overlay.scale").arg(res_scale, 0, 'g', 2);
-    setLine(m_scale, upscaler.isEmpty() ? scale : scale + QLatin1Char(' ') + upscaler);
+    const auto& scaling_telemetry = QueryScalingTelemetry(res_scale);
+    setLine(m_scale, scaling_telemetry.scale_line);
 
     const double speed_pct =
         std::isnan(results.emulation_speed) ? 100.0 : results.emulation_speed * 100.0;
@@ -546,11 +663,19 @@ void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
                                    scaling.ScaleUp(static_cast<u32>((extents >> 16) & 0xFFFF)));
     const QString screen_size = size(static_cast<u32>((extents >> 32) & 0xFFFF),
                                      static_cast<u32>((extents >> 48) & 0xFFFF));
-    setLine(m_scene, scene_size.isEmpty() ? QString() : UiText::Text("overlay.scene").arg(scene_size));
+    setLine(m_scene, scene_size.isEmpty()
+                         ? QString()
+                         : (scaling_telemetry.scene_upscaler_label.isEmpty()
+                                ? UiText::Text("overlay.scene").arg(scene_size)
+                                : UiText::Text("overlay.scene")
+                                          .arg(scene_size) +
+                                      QStringLiteral(" · ") +
+                                      scaling_telemetry.scene_upscaler_label));
     setLine(m_game, game_size.isEmpty() ? QString() : UiText::Text("overlay.game").arg(game_size));
     setLine(m_screen, game_size.isEmpty() || screen_size.isEmpty()
                           ? QString()
-                          : UiText::Text("overlay.screen").arg(screen_size));
+                          : UiText::Text("overlay.screen").arg(screen_size) +
+                                QStringLiteral(" · ") + scaling_telemetry.filter_label);
     setLine(m_gpuAccuracy,
             UiText::Text("overlay.gpu_accuracy")
                 .arg(UiText::ChoiceLabel(Settings::EnumMetadata<Settings::GpuAccuracy>::Index(),

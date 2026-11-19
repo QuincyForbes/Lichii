@@ -594,7 +594,8 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         IsFormatSupported(VK_FORMAT_D24_UNORM_S8_UINT,
                           VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT, FormatType::Optimal);
 
-    supports_conditional_barriers = !is_intel_windows;
+    supports_conditional_barriers =
+        !is_intel_windows && driver_id != VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
 
     CollectPhysicalMemoryInfo();
     CollectToolingInfo();
@@ -1450,10 +1451,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
         loaded_extensions.insert(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
     }
 
-    // EDEN_NX2_GPL=1: graphics pipelines linked from per-stage libraries (vk_pipeline_library).
+    // VK_EXT_graphics_pipeline_library: enabled by default on drivers with fast linking unless
+    // EDEN_NX2_GPL=0 disables it.
     graphics_pipeline_library_requested = [] {
         const char* value = std::getenv("EDEN_NX2_GPL");
-        return value && *value && *value != '0';
+        return value == nullptr || (*value != '\0' && *value != '0');
     }();
     if (graphics_pipeline_library_requested &&
         supported_extensions.contains(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
@@ -2027,16 +2029,24 @@ void Device::RemoveUnsuitableExtensions() {
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
                                        VK_EXT_MESH_SHADER_EXTENSION_NAME);
 
-    // VK_EXT_graphics_pipeline_library (EDEN_NX2_GPL): used only with fast linking, which makes
-    // a link cost a fraction of a millisecond.
+    // VK_EXT_graphics_pipeline_library: used when the driver supports fast-linking libraries
+    // cleanly (unless EDEN_NX2_GPL=0 disables it; EDEN_NX2_GPL=1 forces it even without fast-link
+    // preference).
     if (graphics_pipeline_library_requested) {
+        const bool explicit_gpl = [] {
+            const char* value = std::getenv("EDEN_NX2_GPL");
+            return value && *value && *value != '0';
+        }();
         const bool usable =
             graphics_pipeline_library_features.graphicsPipelineLibrary &&
-            properties.graphics_pipeline_library.graphicsPipelineLibraryFastLinking;
+            properties.graphics_pipeline_library.graphicsPipelineLibraryFastLinking &&
+            (explicit_gpl || CanFastLinkGraphicsLibraries());
         if (!usable) {
-            LOG_WARNING(Render_Vulkan,
-                        "Nx2Perf gpl: the device has no graphics pipeline library fast linking, "
-                        "EDEN_NX2_GPL ignored");
+            if (explicit_gpl) {
+                LOG_WARNING(Render_Vulkan,
+                            "Nx2Perf gpl: the device has no graphics pipeline library fast linking, "
+                            "EDEN_NX2_GPL ignored");
+            }
             loaded_extensions.erase(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
             loaded_extensions.erase(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
             graphics_pipeline_library_features.graphicsPipelineLibrary = VK_FALSE;

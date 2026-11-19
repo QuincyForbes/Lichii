@@ -168,18 +168,19 @@ public:
                                const Tegra::Engines::Fermi2D::Config& copy_config) override;
     bool SupportsGameDlssNetwork() const override;
     bool UsesNvidiaDlss() const override;
+    bool UsesCameraMotionUpscale() const override;
     bool CanProbeGameDlssOutput() const override {
         return true;
     }
     std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
-        const Tegra::Engines::Fermi2D::Surface& src,
-        const Tegra::Engines::Fermi2D::Surface& dst) override;
-    bool AccelerateTemporalUpscale(const Tegra::Engines::Fermi2D::Surface& src,
-                                   const Tegra::Engines::Fermi2D::Surface& dst,
-                                   const Tegra::Engines::Fermi2D::Surface& motion_vectors,
-                                   const Tegra::Texture::TICEntry* depth,
-                                   std::array<f32, 2> jitter,
-                                   std::array<f32, 2> motion_scale, bool use_history = true) override;
+        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
+        std::optional<std::array<u32, 2>> src_region = std::nullopt) override;
+    bool AccelerateTemporalUpscale(
+        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
+        const Tegra::Engines::Fermi2D::Surface& motion_vectors,
+        const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
+        std::array<f32, 2> motion_scale, bool use_history = true,
+        std::optional<std::array<u32, 2>> render_region = std::nullopt) override;
     VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     bool AccelerateCameraMotionUpscale(const Tegra::Engines::Fermi2D::Surface& src,
                                        const Tegra::Engines::Fermi2D::Surface& dst) override;
@@ -406,6 +407,8 @@ private:
     std::optional<u64> oot_camera_sample_frame;
     /// Fsr or Native once chosen for the session; Dlss follows the DLSS or MetalFX setting live.
     mutable std::optional<VideoCommon::OcarinaUpscaleBackend> oot_backend;
+    /// The game started at the DLSS Performance render scale (1920x1080).
+    bool oot_performance_scale{};
     struct OcarinaMotionTrace {
         const Tegra::MemoryManager* camera_channel{};
         const Tegra::MemoryManager* depth_channel{};

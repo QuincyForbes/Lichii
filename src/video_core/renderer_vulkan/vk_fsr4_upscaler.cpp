@@ -339,8 +339,15 @@ bool Fsr4Upscaler::Upscale(const Inputs& in) {
     if (failed.load()) {
         return false;
     }
-    const auto render_capacity = in.max_render_size.value_or(in.render_size);
-    const bool dynamic_resolution = in.max_render_size.has_value();
+    const auto requested_capacity = in.max_render_size.value_or(in.render_size);
+    const bool keep_dynamic = context != nullptr && context_dynamic_resolution &&
+                              !in.max_render_size.has_value() &&
+                              requested_capacity.width <= context_render_capacity.width &&
+                              requested_capacity.height <= context_render_capacity.height &&
+                              in.upscale_size.width == upscale_extent.width &&
+                              in.upscale_size.height == upscale_extent.height;
+    const auto render_capacity = keep_dynamic ? context_render_capacity : requested_capacity;
+    const bool dynamic_resolution = in.max_render_size.has_value() || keep_dynamic;
     const bool new_context = context == nullptr ||
                              render_capacity.width != context_render_capacity.width ||
                              render_capacity.height != context_render_capacity.height ||
@@ -354,6 +361,9 @@ bool Fsr4Upscaler::Upscale(const Inputs& in) {
         }
         CreateOutput(in.upscale_size);
     }
+    const bool render_extent_changed = in.render_size.width != last_render_size.width ||
+                                       in.render_size.height != last_render_size.height;
+    last_render_size = in.render_size;
 
     const auto image_extent = [&](const Image& img) {
         return img.extent.width != 0 && img.extent.height != 0 ? img.extent : in.render_size;
@@ -378,17 +388,24 @@ bool Fsr4Upscaler::Upscale(const Inputs& in) {
                                      image_extent(*in.reactive), 0,
                                      FFX_API_RESOURCE_STATE_COMPUTE_READ);
     }
+    if (in.transparency_and_composition) {
+        dispatch.transparencyAndComposition = Resource(
+            in.transparency_and_composition->image, in.transparency_and_composition->format,
+            image_extent(*in.transparency_and_composition), 0,
+            FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    }
     dispatch.output = Resource(*output_image, UPSCALER_OUTPUT_FORMAT, in.upscale_size,
                                FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
     dispatch.jitterOffset = {in.jitter[0], in.jitter[1]};
     dispatch.motionVectorScale = {in.motion_vector_scale[0], in.motion_vector_scale[1]};
     dispatch.renderSize = {in.render_size.width, in.render_size.height};
     dispatch.upscaleSize = {in.upscale_size.width, in.upscale_size.height};
-    dispatch.enableSharpening = in.sharpen;
-    dispatch.sharpness = in.sharpness;
+    const f32 clamped_sharpness = std::clamp(in.sharpness, 0.0f, 1.0f);
+    dispatch.enableSharpening = in.sharpen && clamped_sharpness > 0.0f;
+    dispatch.sharpness = dispatch.enableSharpening ? clamped_sharpness : 0.0f;
     dispatch.frameTimeDelta = in.frame_time_ms;
     dispatch.preExposure = 1.0f;
-    dispatch.reset = in.reset || new_context;
+    dispatch.reset = in.reset || new_context || render_extent_changed || in.frame_time_ms > 250.0f;
     if (profile == Profile::HdrReversedDepth) {
         dispatch.cameraNear = (std::numeric_limits<f32>::max)();
         dispatch.cameraFar = in.camera_near;
@@ -404,7 +421,7 @@ bool Fsr4Upscaler::Upscale(const Inputs& in) {
     scheduler.Record([this, in, dispatch,
                       output = *output_image](vk::CommandBuffer cmdbuf) {
         // The inputs stay in GENERAL otherwise; FSR 4 reads them as sampled images.
-        boost::container::static_vector<VkImageMemoryBarrier, 5> to_read{
+        boost::container::static_vector<VkImageMemoryBarrier, 6> to_read{
             MakeUpscalerInputToReadBarrier(in.color),
             MakeUpscalerInputToReadBarrier(in.depth),
             MakeUpscalerInputToReadBarrier(in.motion_vectors),
@@ -414,6 +431,10 @@ bool Fsr4Upscaler::Upscale(const Inputs& in) {
         };
         if (in.reactive) {
             to_read.push_back(MakeUpscalerInputToReadBarrier(*in.reactive));
+        }
+        if (in.transparency_and_composition &&
+            (!in.reactive || in.transparency_and_composition->image != in.reactive->image)) {
+            to_read.push_back(MakeUpscalerInputToReadBarrier(*in.transparency_and_composition));
         }
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, to_read);
@@ -432,7 +453,7 @@ bool Fsr4Upscaler::Upscale(const Inputs& in) {
             FfxRuntime::NoteEvaluation();
         }
 
-        boost::container::static_vector<VkImageMemoryBarrier, 5> back{
+        boost::container::static_vector<VkImageMemoryBarrier, 6> back{
             MakeUpscalerInputToGeneralBarrier(in.color),
             MakeUpscalerInputToGeneralBarrier(in.depth),
             MakeUpscalerInputToGeneralBarrier(in.motion_vectors),
@@ -442,6 +463,10 @@ bool Fsr4Upscaler::Upscale(const Inputs& in) {
         };
         if (in.reactive) {
             back.push_back(MakeUpscalerInputToGeneralBarrier(*in.reactive));
+        }
+        if (in.transparency_and_composition &&
+            (!in.reactive || in.transparency_and_composition->image != in.reactive->image)) {
+            back.push_back(MakeUpscalerInputToGeneralBarrier(*in.transparency_and_composition));
         }
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, {}, {}, back);

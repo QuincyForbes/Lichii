@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <string>
 
 #include <filesystem>
 #include <QElapsedTimer>
@@ -602,6 +603,20 @@ private:
     u64 last_renderer_generated_frames = 0;
     QElapsedTimer renderer_gen_fps_timer;
     bool nvidia_frame_gen_active = false;
+    std::optional<Settings::ScalingFilter> last_status_scaling_filter;
+    struct UpscalerStatusKey {
+        Settings::RendererBackend backend{};
+        Settings::Upscaler upscaler{};
+        Settings::ScalingFilter filter{};
+        const char* probed_scene{};
+        bool dlss_active{};
+        bool fsr4_active{};
+        std::string mode_name;
+        std::string preset_name;
+        std::string version;
+        bool operator==(const UpscalerStatusKey&) const = default;
+    };
+    std::optional<UpscalerStatusKey> last_upscaler_status_key;
     QLabel* tas_label = nullptr;
     QLabel* firmware_label = nullptr;
     QPushButton* gpu_accuracy_button = nullptr;

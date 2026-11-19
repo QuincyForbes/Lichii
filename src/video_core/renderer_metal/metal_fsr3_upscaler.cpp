@@ -17,14 +17,23 @@
 #include "common/logging.h"
 #include "video_core/fsr.h"
 #include "video_core/host_shaders/fsr3_upscaler_accumulate_comp_spv.h"
+#include "video_core/host_shaders/fsr3_upscaler_accumulate_ldr_comp_spv.h"
 #include "video_core/host_shaders/fsr3_upscaler_accumulate_sharpen_comp_spv.h"
+#include "video_core/host_shaders/fsr3_upscaler_accumulate_sharpen_ldr_comp_spv.h"
 #include "video_core/host_shaders/fsr3_upscaler_luma_instability_comp_spv.h"
+#include "video_core/host_shaders/fsr3_upscaler_luma_instability_ldr_comp_spv.h"
 #include "video_core/host_shaders/fsr3_upscaler_luma_pyramid_nowave_comp_spv.h"
+#include "video_core/host_shaders/fsr3_upscaler_luma_pyramid_nowave_ldr_comp_spv.h"
 #include "video_core/host_shaders/fsr3_upscaler_prepare_inputs_comp_spv.h"
+#include "video_core/host_shaders/fsr3_upscaler_prepare_inputs_ldr_comp_spv.h"
 #include "video_core/host_shaders/fsr3_upscaler_prepare_reactivity_comp_spv.h"
+#include "video_core/host_shaders/fsr3_upscaler_prepare_reactivity_ldr_comp_spv.h"
 #include "video_core/host_shaders/fsr3_upscaler_rcas_comp_spv.h"
+#include "video_core/host_shaders/fsr3_upscaler_rcas_ldr_comp_spv.h"
 #include "video_core/host_shaders/fsr3_upscaler_shading_change_comp_spv.h"
+#include "video_core/host_shaders/fsr3_upscaler_shading_change_ldr_comp_spv.h"
 #include "video_core/host_shaders/fsr3_upscaler_shading_change_pyramid_nowave_comp_spv.h"
+#include "video_core/host_shaders/fsr3_upscaler_shading_change_pyramid_nowave_ldr_comp_spv.h"
 #include "video_core/renderer_metal/metal_formats.h"
 #include "video_core/renderer_metal/metal_fsr3_upscaler.h"
 #include "video_core/renderer_metal/metal_graphics.h"
@@ -121,8 +130,8 @@ std::array<u32, 3> LocalSize(std::span<const u32> words) {
 
 } // Anonymous namespace
 
-Fsr3Upscaler::Fsr3Upscaler(const Device& device_, Scheduler& scheduler_)
-    : device{device_}, scheduler{scheduler_} {}
+Fsr3Upscaler::Fsr3Upscaler(const Device& device_, Scheduler& scheduler_, Profile profile_)
+    : device{device_}, scheduler{scheduler_}, profile{profile_} {}
 
 Fsr3Upscaler::~Fsr3Upscaler() = default;
 
@@ -174,20 +183,45 @@ bool Fsr3Upscaler::Prepare() {
     tsc.mipmap_filter.Assign(Tegra::Texture::TextureMipmapFilter::Linear);
     linear_sampler = CreateSampler(device, tsc);
     // Metal's SPD reduces without quad shuffles (the SDK's "no wave" variants).
+    const bool ldr = profile == Profile::OcarinaLdr;
     failed = !point_sampler || !linear_sampler ||
-             !BuildPass(passes[PassPrepareInputs], FSR3_UPSCALER_PREPARE_INPUTS_COMP_SPV, true) ||
-             !BuildPass(passes[PassLumaPyramid], FSR3_UPSCALER_LUMA_PYRAMID_NOWAVE_COMP_SPV, true) ||
-             !BuildPass(passes[PassShadingChangePyramid],
-                        FSR3_UPSCALER_SHADING_CHANGE_PYRAMID_NOWAVE_COMP_SPV, true) ||
-             !BuildPass(passes[PassShadingChange], FSR3_UPSCALER_SHADING_CHANGE_COMP_SPV, false) ||
-             !BuildPass(passes[PassPrepareReactivity], FSR3_UPSCALER_PREPARE_REACTIVITY_COMP_SPV,
+             !BuildPass(passes[PassPrepareInputs],
+                        ldr ? std::span<const u32>(FSR3_UPSCALER_PREPARE_INPUTS_LDR_COMP_SPV)
+                            : std::span<const u32>(FSR3_UPSCALER_PREPARE_INPUTS_COMP_SPV),
+                        true) ||
+             !BuildPass(passes[PassLumaPyramid],
+                        ldr ? std::span<const u32>(FSR3_UPSCALER_LUMA_PYRAMID_NOWAVE_LDR_COMP_SPV)
+                            : std::span<const u32>(FSR3_UPSCALER_LUMA_PYRAMID_NOWAVE_COMP_SPV),
+                        true) ||
+             !BuildPass(
+                 passes[PassShadingChangePyramid],
+                 ldr ? std::span<const u32>(FSR3_UPSCALER_SHADING_CHANGE_PYRAMID_NOWAVE_LDR_COMP_SPV)
+                     : std::span<const u32>(FSR3_UPSCALER_SHADING_CHANGE_PYRAMID_NOWAVE_COMP_SPV),
+                 true) ||
+             !BuildPass(passes[PassShadingChange],
+                        ldr ? std::span<const u32>(FSR3_UPSCALER_SHADING_CHANGE_LDR_COMP_SPV)
+                            : std::span<const u32>(FSR3_UPSCALER_SHADING_CHANGE_COMP_SPV),
                         false) ||
-             !BuildPass(passes[PassLumaInstability], FSR3_UPSCALER_LUMA_INSTABILITY_COMP_SPV,
+             !BuildPass(passes[PassPrepareReactivity],
+                        ldr ? std::span<const u32>(FSR3_UPSCALER_PREPARE_REACTIVITY_LDR_COMP_SPV)
+                            : std::span<const u32>(FSR3_UPSCALER_PREPARE_REACTIVITY_COMP_SPV),
                         false) ||
-             !BuildPass(passes[PassAccumulate], FSR3_UPSCALER_ACCUMULATE_COMP_SPV, false) ||
-             !BuildPass(passes[PassAccumulateSharpen], FSR3_UPSCALER_ACCUMULATE_SHARPEN_COMP_SPV,
+             !BuildPass(passes[PassLumaInstability],
+                        ldr ? std::span<const u32>(FSR3_UPSCALER_LUMA_INSTABILITY_LDR_COMP_SPV)
+                            : std::span<const u32>(FSR3_UPSCALER_LUMA_INSTABILITY_COMP_SPV),
                         false) ||
-             !BuildPass(passes[PassRcas], FSR3_UPSCALER_RCAS_COMP_SPV, false);
+             !BuildPass(passes[PassAccumulate],
+                        ldr ? std::span<const u32>(FSR3_UPSCALER_ACCUMULATE_LDR_COMP_SPV)
+                            : std::span<const u32>(FSR3_UPSCALER_ACCUMULATE_COMP_SPV),
+                        false) ||
+             !BuildPass(passes[PassAccumulateSharpen],
+                        ldr ? std::span<const u32>(FSR3_UPSCALER_ACCUMULATE_SHARPEN_LDR_COMP_SPV)
+                            : std::span<const u32>(FSR3_UPSCALER_ACCUMULATE_SHARPEN_COMP_SPV),
+                        false) ||
+             !BuildPass(passes[PassRcas],
+                        ldr ? std::span<const u32>(FSR3_UPSCALER_RCAS_LDR_COMP_SPV)
+                            : std::span<const u32>(FSR3_UPSCALER_RCAS_COMP_SPV),
+                        false);
     prepared = !failed;
     return prepared;
 }
@@ -345,6 +379,11 @@ TextureHandle Fsr3Upscaler::Upscale(const Inputs& in) {
         const f32 cot_half_fov = std::cos(0.5f * fov) / std::sin(0.5f * fov);
         constants.device_to_view_depth = {-1.0f * (0.0f + FLT_EPSILON), near_plane,
                                           1.0f / (cot_half_fov / aspect), 1.0f / cot_half_fov};
+        if (profile == Profile::OcarinaLdr) {
+            constexpr f32 far_plane = 25000.0f;
+            constants.device_to_view_depth[0] = far_plane / (far_plane - near_plane);
+            constants.device_to_view_depth[1] = -far_plane * near_plane / (far_plane - near_plane);
+        }
         constants.tan_half_fov = std::tan(std::atan(std::tan(fov * 0.5f) * aspect));
     }
     constants.jitter = in.jitter;
@@ -449,7 +488,8 @@ TextureHandle Fsr3Upscaler::Upscale(const Inputs& in) {
     ClearTexture(spd_atomic, {0, 0, 0, 0});
     ClearTexture(spd_mips, {0, 0, 0, 0});
     // The standard-depth profile clears to 1.0f's bits, the reversed one to 0.
-    ClearTexture(previous_nearest_depth, {0, 0, 0, 0});
+    const f64 depth_clear = profile == Profile::OcarinaLdr ? static_cast<f64>(0x3f800000U) : 0.0;
+    ClearTexture(previous_nearest_depth, {depth_clear, 0, 0, 0});
 
     const auto tex = [](const Texture& texture) { return Resource{.texture = texture.Handle()}; };
     const auto mip = [&](u32 level) {
@@ -471,7 +511,11 @@ TextureHandle Fsr3Upscaler::Upscale(const Inputs& in) {
     }
     const Resource depth{.texture = depth_color.Handle()};
     const Resource motion{.texture = in.motion};
-    const Resource exposure = tex(frame_info);
+    const Resource exposure = tex(profile == Profile::OcarinaLdr ? unit_exposure : frame_info);
+    const Resource reactive =
+        in.reactive != nullptr ? Resource{.texture = in.reactive} : tex(default_reactive);
+    const Resource transparency =
+        in.transparency != nullptr ? Resource{.texture = in.transparency} : tex(default_reactive);
     const Resource current_luma = tex(luma[p]);
     const auto groups = [](s32 size, u32 tile) {
         return Common::DivCeil(static_cast<u32>(size), tile);
@@ -495,7 +539,7 @@ TextureHandle Fsr3Upscaler::Upscale(const Inputs& in) {
              groups(rw / 2, 8), groups(rh / 2, 8));
     Dispatch(passes[PassPrepareReactivity],
              std::array{tex(previous_nearest_depth), tex(dilated_motion_vectors),
-                        tex(dilated_depth), tex(default_reactive), tex(default_reactive),
+                        tex(dilated_depth), reactive, transparency,
                         tex(accumulation[p]), tex(shading_change), current_luma, exposure,
                         tex(dilated_reactive_masks), tex(new_locks), tex(accumulation[q]), cb_fsr},
              groups(rw, 8), groups(rh, 8));

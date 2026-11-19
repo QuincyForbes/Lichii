@@ -83,6 +83,7 @@ void BlitScreen::SetWindowAdaptPass(const Device& device) {
     case Settings::ScalingFilter::Fsr3:
     case Settings::ScalingFilter::Sgsr:
     case Settings::ScalingFilter::SgsrEdge:
+    case Settings::ScalingFilter::MetalFxSpatial:
     case Settings::ScalingFilter::Bilinear:
     default:
         window_adapt = MakeBilinear(device, swapchain_view_format);
@@ -150,12 +151,19 @@ void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer,
         .width = layout.screen.GetWidth(),
         .height = layout.screen.GetHeight(),
     };
+    const bool window_size_changed =
+        window_size.width != last_window_size.width || window_size.height != last_window_size.height;
 
-    if (layers.size() != framebuffers.size()) {
+    if (layers.size() != framebuffers.size() || window_size_changed) {
+        if (!layers.empty() && !resource_update_required) {
+            WaitIdle(device);
+        }
+        last_window_size = window_size;
         layers.clear();
         for (size_t i = 0; i < framebuffers.size(); ++i) {
             layers.emplace_back(device, memory_allocator, scheduler, device_memory, image_count,
-                                window_size, window_adapt->GetDescriptorSetLayout(), filters);
+                                window_size, window_adapt->GetDescriptorSetLayout(), filters,
+                                &present_manager);
         }
     }
 

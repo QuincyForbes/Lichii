@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -27,15 +28,34 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "core/file_sys/common_funcs.h"
+#include "core/file_sys/content_archive.h"
 #include "core/file_sys/nup_container.h"
+#include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/loader/loader.h"
 #include "video_core/pipeline_cache_files.h"
+#include "video_core/shader_warm/emission_stamp.h"
 #include "video_core/shader_warm/shader_archives.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "video_core/shader_warm/warm_records.h"
+
+#if defined(__APPLE__) && defined(LICHII_METAL_RENDERER)
+namespace Metal {
+struct OfflineWarmSummary {
+    bool ok{};
+    size_t built{};
+    size_t skipped{};
+    size_t failed{};
+    std::string error;
+};
+OfflineWarmSummary CompileWarmShadersOffline(
+    u64 title_id, std::stop_token stop,
+    const std::function<void(size_t done, size_t total, std::string_view stage)>& on_progress = {});
+} // namespace Metal
+#endif
 
 namespace VideoCommon::ShaderWarm {
 namespace {
@@ -48,14 +68,24 @@ constexpr std::string_view StageConverting = "Converting";
 constexpr std::string_view StageWriting = "Writing";
 /// Share of the progress bar for reading and extracting the archives; conversions run alongside
 /// and only their tail after the last archive shows in the rest.
-constexpr double ExtractionShare = 0.95;
-/// Conversions in flight (each holds a copy of its program).
-constexpr size_t MaxPendingJobs = 2048;
+constexpr double ExtractionShare = 0.90;
+/// Queued unique conversions in flight (bounded so peak RAM stays modest).
+constexpr size_t MaxQueuedJobs = 4096;
 constexpr u32 PrecachedPipelinesMagic = 0x31504750; // "PGP1"
 
 fs::path TitleDir(u64 title_id) {
     return Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
            fmt::format("{:016x}", title_id);
+}
+
+constexpr u64 Switch1CounterpartBase(u64 base_id) noexcept {
+    constexpr u64 platform_mask = 0xFF00000000000000ULL;
+    constexpr u64 switch2_platform = 0x0400000000000000ULL;
+    constexpr u64 switch1_platform = 0x0100000000000000ULL;
+    if ((base_id & platform_mask) != switch2_platform) {
+        return base_id;
+    }
+    return (base_id & ~platform_mask) | switch1_platform;
 }
 
 struct ArchiveFile {
@@ -74,9 +104,8 @@ void ListFiles(const FileSys::VirtualDir& dir, const std::string& prefix,
     }
 }
 
-/// The game's RomFS trees in the order the offline pipeline read them: a .nup gives its base
-/// and newest update package (both are read, like the exported packages 0 and 1); other
-/// formats give the loader's RomFS.
+/// The game's RomFS trees: a .nup gives its base, newest update and newest add-on (DLC) packages;
+/// other formats give the loader's RomFS plus any installed AOC RomFS for the title.
 struct GameFiles {
     std::unique_ptr<FileSys::NupContainer> nup;
     std::unique_ptr<Loader::AppLoader> loader;
@@ -85,8 +114,9 @@ struct GameFiles {
 
 /// Opens the game file and collects its RomFS trees into `game`. Returns the error text when the
 /// file cannot be opened or has no RomFS.
-std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_path,
+std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_path, u64 title_id,
                                     GameFiles& game, std::stop_token stop) {
+    const bool has_system_provider = system.GetFilesystem() != nullptr;
     FileSys::VirtualFilesystem filesystem = system.GetFilesystem();
     if (filesystem == nullptr) {
         filesystem = std::make_shared<FileSys::RealVfsFilesystem>();
@@ -96,8 +126,11 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
     if (file == nullptr) {
         return "Cannot open the game file";
     }
+    const u64 own_base = FileSys::GetBaseTitleID(title_id);
+    const u64 s1_base = Switch1CounterpartBase(own_base);
+    std::unordered_set<u64> loaded_aoc_ids;
     if (FileSys::NupContainer::IsNupFile(file)) {
-        // Small memory cache: every member is read once.
+        // Every member is read once across producer threads.
         game.nup = std::make_unique<FileSys::NupContainer>(file, 128 * 1024 * 1024);
         if (game.nup->GetStatus() != Loader::ResultStatus::Success) {
             return "The game file is not a valid package";
@@ -109,7 +142,28 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
         if (const auto update = game.nup->FindBestUpdatePackage()) {
             packages.push_back(*update);
         }
+        const auto& all_packages = game.nup->GetPackages();
+        std::map<u64, size_t> newest_addons;
+        for (size_t i = 0; i < all_packages.size(); ++i) {
+            const auto& pkg = all_packages[i];
+            if (pkg.kind != FileSys::NupContainer::PackageKind::Addon) {
+                continue;
+            }
+            const u64 pkg_base = FileSys::GetBaseTitleID(pkg.title_id);
+            if (title_id != 0 && pkg_base != own_base && pkg_base != s1_base) {
+                continue;
+            }
+            const auto [it, inserted] = newest_addons.try_emplace(pkg.title_id, i);
+            if (!inserted && pkg.version > all_packages[it->second].version) {
+                it->second = i;
+            }
+        }
+        for (const auto& [addon_id, pkg_index] : newest_addons) {
+            packages.push_back(pkg_index);
+            loaded_aoc_ids.insert(addon_id);
+        }
         std::sort(packages.begin(), packages.end());
+        packages.erase(std::unique(packages.begin(), packages.end()), packages.end());
         for (const size_t package : packages) {
             if (stop.stop_requested()) {
                 return "Stopped";
@@ -134,172 +188,254 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
             game.romfs.push_back(std::move(dir));
         }
     }
+    if (has_system_provider && title_id != 0) {
+        const auto& provider = system.GetContentProvider();
+        auto aoc_entries =
+            provider.ListEntriesFilter(FileSys::TitleType::AOC, FileSys::ContentRecordType::Data);
+        std::sort(aoc_entries.begin(), aoc_entries.end(),
+                  [](const auto& a, const auto& b) { return a.title_id < b.title_id; });
+        for (const auto& entry : aoc_entries) {
+            if (stop.stop_requested()) {
+                return "Stopped";
+            }
+            if (loaded_aoc_ids.contains(entry.title_id)) {
+                continue;
+            }
+            const u64 entry_base = FileSys::GetBaseTitleID(entry.title_id);
+            if (entry_base != own_base && entry_base != s1_base) {
+                continue;
+            }
+            const auto nca = provider.GetEntry(entry.title_id, FileSys::ContentRecordType::Data);
+            if (!nca || nca->GetStatus() != Loader::ResultStatus::Success) {
+                continue;
+            }
+            if (const auto aoc_romfs = nca->GetRomFS()) {
+                if (auto dir = FileSys::ExtractRomFS(aoc_romfs)) {
+                    game.romfs.push_back(std::move(dir));
+                    loaded_aoc_ids.insert(entry.title_id);
+                }
+            }
+        }
+    }
     if (game.romfs.empty()) {
         return "The game has no RomFS";
     }
     return std::nullopt;
 }
 
-struct PairHash {
-    u128 a{};
-    u128 b{};
-    bool operator==(const PairHash&) const = default;
-};
-struct PairHasher {
-    size_t operator()(const PairHash& h) const noexcept {
-        return static_cast<size_t>(h.a[0] ^ (h.b[0] * 0x9E3779B97F4A7C15ULL));
-    }
-};
-struct U128Hasher {
-    size_t operator()(const u128& h) const noexcept {
-        return static_cast<size_t>(h[0]);
-    }
-};
-
 u128 Hash128(std::span<const u8> bytes) {
     return Common::CityHash128(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 }
 
-/// One unique vertex or fragment program (make_graphics_warm.py: first manifest program per
-/// code hash, with the origins of that program's code + control identity).
-struct GraphicsProgram {
-    u32 stage{};
-    u128 control{};
-    std::vector<u32> archives;
-    bool built{};
-    u64 hash{};
-};
+u128 HashGraphicsIdentity(u32 stage, bool maxwell, std::span<const u8> prefix) {
+    std::array<u8, 88> head{};
+    head[0] = static_cast<u8>(stage);
+    head[1] = maxwell ? 1 : 0;
+    if (maxwell) {
+        std::memcpy(head.data() + 8, prefix.data() + 0x30, 80);
+        const u128 seed = Hash128(head);
+        const auto body = prefix.subspan(0x80);
+        return Common::CityHash128WithSeed(reinterpret_cast<const char*>(body.data()), body.size(),
+                                           seed);
+    }
+    std::memcpy(head.data() + 8, prefix.data(), 80);
+    const u128 seed = Hash128(head);
+    const auto body = prefix.subspan(128);
+    return Common::CityHash128WithSeed(reinterpret_cast<const char*>(body.data()), body.size(),
+                                       seed);
+}
 
-struct Job {
-    size_t seq{};
-    bool graphics{};
-    u32 stage{};
-    size_t graphics_index{};
-    std::vector<u8> program;
+using Origin = std::pair<u32, u32>; ///< (archive_index, intra_archive_record_index)
+
+struct ComputeDedupKey {
+    bool maxwell{};
+    u128 code_hash{};
     ComputeControl control{};
+    bool operator==(const ComputeDedupKey&) const = default;
 };
 
-struct JobResult {
-    bool ok{};
-    std::vector<u8> bytes; ///< Compute: full entry. Graphics: env record.
-    ComputeKey compute_key{};
-    u64 hash{};
+struct ComputeDedupHasher {
+    size_t operator()(const ComputeDedupKey& k) const noexcept {
+        u64 h = k.code_hash[0] ^ (k.code_hash[1] * 0x9E3779B97F4A7C15ULL);
+        h ^= (u64{k.control.workgroup[0]} << 32) | k.control.workgroup[1];
+        h ^= (u64{k.control.workgroup[2]} << 32) | k.control.shared_memory;
+        h ^= u64{k.control.local_memory} * 0xBF58476D1CE4E5B9ULL;
+        if (k.maxwell) {
+            h ^= 0x94D049BB133111EBULL;
+        }
+        return static_cast<size_t>(h);
+    }
 };
 
-class Converter {
+struct U128Hasher {
+    size_t operator()(const u128& h) const noexcept {
+        return static_cast<size_t>(h[0] ^ (h[1] * 0x9E3779B97F4A7C15ULL));
+    }
+};
+
+struct GraphicsRawEntry {
+    u32 stage{};
+    bool maxwell{};
+    Origin best_origin{~0U, ~0U};
+    std::array<u8, 80> sph{};
+    std::vector<u8> best_bank1;
+    std::vector<u32> archive_ids;
+    LoweredCode lowered;
+    bool lowered_ok{};
+};
+
+struct LowerJob {
+    bool graphics{};
+    bool maxwell{};
+    size_t graphics_index{};
+    ComputeDedupKey compute_id{};
+    std::vector<u8> program;
+};
+
+struct FinishedCompute {
+    ComputeKey key{};
+    ComputeDedupKey id{};
+    std::vector<u8> bytes;
+};
+
+struct FinishedGraphics {
+    size_t index{};
+    LoweredCode lowered;
+};
+
+/// Multi-core lowering pool that executes unique shader jobs and collects completed results
+/// out-of-order into per-worker vectors with zero output lock contention.
+class LowerPool {
 public:
-    /// Starts `threads` workers that convert pushed jobs until `stop` is requested.
-    Converter(size_t threads, std::stop_token stop_) : stop{std::move(stop_)} {
-        for (size_t i = 0; i < threads; ++i) {
-            workers.emplace_back([this] { Work(); });
+    LowerPool(size_t thread_count, std::stop_token stop_, std::atomic<size_t>& completed_,
+              std::atomic<size_t>& skipped_)
+        : stop{std::move(stop_)}, completed{completed_}, skipped{skipped_},
+          worker_compute(thread_count), worker_graphics(thread_count) {
+        workers.reserve(thread_count);
+        for (size_t i = 0; i < thread_count; ++i) {
+            workers.emplace_back([this, i] { Work(i); });
         }
     }
 
-    /// Lets the workers finish the queued jobs, then joins them.
-    ~Converter() {
+    ~LowerPool() {
+        CloseAndJoin();
+    }
+
+    void Push(LowerJob job) {
+        {
+            std::unique_lock lock{mutex};
+            not_full_cv.wait(lock, [this] {
+                return closing || stop.stop_requested() || jobs.size() < MaxQueuedJobs;
+            });
+            if (closing || stop.stop_requested()) {
+                return;
+            }
+            jobs.push_back(std::move(job));
+        }
+        not_empty_cv.notify_one();
+    }
+
+    void CloseAndJoin() {
         {
             std::scoped_lock lock{mutex};
+            if (joined) {
+                return;
+            }
             closing = true;
         }
-        jobs_cv.notify_all();
+        not_empty_cv.notify_all();
+        not_full_cv.notify_all();
         for (auto& worker : workers) {
-            worker.join();
-        }
-    }
-
-    void Push(Job job) {
-        {
-            std::scoped_lock lock{mutex};
-            jobs.push_back(std::move(job));
-            ++pushed;
-        }
-        jobs_cv.notify_one();
-    }
-
-    /// Next result in submission order; waits when `wait` is set, else empty when not ready.
-    std::optional<JobResult> Next(bool wait) {
-        std::unique_lock lock{mutex};
-        for (;;) {
-            const auto it = results.find(next);
-            if (it != results.end()) {
-                JobResult result = std::move(it->second);
-                results.erase(it);
-                ++next;
-                return result;
+            if (worker.joinable()) {
+                worker.join();
             }
-            if (!wait || next == pushed || stop.stop_requested()) {
-                return std::nullopt;
-            }
-            results_cv.wait_for(lock, std::chrono::milliseconds{100});
         }
-    }
-
-    size_t Pending() {
         std::scoped_lock lock{mutex};
-        return pushed - next;
+        joined = true;
+    }
+
+    std::vector<FinishedCompute> TakeCompute() {
+        std::vector<FinishedCompute> merged;
+        size_t total = 0;
+        for (const auto& v : worker_compute) {
+            total += v.size();
+        }
+        merged.reserve(total);
+        for (auto& v : worker_compute) {
+            for (auto& item : v) {
+                merged.push_back(std::move(item));
+            }
+            v.clear();
+        }
+        return merged;
+    }
+
+    void ApplyGraphics(std::deque<GraphicsRawEntry>& entries) {
+        for (auto& v : worker_graphics) {
+            for (auto& item : v) {
+                auto& target = entries[item.index];
+                target.lowered = std::move(item.lowered);
+                target.lowered_ok = true;
+            }
+            v.clear();
+        }
     }
 
 private:
-    /// Worker loop: takes jobs in order, converts each one (skipped once stopping) and files the
-    /// result under its sequence number. Returns once closing with no job left.
-    void Work() {
+    void Work(size_t worker_id) {
         Common::SetCurrentThreadName("ShaderWarmBuild");
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        auto& out_compute = worker_compute[worker_id];
+        auto& out_graphics = worker_graphics[worker_id];
         for (;;) {
-            Job job;
+            LowerJob job;
             {
                 std::unique_lock lock{mutex};
-                jobs_cv.wait(lock, [this] { return closing || !jobs.empty(); });
-                if (jobs.empty()) {
+                not_empty_cv.wait(
+                    lock, [this] { return closing || stop.stop_requested() || !jobs.empty(); });
+                if (stop.stop_requested() || jobs.empty()) {
                     return;
                 }
                 job = std::move(jobs.front());
                 jobs.pop_front();
             }
-            JobResult result;
-            if (!stop.stop_requested()) {
-                result = Convert(job);
-            }
-            {
-                std::scoped_lock lock{mutex};
-                results.emplace(job.seq, std::move(result));
-            }
-            results_cv.notify_all();
-        }
-    }
+            not_full_cv.notify_one();
 
-    /// Lowers one program and makes its compute entry or its graphics environment record. The
-    /// result is not ok when lowering or conversion failed.
-    static JobResult Convert(const Job& job) {
-        JobResult result;
-        try {
-            LoweredCode lowered;
-            if (const auto error = LowerProgram(job.program, job.graphics, lowered)) {
-                LOG_DEBUG(Render_Vulkan, "Shader precache: program not converted: {}", *error);
-                return result;
+            try {
+                LoweredCode lowered;
+                const auto error = job.maxwell
+                                       ? PrepareMaxwellProgram(job.program, job.graphics, lowered)
+                                       : LowerProgram(job.program, job.graphics, lowered);
+                if (error) {
+                    LOG_DEBUG(Render_Vulkan, "Shader precache: program not converted: {}", *error);
+                    skipped.fetch_add(1, std::memory_order_relaxed);
+                } else if (job.graphics) {
+                    out_graphics.push_back({job.graphics_index, std::move(lowered)});
+                } else {
+                    FinishedCompute item;
+                    item.id = job.compute_id;
+                    item.bytes = ComputeEntry(lowered, job.compute_id.control, item.key);
+                    out_compute.push_back(std::move(item));
+                }
+            } catch (const std::exception& e) {
+                LOG_DEBUG(Render_Vulkan, "Shader precache: conversion failed: {}", e.what());
+                skipped.fetch_add(1, std::memory_order_relaxed);
             }
-            if (job.graphics) {
-                result.hash = StageHash(lowered.code);
-                result.bytes = GraphicsEnv(job.stage, lowered, job.program);
-            } else {
-                result.bytes = ComputeEntry(lowered, job.control, result.compute_key);
-            }
-            result.ok = true;
-        } catch (const std::exception& e) {
-            LOG_DEBUG(Render_Vulkan, "Shader precache: conversion failed: {}", e.what());
+            completed.fetch_add(1, std::memory_order_relaxed);
         }
-        return result;
     }
 
     std::stop_token stop;
+    std::atomic<size_t>& completed;
+    std::atomic<size_t>& skipped;
     std::mutex mutex;
-    std::condition_variable jobs_cv;
-    std::condition_variable results_cv;
-    std::deque<Job> jobs;
-    std::map<size_t, JobResult> results;
-    size_t pushed{};
-    size_t next{};
+    std::condition_variable not_empty_cv;
+    std::condition_variable not_full_cv;
+    std::deque<LowerJob> jobs;
     bool closing{};
+    bool joined{};
+    std::vector<std::vector<FinishedCompute>> worker_compute;
+    std::vector<std::vector<FinishedGraphics>> worker_graphics;
     std::vector<std::thread> workers;
 };
 
@@ -328,6 +464,20 @@ void WriteWarmCount(const fs::path& warm_file, u64 entries) {
     out << entries << ' ' << size << ' ' << WarmBuilderVersion << '\n';
 }
 
+bool EndsWithIgnoreCase(std::string_view text, std::string_view suffix) {
+    if (text.size() < suffix.size()) {
+        return false;
+    }
+    const auto tail = text.substr(text.size() - suffix.size());
+    for (size_t i = 0; i < suffix.size(); ++i) {
+        const char a = tail[i] >= 'A' && tail[i] <= 'Z' ? static_cast<char>(tail[i] + 32) : tail[i];
+        if (a != suffix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // Anonymous namespace
 
 fs::path ComputeWarmPath(u64 title_id) {
@@ -340,7 +490,11 @@ fs::path GraphicsWarmPath(u64 title_id) {
 
 bool GraphicsPrecacheRequested() {
     const char* value = std::getenv("EDEN_NX2_GRAPHICS_PRECACHE");
-    return value && *value && *value != '0';
+    if (value && *value) {
+        const std::string_view sv{value};
+        return sv != "0" && sv != "false" && sv != "FALSE" && sv != "off" && sv != "OFF";
+    }
+    return true;
 }
 
 fs::path WarmMarkerPath(const fs::path& warm_file) {
@@ -367,27 +521,54 @@ u64 ReadWarmCount(const fs::path& warm_file) {
     return !ec && actual == size ? entries : 0;
 }
 
+u64 EmissionStamp() {
+    return GeneratedEmissionStamp;
+}
+
 std::optional<WarmStamp> CurrentWarmStamp(const fs::path& warm_file, u64 entries, u32 driver,
-                                          u32 device_id, u32 cache_version) {
+                                          u32 device_id, u32 cache_version, u64 variant) {
     std::error_code ec;
     const auto size = fs::file_size(warm_file, ec);
     if (ec) {
         return std::nullopt;
     }
-    const auto time = fs::last_write_time(warm_file, ec);
-    if (ec) {
+    std::ifstream in(warm_file, std::ios::binary);
+    if (!in) {
         return std::nullopt;
     }
-    return WarmStamp{size,      static_cast<s64>(time.time_since_epoch().count()),
-                     entries,   driver,
-                     device_id, cache_version};
+    std::vector<char> chunk(8U << 20);
+    u64 hash = size;
+    u64 read_total = 0;
+    while (in) {
+        in.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+        const auto got = static_cast<size_t>(in.gcount());
+        if (got == 0) {
+            break;
+        }
+        hash = Common::CityHash64WithSeed(chunk.data(), got, hash);
+        read_total += got;
+    }
+    if (read_total != size) {
+        return std::nullopt;
+    }
+    return WarmStamp{.size = size,
+                     .content_hash = hash,
+                     .entries = entries,
+                     .driver = driver,
+                     .device_id = device_id,
+                     .cache_version = cache_version,
+                     .variant = variant};
 }
 
 std::optional<WarmStamp> ReadWarmMarker(const fs::path& warm_file) {
     std::ifstream in(WarmMarkerPath(warm_file));
     WarmStamp stamp;
-    if (!(in >> stamp.size >> stamp.write_time >> stamp.entries >> stamp.driver >>
-          stamp.device_id >> stamp.cache_version)) {
+    // A marker of the older format (last-write time, no variant) fails here: the programs not in
+    // the cache are built once more.
+    std::string format;
+    if (!(in >> format) || format != "v2" ||
+        !(in >> stamp.size >> stamp.content_hash >> stamp.entries >> stamp.driver >>
+          stamp.device_id >> stamp.cache_version >> stamp.variant)) {
         return std::nullopt;
     }
     return stamp;
@@ -395,10 +576,23 @@ std::optional<WarmStamp> ReadWarmMarker(const fs::path& warm_file) {
 
 bool WriteWarmMarker(const fs::path& warm_file, const WarmStamp& stamp) {
     std::ofstream out(WarmMarkerPath(warm_file), std::ios::trunc);
-    out << stamp.size << ' ' << stamp.write_time << ' ' << stamp.entries << ' ' << stamp.driver
-        << ' ' << stamp.device_id << ' ' << stamp.cache_version << '\n';
+    out << "v2 " << stamp.size << ' ' << stamp.content_hash << ' ' << stamp.entries << ' '
+        << stamp.driver << ' ' << stamp.device_id << ' ' << stamp.cache_version << ' '
+        << stamp.variant << '\n';
     out.close();
     return static_cast<bool>(out);
+}
+
+void DropStaleWarmMarker(const fs::path& warm_file, const fs::path& new_file) {
+    if (const auto marker = ReadWarmMarker(warm_file)) {
+        const auto incoming = CurrentWarmStamp(new_file, 0, 0, 0, 0);
+        if (incoming && incoming->size == marker->size &&
+            incoming->content_hash == marker->content_hash) {
+            return;
+        }
+    }
+    std::error_code ignored;
+    fs::remove(WarmMarkerPath(warm_file), ignored);
 }
 
 bool WarmPending(u64 title_id) {
@@ -444,7 +638,10 @@ bool RefreshWarmFiles(Core::System& system, u64 title_id, std::stop_token stop) 
         Settings::values.precache_shaders.GetValue() != Settings::PrecacheShaders::Always) {
         return false;
     }
-    const auto reason = WarmFilesStale(ComputeWarmPath(title_id));
+    auto reason = WarmFilesStale(ComputeWarmPath(title_id));
+    if (!reason && GraphicsPrecacheRequested()) {
+        reason = WarmFilesStale(GraphicsWarmPath(title_id));
+    }
     if (!reason) {
         return false;
     }
@@ -552,16 +749,25 @@ bool WritePrecachedPipelines(const fs::path& file, const DriverStamp& stamp,
 }
 
 bool DeleteWarmFiles(u64 title_id, std::string* error) {
+    const auto dir = TitleDir(title_id);
     const auto warm = ComputeWarmPath(title_id);
     fs::path tmp = warm;
     tmp += ".tmp";
     const auto graphics = GraphicsWarmPath(title_id);
     fs::path graphics_tmp = graphics;
     graphics_tmp += ".tmp";
+    const auto slow = dir / "precache-slow.bin";
+    const auto metal_stages = dir / "metal_stages.v1.bin";
+    fs::path metal_stages_tmp = metal_stages;
+    metal_stages_tmp += ".tmp";
+    const auto metal_pipelines = dir / "metal_pipelines.bin";
+    fs::path metal_pipelines_tmp = metal_pipelines;
+    metal_pipelines_tmp += ".tmp";
     bool ok = true;
     for (const auto& path :
          {warm, WarmMarkerPath(warm), WarmCountPath(warm), tmp, graphics, WarmMarkerPath(graphics),
-          WarmCountPath(graphics), graphics_tmp, PrecachedPipelinesPath(title_id)}) {
+          WarmCountPath(graphics), graphics_tmp, PrecachedPipelinesPath(title_id), slow,
+          metal_stages, metal_stages_tmp, metal_pipelines, metal_pipelines_tmp}) {
         std::error_code ec;
         fs::remove(path, ec);
         if (ec) {
@@ -572,6 +778,41 @@ bool DeleteWarmFiles(u64 title_id, std::string* error) {
         }
     }
     return ok;
+}
+
+GpuWarmSummary CompileWarmShadersOffline(u64 title_id, std::stop_token stop,
+                                         const std::function<void(const Progress&)>& on_progress) {
+#if defined(__APPLE__) && defined(LICHII_METAL_RENDERER)
+    if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Metal) {
+        std::function<void(size_t, size_t, std::string_view)> metal_progress;
+        if (on_progress) {
+            metal_progress = [&on_progress](size_t done, size_t total, std::string_view stage) {
+                on_progress(Progress{
+                    .stage = std::string{stage},
+                    .done = done,
+                    .total = total,
+                    .fraction =
+                        total != 0 ? static_cast<double>(done) / static_cast<double>(total) : 0.0,
+                });
+            };
+        }
+        const auto summary =
+            ::Metal::CompileWarmShadersOffline(title_id, std::move(stop), metal_progress);
+        return GpuWarmSummary{
+            .supported = true,
+            .ok = summary.ok,
+            .built = summary.built,
+            .skipped = summary.skipped,
+            .failed = summary.failed,
+            .error = summary.error,
+        };
+    }
+#else
+    static_cast<void>(title_id);
+    static_cast<void>(stop);
+    static_cast<void>(on_progress);
+#endif
+    return GpuWarmSummary{.supported = false};
 }
 
 Result BuildWarmFiles(Core::System& system, const fs::path& game_path, u64 title_id,
@@ -587,38 +828,41 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
                           std::stop_token stop) {
     Result result;
     u64 total_bytes = 0;
-    u64 bytes_done = 0;
-    size_t seq = 0;
-    size_t consumed = 0;
+    std::atomic<u64> bytes_done{0};
+    std::atomic<size_t> jobs_pushed{0};
+    std::atomic<size_t> jobs_completed{0};
+    std::atomic<size_t> skipped_count{0};
     double reported_fraction = 0.0;
     auto last_report = std::chrono::steady_clock::time_point{};
-    const auto report = [&](std::string_view stage, size_t done, size_t total) {
+    const auto report = [&](std::string_view stage, size_t done, size_t total, bool force = false) {
         if (!progress) {
             return;
         }
         const auto now = std::chrono::steady_clock::now();
-        const bool last = total != 0 && done == total;
+        const bool last = force || (total != 0 && done == total);
         if (!last && now - last_report < std::chrono::milliseconds{50}) {
             return;
         }
         last_report = now;
+        const u64 b_done = bytes_done.load(std::memory_order_relaxed);
+        const size_t pushed = jobs_pushed.load(std::memory_order_relaxed);
+        const size_t completed = jobs_completed.load(std::memory_order_relaxed);
         const double extracted =
-            total_bytes != 0 ? static_cast<double>(bytes_done) / static_cast<double>(total_bytes)
-                             : 0.0;
+            total_bytes != 0 ? static_cast<double>(b_done) / static_cast<double>(total_bytes) : 0.0;
         double fraction = ExtractionShare * extracted;
         if (stage == StageConverting) {
             fraction = ExtractionShare + (1.0 - ExtractionShare) *
-                                             (seq != 0 ? static_cast<double>(consumed) /
-                                                             static_cast<double>(seq)
-                                                       : 1.0);
+                                             (pushed != 0 ? static_cast<double>(completed) /
+                                                                static_cast<double>(pushed)
+                                                          : 1.0);
         } else if (stage == StageWriting) {
-            fraction = last ? 1.0 : reported_fraction;
+            fraction = (total != 0 && done == total) ? 1.0 : std::max(reported_fraction, 0.98);
         }
         reported_fraction = std::max(reported_fraction, std::min(fraction, 1.0));
-        progress(Progress{std::string(stage), done, total, reported_fraction, seq});
+        progress(Progress{std::string(stage), done, total, reported_fraction, pushed});
     };
     const auto begin = std::chrono::steady_clock::now();
-    report(StageReading, 0, 0);
+    report(StageReading, 0, 0, true);
 
     const fs::path output_dir = options.output_dir.empty() ? TitleDir(title_id) : options.output_dir;
     std::error_code ec;
@@ -651,9 +895,6 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     if (options.runtime_caches) {
         caches = *options.runtime_caches;
     } else if (build_graphics) {
-        // The play history the guesses come from: this fork's cache (vulkan-frizti), else the
-        // shared name of this version, else the newest cache of a version with the same record
-        // layout (zortos293/Lichii builds).
         std::vector<fs::path> candidates{
             VideoCommon::VersionedPipelineCachePath(TitleDir(title_id), "vulkan-frizti",
                                                     VideoCommon::VulkanPipelineCacheVersion),
@@ -684,15 +925,15 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     }
 
     GameFiles game;
-    if (const auto error = OpenGame(system, game_path, game, stop)) {
+    if (const auto error = OpenGame(system, game_path, title_id, game, stop)) {
         return fail(*error);
     }
     if (stop.stop_requested()) {
         return fail("Stopped");
     }
 
-    // Archive list, in the offline pipeline's order: every shader archive of each package, then
-    // each package's effects, sorted by path inside a package (see ClassifyGameFile).
+    // Archive list: every shader archive of each package, then each package's effects, sorted by
+    // path inside a package (see ClassifyGameFile).
     std::vector<ArchiveFile> archives;
     std::vector<ArchiveFile> effects;
     ZstdDictionaries dictionaries;
@@ -721,242 +962,343 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         effects.insert(effects.end(), package_effects.begin(), package_effects.end());
     }
     archives.insert(archives.end(), effects.begin(), effects.end());
+    effects.clear();
     if (dictionary_pack) {
         try {
             dictionaries.Load(dictionary_pack->ReadAllBytes());
         } catch (const ArchiveError& e) {
             LOG_WARNING(Render_Vulkan, "Shader precache: zstd dictionary pack: {}", e.what());
         }
+        dictionary_pack = nullptr;
     }
-    // Without archives the file is written empty: the precache then has only the pipeline cache
-    // of earlier sessions to build.
+
     result.archives = archives.size();
-    for (const auto& archive : archives) {
-        total_bytes += archive.file->GetSize();
+    std::vector<u32> archive_id_by_index(archives.size());
+    {
+        std::unordered_map<std::string, u32> path_to_id;
+        path_to_id.reserve(archives.size());
+        for (size_t i = 0; i < archives.size(); ++i) {
+            total_bytes += archives[i].file->GetSize();
+            const auto [it, _] =
+                path_to_id.try_emplace(archives[i].path, static_cast<u32>(path_to_id.size()));
+            archive_id_by_index[i] = it->second;
+        }
     }
     if (stop.stop_requested()) {
         return fail("Stopped");
     }
-    LOG_INFO(Render_Vulkan, "Shader precache build: {} archives, {} zstd dictionaries",
-             archives.size(), dictionaries.Count());
+    const size_t hw = std::max<size_t>(std::thread::hardware_concurrency(), 2);
+    const size_t lower_threads =
+        options.threads != 0 ? options.threads : std::clamp<size_t>(hw, 2, 16);
+    const size_t producer_threads =
+        archives.empty() ? 0 : std::min<size_t>(archives.size(), std::clamp<size_t>(hw / 2, 2, 8));
+    LOG_INFO(Render_Vulkan,
+             "Shader precache build: {} archives, {} zstd dictionaries, {} reader and {} lowering "
+             "threads",
+             archives.size(), dictionaries.Count(), producer_threads, lower_threads);
 
-    compute_out.open(compute_tmp, std::ios::binary | std::ios::trunc);
-    if (build_graphics) {
-        graphics_out.open(graphics_tmp, std::ios::binary | std::ios::trunc);
-    }
-    if (!compute_out || (build_graphics && !graphics_out)) {
-        return fail("Cannot write to " + Common::FS::PathToUTF8String(output_dir));
-    }
-    WriteHeader(compute_out);
-    if (build_graphics) {
-        WriteHeader(graphics_out);
-    }
+    std::mutex vfs_read_mutex;
+    const bool lock_vfs_reads = game.nup == nullptr;
+    std::mutex compute_mutex;
+    std::unordered_map<ComputeDedupKey, Origin, ComputeDedupHasher> compute_seen;
+    std::mutex graphics_mutex;
+    std::unordered_map<u128, size_t, U128Hasher> graphics_map;
+    std::deque<GraphicsRawEntry> graphics_entries;
+    std::atomic<size_t> archive_errors{0};
+    std::atomic<size_t> member_errors{0};
+    std::atomic<size_t> next_archive{0};
+    std::atomic<size_t> archives_done{0};
 
-    std::unordered_set<PairHash, PairHasher> compute_identities;
-    std::unordered_set<std::string> compute_keys;
-    // Unique vertex and fragment programs by code hash, in first-seen order.
-    std::unordered_map<u128, size_t, U128Hasher> graphics_index;
-    std::vector<GraphicsProgram> graphics;
-    std::unordered_set<u64> fragment_hashes;
-    std::unordered_set<u64> vertex_hashes;
-    struct WrittenVertex {
-        size_t program;
-        u64 key_offset;
-    };
-    std::vector<WrittenVertex> written_vertices;
-    struct HeldVertex {
-        size_t program;
-        std::vector<u8> env;
-    };
-    std::vector<HeldVertex> held_vertices;
-    size_t archive_errors = 0;
-    size_t member_errors = 0;
+    auto lower_pool =
+        std::make_unique<LowerPool>(lower_threads, stop, jobs_completed, skipped_count);
 
-    const size_t threads =
-        options.threads != 0
-            ? options.threads
-            : std::clamp<size_t>(std::thread::hardware_concurrency() / 4, 2, 6);
-    auto converter = std::make_unique<Converter>(threads, stop);
-
-    // Consumes finished conversions in submission order (first program wins on equal keys).
-    std::vector<std::pair<bool, size_t>> job_kinds; // graphics?, graphics program index
-    const auto consume = [&](JobResult&& r) {
-        const auto [is_graphics, index] = job_kinds[consumed++];
-        if (!r.ok) {
-            ++result.skipped;
-            return;
-        }
-        if (!is_graphics) {
-            const std::string key(reinterpret_cast<const char*>(r.compute_key.data()),
-                                  r.compute_key.size());
-            if (compute_keys.insert(key).second) {
-                compute_out.write(reinterpret_cast<const char*>(r.bytes.data()),
-                                  static_cast<std::streamsize>(r.bytes.size()));
-                ++result.compute_programs;
-            }
-            return;
-        }
-        GraphicsProgram& program = graphics[index];
-        program.built = true;
-        program.hash = r.hash;
-        if (program.stage == 4) {
-            if (!fragment_hashes.insert(r.hash).second) {
-                return; // same key as an earlier entry
-            }
-            const auto key = GraphicsEntryKey(4, fragment_template, r.hash, 0);
-            Write(graphics_out, u32{1});
-            graphics_out.write(reinterpret_cast<const char*>(r.bytes.data()),
-                               static_cast<std::streamsize>(r.bytes.size()));
-            graphics_out.write(reinterpret_cast<const char*>(key.data()),
-                               static_cast<std::streamsize>(key.size()));
-            ++result.fragment_programs;
-            return;
-        }
-        if (!vertex_hashes.insert(r.hash).second) {
-            // Same stage hash: same key only if the attribute guess matches, known at the end.
-            held_vertices.push_back({index, std::move(r.bytes)});
-            return;
-        }
-        const auto key = GraphicsEntryKey(0, vertex_template, r.hash, 0);
-        Write(graphics_out, u32{1});
-        graphics_out.write(reinterpret_cast<const char*>(r.bytes.data()),
-                           static_cast<std::streamsize>(r.bytes.size()));
-        const auto key_offset = static_cast<u64>(graphics_out.tellp());
-        graphics_out.write(reinterpret_cast<const char*>(key.data()),
-                           static_cast<std::streamsize>(key.size()));
-        written_vertices.push_back({index, key_offset});
-    };
-    const auto drain = [&](bool wait_all) {
-        while (auto r = converter->Next(wait_all)) {
-            consume(std::move(*r));
-        }
-    };
-
-    for (size_t archive_index = 0; archive_index < archives.size(); ++archive_index) {
-        if (stop.stop_requested()) {
-            converter.reset();
-            return fail("Stopped");
-        }
-        const auto& archive = archives[archive_index];
-        // Half of an archive's share when read, the rest when walked.
-        const u64 archive_bytes = archive.file->GetSize();
-        bytes_done += archive_bytes / 2;
-        report(StageExtracting, archive_index, archives.size());
-        const auto data = archive.file->ReadAllBytes();
-        const auto name = archive.path.substr(archive.path.rfind('/') + 1);
-        const auto on_record = [&](const ShaderRecord& record) {
-            const bool is_graphics =
-                build_graphics &&
-                (record.stage == ProgramStage::Vertex || record.stage == ProgramStage::Fragment);
-            if (record.stage != ProgramStage::Compute && !is_graphics) {
-                return;
-            }
-            const u128 code = Hash128(record.code);
-            const u128 control = Hash128(record.control);
-            Job job;
-            if (is_graphics) {
-                const auto [it, inserted] = graphics_index.try_emplace(code, graphics.size());
-                if (!inserted) {
-                    GraphicsProgram& program = graphics[it->second];
-                    if (program.control == control) {
-                        program.archives.push_back(static_cast<u32>(archive_index));
+    {
+        std::vector<std::thread> producers;
+        producers.reserve(producer_threads);
+        for (size_t t = 0; t < producer_threads; ++t) {
+            producers.emplace_back([&] {
+                Common::SetCurrentThreadName("ShaderWarmRead");
+                Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+                for (;;) {
+                    if (stop.stop_requested()) {
+                        return;
                     }
-                    return;
-                }
-                graphics.push_back({record.stage == ProgramStage::Vertex ? 0U : 4U, control,
-                                    {static_cast<u32>(archive_index)}});
-                job.graphics = true;
-                job.stage = graphics.back().stage;
-                job.graphics_index = it->second;
-            } else {
-                if (!compute_identities.insert(PairHash{code, control}).second) {
-                    return;
-                }
-                const auto values = ReadComputeControl(record.control);
-                if (!values || !values->workgroup[0] || !values->workgroup[1] ||
-                    !values->workgroup[2]) {
-                    ++result.skipped;
-                    return;
-                }
-                job.control = *values;
-                job.stage = 5;
-            }
-            job.seq = seq++;
-            job.program.assign(record.code.begin(), record.code.end());
-            job_kinds.emplace_back(job.graphics, job.graphics_index);
-            converter->Push(std::move(job));
-            while (converter->Pending() > MaxPendingJobs && !stop.stop_requested()) {
-                if (auto r = converter->Next(true)) {
-                    consume(std::move(*r));
-                }
-            }
-        };
-        const auto on_member_error = [&](const std::string& error) {
-            ++member_errors;
-            LOG_DEBUG(Render_Vulkan, "Shader precache: {}: {}", archive.path, error);
-        };
-        try {
-            WalkArchive(data, name, &dictionaries, on_record, on_member_error, stop);
-        } catch (const ArchiveError& e) {
-            ++archive_errors;
-            LOG_WARNING(Render_Vulkan, "Shader precache: {}: {}", archive.path, e.what());
-        }
-        bytes_done += archive_bytes - archive_bytes / 2;
-        drain(false);
-    }
-    report(StageExtracting, archives.size(), archives.size());
+                    const size_t archive_index =
+                        next_archive.fetch_add(1, std::memory_order_relaxed);
+                    if (archive_index >= archives.size()) {
+                        return;
+                    }
+                    const auto& archive = archives[archive_index];
+                    const u64 archive_bytes = archive.file->GetSize();
+                    bytes_done.fetch_add(archive_bytes / 2, std::memory_order_relaxed);
 
-    const size_t total_jobs = seq;
-    while (consumed < total_jobs) {
-        if (stop.stop_requested()) {
-            converter.reset();
-            return fail("Stopped");
+                    std::vector<u8> data;
+                    {
+                        std::unique_lock<std::mutex> read_lock{vfs_read_mutex, std::defer_lock};
+                        if (lock_vfs_reads) {
+                            read_lock.lock();
+                        }
+                        // Skip large uncompressed audio/asset .pck files (Wwise AKPK / Godot GDPC)
+                        // after a 4-byte magic peek instead of reading hundreds of MiB into RAM.
+                        bool skip_pck = false;
+                        if (archive_bytes > (4ULL << 20) &&
+                            EndsWithIgnoreCase(archive.path, ".pck")) {
+                            std::array<u8, 4> head{};
+                            if (archive.file->Read(head.data(), head.size(), 0) == head.size() &&
+                                (std::memcmp(head.data(), "AKPK", 4) == 0 ||
+                                 std::memcmp(head.data(), "GDPC", 4) == 0)) {
+                                skip_pck = true;
+                            }
+                        }
+                        if (!skip_pck) {
+                            data = archive.file->ReadAllBytes();
+                        }
+                    }
+
+                    if (!data.empty() && !stop.stop_requested()) {
+                        const auto name = archive.path.substr(archive.path.rfind('/') + 1);
+                        const u32 archive_id = archive_id_by_index[archive_index];
+                        u32 record_index = 0;
+                        const auto on_record = [&](const ShaderRecord& record) {
+                            const Origin origin{static_cast<u32>(archive_index), record_index++};
+                            const bool is_graphics = build_graphics &&
+                                                     (record.stage == ProgramStage::Vertex ||
+                                                      record.stage == ProgramStage::Fragment);
+                            if (record.stage != ProgramStage::Compute && !is_graphics) {
+                                return;
+                            }
+                            if (is_graphics) {
+                                const auto prefix_size =
+                                    CaptureProgramPrefixSize(record.code, true, record.maxwell);
+                                if (!prefix_size) {
+                                    skipped_count.fetch_add(1, std::memory_order_relaxed);
+                                    return;
+                                }
+                                const u32 stage =
+                                    record.stage == ProgramStage::Vertex ? 0U : 4U;
+                                const auto prefix = record.code.first(*prefix_size);
+                                const u128 gfx_id =
+                                    HashGraphicsIdentity(stage, record.maxwell, prefix);
+                                const auto bank1 =
+                                    ExtractBank1(record.code, record.control, record.maxwell);
+                                size_t entry_index = 0;
+                                bool need_lower = false;
+                                {
+                                    std::scoped_lock lock{graphics_mutex};
+                                    const auto [it, inserted] =
+                                        graphics_map.try_emplace(gfx_id, graphics_entries.size());
+                                    entry_index = it->second;
+                                    if (inserted) {
+                                        auto& entry = graphics_entries.emplace_back();
+                                        entry.stage = stage;
+                                        entry.maxwell = record.maxwell;
+                                        entry.best_origin = origin;
+                                        const auto sph_src = record.maxwell
+                                                                 ? record.code.subspan(0x30, 80)
+                                                                 : record.code.first(80);
+                                        std::memcpy(entry.sph.data(), sph_src.data(), 80);
+                                        entry.best_bank1.assign(bank1.begin(), bank1.end());
+                                        entry.archive_ids.push_back(archive_id);
+                                        need_lower = true;
+                                    } else {
+                                        auto& entry = graphics_entries[entry_index];
+                                        entry.archive_ids.push_back(archive_id);
+                                        if (origin < entry.best_origin) {
+                                            entry.best_origin = origin;
+                                            entry.best_bank1.assign(bank1.begin(), bank1.end());
+                                        }
+                                    }
+                                }
+                                if (need_lower) {
+                                    LowerJob job;
+                                    job.graphics = true;
+                                    job.maxwell = record.maxwell;
+                                    job.graphics_index = entry_index;
+                                    job.program.assign(prefix.begin(), prefix.end());
+                                    jobs_pushed.fetch_add(1, std::memory_order_relaxed);
+                                    lower_pool->Push(std::move(job));
+                                }
+                                return;
+                            }
+
+                            const auto values =
+                                ReadComputeControl(record.control, record.maxwell);
+                            if (!values || !values->workgroup[0] || !values->workgroup[1] ||
+                                !values->workgroup[2]) {
+                                skipped_count.fetch_add(1, std::memory_order_relaxed);
+                                return;
+                            }
+                            const auto prefix_size =
+                                CaptureProgramPrefixSize(record.code, false, record.maxwell);
+                            if (!prefix_size) {
+                                skipped_count.fetch_add(1, std::memory_order_relaxed);
+                                return;
+                            }
+                            const auto prefix = record.code.first(*prefix_size);
+                            const ComputeDedupKey ckey{record.maxwell, Hash128(prefix), *values};
+                            bool need_lower = false;
+                            {
+                                std::scoped_lock lock{compute_mutex};
+                                const auto [it, inserted] =
+                                    compute_seen.try_emplace(ckey, origin);
+                                if (inserted) {
+                                    need_lower = true;
+                                } else if (origin < it->second) {
+                                    it->second = origin;
+                                }
+                            }
+                            if (need_lower) {
+                                LowerJob job;
+                                job.graphics = false;
+                                job.maxwell = record.maxwell;
+                                job.compute_id = ckey;
+                                job.program.assign(prefix.begin(), prefix.end());
+                                jobs_pushed.fetch_add(1, std::memory_order_relaxed);
+                                lower_pool->Push(std::move(job));
+                            }
+                        };
+                        const auto on_member_error = [&](const std::string& error) {
+                            member_errors.fetch_add(1, std::memory_order_relaxed);
+                            LOG_DEBUG(Render_Vulkan, "Shader precache: {}: {}", archive.path,
+                                      error);
+                        };
+                        try {
+                            WalkArchive(data, name, &dictionaries, on_record, on_member_error,
+                                        stop);
+                        } catch (const ArchiveError& e) {
+                            archive_errors.fetch_add(1, std::memory_order_relaxed);
+                            LOG_WARNING(Render_Vulkan, "Shader precache: {}: {}", archive.path,
+                                        e.what());
+                        }
+                    }
+
+                    bytes_done.fetch_add(archive_bytes - archive_bytes / 2,
+                                         std::memory_order_relaxed);
+                    archives_done.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
         }
-        report(StageConverting, consumed, total_jobs);
-        if (auto r = converter->Next(true)) {
-            consume(std::move(*r));
+
+        // Calling thread drives progress reporting while producers walk archives.
+        while (archives_done.load(std::memory_order_relaxed) < archives.size() &&
+               !stop.stop_requested()) {
+            report(StageExtracting, archives_done.load(std::memory_order_relaxed), archives.size());
+            std::this_thread::sleep_for(std::chrono::milliseconds{25});
+        }
+        for (auto& producer : producers) {
+            producer.join();
         }
     }
-    report(StageConverting, total_jobs, total_jobs);
-    converter.reset();
+    if (stop.stop_requested()) {
+        lower_pool.reset();
+        return fail("Stopped");
+    }
+    report(StageExtracting, archives.size(), archives.size(), true);
+
+    const size_t total_jobs = jobs_pushed.load(std::memory_order_relaxed);
+    while (jobs_completed.load(std::memory_order_relaxed) < total_jobs && !stop.stop_requested()) {
+        report(StageConverting, jobs_completed.load(std::memory_order_relaxed), total_jobs);
+        std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    }
+    lower_pool->CloseAndJoin();
+    if (stop.stop_requested()) {
+        lower_pool.reset();
+        return fail("Stopped");
+    }
+    report(StageConverting, total_jobs, total_jobs, true);
+
+    auto finished_compute = lower_pool->TakeCompute();
+    lower_pool->ApplyGraphics(graphics_entries);
+    lower_pool.reset();
+    result.skipped = skipped_count.load(std::memory_order_relaxed);
+
     for (auto& archive : archives) {
         archive.file = nullptr;
     }
-    effects.clear();
-    dictionary_pack = nullptr;
     game.romfs.clear();
     game.loader.reset();
     game.nup.reset();
 
-    // Vertex attribute types (make_graphics_warm.py attr_types): per slot, the most common
-    // nonzero value among the runtime pipelines of the OTHER vertex shaders of the same
-    // archive(s); slots without data are 1 (float). Without runtime data: built-in default.
-    std::unordered_map<std::string, u32> archive_ids;
-    for (size_t i = 0; i < archives.size(); ++i) {
-        archive_ids.try_emplace(archives[i].path, static_cast<u32>(archive_ids.size()));
+    // Sort & deduplicate compute entries deterministically by ComputeKey (earliest origin wins).
+    struct OrderedCompute {
+        ComputeKey key{};
+        Origin origin{};
+        size_t index{};
+    };
+    std::vector<OrderedCompute> ordered_compute;
+    ordered_compute.reserve(finished_compute.size());
+    for (size_t i = 0; i < finished_compute.size(); ++i) {
+        ordered_compute.push_back(
+            {finished_compute[i].key, compute_seen.at(finished_compute[i].id), i});
     }
-    const auto archive_id = [&](u32 index) { return archive_ids.at(archives[index].path); };
-    // Archive identity: the path inside the RomFS (the same file in both packages is one).
+    std::sort(ordered_compute.begin(), ordered_compute.end(),
+              [](const OrderedCompute& a, const OrderedCompute& b) {
+                  return a.key != b.key ? a.key < b.key : a.origin < b.origin;
+              });
+
+    // Deduplicate graphics strictly by (stage, lowered_code_hash), merging archive_ids and
+    // selecting the canonical earliest-origin record so output is compact and 100% deterministic.
+    struct DeduplicatedGraphics {
+        u32 stage{};
+        u64 hash{};
+        Origin best_origin{~0U, ~0U};
+        size_t winner_index{};
+        std::vector<u32> archive_ids;
+    };
+    std::vector<DeduplicatedGraphics> ordered_graphics;
+    if (build_graphics) {
+        std::map<std::pair<u32, u64>, size_t> by_stage_hash;
+        for (size_t i = 0; i < graphics_entries.size(); ++i) {
+            auto& entry = graphics_entries[i];
+            if (!entry.lowered_ok) {
+                continue;
+            }
+            const u64 hash = entry.lowered.stage_hash != 0 ? entry.lowered.stage_hash
+                                                           : StageHash(entry.lowered.code);
+            const auto [it, inserted] =
+                by_stage_hash.try_emplace({entry.stage, hash}, ordered_graphics.size());
+            if (inserted) {
+                ordered_graphics.push_back(
+                    {entry.stage, hash, entry.best_origin, i, std::move(entry.archive_ids)});
+            } else {
+                auto& merged = ordered_graphics[it->second];
+                merged.archive_ids.insert(merged.archive_ids.end(), entry.archive_ids.begin(),
+                                          entry.archive_ids.end());
+                if (entry.best_origin < merged.best_origin) {
+                    merged.best_origin = entry.best_origin;
+                    merged.winner_index = i;
+                }
+            }
+        }
+        for (auto& item : ordered_graphics) {
+            std::sort(item.archive_ids.begin(), item.archive_ids.end());
+            item.archive_ids.erase(std::unique(item.archive_ids.begin(), item.archive_ids.end()),
+                                   item.archive_ids.end());
+        }
+    }
+
+    // Per-archive sibling vertex attribute statistics (deterministic via sorted archive_ids).
     std::unordered_map<u32, std::set<u64>> by_archive;
-    for (const auto& program : graphics) {
-        if (program.stage == 0 && program.built &&
-            stats.vertex_attributes.contains(program.hash)) {
-            for (const u32 a : program.archives) {
-                by_archive[archive_id(a)].insert(program.hash);
+    if (build_graphics && use_stats) {
+        for (const auto& item : ordered_graphics) {
+            if (item.stage == 0 && stats.vertex_attributes.contains(item.hash)) {
+                for (const u32 aid : item.archive_ids) {
+                    by_archive[aid].insert(item.hash);
+                }
             }
         }
     }
-    const auto attribute_types = [&](const GraphicsProgram& program) -> u64 {
+    const auto attribute_types = [&](const DeduplicatedGraphics& item) -> u64 {
         if (!use_stats) {
             return DefaultAttributeTypes;
         }
         std::set<u64> others;
-        for (const u32 a : program.archives) {
-            if (const auto it = by_archive.find(archive_id(a)); it != by_archive.end()) {
+        for (const u32 aid : item.archive_ids) {
+            if (const auto it = by_archive.find(aid); it != by_archive.end()) {
                 others.insert(it->second.begin(), it->second.end());
             }
         }
-        others.erase(program.hash);
+        others.erase(item.hash);
         std::array<std::array<size_t, 4>, 32> counts{};
         std::array<std::array<size_t, 4>, 32> first{};
         size_t order = 0;
@@ -990,58 +1332,85 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         return types;
     };
 
-    report(StageWriting, 0, written_vertices.size() + held_vertices.size());
-    std::set<std::pair<u64, u64>> vertex_keys; // (stage hash, attribute types)
-    std::vector<std::pair<u64, u64>> patches;  // key offset, attribute types
-    for (const auto& written : written_vertices) {
-        const auto& program = graphics[written.program];
-        const u64 types = attribute_types(program);
-        vertex_keys.emplace(program.hash, types);
-        patches.emplace_back(written.key_offset + AttributeTypesOffset, types);
+    const size_t total_writes = ordered_compute.size() + ordered_graphics.size();
+    report(StageWriting, 0, total_writes, true);
+
+    std::vector<char> compute_buf(1U << 20);
+    std::vector<char> graphics_buf(build_graphics ? (1U << 20) : 0);
+    compute_out.rdbuf()->pubsetbuf(compute_buf.data(),
+                                   static_cast<std::streamsize>(compute_buf.size()));
+    compute_out.open(compute_tmp, std::ios::binary | std::ios::trunc);
+    if (build_graphics) {
+        graphics_out.rdbuf()->pubsetbuf(graphics_buf.data(),
+                                        static_cast<std::streamsize>(graphics_buf.size()));
+        graphics_out.open(graphics_tmp, std::ios::binary | std::ios::trunc);
     }
-    for (auto& held : held_vertices) {
-        const auto& program = graphics[held.program];
-        const u64 types = attribute_types(program);
-        if (!vertex_keys.emplace(program.hash, types).second) {
-            continue;
+    if (!compute_out || (build_graphics && !graphics_out)) {
+        return fail("Cannot write to " + Common::FS::PathToUTF8String(output_dir));
+    }
+    WriteHeader(compute_out);
+    if (build_graphics) {
+        WriteHeader(graphics_out);
+    }
+
+    size_t written_items = 0;
+    for (size_t i = 0; i < ordered_compute.size(); ++i) {
+        if (stop.stop_requested()) {
+            return fail("Stopped");
         }
-        const auto key = GraphicsEntryKey(0, vertex_template, program.hash, types);
-        Write(graphics_out, u32{1});
-        graphics_out.write(reinterpret_cast<const char*>(held.env.data()),
-                           static_cast<std::streamsize>(held.env.size()));
-        graphics_out.write(reinterpret_cast<const char*>(key.data()),
-                           static_cast<std::streamsize>(key.size()));
-        held.env = {};
+        if (i == 0 || ordered_compute[i].key != ordered_compute[i - 1].key) {
+            const auto& bytes = finished_compute[ordered_compute[i].index].bytes;
+            compute_out.write(reinterpret_cast<const char*>(bytes.data()),
+                              static_cast<std::streamsize>(bytes.size()));
+            ++result.compute_programs;
+        }
+        if (++written_items % 2048 == 0) {
+            report(StageWriting, written_items, total_writes);
+        }
     }
-    result.vertex_programs = vertex_keys.size();
+    finished_compute.clear();
+
+    if (build_graphics) {
+        for (const auto& item : ordered_graphics) {
+            if (stop.stop_requested()) {
+                return fail("Stopped");
+            }
+            const auto& winner = graphics_entries[item.winner_index];
+            const u64 types = item.stage == 0 ? attribute_types(item) : 0ULL;
+            const auto env =
+                GraphicsEnvFromParts(item.stage, winner.lowered, winner.sph, winner.best_bank1);
+            const auto key = GraphicsEntryKey(
+                item.stage, item.stage == 0 ? vertex_template : fragment_template, item.hash,
+                types);
+            Write(graphics_out, u32{1});
+            graphics_out.write(reinterpret_cast<const char*>(env.data()),
+                               static_cast<std::streamsize>(env.size()));
+            graphics_out.write(reinterpret_cast<const char*>(key.data()),
+                               static_cast<std::streamsize>(key.size()));
+            if (item.stage == 0) {
+                ++result.vertex_programs;
+            } else {
+                ++result.fragment_programs;
+            }
+            if (++written_items % 2048 == 0) {
+                report(StageWriting, written_items, total_writes);
+            }
+        }
+    }
+    graphics_entries.clear();
+
     compute_out.close();
     if (build_graphics) {
         graphics_out.close();
     }
-    if (!compute_out || !graphics_out) {
+    if (!compute_out || (build_graphics && !graphics_out)) {
         return fail("Writing the precache files failed");
     }
-    if (build_graphics) {
-        std::fstream patch(graphics_tmp, std::ios::binary | std::ios::in | std::ios::out);
-        if (!patch) {
-            return fail("Cannot reopen " + Common::FS::PathToUTF8String(graphics_tmp));
-        }
-        size_t done = 0;
-        for (const auto& [offset, types] : patches) {
-            patch.seekp(static_cast<std::streamoff>(offset));
-            patch.write(reinterpret_cast<const char*>(&types), sizeof(types));
-            if (++done % 4096 == 0) {
-                report(StageWriting, done, patches.size());
-            }
-        }
-        if (!patch) {
-            return fail("Writing the precache files failed");
-        }
-    }
-    // New files: the markers and counts of the old ones no longer apply. Each is removed right
-    // before its file is replaced, so a failed replacement leaves the other file's marker intact.
+
+    // Keep an existing .done marker when the rebuilt file has the exact same content hash; drop
+    // it only when the contents changed.
     std::error_code ignored;
-    fs::remove(WarmMarkerPath(compute_path), ignored);
+    DropStaleWarmMarker(compute_path, compute_tmp);
     fs::remove(WarmCountPath(compute_path), ignored);
     fs::rename(compute_tmp, compute_path, ec);
     if (ec) {
@@ -1049,7 +1418,7 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     }
     WriteWarmCount(compute_path, result.compute_programs);
     if (build_graphics) {
-        fs::remove(WarmMarkerPath(graphics_path), ignored);
+        DropStaleWarmMarker(graphics_path, graphics_tmp);
         fs::remove(WarmCountPath(graphics_path), ignored);
         fs::rename(graphics_tmp, graphics_path, ec);
         if (ec) {
@@ -1057,13 +1426,13 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         }
         WriteWarmCount(graphics_path, result.vertex_programs + result.fragment_programs);
     }
-    report(StageWriting, patches.size(), patches.size());
+    report(StageWriting, total_writes, total_writes, true);
     result.ok = true;
     LOG_INFO(Render_Vulkan,
              "Shader precache build for {:016x}: {} compute, {} vertex, {} fragment entries, {} "
              "programs skipped, {} archive and {} member errors, {:.1f} s",
              title_id, result.compute_programs, result.vertex_programs, result.fragment_programs,
-             result.skipped, archive_errors, member_errors,
+             result.skipped, archive_errors.load(), member_errors.load(),
              std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
     return result;
 }

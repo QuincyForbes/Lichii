@@ -102,6 +102,9 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
             .auto_exposure = inputs.auto_exposure,
         };
         if (state.scaler == nil || !(state.key == key)) {
+            if (state.output != nil) {
+                scheduler.Finish();
+            }
             if (![MTLFXTemporalScalerDescriptor supportsDevice:device.GetDevice()]) {
                 return decline("not supported on this GPU");
             }

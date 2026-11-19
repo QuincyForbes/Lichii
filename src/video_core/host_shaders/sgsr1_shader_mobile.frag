@@ -28,6 +28,7 @@ vec4 weightY(vec4 dx, vec4 dy, vec4 std) {
 
 void main() {
     vec4 color = textureLod(sampler0, texcoord.xy, 0.0f);
+    float alpha = color.w;
     // image coord
     vec2 icoord = (texcoord * size + vec2(-0.5f, 0.5f));
     vec2 icoord_pixel = floor(icoord);
@@ -78,6 +79,6 @@ void main() {
         float dy = clamp(fy - color.y + mean, -23.0f / 255.0f, 23.0f / 255.0f);
         color = clamp(color + dy, 0.0f, 1.0f);
     }
-    color.w = 1.0f;  //assume alpha channel is not used
+    color.w = alpha;
     frag_color.xyzw = color;
 }

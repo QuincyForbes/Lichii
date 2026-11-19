@@ -84,6 +84,7 @@ private:
     VkFormat swapchain_view_format{};
 
     Settings::ScalingFilter scaling_filter{};
+    VkExtent2D last_window_size{};
     std::unique_ptr<WindowAdaptPass> window_adapt{};
     std::list<Layer> layers{};
 };

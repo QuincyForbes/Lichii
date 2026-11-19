@@ -40,7 +40,7 @@ T Get(std::span<const u8> data, size_t offset) {
 
 /// The GenericEnvironment::Serialize header: six u64 counts and seven u32 fields.
 void PutEnvHeader(std::vector<u8>& out, u64 code_size, u64 cbuf_count, u32 local_memory,
-                  u32 texture_bound, u32 start_address, u32 stage) {
+                  u32 texture_bound, u32 start_address, u32 stage, u32 read_lowest = 0) {
     Put<u64>(out, code_size);
     Put<u64>(out, 0); // texture types
     Put<u64>(out, 0); // texture pixel formats
@@ -50,9 +50,9 @@ void PutEnvHeader(std::vector<u8>& out, u64 code_size, u64 cbuf_count, u32 local
     Put<u32>(out, local_memory);
     Put<u32>(out, texture_bound);
     Put<u32>(out, start_address);
-    Put<u32>(out, 0);                                  // read lowest
-    Put<u32>(out, static_cast<u32>(code_size - 8));    // read highest
-    Put<u32>(out, 1);                                  // viewport transform state
+    Put<u32>(out, read_lowest);
+    Put<u32>(out, read_lowest + static_cast<u32>(code_size - 8)); // read highest
+    Put<u32>(out, 1);                                             // viewport transform state
     Put<u32>(out, stage);
 }
 
@@ -85,7 +85,87 @@ size_t TailSize(u32 stage) {
     return 80 + (stage == 3 ? 32 : 0) + (stage == 7 || stage == 8 ? 92 : 0);
 }
 
+constexpr u64 MaxwellSelfBranchA = 0xE2400FFFFF87000FULL;
+constexpr u64 MaxwellSelfBranchB = 0xE2400FFFFF07000FULL;
+
+std::optional<size_t> FindMaxwellEnd(std::span<const u8> bytes, size_t inst_offset,
+                                     size_t align_bias) {
+    if (bytes.size() <= inst_offset || (bytes.size() - inst_offset) % sizeof(u64) != 0) {
+        return std::nullopt;
+    }
+    const size_t limit = std::min<size_t>(bytes.size(), inst_offset + 0x100000);
+    for (size_t offset = inst_offset; offset + sizeof(u64) <= limit; offset += sizeof(u64)) {
+        if ((align_bias + offset) % 32 == 0) {
+            continue; // Maxwell scheduling word
+        }
+        const u64 inst = Get<u64>(bytes, offset);
+        if (inst == MaxwellSelfBranchA || inst == MaxwellSelfBranchB) {
+            return offset + sizeof(u64);
+        }
+    }
+    return std::nullopt;
+}
+
 } // Anonymous namespace
+
+std::optional<size_t> CaptureProgramPrefixSize(std::span<const u8> program, bool graphics,
+                                               bool maxwell) {
+    if (maxwell) {
+        if (graphics) {
+            if (program.size() <= 0x80 || Get<u32>(program, 0) != 0x12345678) {
+                return std::nullopt;
+            }
+            const u32 type = (Get<u32>(program, 0x30) >> 10) & 15;
+            if (type < 1 || type > 5) {
+                return std::nullopt;
+            }
+            const auto end = FindMaxwellEnd(program.subspan(0x30), 0x50, 0x30);
+            return end ? std::optional<size_t>{0x30 + *end} : std::nullopt;
+        }
+        const size_t start =
+            program.size() > 0x100 && Get<u32>(program, 0) == 0x12345679 ? 0x100 : 0;
+        if (program.size() <= start) {
+            return std::nullopt;
+        }
+        const auto end = FindMaxwellEnd(program.subspan(start), 0, 0);
+        return end ? std::optional<size_t>{start + *end} : std::nullopt;
+    }
+    using Shader::Ampere::Instruction;
+    const size_t header_size = graphics ? 128 : 0;
+    if (program.size() <= header_size || (program.size() - header_size) % sizeof(Instruction) ||
+        (program.size() - header_size) / sizeof(Instruction) > 65536) {
+        return std::nullopt;
+    }
+    if (graphics) {
+        const u32 type = (Get<u32>(program, 0) >> 10) & 15;
+        if (type < 1 || type > 5) {
+            return std::nullopt;
+        }
+    }
+    const size_t count = (program.size() - header_size) / sizeof(Instruction);
+    Shader::Ampere::ProgramCaptureState capture;
+    size_t captured_count = 0;
+    for (size_t index = 0; index < count; ++index) {
+        Instruction inst;
+        std::memcpy(&inst, program.data() + header_size + index * sizeof(Instruction),
+                    sizeof(Instruction));
+        if (inst.Bits(0, 12) == 0x95c) {
+            return std::nullopt;
+        }
+        const auto result = capture.Observe(inst, static_cast<u32>(index));
+        if (result == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget) {
+            return std::nullopt;
+        }
+        if (result == Shader::Ampere::ProgramCaptureState::Result::Complete) {
+            captured_count = index + 1;
+            break;
+        }
+    }
+    if (captured_count == 0) {
+        return std::nullopt;
+    }
+    return header_size + captured_count * sizeof(Instruction);
+}
 
 std::optional<std::string> LowerProgram(std::span<const u8> program, bool graphics,
                                         LoweredCode& out) {
@@ -157,6 +237,48 @@ std::optional<std::string> LowerProgram(std::span<const u8> program, bool graphi
     out.code.resize(words.size() * sizeof(u64));
     std::memcpy(out.code.data(), words.data(), out.code.size());
     out.texture_buffer = lowered.required_texture_buffer;
+    out.stage_hash = StageHash(out.code);
+    out.maxwell = false;
+    return std::nullopt;
+}
+
+std::optional<std::string> PrepareMaxwellProgram(std::span<const u8> program, bool graphics,
+                                                 LoweredCode& out) {
+    if (graphics) {
+        if (program.size() <= 0x80 || Get<u32>(program, 0) != 0x12345678) {
+            return "Invalid Maxwell graphics header";
+        }
+        const u32 type = (Get<u32>(program, 0x30) >> 10) & 15;
+        if (type < 1 || type > 5) {
+            return "Invalid Maxwell SPH stage";
+        }
+        const auto sph_and_code = program.subspan(0x30);
+        const auto end = FindMaxwellEnd(sph_and_code, 0x50, 0x30);
+        if (!end || *end <= sizeof(u64)) {
+            return "Maxwell graphics shader lacks a self-branch terminator";
+        }
+        out.code.assign(sph_and_code.begin(), sph_and_code.begin() + static_cast<ptrdiff_t>(*end));
+        out.stage_hash =
+            Common::CityHash64(reinterpret_cast<const char*>(out.code.data()), *end - sizeof(u64));
+        out.texture_buffer = 2;
+        out.maxwell = true;
+        return std::nullopt;
+    }
+    const size_t start =
+        program.size() > 0x100 && Get<u32>(program, 0) == 0x12345679 ? 0x100 : 0;
+    if (program.size() <= start) {
+        return "Invalid Maxwell compute code";
+    }
+    const auto inst_bytes = program.subspan(start);
+    const auto end = FindMaxwellEnd(inst_bytes, 0, 0);
+    if (!end || *end <= sizeof(u64)) {
+        return "Maxwell compute shader lacks a self-branch terminator";
+    }
+    out.code.assign(inst_bytes.begin(), inst_bytes.begin() + static_cast<ptrdiff_t>(*end));
+    out.stage_hash =
+        Common::CityHash64(reinterpret_cast<const char*>(out.code.data()), *end - sizeof(u64));
+    out.texture_buffer = 2;
+    out.maxwell = true;
     return std::nullopt;
 }
 
@@ -164,7 +286,24 @@ u64 StageHash(std::span<const u8> code) {
     return Common::CityHash64(reinterpret_cast<const char*>(code.data()), code.size()) ^ HashXor;
 }
 
-std::optional<ComputeControl> ReadComputeControl(std::span<const u8> control) {
+std::optional<ComputeControl> ReadComputeControl(std::span<const u8> control, bool maxwell) {
+    if (maxwell) {
+        if (control.size() < 0x760 || Get<u32>(control, 0) != 0x98761234) {
+            return std::nullopt;
+        }
+        ComputeControl result;
+        for (size_t i = 0; i < 3; ++i) {
+            result.workgroup[i] = Get<u32>(control, 0x748 + i * 4);
+        }
+        result.shared_memory =
+            static_cast<u32>((u64{Get<u32>(control, 0x754)} + 255) / 256 * 256);
+        const u32 local_pos = Get<u32>(control, 0x758);
+        const u32 local_crs = Get<u32>(control, 0x75c);
+        if (local_pos <= (1U << 20) && local_crs <= (1U << 20)) {
+            result.local_memory = local_pos + local_crs;
+        }
+        return result;
+    }
     if (control.size() < 108) {
         return std::nullopt;
     }
@@ -178,6 +317,20 @@ std::optional<ComputeControl> ReadComputeControl(std::span<const u8> control) {
     return result;
 }
 
+std::span<const u8> ExtractBank1(std::span<const u8> program, std::span<const u8> control,
+                                 bool maxwell) {
+    if (maxwell) {
+        if (control.size() >= 0x708 && Get<u32>(control, 0) == 0x98761234) {
+            const u32 c1_off = Get<u32>(control, 0x700);
+            if (c1_off != 0 && c1_off < program.size()) {
+                return program.subspan(c1_off, std::min<size_t>(256, program.size() - c1_off));
+            }
+        }
+        return {};
+    }
+    return program.last(std::min<size_t>(256, program.size()));
+}
+
 std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& control,
                              ComputeKey& key) {
     std::vector<u8> out;
@@ -185,15 +338,18 @@ std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& c
     Put<u32>(out, 1);
     // Like InitializeNativeCode: the program's own bank when it names one.
     const u32 texture_bound = lowered.texture_buffer != ~0U ? lowered.texture_buffer : 0;
-    PutEnvHeader(out, lowered.code.size(), 0, control.local_memory, texture_bound, 80,
-                 ComputeStage);
+    const u32 start_address = lowered.maxwell ? 0U : 80U;
+    PutEnvHeader(out, lowered.code.size(), 0, control.local_memory, texture_bound, start_address,
+                 ComputeStage, 0);
     PutBytes(out, lowered.code);
     for (const u32 size : control.workgroup) {
         Put<u32>(out, size);
     }
     Put<u32>(out, control.shared_memory);
+    const u64 unique_hash = lowered.stage_hash != 0 ? lowered.stage_hash : StageHash(lowered.code);
     std::vector<u8> key_bytes;
-    Put<u64>(key_bytes, StageHash(lowered.code));
+    key_bytes.reserve(key.size());
+    Put<u64>(key_bytes, unique_hash);
     Put<u32>(key_bytes, control.shared_memory);
     for (const u32 size : control.workgroup) {
         Put<u32>(key_bytes, size);
@@ -203,27 +359,43 @@ std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& c
     return out;
 }
 
-std::vector<u8> GraphicsEnv(u32 stage, const LoweredCode& lowered, std::span<const u8> program) {
-    const auto sph = program.first(80);
+std::vector<u8> GraphicsEnvFromParts(u32 stage, const LoweredCode& lowered,
+                                     std::span<const u8> sph, std::span<const u8> bank1) {
     const u32 bound = lowered.texture_buffer != ~0U ? lowered.texture_buffer
                                                      : (stage == 0 ? 0U : 2U);
-    // Constant buffer bank 1 = the last 256 bytes of the program allocation.
-    const auto bank1 = program.last(std::min<size_t>(256, program.size()));
-    const size_t cbuf_count = (bank1.size() & ~size_t{3}) / 4;
+    const size_t total_words = (bank1.size() & ~size_t{3}) / 4;
+    // GuessMissing returns 0 for missing bank 1 words, so only non-zero words need to be stored.
+    size_t cbuf_count = 0;
+    for (size_t i = 0; i < total_words; ++i) {
+        if (Get<u32>(bank1, i * 4) != 0) {
+            ++cbuf_count;
+        }
+    }
     const u32 w1 = Get<u32>(sph, 4), w2 = Get<u32>(sph, 8), w3 = Get<u32>(sph, 12);
     const u64 local_memory =
         ((u64{w1} & 0xFFFFFF) | ((u64{w2} & 0xFFFFFF) << 24)) + (u64{w3} & 0xFFFFFF);
+    const u32 start_address = lowered.maxwell ? 0x30U : 0U;
     std::vector<u8> out;
     out.reserve(EnvHeaderSize + lowered.code.size() + cbuf_count * 12 + 80);
-    PutEnvHeader(out, lowered.code.size(), cbuf_count, static_cast<u32>(local_memory), bound, 0,
-                 stage);
+    PutEnvHeader(out, lowered.code.size(), cbuf_count, static_cast<u32>(local_memory), bound,
+                 start_address, stage, start_address);
     PutBytes(out, lowered.code);
-    for (size_t i = 0; i < cbuf_count; ++i) {
-        Put<u64>(out, (u64{1} << 32) | (i * 4));
-        Put<u32>(out, Get<u32>(bank1, i * 4));
+    for (size_t i = 0; i < total_words; ++i) {
+        const u32 word = Get<u32>(bank1, i * 4);
+        if (word != 0) {
+            Put<u64>(out, (u64{1} << 32) | (i * 4));
+            Put<u32>(out, word);
+        }
     }
-    PutBytes(out, sph);
+    PutBytes(out, sph.first(80));
     return out;
+}
+
+std::vector<u8> GraphicsEnv(u32 stage, const LoweredCode& lowered, std::span<const u8> program) {
+    const auto sph = lowered.maxwell ? std::span<const u8>{lowered.code}.first(80)
+                                     : program.first(80);
+    const auto bank1 = program.last(std::min<size_t>(256, program.size()));
+    return GraphicsEnvFromParts(stage, lowered, sph, bank1);
 }
 
 GraphicsKey GraphicsEntryKey(u32 stage, const GraphicsKey& template_key, u64 stage_hash,

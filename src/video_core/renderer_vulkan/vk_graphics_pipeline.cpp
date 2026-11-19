@@ -578,8 +578,12 @@ GraphicsPipeline::GraphicsPipeline(
                     stage_builder.UsesUpdateAfterBindPool());
             }
         }
+        DescriptorLayoutBuilder layout_builder{device};
+        if (IsMeshPipeline()) {
+            layout_builder.SetUsesMesh();
+        }
         owned_pipeline_layout =
-            DescriptorLayoutBuilder{device}.CreateIndependentPipelineLayout(set_layouts, true);
+            layout_builder.CreateIndependentPipelineLayout(set_layouts, true);
         pipeline_layout = *owned_pipeline_layout;
     } else {
         DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, mesh_emulation)};
@@ -2374,11 +2378,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         };
         const auto make_compute = [&](VkShaderModule module, VkPipelineLayout layout,
                                       const Shader::Info* info) {
-            const bool uses_warp_ops{info && (info->uses_subgroup_vote ||
-                                              info->uses_subgroup_invocation_id ||
-                                              info->uses_subgroup_shuffles ||
-                                              info->uses_subgroup_mask ||
-                                              info->uses_quad_shuffles || info->uses_fswzadd)};
+            const bool uses_warp_ops{info && info->UsesWarpOps()};
             const bool force_warp_size{uses_warp_ops && device.IsExtSubgroupSizeControlSupported() &&
                                        device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)};
             return device.GetLogical().CreateComputePipeline(
@@ -2554,7 +2554,11 @@ std::string GraphicsPipeline::ShaderLibraryKey(GplPart part, const PipelineState
     // Same render pass handle = same formats and samples (the render pass cache keeps them).
     key_writer.Add(render_pass);
     key_writer.Add(static_cast<u32>(LibraryFlags(device)));
-    const VkPushConstantRange push_range{DescriptorLayoutBuilder{device}.PushConstantRange()};
+    DescriptorLayoutBuilder push_builder{device};
+    if (IsMeshPipeline()) {
+        push_builder.SetUsesMesh();
+    }
+    const VkPushConstantRange push_range{push_builder.PushConstantRange()};
     key_writer.Add(push_range.stageFlags);
     key_writer.Add(push_range.offset);
     key_writer.Add(push_range.size);
@@ -2689,8 +2693,12 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
             .pSpecializationInfo = nullptr,
         });
     }
+    DescriptorLayoutBuilder layout_builder{device};
+    if (IsMeshPipeline()) {
+        layout_builder.SetUsesMesh();
+    }
     library.layout =
-        DescriptorLayoutBuilder{device}.CreateIndependentPipelineLayout(set_layouts, true);
+        layout_builder.CreateIndependentPipelineLayout(set_layouts, true);
     const bool pre_rasterization = part == GplPart::PreRasterization;
     const VkGraphicsPipelineLibraryCreateInfoEXT library_ci{
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
@@ -2786,8 +2794,16 @@ bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass) {
             if (!has_shader) {
                 continue;
             }
-            const u64 name = part == GplPart::PreRasterization ? key.unique_hashes[1]
-                                                               : key.unique_hashes[5];
+            u64 name = key.unique_hashes[5];
+            if (part == GplPart::PreRasterization) {
+                name = 0;
+                for (size_t s = 1; s < 5; ++s) {
+                    if (key.unique_hashes[s] != 0) {
+                        name = key.unique_hashes[s];
+                        break;
+                    }
+                }
+            }
             shader_libraries[index] = library_cache->GetOrCreate(
                 part, ShaderLibraryKey(part, states, render_pass),
                 [&] { return MakeShaderLibrary(part, states, render_pass); }, name);

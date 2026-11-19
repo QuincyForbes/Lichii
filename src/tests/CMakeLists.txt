@@ -32,6 +32,11 @@ add_executable(tests
     video_core/ampere_starfox_test10.cpp
     video_core/ampere_yoshi_title.cpp
     video_core/ampere_yoshi_compute.cpp
+    video_core/buffer_cache_ports.cpp
+    video_core/conditional_barrier.cpp
+    video_core/mesh_raster_topology.cpp
+    video_core/pipeline_eviction_policy.cpp
+    video_core/scaled_image_fits.cpp
     video_core/texture_rect_descriptor.cpp
     audio_core/batch_decoder.cpp
     audio_core/adpcm_decode.cpp

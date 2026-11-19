@@ -26,11 +26,11 @@ namespace VideoCommon::ShaderWarm {
 /// files, in pipeline cache format with no recorded reads.
 std::filesystem::path ComputeWarmPath(u64 title_id);
 /// The title's vertex and fragment programs (<shader dir>/<title id>/warm-graphics.bin), one
-/// single-stage entry each with a guessed draw state. Used with graphics pipeline libraries only.
+/// single-stage entry each with a guessed draw state, deduplicated by (stage, lowered_code_hash).
 std::filesystem::path GraphicsWarmPath(u64 title_id);
-/// EDEN_NX2_GRAPHICS_PRECACHE=1: the graphics file is built with the precache file and, with
-/// graphics pipeline libraries (EDEN_NX2_GPL=1), built on the loading screen after it. Off by
-/// default: Ocarina's file is 1.5 GB and takes six minutes to build on a 24-thread CPU.
+/// Enabled by default (disable with EDEN_NX2_GRAPHICS_PRECACHE=0): the deduplicated graphics
+/// precache file is built alongside warm-compute.bin and warmed by graphics pipeline libraries /
+/// offline stage compilation.
 bool GraphicsPrecacheRequested();
 
 /// "Already precached" marker of a precache file (same folder, extension .done), written by the
@@ -46,33 +46,50 @@ std::filesystem::path WarmCountPath(const std::filesystem::path& warm_file);
 /// file of another size.
 u64 ReadWarmCount(const std::filesystem::path& warm_file);
 
-/// What a marker records: the precache file's size and last-write time, its entry count, the GPU
-/// driver version and device ID and the pipeline cache version.
+/// What a marker records: the precache file's size and content hash, its entry count, the GPU
+/// driver version and device ID, the pipeline cache version and the variant: a hash of the build's
+/// SPIR-V/MSL emission sources (EmissionStamp) and of the settings that change the shader code or
+/// pipeline state of the precache builds (resolution scaling, for one).
+/// The content, not the last-write time: building the file again with the same shaders ("Precache
+/// Shaders" by hand) keeps an unchanged marker instead of rebuilding every program.
 struct WarmStamp {
     u64 size{};
-    s64 write_time{};
+    u64 content_hash{};
     u64 entries{};
     u32 driver{};
     u32 device_id{};
     u32 cache_version{};
+    u64 variant{};
 
-    /// True when `other` was written for the same file, driver, device and cache version (the
-    /// entry count is informative).
+    /// True when `other` was written for the same file contents, driver, device, cache version
+    /// and variant (the entry count is informative).
     [[nodiscard]] bool Matches(const WarmStamp& other) const noexcept {
-        return size == other.size && write_time == other.write_time && driver == other.driver &&
-               device_id == other.device_id && cache_version == other.cache_version;
+        return size == other.size && content_hash == other.content_hash &&
+               driver == other.driver && device_id == other.device_id &&
+               cache_version == other.cache_version && variant == other.variant;
     }
 };
 
-/// The stamp of `warm_file` as it is now, empty when its size or time cannot be read.
+/// A hash of this build's sources that shape the SPIR-V/MSL of guest shaders (the recompiler
+/// without its OpenGL backends, the native lowering, the shader environment and the emission
+/// wrappers), made when it is built.
+[[nodiscard]] u64 EmissionStamp();
+
+/// The stamp of `warm_file` as it is now, empty when it cannot be read.
 std::optional<WarmStamp> CurrentWarmStamp(const std::filesystem::path& warm_file, u64 entries,
-                                          u32 driver, u32 device_id, u32 cache_version);
+                                          u32 driver, u32 device_id, u32 cache_version,
+                                          u64 variant = 0);
 
 /// The marker of `warm_file`, empty when there is none or it cannot be read.
 std::optional<WarmStamp> ReadWarmMarker(const std::filesystem::path& warm_file);
 
 /// Writes the marker of `warm_file`. Returns false when it cannot be written.
 bool WriteWarmMarker(const std::filesystem::path& warm_file, const WarmStamp& stamp);
+
+/// Removes the marker of `warm_file` before `new_file` replaces it, unless the marker was written
+/// for the same contents: a rebuild that comes out identical stays done.
+void DropStaleWarmMarker(const std::filesystem::path& warm_file,
+                         const std::filesystem::path& new_file);
 
 /// True when the title's precache has never finished: no precache file yet, or no marker next
 /// to it. A marker that no longer matches (new driver) is not seen here: the emulator checks that
@@ -141,9 +158,9 @@ std::unordered_set<u64> ReadPrecachedPipelines(const std::filesystem::path& file
 bool WritePrecachedPipelines(const std::filesystem::path& file, const DriverStamp& stamp,
                              const std::unordered_set<u64>& hashes);
 
-/// Removes the title's precache file, its marker and count, the list of precached graphics
-/// pipelines and a leftover temporary file (rebuild or delete from the UI). Returns false when a file exists but cannot be removed, with
-/// the reason in `error` when given.
+/// Removes the title's precache files, their markers and counts, precache-graphics.bin,
+/// precache-slow.bin, Metal stage/pipeline archives and leftover temporary files. Returns false
+/// when a file exists but cannot be removed, with the reason in `error` when given.
 bool DeleteWarmFiles(u64 title_id, std::string* error = nullptr);
 
 struct Progress {
@@ -155,6 +172,21 @@ struct Progress {
     double fraction{};
     size_t programs{};   ///< Programs found so far
 };
+
+struct GpuWarmSummary {
+    bool supported{};
+    bool ok{};
+    size_t built{};
+    size_t skipped{};
+    size_t failed{};
+    std::string error;
+};
+
+/// Compiles extracted warm shaders offline into the host GPU stage/pipeline cache when supported
+/// by the active backend (Metal on Apple); returns `.supported = false` otherwise.
+GpuWarmSummary CompileWarmShadersOffline(
+    u64 title_id, std::stop_token stop = {},
+    const std::function<void(const Progress&)>& on_progress = {});
 
 struct Result {
     bool ok{};
@@ -194,7 +226,7 @@ struct BuildOptions {
     std::optional<std::vector<std::filesystem::path>> runtime_caches;
     /// Whether warm-graphics.bin is built too. Unset: GraphicsPrecacheRequested().
     std::optional<bool> graphics;
-    /// Conversion threads, 0: a quarter of the CPU threads, 2 to 6.
+    /// Conversion threads, 0: hardware_concurrency clamped to 2..16.
     size_t threads{};
 };
 

@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <string_view>
 
@@ -295,8 +297,22 @@ namespace {
     return view.range.base.level == 0 && view.range.base.layer == 0;
 }
 
+[[nodiscard]] std::optional<std::array<u32, 2>> HostExtent(const ImageView& view) noexcept {
+    const Image* const image = view.BackingImage();
+    if (image == nullptr) {
+        return std::nullopt;
+    }
+    if (image->IsRescaled()) {
+        const auto& resolution = Settings::values.resolution_info;
+        return std::array{resolution.ScaleUp(view.size.width),
+                          resolution.ScaleUp(view.size.height)};
+    }
+    return std::array{view.size.width, view.size.height};
+}
+
 [[nodiscard]] bool ViewFitsExtent(const ImageView& view, std::array<u32, 2> requested) noexcept {
-    return VideoCommon::DlssContract::FitsExtent(requested, {view.size.width, view.size.height});
+    const auto extent = HostExtent(view);
+    return extent && VideoCommon::DlssContract::FitsExtent(requested, *extent);
 }
 
 constexpr u64 MaxTexturePoolBytes = u64{256} << 20;
@@ -777,42 +793,111 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
 }
 
 bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
-    // FSR 3.1 replaces DLSS; the temporal stand-in only runs when FSR cannot (no depth, a GPU
-    // without what its passes need, a failed start). EDEN_NX2_DLSS_REPLACEMENT=standin forces
-    // the stand-in for A/B runs, as on Vulkan.
-    static const bool force_standin = [] {
-        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value != nullptr && std::string_view{value} == "standin";
-    }();
-    if (force_standin) {
+    if (Settings::GameDlssNetworkChosen()) {
         return false;
     }
-    if (Settings::MetalFxTemporalChosen() && !temporal_unsupported) {
-        return true;
+    // FSR 3.1 or MetalFX replaces DLSS; the temporal stand-in only runs when neither can (no depth,
+    // a GPU without what its passes need, a failed start). EDEN_NX2_DLSS_REPLACEMENT=standin forces
+    // the stand-in for A/B runs, as on Vulkan.
+    static const std::string_view replacement = []() -> std::string_view {
+        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+        return value != nullptr ? std::string_view{value} : std::string_view{};
+    }();
+    if (replacement == "standin" || replacement == "native") {
+        return false;
     }
-    return !fsr3_unsupported;
+    switch (Settings::values.upscaler.GetValue()) {
+    case Settings::Upscaler::Game:
+        return false;
+    case Settings::Upscaler::MetalFx:
+        return !temporal_unsupported || !fsr3_unsupported;
+    case Settings::Upscaler::Fsr3:
+    case Settings::Upscaler::Fsr4:
+        return !fsr3_unsupported || !temporal_unsupported;
+    case Settings::Upscaler::Auto:
+    case Settings::Upscaler::Dlss:
+    default:
+        return !temporal_unsupported || !fsr3_unsupported;
+    }
+}
+
+void TextureCacheRuntime::NoteTemporalLodBias(std::array<u32, 2> render_size,
+                                              std::array<u32, 2> output_size) noexcept {
+    if (render_size[0] == 0 || output_size[0] <= render_size[0]) {
+        temporal_lod_bias = 0.0f;
+        return;
+    }
+    const f32 raw_bias =
+        std::log2(static_cast<f32>(render_size[0]) / static_cast<f32>(output_size[0]));
+    temporal_lod_bias = std::clamp(std::round(raw_bias * 4.0f) * 0.25f, -3.75f, 0.0f);
+    temporal_lod_frame = pool_frame;
 }
 
 bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst,
                                           ImageView& input_color, ImageView& motion_vectors,
                                           ImageView* depth, std::array<u32, 2> render_size,
                                           std::array<f32, 2> jitter,
-                                          std::array<f32, 2> motion_scale, bool use_history) {
-    if (dst_framebuffer == nullptr) {
+                                          std::array<f32, 2> motion_scale, bool use_history,
+                                          std::optional<std::array<u32, 2>> render_region) {
+    if (dst_framebuffer == nullptr || Settings::GameDlssNetworkChosen()) {
         return false;
     }
-    if (use_history && depth != nullptr && WantsTemporalUpscaleDepth() &&
-        MetalFxTemporalUpscale(dst_framebuffer, dst, input_color, motion_vectors, *depth,
-                               render_size, jitter, motion_scale)) {
+    if (render_region && (*render_region)[0] != 0 && (*render_region)[1] != 0) {
+        render_size = *render_region;
+    }
+    static const std::string_view replacement = []() -> std::string_view {
+        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+        return value != nullptr ? std::string_view{value} : std::string_view{};
+    }();
+    if (replacement == "native") {
+        return false;
+    }
+    const std::array<u32, 2> output_size{dst_framebuffer->Width(), dst_framebuffer->Height()};
+    if (use_history && depth != nullptr && WantsTemporalUpscaleDepth()) {
+        const auto setting = Settings::values.upscaler.GetValue();
+        const bool prefer_fsr = replacement == "fsr" ||
+                                (replacement.empty() &&
+                                 (setting == Settings::Upscaler::Fsr3 ||
+                                  setting == Settings::Upscaler::Fsr4));
+        const bool allow_metalfx = replacement != "fsr" && !temporal_unsupported;
+        const bool allow_fsr =
+            replacement != "dlss" && replacement != "metalfx" && !fsr3_unsupported;
+        if (prefer_fsr) {
+            if (allow_fsr &&
+                Fsr3TemporalUpscale(dst_framebuffer, dst, input_color, motion_vectors, *depth,
+                                    render_size, jitter, motion_scale)) {
+                NoteTemporalLodBias(render_size, output_size);
+                return true;
+            }
+            if (allow_metalfx &&
+                MetalFxTemporalUpscale(dst_framebuffer, dst, input_color, motion_vectors, *depth,
+                                       render_size, jitter, motion_scale)) {
+                NoteTemporalLodBias(render_size, output_size);
+                return true;
+            }
+        } else {
+            if (allow_metalfx &&
+                MetalFxTemporalUpscale(dst_framebuffer, dst, input_color, motion_vectors, *depth,
+                                       render_size, jitter, motion_scale)) {
+                NoteTemporalLodBias(render_size, output_size);
+                return true;
+            }
+            if (!fsr3_unsupported &&
+                Fsr3TemporalUpscale(dst_framebuffer, dst, input_color, motion_vectors, *depth,
+                                    render_size, jitter, motion_scale)) {
+                NoteTemporalLodBias(render_size, output_size);
+                return true;
+            }
+        }
+    }
+    if (TemporalStandIn(dst_framebuffer, dst, input_color, motion_vectors, render_size, jitter,
+                        motion_scale, use_history)) {
+        if (use_history) {
+            NoteTemporalLodBias(render_size, output_size);
+        }
         return true;
     }
-    if (use_history && depth != nullptr && WantsTemporalUpscaleDepth() && !fsr3_unsupported &&
-        Fsr3TemporalUpscale(dst_framebuffer, dst, input_color, motion_vectors, *depth,
-                            render_size, jitter, motion_scale)) {
-        return true;
-    }
-    return TemporalStandIn(dst_framebuffer, dst, input_color, motion_vectors, render_size, jitter,
-                           motion_scale, use_history);
+    return false;
 }
 
 bool TextureCacheRuntime::Fsr3TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst,
@@ -826,13 +911,19 @@ bool TextureCacheRuntime::Fsr3TemporalUpscale(Framebuffer* dst_framebuffer, Imag
     constexpr bool use_history = true;
     ImageView* const depth = &depth_view;
     const std::array<u32, 2> output_size{dst_framebuffer->Width(), dst_framebuffer->Height()};
+    const bool whole_input = HostExtent(input_color) == render_size;
+    const auto same_size = [&](const ImageView& view) {
+        return !whole_input || (input_color.size.width == view.size.width &&
+                                input_color.size.height == view.size.height);
+    };
     if (!IsPlainBaseView(dst) || !IsPlainBaseView(input_color) ||
         !IsPlainBaseView(motion_vectors) || !IsPlainBaseView(*depth) ||
         dst_framebuffer->Samples() != 1 || !IsColor(dst.HostClass()) ||
         !ViewFitsExtent(input_color, render_size) || !ViewFitsExtent(dst, output_size) ||
         !ViewFitsExtent(motion_vectors, render_size) || !ViewFitsExtent(*depth, render_size) ||
-        motion_vectors.format != PixelFormat::R16G16_FLOAT ||
-        depth->format != PixelFormat::D32_FLOAT || input_color.ImageHandle() == dst.ImageHandle() ||
+        motion_vectors.format != PixelFormat::R16G16_FLOAT || !same_size(motion_vectors) ||
+        depth->format != PixelFormat::D32_FLOAT || !same_size(*depth) ||
+        input_color.ImageHandle() == dst.ImageHandle() ||
         !DlssContract::ValidColorFormats(input_color.format, dst.format, use_history) ||
         !DlssContract::ValidGeometry(render_size, output_size, jitter, motion_scale)) {
         return false;
@@ -846,14 +937,19 @@ bool TextureCacheRuntime::Fsr3TemporalUpscale(Framebuffer* dst_framebuffer, Imag
         fsr3_unsupported = true;
         return false;
     }
-    // A gap in the evaluations (a menu, a movie, a load) starts the history again.
+    // A gap in the evaluations (frame gap > 1, elapsed > 250 ms) or extent change starts history again.
     const auto now = std::chrono::steady_clock::now();
     const f32 frame_time_ms =
         fsr3_last_evaluation
             ? std::chrono::duration<f32, std::milli>(now - *fsr3_last_evaluation).count()
             : 1000.0f / 30.0f;
-    const bool reset = !fsr3_last_evaluation || frame_time_ms > 250.0f;
+    const bool reset = !fsr3_last_evaluation || frame_time_ms > 250.0f ||
+                       !fsr3_last_frame || pool_frame > *fsr3_last_frame + 1 ||
+                       fsr3_last_render != render_size || fsr3_last_output != output_size;
     fsr3_last_evaluation = now;
+    fsr3_last_frame = pool_frame;
+    fsr3_last_render = render_size;
+    fsr3_last_output = output_size;
     // FSR's own RCAS, set by the sharpness slider as on Vulkan; EDEN_NX2_TEMPORAL_SHARPEN
     // overrides it.
     static const char* const sharpen_override = std::getenv("EDEN_NX2_TEMPORAL_SHARPEN");
@@ -876,7 +972,7 @@ bool TextureCacheRuntime::Fsr3TemporalUpscale(Framebuffer* dst_framebuffer, Imag
         .frame_time_ms = frame_time_ms,
         .reset = reset,
         .sharpen = sharpen,
-        .sharpness = 1.0f - stops / 2.0f,
+        .sharpness = std::clamp(1.0f - stops / 2.0f, 0.0f, 1.0f),
     });
     const s32 width = static_cast<s32>(output_size[0]);
     const s32 height = static_cast<s32>(output_size[1]);
@@ -932,25 +1028,32 @@ bool TextureCacheRuntime::TemporalStandIn(Framebuffer* dst_framebuffer, ImageVie
         !DlssContract::ValidGeometry(render_size, output_size, jitter, motion_scale)) {
         return false;
     }
+    const bool whole_input = HostExtent(input_color) == render_size;
     if (use_history && (!IsPlainBaseView(motion_vectors) ||
                         !ViewFitsExtent(motion_vectors, render_size) ||
                         motion_vectors.format != PixelFormat::R16G16_FLOAT ||
-                        input_color.size.width != motion_vectors.size.width ||
-                        input_color.size.height != motion_vectors.size.height)) {
+                        (whole_input && (input_color.size.width != motion_vectors.size.width ||
+                                         input_color.size.height != motion_vectors.size.height)))) {
         return false;
     }
     if (!present_passes) {
         present_passes = std::make_unique<PresentPasses>(device, scheduler);
     }
+    const bool reset_history = !standin_last_frame || pool_frame > *standin_last_frame + 1 ||
+                               standin_last_render != render_size;
+    standin_last_frame = pool_frame;
+    standin_last_render = render_size;
     if (!present_passes->TemporalFilter({
             .color = input_color.Handle(Shader::TextureType::Color2D),
             .motion = use_history ? motion_vectors.Handle(Shader::TextureType::Color2D) : nullptr,
             .target = dst.RenderTarget(),
             .format = dst.HostFormat(),
             .size = output_size,
+            .render_size = render_size,
             .jitter = jitter,
             .motion_scale = motion_scale,
             .use_history = use_history,
+            .reset = reset_history,
         })) {
         LOG_WARNING(Render_Metal, "Metal: temporal stand-in unavailable; the game's DLSS runs");
         standin_failed = true;
@@ -976,15 +1079,19 @@ bool TextureCacheRuntime::MetalFxTemporalUpscale(Framebuffer* dst_framebuffer, I
     namespace DlssContract = VideoCommon::DlssContract;
     constexpr bool use_history = true;
     ImageView* const depth = &depth_view;
-    // Images are never rescaled on Metal: each view's size is its texture's.
     const std::array<u32, 2> output_size{dst_framebuffer->Width(), dst_framebuffer->Height()};
+    const bool whole_input = HostExtent(input_color) == render_size;
+    const auto same_size = [&](const ImageView& view) {
+        return !whole_input || (input_color.size.width == view.size.width &&
+                                input_color.size.height == view.size.height);
+    };
     if (!IsPlainBaseView(dst) || !IsPlainBaseView(input_color) ||
         !IsPlainBaseView(motion_vectors) || !IsPlainBaseView(*depth) ||
         dst_framebuffer->Samples() != 1 || !IsColor(dst.HostClass()) ||
         !ViewFitsExtent(input_color, render_size) || !ViewFitsExtent(dst, output_size) ||
         !ViewFitsExtent(motion_vectors, render_size) || !ViewFitsExtent(*depth, render_size) ||
-        motion_vectors.format != PixelFormat::R16G16_FLOAT ||
-        depth->format != PixelFormat::D32_FLOAT ||
+        motion_vectors.format != PixelFormat::R16G16_FLOAT || !same_size(motion_vectors) ||
+        depth->format != PixelFormat::D32_FLOAT || !same_size(*depth) ||
         input_color.ImageHandle() == dst.ImageHandle() ||
         !DlssContract::ValidColorFormats(input_color.format, dst.format, use_history) ||
         !DlssContract::ValidGeometry(render_size, output_size, jitter, motion_scale)) {
@@ -998,11 +1105,16 @@ bool TextureCacheRuntime::MetalFxTemporalUpscale(Framebuffer* dst_framebuffer, I
         }
         temporal = std::make_unique<TemporalUpscaler>();
     }
-    // A gap in the evaluations (a menu, a movie, a load) starts the history again.
+    // A gap in the evaluations (frame gap > 1, elapsed > 250 ms) or extent change starts history again.
     const auto now = std::chrono::steady_clock::now();
     const bool reset = !temporal_last_evaluation ||
-                       now - *temporal_last_evaluation > std::chrono::milliseconds{250};
+                       now - *temporal_last_evaluation > std::chrono::milliseconds{250} ||
+                       !temporal_last_frame || pool_frame > *temporal_last_frame + 1 ||
+                       temporal_last_render != render_size || temporal_last_output != output_size;
     temporal_last_evaluation = now;
+    temporal_last_frame = pool_frame;
+    temporal_last_render = render_size;
+    temporal_last_output = output_size;
     const TextureHandle output = temporal->Upscale(
         device, scheduler,
         {
@@ -1130,6 +1242,87 @@ bool TextureCacheRuntime::UpscaleWithCameraMotion(Framebuffer* dst_framebuffer,
     return true;
 }
 
+void TextureCacheRuntime::ZeroTexture(TextureHandle tex, const TextureDesc& tex_desc,
+                                      PixelFormat guest_format) {
+    if (tex == nullptr || tex_desc.width == 0 || tex_desc.height == 0 || tex_desc.samples > 1) {
+        return;
+    }
+    const FormatClass fmt_class = ClassOf(tex_desc.format);
+    if (tex_desc.render_target) {
+        const bool clear_color = IsColor(fmt_class);
+        const bool clear_depth =
+            fmt_class == FormatClass::Depth || fmt_class == FormatClass::DepthStencil;
+        const bool clear_stencil =
+            fmt_class == FormatClass::Stencil || fmt_class == FormatClass::DepthStencil;
+        for (u32 level = 0; level < tex_desc.levels; ++level) {
+            const u32 width = (std::max)(tex_desc.width >> level, 1U);
+            const u32 height = (std::max)(tex_desc.height >> level, 1U);
+            for (u32 layer = 0; layer < tex_desc.layers; ++layer) {
+                ClearPass clear{};
+                const Attachment att{.texture = tex, .level = level, .slice = layer};
+                if (clear_color) {
+                    clear.color[0] = att;
+                    clear.clear_color[0] = true;
+                    clear.color_value[0] = {0.0, 0.0, 0.0, 0.0};
+                }
+                if (clear_depth) {
+                    clear.depth = att;
+                    clear.clear_depth = true;
+                    clear.depth_value = 0.0;
+                }
+                if (clear_stencil) {
+                    clear.stencil = att;
+                    clear.clear_stencil = true;
+                    clear.stencil_value = 0;
+                }
+                clear.width = width;
+                clear.height = height;
+                scheduler.Clear(clear);
+            }
+        }
+        return;
+    }
+    if (!IsColor(fmt_class)) {
+        return;
+    }
+    const bool converted = IsConverted(device, guest_format);
+    const u32 block_w = converted ? 1U : VideoCore::Surface::DefaultBlockWidth(guest_format);
+    const u32 block_h = converted ? 1U : VideoCore::Surface::DefaultBlockHeight(guest_format);
+    const u32 block_bytes = converted ? VideoCommon::ConvertedBytesPerBlock(guest_format)
+                                      : VideoCore::Surface::BytesPerBlock(guest_format);
+    if (block_bytes == 0) {
+        return;
+    }
+    const u32 top_blocks_x = Common::DivCeil(tex_desc.width, block_w);
+    const u32 top_blocks_y = Common::DivCeil(tex_desc.height, block_h);
+    const u64 slice_bytes = u64{top_blocks_x} * top_blocks_y * block_bytes;
+    if (slice_bytes == 0 || slice_bytes > (u64{64} << 20)) {
+        return;
+    }
+    StagingBufferRef zero_staging = UploadStagingBuffer(static_cast<size_t>(slice_bytes));
+    if (zero_staging.mapped_span.size() < slice_bytes) {
+        return;
+    }
+    std::memset(zero_staging.mapped_span.data(), 0, static_cast<size_t>(slice_bytes));
+    for (u32 level = 0; level < tex_desc.levels; ++level) {
+        const u32 lw = (std::max)(tex_desc.width >> level, 1U);
+        const u32 lh = (std::max)(tex_desc.height >> level, 1U);
+        const u32 row_bytes = Common::DivCeil(lw, block_w) * block_bytes;
+        const u32 img_bytes = Common::DivCeil(lh, block_h) * row_bytes;
+        for (u32 layer = 0; layer < tex_desc.layers; ++layer) {
+            scheduler.CopyBufferToTexture(zero_staging.buffer, zero_staging.offset, row_bytes,
+                                          img_bytes, tex, level, layer, Offset3D{},
+                                          Extent3D{lw, lh, 1});
+        }
+    }
+}
+
+void TextureCacheRuntime::TransitionImageLayout(Image& image) {
+    if (image.TakePoolZeroNeeded()) {
+        ZeroTexture(image.BaseHandle(), image.BaseDesc(), image.info.format);
+    }
+}
+
 void TextureCacheRuntime::AccelerateImageUpload(Image&, const StagingBufferRef&,
                                                 std::span<const VideoCommon::SwizzleParameters>,
                                                 u32, u32) {
@@ -1229,6 +1422,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         }
     }
     std::tie(texture, base_texture_bytes) = runtime->AcquireTexture(desc, &from_pool);
+    needs_pool_zero = from_pool;
     if (!texture) {
         LOG_ERROR(Render_Metal, "Metal: texture {}x{}x{} format {} levels {} layers {} failed",
                   desc.width, desc.height, desc.depth, info.format, desc.levels, desc.layers);
@@ -1636,6 +1830,7 @@ bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
 
 void Image::UploadMemory(BufferHandle buffer, size_t offset,
                          std::span<const VideoCommon::BufferImageCopy> copies, bool ahead) {
+    needs_pool_zero = false;
     if (!CanCopyWithBuffers()) {
         return;
     }
@@ -2068,15 +2263,19 @@ Attachment ImageView::RenderTarget() const noexcept {
 f32 TextureCacheRuntime::OcarinaLodBias() {
     if (!ocarina_lod_bias) {
         const bool ocarina = Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
-        // MetalFX temporal takes Vulkan's Dlss backend (RasterizerMetal::OcarinaTemporalEnabled);
-        // FSR 3.1 has no Metal path.
-        ocarina_lod_bias = ocarina && OcarinaTemporal::Enabled() &&
-                                   Settings::MetalFxTemporalChosen()
-                               ? VideoCommon::OcarinaFsrLodBias(
-                                     VideoCommon::OcarinaUpscaleBackend::Dlss,
-                                     Settings::OcarinaDlssModeFor(
-                                         Settings::values.oot_resolution.GetValue()))
-                               : 0.0f;
+        f32 bias = 0.0f;
+        if (ocarina && OcarinaTemporal::Enabled()) {
+            const auto backend = OcarinaTemporal::ResolveBackend(device);
+            const auto effective_res = Settings::OcarinaUpscaledResolution(
+                Settings::values.oot_resolution.GetValue(), Settings::values.upscaler.GetValue(),
+                Settings::IsDockedMode());
+            const auto mode = Settings::OcarinaDlssModeFor(effective_res);
+            bias = VideoCommon::OcarinaFsrLodBias(backend, mode);
+            if (bias == 0.0f && backend == VideoCommon::OcarinaUpscaleBackend::Dlss) {
+                bias = VideoCommon::OcarinaDlssLodBias(mode);
+            }
+        }
+        ocarina_lod_bias = bias;
     }
     return *ocarina_lod_bias;
 }
@@ -2120,8 +2319,16 @@ void* Sampler::HandleFor(const ImageView& view, bool is_depth) {
     if (!with_variants) {
         return sampler.Get();
     }
-    enum : u8 { ReduceAnisotropy = 1, ForceNearest = 2, DropCompare = 4, DropBias = 8, Srgb = 16 };
-    u8 key = 0;
+    using Tegra::Texture::TextureMipmapFilter;
+    enum : u16 {
+        ReduceAnisotropy = 1,
+        ForceNearest = 2,
+        DropCompare = 4,
+        DropBias = 8,
+        Srgb = 16,
+        TemporalBiasShift = 8,
+    };
+    u16 key = 0;
     if (has_added_anisotropy && !view.SupportsAnisotropy()) {
         key |= ReduceAnisotropy;
     }
@@ -2134,13 +2341,20 @@ void* Sampler::HandleFor(const ImageView& view, bool is_depth) {
     if (has_depth_comparison && !is_depth) {
         key |= DropCompare;
     }
+    const Image* const image = view.BackingImage();
+    const bool gpu_written = image != nullptr && True(image->flags & ImageFlagBits::GpuModified);
     if (added_lod_bias != 0.0f) {
-        const Image* const image = view.BackingImage();
-        if (!VideoCommon::KeepOcarinaFsrLodBias(
-                Settings::IsDockedMode(), false,
-                image != nullptr && True(image->flags & ImageFlagBits::GpuModified))) {
+        if (!VideoCommon::KeepOcarinaFsrLodBias(true, runtime->ocarina_upscaler_failed,
+                                                gpu_written)) {
             key |= DropBias;
         }
+    } else if (!gpu_written && runtime->temporal_lod_bias < -0.125f &&
+               runtime->temporal_lod_frame + 2 >= runtime->PoolFrame() &&
+               tsc.mipmap_filter.Value() != TextureMipmapFilter::None &&
+               tsc.LodBias() == 0.0f && SamplerBiasSupported(*device)) {
+        const u16 steps = static_cast<u16>(
+            std::clamp(static_cast<int>(std::lround(-runtime->temporal_lod_bias * 4.0f)), 0, 15));
+        key |= static_cast<u16>(steps << TemporalBiasShift);
     }
     if (has_srgb_border && VideoCore::Surface::IsPixelFormatSRGB(view.format)) {
         key |= Srgb;
@@ -2151,9 +2365,13 @@ void* Sampler::HandleFor(const ImageView& view, bool is_depth) {
     if (const auto it = std::ranges::find(variants, key, &Variant::key); it != variants.end()) {
         return it->state.Get();
     }
+    const u16 temporal_steps = key >> TemporalBiasShift;
+    const f32 effective_bias =
+        temporal_steps != 0 ? -0.25f * static_cast<f32>(temporal_steps)
+                            : ((key & DropBias) != 0 ? 0.0f : added_lod_bias);
     Object state = CreateSampler(*device, tsc,
                                  SamplerOptions{
-                                     .added_lod_bias = (key & DropBias) != 0 ? 0.0f : added_lod_bias,
+                                     .added_lod_bias = effective_bias,
                                      .reduce_anisotropy = (key & ReduceAnisotropy) != 0,
                                      .force_nearest = (key & ForceNearest) != 0,
                                      .drop_compare = (key & DropCompare) != 0,

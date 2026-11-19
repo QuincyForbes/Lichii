@@ -80,6 +80,27 @@ static_assert(Last <= (std::numeric_limits<u8>::max)());
 
 } // namespace Dirty
 
+// Mesh draws are issued as point draws; the rasterizer uses SET_MESH_SHADER_A's output topology.
+template <typename Regs>
+constexpr Regs::PrimitiveTopology RasterTopologyOf(const Regs& regs,
+                                                   typename Regs::PrimitiveTopology draw_topology) {
+    if constexpr (requires { regs.RasterTopology(draw_topology); }) {
+        return regs.RasterTopology(draw_topology);
+    } else {
+        if (!regs.IsMeshEnabled()) {
+            return draw_topology;
+        }
+        switch (regs.reg_array[Regs::MeshControl + 1] & 0xf) {
+        case 0:
+            return Regs::PrimitiveTopology::Points;
+        case 1:
+            return Regs::PrimitiveTopology::Lines;
+        default:
+            return Regs::PrimitiveTopology::Triangles;
+        }
+    }
+}
+
 class StateTracker {
     using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 
@@ -89,6 +110,7 @@ public:
     void InvalidateCommandBufferState() {
         (*flags) |= invalidation_flags;
         current_topology = INVALID_TOPOLOGY;
+        current_raster_topology = INVALID_TOPOLOGY;
         stencil_reset = true;
         ++command_buffer_epoch;
     }
@@ -306,6 +328,12 @@ public:
         return has_changed;
     }
 
+    bool ChangeRasterTopology(Maxwell::PrimitiveTopology new_topology) {
+        const bool has_changed = current_raster_topology != new_topology;
+        current_raster_topology = new_topology;
+        return has_changed;
+    }
+
     void SetupTables(Tegra::Control::ChannelState& channel_state);
 
     void ChangeChannel(Tegra::Control::ChannelState& channel_state);
@@ -331,6 +359,7 @@ private:
     Tegra::Engines::Maxwell3D::DirtyState::Flags default_flags;
     Tegra::Engines::Maxwell3D::DirtyState::Flags invalidation_flags;
     Maxwell::PrimitiveTopology current_topology = INVALID_TOPOLOGY;
+    Maxwell::PrimitiveTopology current_raster_topology = INVALID_TOPOLOGY;
     bool two_sided_stencil = false;
     StencilProperties front{};
     StencilProperties back{};

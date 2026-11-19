@@ -14,14 +14,22 @@
 #endif
 
 #include "common/logging.h"
+#include "common/settings.h"
+#include "video_core/fsr.h"
 #include "video_core/ocarina_upscale.h"
 #include "video_core/host_shaders/camera_motion_vectors_comp_spv.h"
 #include "video_core/host_shaders/ocarina_actor_motion_frag_spv.h"
 #include "video_core/host_shaders/ocarina_actor_motion_vert_spv.h"
 #include "video_core/host_shaders/ocarina_bilinear_upscale_comp_spv.h"
 #include "video_core/host_shaders/ocarina_camera_motion_comp_spv.h"
+#include "video_core/host_shaders/ocarina_dlss_4k_composite_comp_spv.h"
+#include "video_core/host_shaders/ocarina_dlss_4k_reference_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_bias_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_color_comp_spv.h"
+#if __has_include("video_core/host_shaders/ocarina_dlss_effects_base_comp_spv.h")
+#include "video_core/host_shaders/ocarina_dlss_effects_base_comp_spv.h"
+#define LICHII_HAS_OOT_EFFECTS_BASE_SPV 1
+#endif
 #include "video_core/host_shaders/ocarina_dlss_effects_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_output_comp_spv.h"
 #include "video_core/renderer_metal/metal_formats.h"
@@ -132,9 +140,11 @@ bool OcarinaUpscale::BilinearEnabled() {
     return enabled;
 }
 
-bool OcarinaUpscale::IsBilinearPass(u64 shader_hash, const Shader::Info& info) {
-    // As Vulkan's ComputePipeline::CanReplaceOcarinaUpscale.
-    return std::ranges::find(BilinearShaders, shader_hash) != BilinearShaders.end() &&
+bool OcarinaUpscale::IsBilinearPass(u64 native_key, u64 shader_hash, const Shader::Info& info) {
+    // As Vulkan's TryOcarinaBilinear.
+    const auto pass = VideoCommon::FindOcarinaUpscalePass(native_key, shader_hash);
+    return (pass == VideoCommon::OcarinaUpscalePass::Scaled ||
+            pass == VideoCommon::OcarinaUpscalePass::ThreeQuarter) &&
            SamplesIntoOneImage(info);
 }
 
@@ -332,6 +342,16 @@ bool OcarinaTemporal::HandheldEnabled() {
     return enabled;
 }
 
+bool OcarinaTemporal::Present4kEnabled() {
+    static const bool enabled = [] {
+        if (const char* const value = std::getenv("EDEN_NX2_METAL_OOT_4K")) {
+            return value[0] != '0';
+        }
+        return !TranslateForIos;
+    }();
+    return enabled;
+}
+
 bool OcarinaTemporal::ActorEnabled() {
     static const bool enabled = EnvironmentOn("EDEN_NX2_METAL_OOT_ACTOR");
     return enabled;
@@ -342,8 +362,47 @@ bool OcarinaTemporal::EffectsEnabled() {
     return enabled;
 }
 
-bool OcarinaTemporal::IsTemporalPass(u64 shader_hash, const Shader::Info& info) {
-    return std::ranges::find(TemporalShaders, shader_hash) != TemporalShaders.end() &&
+VideoCommon::OcarinaUpscaleBackend OcarinaTemporal::ResolveBackend(const Device& device,
+                                                                   bool metalfx_failed,
+                                                                   bool fsr_failed) {
+    using Backend = VideoCommon::OcarinaUpscaleBackend;
+    if (!Enabled()) {
+        return Backend::Native;
+    }
+    const bool metalfx_ok = !metalfx_failed && TemporalUpscaler::IsSupported(device);
+    const bool fsr_ok = !fsr_failed;
+    if (const char* const raw = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+        raw != nullptr && raw[0] != '\0') {
+        const std::string_view override{raw};
+        if (override == "native") {
+            return Backend::Native;
+        }
+        if (override == "fsr") {
+            return fsr_ok ? Backend::Fsr : Backend::Native;
+        }
+        if (override == "dlss" || override == "metalfx") {
+            return metalfx_ok ? Backend::Dlss : (fsr_ok ? Backend::Fsr : Backend::Native);
+        }
+    }
+    switch (Settings::values.upscaler.GetValue()) {
+    case Settings::Upscaler::Game:
+        return Backend::Native;
+    case Settings::Upscaler::MetalFx:
+        return metalfx_ok ? Backend::Dlss : Backend::Native;
+    case Settings::Upscaler::Fsr3:
+        return fsr_ok ? Backend::Fsr : Backend::Native;
+    case Settings::Upscaler::Fsr4:
+        return fsr_ok ? Backend::Fsr : (metalfx_ok ? Backend::Dlss : Backend::Native);
+    case Settings::Upscaler::Auto:
+    case Settings::Upscaler::Dlss:
+    default:
+        return metalfx_ok ? Backend::Dlss : (fsr_ok ? Backend::Fsr : Backend::Native);
+    }
+}
+
+bool OcarinaTemporal::IsTemporalPass(u64 native_key, u64 shader_hash, const Shader::Info& info) {
+    return VideoCommon::FindOcarinaUpscalePass(native_key, shader_hash) !=
+               VideoCommon::OcarinaUpscalePass::None &&
            SamplesIntoOneImage(info);
 }
 
@@ -352,11 +411,18 @@ bool OcarinaTemporal::IsScaledPass(u64 shader_hash) {
            TemporalShaders.begin() + 5;
 }
 
-bool OcarinaTemporal::Available() {
+VideoCommon::OcarinaUpscaleBackend OcarinaTemporal::Backend() {
+    if (failed) {
+        return VideoCommon::OcarinaUpscaleBackend::Native;
+    }
     if (!supported) {
         supported = TemporalUpscaler::IsSupported(device);
     }
-    return *supported && !failed;
+    return ResolveBackend(device, metalfx_failed || !*supported, fsr3_failed);
+}
+
+bool OcarinaTemporal::Available() {
+    return Backend() != VideoCommon::OcarinaUpscaleBackend::Native;
 }
 
 bool OcarinaTemporal::Prepare() {
@@ -366,12 +432,21 @@ bool OcarinaTemporal::Prepare() {
     failed = true;
     std::string error;
     sampler = CreateLinearClampSampler(device);
+    Tegra::Texture::TSCEntry point_tsc{};
+    point_tsc.wrap_u.Assign(Tegra::Texture::WrapMode::ClampToEdge);
+    point_tsc.wrap_v.Assign(Tegra::Texture::WrapMode::ClampToEdge);
+    point_tsc.wrap_p.Assign(Tegra::Texture::WrapMode::ClampToEdge);
+    point_tsc.mag_filter.Assign(Tegra::Texture::TextureFilter::Nearest);
+    point_tsc.min_filter.Assign(Tegra::Texture::TextureFilter::Nearest);
+    point_tsc.mipmap_filter.Assign(Tegra::Texture::TextureMipmapFilter::None);
+    point_sampler = CreateSampler(device, point_tsc);
     // The scene depth (binding 0) is a depth texture.
     ShaderTranslate::Options motion_options{};
     motion_options.depth_images = {{0, 0}};
     if (!BuildPass(device, motion_pass, OCARINA_CAMERA_MOTION_COMP_SPV, error, motion_options) ||
         !BuildPass(device, color_pass, OCARINA_DLSS_COLOR_COMP_SPV, error) ||
-        !BuildPass(device, output_pass, OCARINA_DLSS_OUTPUT_COMP_SPV, error) || !sampler) {
+        !BuildPass(device, output_pass, OCARINA_DLSS_OUTPUT_COMP_SPV, error) || !sampler ||
+        !point_sampler) {
         LOG_WARNING(Render_Metal, "Metal: Ocarina temporal upscale unavailable: {}", error);
         return false;
     }
@@ -475,7 +550,13 @@ bool OcarinaTemporal::PrepareEffects() {
     }
     effects_failed = true;
     std::string error;
-    if (!BuildPass(device, effects_mark_pass, OCARINA_DLSS_EFFECTS_COMP_SPV, error) ||
+#ifdef LICHII_HAS_OOT_EFFECTS_BASE_SPV
+    const std::span<const u32> base_spv{OCARINA_DLSS_EFFECTS_BASE_COMP_SPV};
+#else
+    const std::span<const u32> base_spv{OCARINA_DLSS_COLOR_COMP_SPV};
+#endif
+    if (!BuildPass(device, effects_base_pass, base_spv, error) ||
+        !BuildPass(device, effects_mark_pass, OCARINA_DLSS_EFFECTS_COMP_SPV, error) ||
         !BuildPass(device, effects_bias_pass, OCARINA_DLSS_BIAS_COMP_SPV, error) ||
         !Prepare()) {
         LOG_WARNING(Render_Metal, "Metal: Ocarina effects mask unavailable: {}", error);
@@ -489,6 +570,9 @@ bool OcarinaTemporal::PrepareEffects() {
 bool OcarinaTemporal::Resize(std::array<u32, 2> extent) {
     if (extent == size && motion && color) {
         return true;
+    }
+    if (motion || color) {
+        scheduler.Finish();
     }
     const auto make = [&](u32 format, bool render_target) {
         return CreateTexture(device, {.kind = TextureKind::e2D,
@@ -697,6 +781,9 @@ void OcarinaTemporal::SaveEffectsBase(TextureHandle scene, std::array<u32, 2> ex
         return;
     }
     if (effects.extent != extent || !effects.base) {
+        if (effects.base) {
+            scheduler.Finish();
+        }
         const auto make = [&](u32 format) {
             return CreateTexture(device, {.kind = TextureKind::e2D,
                                           .format = format,
@@ -715,7 +802,7 @@ void OcarinaTemporal::SaveEffectsBase(TextureHandle scene, std::array<u32, 2> ex
             return;
         }
     }
-    Run(color_pass, scene, effects.base.Get(), {}, extent);
+    Run(effects_base_pass, scene, effects.base.Get(), {}, extent);
     effects.base_frame = frame;
 }
 
@@ -746,8 +833,10 @@ bool OcarinaTemporal::EncodeEffectsBias(u64 frame, std::array<u32, 2> extent) {
 }
 
 bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
-    if (!Available()) {
-        reason = "MetalFX temporal unavailable";
+    using UpscaleBackend = VideoCommon::OcarinaUpscaleBackend;
+    UpscaleBackend backend = Backend();
+    if (backend == UpscaleBackend::Native) {
+        reason = "Ocarina temporal upscaler unavailable";
         return false;
     }
     if (last_frame == frame.frame) {
@@ -759,6 +848,14 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
         reason = "camera matrix not invertible";
         return false;
     }
+    const f32 projection_y = std::hypot(frame.current[4], frame.current[5], frame.current[6]);
+    if (backend == UpscaleBackend::Fsr && (!std::isfinite(projection_y) || projection_y < 0.01f)) {
+        reason = "camera projection invalid";
+        return false;
+    }
+    const std::array<u32, 2> output_size =
+        frame.output_size[0] != 0 && frame.output_size[1] != 0 ? frame.output_size
+                                                               : frame.target_size;
     std::optional<ActorMotion> actor;
     if (frame.actor != nullptr) {
         actor.emplace(ActorMotion{*frame.actor, frame.current, frame.previous});
@@ -769,44 +866,189 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
         return false;
     }
     Run(color_pass, frame.color, color.Get(), {}, frame.extent);
-    const bool reactive = EffectsEnabled() && TemporalUpscaler::ReactiveMaskSupported() &&
-                          EncodeEffectsBias(frame.frame, frame.extent);
-    if (reactive) {
-        ++effects_frames;
-    }
+    const bool bias_encoded = EffectsEnabled() && EncodeEffectsBias(frame.frame, frame.extent);
+    const auto now = std::chrono::steady_clock::now();
+    const f32 elapsed =
+        last_evaluation
+            ? std::chrono::duration<f32, std::milli>(now - *last_evaluation).count()
+            : 16.67f;
     const bool reset = !last_frame || frame.frame != *last_frame + 1 ||
+                       last_render_size != frame.extent || last_output_size != output_size ||
+                       last_backend != backend || elapsed > 250.0f ||
                        !std::ranges::equal(frame.previous, last_view_projection,
                                            [](f32 a, f32 b) { return std::abs(a - b) < 0.001f; });
-    const TextureHandle output = upscaler.Upscale(device, scheduler,
-                                                  {
-                                                      .color = color.Get(),
-                                                      .depth = frame.depth,
-                                                      .motion = motion.Get(),
-                                                      .render_size = frame.extent,
-                                                      .output_size = frame.target_size,
-                                                      // EDEN_NX2_DLSS_JITTER=2: y flipped.
-                                                      .jitter = {frame.jitter[0],
-                                                                 VideoCommon::OcarinaDlssJitterMode() == 2
-                                                                     ? -frame.jitter[1]
-                                                                     : frame.jitter[1]},
-                                                      .motion_vector_scale = {1.0f, 1.0f},
-                                                      .reset = reset,
-                                                      .depth_reversed = false,
-                                                      .auto_exposure = false,
-                                                      .reactive = reactive
-                                                                      ? effects.bias.Get()
-                                                                      : nullptr,
-                                                  });
+
+    TextureHandle output = nullptr;
+    if (backend == UpscaleBackend::Dlss) {
+        const bool reactive = bias_encoded && TemporalUpscaler::ReactiveMaskSupported();
+        output = upscaler.Upscale(
+            device, scheduler,
+            {
+                .color = color.Get(),
+                .depth = frame.depth,
+                .motion = motion.Get(),
+                .render_size = frame.extent,
+                .output_size = output_size,
+                // EDEN_NX2_DLSS_JITTER=2: y flipped.
+                .jitter = {frame.jitter[0], VideoCommon::OcarinaDlssJitterMode() == 2
+                                                ? -frame.jitter[1]
+                                                : frame.jitter[1]},
+                .motion_vector_scale = {1.0f, 1.0f},
+                .reset = reset,
+                .depth_reversed = false,
+                .auto_exposure = false,
+                .reactive = reactive ? effects.bias.Get() : nullptr,
+            });
+        if (output != nullptr) {
+            if (reactive) {
+                ++effects_frames;
+            }
+        } else {
+            metalfx_failed = true;
+            backend = Backend();
+        }
+    }
+    if (output == nullptr && backend == UpscaleBackend::Fsr) {
+        if (!std::isfinite(projection_y) || projection_y < 0.01f) {
+            reason = "camera projection invalid";
+            return false;
+        }
+        if (!fsr3) {
+            fsr3 = std::make_unique<Fsr3Upscaler>(device, scheduler,
+                                                  Fsr3Upscaler::Profile::OcarinaLdr);
+        }
+        const f32 sharpness = FSR::RcasSharpnessFromStops(
+            static_cast<f32>(Settings::values.fsr_sharpening_slider.GetValue()) / 100.0f);
+        const bool fsr_reset = reset || last_backend != UpscaleBackend::Fsr;
+        const TextureHandle mask = bias_encoded ? effects.bias.Get() : nullptr;
+        output = fsr3->Upscale({
+            .color = color.Get(),
+            .depth = frame.depth,
+            .motion = motion.Get(),
+            .reactive = mask,
+            .transparency = mask,
+            .render_size = frame.extent,
+            .upscale_size = output_size,
+            .jitter = frame.jitter,
+            .motion_vector_scale = {1.0f, 1.0f},
+            .frame_time_ms = elapsed,
+            .reset = fsr_reset,
+            .sharpen = sharpness > 0.0f,
+            .sharpness = sharpness,
+            .vertical_fov = 2.0f * std::atan(1.0f / projection_y),
+        });
+        if (output != nullptr) {
+            if (bias_encoded) {
+                ++effects_frames;
+            }
+        } else {
+            fsr3_failed = true;
+        }
+    }
     if (output == nullptr) {
-        failed = true;
-        reason = "MetalFX declined the frame";
+        if (Backend() == UpscaleBackend::Native) {
+            failed = true;
+        }
+        reason = metalfx_failed && !fsr3_failed ? "MetalFX declined the frame"
+                                                : "FSR 3.1 declined the frame";
         return false;
     }
-    Run(output_pass, output, frame.target, {}, frame.target_size);
+
+    last_upscaled = output;
+    if (frame.target != nullptr) {
+        const bool same_size = output_size == frame.target_size;
+        void* const out_sampler = same_size && point_sampler ? point_sampler.Get() : sampler.Get();
+        scheduler.BeginCompute(output_pass.state.Get());
+        for (const ShaderTranslate::ResourceSlot& slot : output_pass.slots) {
+            switch (slot.kind) {
+            case ShaderTranslate::ResourceKind::Buffer:
+                break;
+            case ShaderTranslate::ResourceKind::Texture:
+                scheduler.BindTexture(ShaderStage::Compute, slot.index,
+                                      slot.binding == 0 ? output : frame.target);
+                break;
+            case ShaderTranslate::ResourceKind::Sampler:
+                scheduler.BindSampler(ShaderStage::Compute, slot.index, out_sampler);
+                break;
+            }
+        }
+        scheduler.Dispatch({(frame.target_size[0] + GroupSize - 1) / GroupSize,
+                            (frame.target_size[1] + GroupSize - 1) / GroupSize, 1},
+                           {GroupSize, GroupSize, 1});
+    }
+    last_evaluation = now;
     last_frame = frame.frame;
+    last_render_size = frame.extent;
+    last_output_size = output_size;
+    last_backend = backend;
     last_view_projection = frame.current;
     ++passes;
     return true;
+}
+
+void OcarinaTemporal::SaveSceneReference(TextureHandle guest_scene) {
+    if (guest_scene == nullptr || composite_failed || !Prepare()) {
+        return;
+    }
+    constexpr std::array<u32, 2> ReferenceExtent{2560, 1440};
+    if (!reference_pass.state) {
+        std::string error;
+        if (!BuildPass(device, reference_pass, OCARINA_DLSS_4K_REFERENCE_COMP_SPV, error)) {
+            LOG_WARNING(Render_Metal, "Metal: Ocarina 4K reference pass unavailable: {}", error);
+            composite_failed = true;
+            return;
+        }
+    }
+    if (!native_scene) {
+        native_scene = CreateTexture(device, {.kind = TextureKind::e2D,
+                                              .format = Fmt::RGBA8Unorm,
+                                              .width = ReferenceExtent[0],
+                                              .height = ReferenceExtent[1],
+                                              .shader_write = true,
+                                              .pixel_format_view = false});
+        if (!native_scene) {
+            composite_failed = true;
+            return;
+        }
+    }
+    Run(reference_pass, guest_scene, native_scene.Get(), {}, ReferenceExtent);
+}
+
+TextureHandle OcarinaTemporal::Composite4k(TextureHandle native_composite, u64 frame) {
+    if (composited_frame == frame && composite) {
+        return composite.Get();
+    }
+    if (native_composite == nullptr || last_upscaled == nullptr || !native_scene ||
+        composite_failed || !Prepare()) {
+        return nullptr;
+    }
+    constexpr std::array<u32, 2> CompositeExtent{3840, 2160};
+    if (!composite_pass.state) {
+        std::string error;
+        if (!BuildPass(device, composite_pass, OCARINA_DLSS_4K_COMPOSITE_COMP_SPV, error)) {
+            LOG_WARNING(Render_Metal, "Metal: Ocarina 4K composite pass unavailable: {}", error);
+            composite_failed = true;
+            return nullptr;
+        }
+    }
+    if (!composite) {
+        composite = CreateTexture(device, {.kind = TextureKind::e2D,
+                                           .format = Fmt::RGBA8Unorm,
+                                           .width = CompositeExtent[0],
+                                           .height = CompositeExtent[1],
+                                           .shader_write = true,
+                                           .pixel_format_view = false});
+        if (!composite) {
+            composite_failed = true;
+            return nullptr;
+        }
+    }
+    const std::array<TextureHandle, 3> inputs{last_upscaled, native_scene.Get(), native_composite};
+    const u32 use_dlss = !failed ? 1U : 0U;
+    Run(composite_pass, inputs, composite.Get(),
+        std::span(reinterpret_cast<const u8*>(&use_dlss), sizeof(use_dlss)), CompositeExtent);
+    composited_frame = frame;
+    return composite.Get();
 }
 
 u64 OcarinaTemporal::TakePasses() noexcept {

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <optional>
@@ -89,8 +90,10 @@ constexpr OcarinaUpscalePass FindOcarinaUpscalePass(u64 native_key, u64 shader_h
     return {OcarinaUpscale::Halton(index, 2) - center, OcarinaUpscale::Halton(index, 3) - center};
 }
 
+/// render_scaled: a DLSS render-scale patch shrank the scene to a size FSR 3.1 takes, so FSR 3.1
+/// reconstructs it when DLSS can't run.
 constexpr OcarinaUpscaleBackend SelectOcarinaUpscaler(bool fsr_enabled, bool dlss_enabled,
-                                                    bool dlss_available,
+                                                    bool dlss_available, bool render_scaled,
                                                     std::string_view override) {
     if (override == "native") {
         return OcarinaUpscaleBackend::Native;
@@ -101,15 +104,40 @@ constexpr OcarinaUpscaleBackend SelectOcarinaUpscaler(bool fsr_enabled, bool dls
     if ((dlss_enabled || override == "dlss") && dlss_available) {
         return OcarinaUpscaleBackend::Dlss;
     }
-    return fsr_enabled ? OcarinaUpscaleBackend::Fsr : OcarinaUpscaleBackend::Native;
+    return fsr_enabled || render_scaled ? OcarinaUpscaleBackend::Fsr
+                                        : OcarinaUpscaleBackend::Native;
+}
+
+constexpr OcarinaUpscaleBackend SelectOcarinaUpscaler(bool fsr_enabled, bool dlss_enabled,
+                                                    bool dlss_available,
+                                                    std::string_view override) {
+    return SelectOcarinaUpscaler(fsr_enabled, dlss_enabled, dlss_available, false, override);
+}
+
+inline std::atomic<u32>& AppliedOcarinaRenderScaleStorage() noexcept {
+    static std::atomic<u32> value{};
+    return value;
+}
+
+inline void SetAppliedOcarinaRenderScale(std::optional<Settings::DlssQuality> quality) noexcept {
+    AppliedOcarinaRenderScaleStorage().store(quality ? static_cast<u32>(*quality) + 1 : 0,
+                                             std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline std::optional<Settings::DlssQuality> AppliedOcarinaRenderScale() noexcept {
+    const u32 value = AppliedOcarinaRenderScaleStorage().load(std::memory_order_relaxed);
+    if (value == 0) {
+        return std::nullopt;
+    }
+    return static_cast<Settings::DlssQuality>(value - 1);
 }
 
 /// EDEN_NX2_DLSS_JITTER (boot, 0 = off): DLSS or MetalFX gets the camera jitter the FSR path uses.
-/// 1 = the jitter as FSR gets it, 2 = with its vertical sign flipped.
+/// 1 = the jitter as FSR gets it (default), 2 = with its vertical sign flipped.
 inline int OcarinaDlssJitterMode() {
     static const int mode = [] {
         const char* value = std::getenv("EDEN_NX2_DLSS_JITTER");
-        return value != nullptr ? std::atoi(value) : 0;
+        return value != nullptr ? std::atoi(value) : 1;
     }();
     return mode;
 }

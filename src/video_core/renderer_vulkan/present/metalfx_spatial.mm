@@ -52,6 +52,7 @@ struct MetalFxSpatial::Impl {
     MetalFxContext context;
     VkExtent2D extent;
     VkExtent2D input_extent{};
+    VkExtent2D unsupported_input{};
     vk::Image input;
     vk::Image output;
     vk::ImageView output_view;
@@ -63,6 +64,10 @@ bool MetalFxSpatial::Impl::Prepare(Scheduler& scheduler, VkExtent2D input_size) 
     if (scaler != nil && input_extent.width == input_size.width &&
         input_extent.height == input_size.height) {
         return true;
+    }
+    if (unsupported_input.width == input_size.width &&
+        unsupported_input.height == input_size.height) {
+        return false;
     }
     if (input) {
         scheduler.Finish();
@@ -95,6 +100,7 @@ bool MetalFxSpatial::Impl::Prepare(Scheduler& scheduler, VkExtent2D input_size) 
     id<MTLTexture> input_texture = context.Texture(*input);
     id<MTLTexture> output_texture = context.Texture(*output);
     if (input_texture == nil || output_texture == nil) {
+        failed = true;
         return false;
     }
     MTLFXSpatialScalerDescriptor* descriptor = [[MTLFXSpatialScalerDescriptor alloc] init];
@@ -106,18 +112,28 @@ bool MetalFxSpatial::Impl::Prepare(Scheduler& scheduler, VkExtent2D input_size) 
     descriptor.outputTextureFormat = output_texture.pixelFormat;
     // The present chain is in display (gamma) space.
     descriptor.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
-    scaler = [descriptor newSpatialScalerWithDevice:context.MtlDevice()];
+    @try {
+        scaler = [descriptor newSpatialScalerWithDevice:context.MtlDevice()];
+    } @catch (NSException* exception) {
+        const char* const reason = exception.reason.UTF8String;
+        LOG_WARNING(Render_Vulkan, "MetalFX spatial: creating the scaler raised: {}",
+                    reason ? reason : "no reason given");
+        scaler = nil;
+    }
     if (scaler == nil) {
         LOG_WARNING(Render_Vulkan, "MetalFX spatial: no scaler for {}x{} -> {}x{}",
                     input_size.width, input_size.height, extent.width, extent.height);
+        unsupported_input = input_size;
         return false;
     }
     if (!HasUsage(input_texture, scaler.colorTextureUsage) ||
         !HasUsage(output_texture, scaler.outputTextureUsage)) {
         LOG_WARNING(Render_Vulkan, "MetalFX spatial: the images lack the texture usage it needs");
         scaler = nil;
+        failed = true;
         return false;
     }
+    unsupported_input = {};
     LOG_INFO(Render_Vulkan, "MetalFX spatial: {}x{} -> {}x{}", input_size.width,
              input_size.height, extent.width, extent.height);
     return true;
@@ -162,9 +178,13 @@ std::optional<VkImageView> MetalFxSpatial::Draw(Scheduler& scheduler, VkImage so
         .width = static_cast<u32>(std::max(1, std::abs(right - left))),
         .height = static_cast<u32>(std::max(1, std::abs(bottom - top))),
     };
+    // MetalFX Spatial only upscales: fall back per-frame on 1:1 or downscaling and recover when
+    // upscaling resumes.
+    if (state.extent.width <= input_size.width || state.extent.height <= input_size.height) {
+        return std::nullopt;
+    }
     @autoreleasepool {
         if (!state.Prepare(scheduler, input_size)) {
-            state.failed = true;
             return std::nullopt;
         }
 
@@ -209,7 +229,14 @@ std::optional<VkImageView> MetalFxSpatial::Draw(Scheduler& scheduler, VkImage so
             scaler.outputTexture = output_texture;
             scaler.inputContentWidth = input_size.width;
             scaler.inputContentHeight = input_size.height;
-            [scaler encodeToCommandBuffer:command_buffer];
+            @try {
+                [scaler encodeToCommandBuffer:command_buffer];
+            } @catch (NSException* exception) {
+                const char* const reason = exception.reason.UTF8String;
+                LOG_ERROR(Render_Vulkan, "MetalFX spatial: encoding raised: {}",
+                          reason ? reason : "no reason given");
+                return false;
+            }
             return true;
         });
         if (!ran) {

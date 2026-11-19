@@ -23,10 +23,17 @@ class Device;
 
 class Fsr3Upscaler {
 public:
+    enum class Profile : u8 {
+        HdrReversedDepth,
+        OcarinaLdr,
+    };
+
     struct Inputs {
-        TextureHandle color;   ///< HDR colour at render size.
+        TextureHandle color;   ///< HDR or LDR colour at render size.
         TextureHandle depth;   ///< Device depth (a depth texture) at render size.
         TextureHandle motion;  ///< Motion to the previous frame at the render size.
+        TextureHandle reactive{};      ///< Optional reactive mask (R8/R16F) at render size.
+        TextureHandle transparency{};  ///< Optional transparency & composition mask at render size.
         std::array<u32, 2> render_size;
         std::array<u32, 2> upscale_size;
         /// This frame's sample offset in render pixels.
@@ -40,7 +47,8 @@ public:
         f32 vertical_fov = 1.04719755f;
     };
 
-    explicit Fsr3Upscaler(const Device& device, Scheduler& scheduler);
+    explicit Fsr3Upscaler(const Device& device, Scheduler& scheduler,
+                          Profile profile = Profile::HdrReversedDepth);
     ~Fsr3Upscaler();
 
     /// Whether this GPU runs the passes (texture atomics, the formats); logged once when not.
@@ -49,6 +57,10 @@ public:
     /// Records one evaluation; the output (RGBA16F at the upscale size), valid until the next
     /// call, or null when it can't be made.
     [[nodiscard]] TextureHandle Upscale(const Inputs& inputs);
+
+    [[nodiscard]] TextureHandle Output() const noexcept {
+        return output.Handle();
+    }
 
 private:
     struct Texture {
@@ -86,6 +98,7 @@ private:
 
     const Device& device;
     Scheduler& scheduler;
+    Profile profile{Profile::HdrReversedDepth};
     Object point_sampler;
     Object linear_sampler;
     std::array<Pass, 9> passes;

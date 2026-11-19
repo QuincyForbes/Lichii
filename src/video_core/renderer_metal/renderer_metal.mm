@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <csignal>
 #include <cstdlib>
@@ -127,22 +128,32 @@ public:
     TextureHandle Upscale(const Device& device, Scheduler& scheduler, TextureHandle source,
                           const std::array<s32, 4>& source_rect, u32 output_width,
                           u32 output_height) {
-        if (failed || output_width == 0 || output_height == 0) {
+        if (device_unsupported || source == nullptr || output_width == 0 || output_height == 0) {
             return nullptr;
         }
         if (@available(iOS 16.0, macOS 13.0, *)) {
             const u32 input_width = static_cast<u32>(std::abs(source_rect[2] - source_rect[0]));
             const u32 input_height = static_cast<u32>(std::abs(source_rect[3] - source_rect[1]));
-            const MTLPixelFormat format = AsTexture(source).pixelFormat;
-            if (input_width == 0 || input_height == 0) {
+            // MetalFX spatial only upscales strictly larger outputs; 1:1, downscales and tiny
+            // transient crops fall back for the frame without disabling future frames.
+            if (input_width == 0 || input_height == 0 || output_width <= input_width ||
+                output_height <= input_height) {
+                return nullptr;
+            }
+            const id<MTLTexture> src_tex = AsTexture(source);
+            if (src_tex == nil) {
+                return nullptr;
+            }
+            const MTLPixelFormat src_format = src_tex.pixelFormat;
+            const MTLPixelFormat format = SupportedInputFormat(src_format);
+            if (format == MTLPixelFormatInvalid) {
                 return nullptr;
             }
             if (scaler == nil || input_width != in_width || input_height != in_height ||
                 output_width != out_width || output_height != out_height ||
                 format != in_format) {
-                if (!Prepare(device, format, input_width, input_height, output_width,
+                if (!Prepare(device, scheduler, format, input_width, input_height, output_width,
                              output_height)) {
-                    failed = true;
                     return nullptr;
                 }
             }
@@ -155,7 +166,7 @@ public:
                 .dst_rect = {0, 0, static_cast<s32>(input_width), static_cast<s32>(input_height)},
                 .dst_width = input_width,
                 .dst_height = input_height,
-                .linear = false,
+                .linear = format != src_format,
                 .keep_dst = false,
             });
             if (!copied) {
@@ -163,24 +174,57 @@ public:
             }
             const id<MTLCommandBuffer> command_buffer =
                 (__bridge id<MTLCommandBuffer>)scheduler.CommandBuffer();
+            if (command_buffer == nil) {
+                return nullptr;
+            }
             id<MTLFXSpatialScaler> spatial = scaler;
             spatial.colorTexture = input;
             spatial.outputTexture = output;
             spatial.inputContentWidth = input_width;
             spatial.inputContentHeight = input_height;
-            [spatial encodeToCommandBuffer:command_buffer];
+            @try {
+                [spatial encodeToCommandBuffer:command_buffer];
+            } @catch (NSException* exception) {
+                const char* const reason = exception.reason.UTF8String;
+                LOG_WARNING(Render_Metal, "MetalFX spatial: encoding raised: {}",
+                            reason != nullptr ? reason : "no reason");
+                scaler = nil;
+                return nullptr;
+            }
             return (__bridge void*)output;
         }
-        failed = true;
+        device_unsupported = true;
         return nullptr;
     }
 
 private:
-    bool Prepare(const Device& device, MTLPixelFormat format, u32 input_width, u32 input_height,
-                 u32 output_width, u32 output_height) API_AVAILABLE(ios(16.0), macos(13.0)) {
+    static MTLPixelFormat SupportedInputFormat(MTLPixelFormat format) noexcept {
+        switch (format) {
+        case MTLPixelFormatRGBA8Unorm:
+        case MTLPixelFormatRGBA8Unorm_sRGB:
+        case MTLPixelFormatBGRA8Unorm:
+        case MTLPixelFormatBGRA8Unorm_sRGB:
+        case MTLPixelFormatRGB10A2Unorm:
+        case MTLPixelFormatRGBA16Float:
+        case MTLPixelFormatRG11B10Float:
+            return format;
+        default:
+            // Any other displayable format blits cleanly into RGBA16Float for MetalFX.
+            return format != MTLPixelFormatInvalid ? MTLPixelFormatRGBA16Float
+                                                   : MTLPixelFormatInvalid;
+        }
+    }
+
+    bool Prepare(const Device& device, Scheduler& scheduler, MTLPixelFormat format,
+                 u32 input_width, u32 input_height, u32 output_width,
+                 u32 output_height) API_AVAILABLE(ios(16.0), macos(13.0)) {
         if (![MTLFXSpatialScalerDescriptor supportsDevice:device.GetDevice()]) {
             LOG_WARNING(Render_Metal, "MetalFX spatial: not supported on this GPU");
+            device_unsupported = true;
             return false;
+        }
+        if (input != nil || output != nil) {
+            scheduler.Finish();
         }
         MTLFXSpatialScalerDescriptor* descriptor = [[MTLFXSpatialScalerDescriptor alloc] init];
         descriptor.inputWidth = input_width;
@@ -191,10 +235,22 @@ private:
         descriptor.outputTextureFormat = static_cast<MTLPixelFormat>(DrawableFormat());
         // The present chain is in display (gamma) space.
         descriptor.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
-        id<MTLFXSpatialScaler> spatial = [descriptor newSpatialScalerWithDevice:device.GetDevice()];
+        id<MTLFXSpatialScaler> spatial = nil;
+        @try {
+            spatial = [descriptor newSpatialScalerWithDevice:device.GetDevice()];
+        } @catch (NSException* exception) {
+            const char* const reason = exception.reason.UTF8String;
+            LOG_WARNING(Render_Metal, "MetalFX spatial: creating scaler {}x{} -> {}x{} raised: {}",
+                        input_width, input_height, output_width, output_height,
+                        reason != nullptr ? reason : "no reason");
+            spatial = nil;
+        }
         if (spatial == nil) {
-            LOG_WARNING(Render_Metal, "MetalFX spatial: no scaler for {}x{} -> {}x{}", input_width,
-                        input_height, output_width, output_height);
+            if (warned_sizes < 8) {
+                ++warned_sizes;
+                LOG_WARNING(Render_Metal, "MetalFX spatial: no scaler for {}x{} -> {}x{}",
+                            input_width, input_height, output_width, output_height);
+            }
             return false;
         }
         const auto make = [&](u32 width, u32 height, MTLPixelFormat texture_format,
@@ -208,16 +264,19 @@ private:
             texture.usage = usage;
             return [device.GetDevice() newTextureWithDescriptor:texture];
         };
-        input = make(input_width, input_height, format,
-                     spatial.colorTextureUsage | MTLTextureUsageRenderTarget |
-                         MTLTextureUsageShaderRead);
-        output = make(output_width, output_height,
-                      static_cast<MTLPixelFormat>(DrawableFormat()),
-                      spatial.outputTextureUsage | MTLTextureUsageShaderRead);
-        if (input == nil || output == nil) {
+        id<MTLTexture> new_input =
+            make(input_width, input_height, format,
+                 spatial.colorTextureUsage | MTLTextureUsageRenderTarget |
+                     MTLTextureUsageShaderRead);
+        id<MTLTexture> new_output =
+            make(output_width, output_height, static_cast<MTLPixelFormat>(DrawableFormat()),
+                 spatial.outputTextureUsage | MTLTextureUsageShaderRead);
+        if (new_input == nil || new_output == nil) {
             return false;
         }
         scaler = spatial;
+        input = new_input;
+        output = new_output;
         in_width = input_width;
         in_height = input_height;
         out_width = output_width;
@@ -235,8 +294,9 @@ private:
     u32 in_height{};
     u32 out_width{};
     u32 out_height{};
+    u32 warned_sizes{};
     MTLPixelFormat in_format{MTLPixelFormatInvalid};
-    bool failed{};
+    bool device_unsupported{};
 };
 
 /// Host code addresses as "image+offset" (the offsets symbolicate against the image's dSYM).
@@ -459,6 +519,7 @@ struct RendererMetal::Impl {
         u32 height{};
         u64 ready_tick{};
         bool drawn{};
+        bool nearest{};
     };
     struct AsyncPresentSync {
         std::mutex mutex;
@@ -477,6 +538,7 @@ struct RendererMetal::Impl {
     id<MTLCommandQueue> async_present_queue = nil;
     id<MTLRenderPipelineState> async_present_pipeline = nil;
     id<MTLSamplerState> async_present_sampler = nil;
+    id<MTLSamplerState> async_present_nearest_sampler = nil;
     bool async_present_failed{};
 
     void NoteDrawableWait(u64 waited_ns) noexcept;
@@ -613,35 +675,46 @@ bool RendererMetal::Impl::DrawLayers(std::span<const Tegra::FramebufferConfig> f
                                     static_cast<s32>(crop.right * width),
                                     static_cast<s32>(crop.bottom * height)};
         TextureHandle texture = source.texture;
-        bool linear = true;
         const Settings::ScalingFilter filter = Settings::values.scaling_filter.GetValue();
+        bool linear = filter != Settings::ScalingFilter::NearestNeighbor &&
+                      filter != Settings::ScalingFilter::Mmpx;
+        const bool is_applet = (framebuffer.layer_stack_mask &
+                                Service::Nvnflinger::LayerStackBit(
+                                    Service::Nvnflinger::LayerStackId::Recording)) == 0;
+        const bool already_upscaled = source.already_upscaled;
+        const bool anti_aliased = already_upscaled || source.anti_aliased;
         const s32 screen_width = static_cast<s32>(screen.right - screen.left);
         const s32 screen_height = static_cast<s32>(screen.bottom - screen.top);
         if (apply_filters && PresentPasses::Enabled() && screen_width > 0 && screen_height > 0) {
-            // Vulkan's Layer::ConfigureDraw: anti-aliasing over the layer's texture,
-            // then FSR or SGSR to the screen's size, then the window filter.
+            // Vulkan's Layer::ConfigureDraw: anti-aliasing over the layer's texture (skipped when
+            // Ocarina temporal AA/upscaling already ran), then FSR/FSR3/SGSR to the screen's size,
+            // then the window filter.
             PresentPasses::Source passes_source{
                 .texture = texture,
                 .size = {source.scaled_width, source.scaled_height},
                 .render = {source.scaled_width, source.scaled_height},
                 .crop = {crop.left, crop.top, crop.right, crop.bottom},
             };
-            passes_source = present.AntiAlias(
-                passes_source, Settings::values.anti_aliasing.GetValue());
+            if (!anti_aliased && !is_applet) {
+                passes_source = present.AntiAlias(
+                    passes_source, Settings::values.anti_aliasing.GetValue());
+            }
 #ifdef HAS_RESHADE
             // The post-processing chain (Vulkan's Layer::ConfigureDraw): the guest's own layers,
             // not the applet's, before the upscaler.
-            const bool is_applet = (framebuffer.layer_stack_mask &
-                                    Service::Nvnflinger::LayerStackBit(
-                                        Service::Nvnflinger::LayerStackId::Recording)) == 0;
-            if (!is_applet && PostProcess::Wanted()) {
+            if (!already_upscaled && !is_applet && PostProcess::Wanted()) {
                 passes_source.texture =
                     post_process.Apply(passes_source.texture, passes_source.size);
             }
 #endif
-            passes_source = present.Upscale(
-                passes_source, filter,
-                {static_cast<u32>(screen_width), static_cast<u32>(screen_height)});
+            const bool skip_sgsr = is_applet &&
+                                   (filter == Settings::ScalingFilter::Sgsr ||
+                                    filter == Settings::ScalingFilter::SgsrEdge);
+            if (!already_upscaled && !skip_sgsr) {
+                passes_source = present.Upscale(
+                    passes_source, filter,
+                    {static_cast<u32>(screen_width), static_cast<u32>(screen_height)});
+            }
             if (PresentPasses::HasWindowShader(filter) &&
                 present.DrawWindow(
                     passes_source, filter, target, target_format,
@@ -659,9 +732,11 @@ bool RendererMetal::Impl::DrawLayers(std::span<const Tegra::FramebufferConfig> f
                         static_cast<s32>(passes_source.crop[1] * pass_height),
                         static_cast<s32>(passes_source.crop[2] * pass_width),
                         static_cast<s32>(passes_source.crop[3] * pass_height)};
-            linear = filter != Settings::ScalingFilter::NearestNeighbor;
+            linear = filter != Settings::ScalingFilter::NearestNeighbor &&
+                     filter != Settings::ScalingFilter::Mmpx;
         }
-        if (!drawn && apply_filters && filter == Settings::ScalingFilter::MetalFxSpatial) {
+        if (!drawn && apply_filters && !already_upscaled && !is_applet &&
+            filter == Settings::ScalingFilter::MetalFxSpatial) {
             const u32 out_width = screen.right - screen.left;
             const u32 out_height = screen.bottom - screen.top;
             if (TextureHandle upscaled = spatial.Upscale(
@@ -856,13 +931,17 @@ bool RendererMetal::Impl::EnsureAsyncPresenter() {
     sdesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
     sdesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
     async_present_sampler = [mtl newSamplerStateWithDescriptor:sdesc];
+    sdesc.minFilter = MTLSamplerMinMagFilterNearest;
+    sdesc.magFilter = MTLSamplerMinMagFilterNearest;
+    async_present_nearest_sampler = [mtl newSamplerStateWithDescriptor:sdesc];
     if (async_present_queue == nil || async_present_pipeline == nil ||
-        async_present_sampler == nil) {
+        async_present_sampler == nil || async_present_nearest_sampler == nil) {
         LOG_WARNING(Render_Metal, "Metal: async present worker unavailable ({}); presenting inline",
                     error != nil ? error.localizedDescription.UTF8String : "resource init failed");
         async_present_queue = nil;
         async_present_pipeline = nil;
         async_present_sampler = nil;
+        async_present_nearest_sampler = nil;
         async_present_failed = true;
         return false;
     }
@@ -923,7 +1002,9 @@ void RendererMetal::Impl::RunAsyncPresentWorker() {
                                                      static_cast<f64>(dst_h), 0.0, 1.0}];
                         [enc setScissorRect:MTLScissorRect{0, 0, dst_w, dst_h}];
                         [enc setFragmentTexture:AsTexture(job.texture) atIndex:0];
-                        [enc setFragmentSamplerState:async_present_sampler atIndex:0];
+                        [enc setFragmentSamplerState:job.nearest ? async_present_nearest_sampler
+                                                                 : async_present_sampler
+                                             atIndex:0];
                         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
                         [enc endEncoding];
                     }
@@ -1012,6 +1093,9 @@ bool RendererMetal::Impl::SubmitAsyncPresent(
     scheduler.NotePresent(drawn);
     const u64 ready_tick = scheduler.Flush(CommitReason::Present);
     slot.render_tick = ready_tick;
+    const Settings::ScalingFilter filter = Settings::values.scaling_filter.GetValue();
+    const bool nearest = filter == Settings::ScalingFilter::NearestNeighbor ||
+                         filter == Settings::ScalingFilter::Mmpx;
     {
         std::scoped_lock lock{async_sync->mutex};
         async_sync->slot_busy[slot_idx] = true;
@@ -1022,6 +1106,7 @@ bool RendererMetal::Impl::SubmitAsyncPresent(
             .height = layout.height,
             .ready_tick = ready_tick,
             .drawn = drawn,
+            .nearest = nearest,
         });
     }
     async_sync->work_cv.notify_one();
@@ -1127,6 +1212,19 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
                     Layout::FramebufferLayout draw_layout = layout;
                     draw_layout.width = dst_w;
                     draw_layout.height = dst_h;
+                    if ((dst_w != layout.width || dst_h != layout.height) &&
+                        layout.width > 0 && layout.height > 0) {
+                        const f64 sx = static_cast<f64>(dst_w) / static_cast<f64>(layout.width);
+                        const f64 sy = static_cast<f64>(dst_h) / static_cast<f64>(layout.height);
+                        draw_layout.screen.left =
+                            static_cast<u32>(std::lround(layout.screen.left * sx));
+                        draw_layout.screen.right =
+                            static_cast<u32>(std::lround(layout.screen.right * sx));
+                        draw_layout.screen.top =
+                            static_cast<u32>(std::lround(layout.screen.top * sy));
+                        draw_layout.screen.bottom =
+                            static_cast<u32>(std::lround(layout.screen.bottom * sy));
+                    }
                     const Attachment target{.texture = (__bridge void*)dst_tex};
                     const bool drawn =
                         impl->DrawLayers(framebuffers, target, DrawableFormat(), draw_layout, true);

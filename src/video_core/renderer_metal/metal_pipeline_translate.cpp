@@ -5,10 +5,14 @@
 #include <atomic>
 #include <bit>
 #include <bitset>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <iterator>
 #include <mutex>
+#include <system_error>
 
 #include <boost/container/small_vector.hpp>
 
@@ -285,22 +289,259 @@ void ApplyFragmentState(Shader::RuntimeInfo& info, const GraphicsPipelineKey& ke
 
 std::atomic<u64> visual_workaround_edits{};
 
-/// Vulkan's EDEN_NX2_OOT_VISUAL_WORKAROUND=1 (read under EDEN_NX2_METAL_VULKAN_SWITCHES): its
-/// opt-in edit of two of Ocarina of Time's programs (the fog dispatch, the exposure pass).
-void ApplyVisualWorkaround(Shader::IR::Program& program, u64 hash) {
+bool VisualWorkaroundEnabled() {
     static const bool enabled = [] {
         const char* const value = VulkanSwitch("EDEN_NX2_OOT_VISUAL_WORKAROUND");
         return value != nullptr && std::string_view{value} == "1";
     }();
+    return enabled;
+}
+
+/// Vulkan's EDEN_NX2_OOT_VISUAL_WORKAROUND=1 (read under EDEN_NX2_METAL_VULKAN_SWITCHES): its
+/// opt-in edit of two of Ocarina of Time's programs (the fog dispatch, the exposure pass).
+void ApplyVisualWorkaround(Shader::IR::Program& program, u64 hash) {
     if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
-            program, Settings::GetCurrentProgramID(), hash, enabled)) {
+            program, Settings::GetCurrentProgramID(), hash, VisualWorkaroundEnabled())) {
         visual_workaround_edits.fetch_add(1, std::memory_order_relaxed);
         LOG_WARNING(Render_Metal, "Metal: Ocarina visual workaround edited {} instructions of {:016x}",
                     *edits, hash);
     }
 }
 
+constexpr u64 StageMslMagic = 0x3156534754534C4DULL; // "MLSTGSV1"
+
+[[nodiscard]] bool StageMslCacheEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_STAGE_CACHE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+[[nodiscard]] std::optional<u128> MakeStageMslKey(std::span<const u32> spirv,
+                                                  ShaderTranslate::Stage stage,
+                                                  const ShaderTranslate::Options& options) {
+    if (!options.inputs.empty() || !options.depth_images.empty() ||
+        options.tessellation.output_vertices != 0) {
+        return std::nullopt;
+    }
+    static const bool env_invariant = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_INVARIANT_POSITION");
+        return value != nullptr && value[0] == '1';
+    }();
+    const u128 spirv_hash = Common::CityHash128(
+        reinterpret_cast<const char*>(spirv.data()), spirv.size() * sizeof(u32));
+    struct OptionKey {
+        u64 spirv_lo;
+        u64 spirv_hi;
+        u32 apple_family;
+        u32 msl_major;
+        u32 msl_minor;
+        u32 first_vertex_buffer_slot;
+        u32 vertex_index_size;
+        u32 flags;
+    } const key{
+        .spirv_lo = spirv_hash[0],
+        .spirv_hi = spirv_hash[1],
+        .apple_family = options.apple_family,
+        .msl_major = options.msl_major,
+        .msl_minor = options.msl_minor,
+        .first_vertex_buffer_slot = options.first_vertex_buffer_slot,
+        .vertex_index_size = options.vertex_index_size,
+        .flags = static_cast<u32>(stage) | (options.ios ? (1U << 8) : 0U) |
+                 (options.flip_vertex_y ? (1U << 9) : 0U) |
+                 ((options.invariant_float_math || env_invariant) ? (1U << 10) : 0U) |
+                 (options.point_size_builtin ? (1U << 11) : 0U) |
+                 (options.sampler_reduction ? (1U << 12) : 0U) |
+                 (options.spill_buffers ? (1U << 13) : 0U) |
+                 (options.drop_point_size ? (1U << 14) : 0U) |
+                 (options.force_temporary ? (1U << 15) : 0U),
+    };
+    return Common::CityHash128(reinterpret_cast<const char*>(&key), sizeof(key));
+}
+
 } // Anonymous namespace
+
+void StageMslCache::Open(const std::filesystem::path& file_path, u64 build_stamp) {
+    if (!StageMslCacheEnabled()) {
+        return;
+    }
+    std::unique_lock lock{mutex};
+    path = file_path;
+    stamp = build_stamp;
+    open = true;
+    dirty = false;
+    entries.clear();
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    u64 magic{}, stored_stamp{}, count{};
+    if (!in.read(reinterpret_cast<char*>(&magic), sizeof(magic)) ||
+        !in.read(reinterpret_cast<char*>(&stored_stamp), sizeof(stored_stamp)) ||
+        !in.read(reinterpret_cast<char*>(&count), sizeof(count)) || magic != StageMslMagic ||
+        (stamp != 0 && stored_stamp != stamp) || count > 262144) {
+        return;
+    }
+    const auto read_str = [&](std::string& out, u32 max_len) {
+        u32 len{};
+        if (!in.read(reinterpret_cast<char*>(&len), sizeof(len)) || len > max_len) {
+            return false;
+        }
+        out.resize(len);
+        return len == 0 || static_cast<bool>(in.read(out.data(), len));
+    };
+    entries.reserve(static_cast<size_t>(count));
+    for (u64 i = 0; i < count; ++i) {
+        u128 key{};
+        ShaderTranslate::Result res{};
+        u32 num_slots{}, num_outputs{};
+        if (!in.read(reinterpret_cast<char*>(&key), sizeof(key)) ||
+            !read_str(res.source, 16U << 20) ||
+            !read_str(res.source_without_reduction, 16U << 20) ||
+            !read_str(res.entry_point, 4096) ||
+            !in.read(reinterpret_cast<char*>(&num_slots), sizeof(num_slots)) || num_slots > 4096) {
+            entries.clear();
+            return;
+        }
+        res.slots.resize(num_slots);
+        if (num_slots != 0 &&
+            !in.read(reinterpret_cast<char*>(res.slots.data()),
+                     static_cast<std::streamsize>(num_slots * sizeof(ShaderTranslate::ResourceSlot)))) {
+            entries.clear();
+            return;
+        }
+        if (!in.read(reinterpret_cast<char*>(&num_outputs), sizeof(num_outputs)) ||
+            num_outputs > 4096) {
+            entries.clear();
+            return;
+        }
+        res.outputs.resize(num_outputs);
+        if (num_outputs != 0 &&
+            !in.read(reinterpret_cast<char*>(res.outputs.data()),
+                     static_cast<std::streamsize>(num_outputs *
+                                                  sizeof(ShaderTranslate::InterfaceVariable)))) {
+            entries.clear();
+            return;
+        }
+        if (!in.read(reinterpret_cast<char*>(&res.tessellation_slots),
+                     sizeof(res.tessellation_slots)) ||
+            !in.read(reinterpret_cast<char*>(&res.reduction_slot), sizeof(u32)) ||
+            !in.read(reinterpret_cast<char*>(&res.spill_slot), sizeof(u32)) ||
+            !in.read(reinterpret_cast<char*>(&res.sampler_spill_slot), sizeof(u32)) ||
+            !in.read(reinterpret_cast<char*>(&res.array_spill_slot), sizeof(u32)) ||
+            !in.read(reinterpret_cast<char*>(&res.array_spill_entries), sizeof(u32)) ||
+            res.source.empty()) {
+            entries.clear();
+            return;
+        }
+        entries.emplace(key, std::move(res));
+    }
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
+    LOG_INFO(Render_Metal, "Metal: stage MSL cache {} loaded ({} stages, {:.1f} ms)",
+             path.string(), entries.size(), ms);
+}
+
+void StageMslCache::Save() {
+    std::shared_lock lock{mutex};
+    if (!open || !dirty || path.empty()) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::filesystem::path tmp = path;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            return;
+        }
+        const u64 magic = StageMslMagic;
+        const u64 count = entries.size();
+        out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+        out.write(reinterpret_cast<const char*>(&stamp), sizeof(stamp));
+        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        const auto write_str = [&](const std::string& str) {
+            const u32 len = static_cast<u32>(str.size());
+            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+            if (len != 0) {
+                out.write(str.data(), len);
+            }
+        };
+        for (const auto& [key, res] : entries) {
+            out.write(reinterpret_cast<const char*>(&key), sizeof(key));
+            write_str(res.source);
+            write_str(res.source_without_reduction);
+            write_str(res.entry_point);
+            const u32 num_slots = static_cast<u32>(res.slots.size());
+            out.write(reinterpret_cast<const char*>(&num_slots), sizeof(num_slots));
+            if (num_slots != 0) {
+                out.write(reinterpret_cast<const char*>(res.slots.data()),
+                          static_cast<std::streamsize>(num_slots *
+                                                       sizeof(ShaderTranslate::ResourceSlot)));
+            }
+            const u32 num_outputs = static_cast<u32>(res.outputs.size());
+            out.write(reinterpret_cast<const char*>(&num_outputs), sizeof(num_outputs));
+            if (num_outputs != 0) {
+                out.write(reinterpret_cast<const char*>(res.outputs.data()),
+                          static_cast<std::streamsize>(
+                              num_outputs * sizeof(ShaderTranslate::InterfaceVariable)));
+            }
+            out.write(reinterpret_cast<const char*>(&res.tessellation_slots),
+                      sizeof(res.tessellation_slots));
+            out.write(reinterpret_cast<const char*>(&res.reduction_slot), sizeof(u32));
+            out.write(reinterpret_cast<const char*>(&res.spill_slot), sizeof(u32));
+            out.write(reinterpret_cast<const char*>(&res.sampler_spill_slot), sizeof(u32));
+            out.write(reinterpret_cast<const char*>(&res.array_spill_slot), sizeof(u32));
+            out.write(reinterpret_cast<const char*>(&res.array_spill_entries), sizeof(u32));
+        }
+        if (!out.good()) {
+            lock.unlock();
+            std::filesystem::remove(tmp, ec);
+            return;
+        }
+    }
+    const size_t saved_count = entries.size();
+    const std::filesystem::path dst_path = path;
+    lock.unlock();
+    std::unique_lock write_lock{mutex};
+    std::filesystem::rename(tmp, dst_path, ec);
+    if (!ec) {
+        dirty = false;
+        LOG_INFO(Render_Metal, "Metal: stage MSL cache {} written ({} stages)", dst_path.string(),
+                 saved_count);
+    }
+}
+
+std::optional<ShaderTranslate::Result> StageMslCache::Find(const u128& key) const {
+    if (!StageMslCacheEnabled()) {
+        return std::nullopt;
+    }
+    std::shared_lock lock{mutex};
+    const auto it = entries.find(key);
+    if (it == entries.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+void StageMslCache::Insert(const u128& key, const ShaderTranslate::Result& result) {
+    if (!StageMslCacheEnabled() || result.source.empty()) {
+        return;
+    }
+    std::unique_lock lock{mutex};
+    if (entries.emplace(key, result).second) {
+        dirty = true;
+    }
+}
+
+size_t StageMslCache::Size() const {
+    std::shared_lock lock{mutex};
+    return entries.size();
+}
 
 u64 PipelineTranslator::VisualWorkaroundEdits() noexcept {
     return visual_workaround_edits.load(std::memory_order_relaxed);
@@ -351,8 +592,11 @@ size_t ComputePipelineKey::Hash() const noexcept {
         Common::CityHash64(reinterpret_cast<const char*>(this), sizeof *this));
 }
 
-PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_mesh_)
-    : native_mesh{native_mesh_ && NativeMeshEnabled()}, native_mesh_capable{native_mesh_} {
+PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_mesh_,
+                                       VideoCommon::StageCache* stage_cache_,
+                                       StageMslCache* msl_cache_)
+    : stage_cache{stage_cache_}, msl_cache{msl_cache_},
+      native_mesh{native_mesh_ && NativeMeshEnabled()}, native_mesh_capable{native_mesh_} {
     enum class PreciseMode : u8 { All, Mixed, Fma, Strip };
     static const PreciseMode precise_mode = [] {
         const char* const value = std::getenv("EDEN_NX2_METAL_PRECISE");
@@ -503,13 +747,71 @@ std::optional<StageProgram> PipelineTranslator::Translate(
     return FromSpirv(spirv, program, stage, options != nullptr ? *options : translate_options);
 }
 
+std::optional<StageProgram> PipelineTranslator::TranslateCached(
+    size_t slot, Shader::IR::Program& program, ShaderTranslate::Stage stage,
+    Shader::Backend::Bindings& bindings, const Shader::RuntimeInfo& runtime_info,
+    const ShaderTranslate::Options* options) {
+    using Cache = VideoCommon::StageCache;
+    const ShaderTranslate::Options& eff_options =
+        options != nullptr ? *options : translate_options;
+    const Cache::Translation* const translation =
+        stage_cache == nullptr || !stage_cache->Enabled() || slot >= stage_reuse.reused.size()
+            ? nullptr
+            : (stage_reuse.reused[slot] ? stage_reuse.reused[slot].get()
+                                        : stage_reuse.recorded[slot].get());
+    if (translation == nullptr) {
+        return Translate(program, stage, bindings, runtime_info, &eff_options);
+    }
+    std::vector<u8> runtime_key = Cache::RuntimeKey(runtime_info, bindings);
+    std::shared_ptr<const Cache::Emitted> emitted;
+    if (stage_reuse.reused[slot]) {
+        emitted = stage_cache->FindEmitted(*stage_reuse.reused[slot], runtime_key);
+    }
+    if (emitted && !stage_cache->Verify()) {
+        program = emitted->program;
+        bindings = emitted->bindings_out;
+        stage_cache->CountReuse(true);
+        return FromSpirv(emitted->spirv, program, stage, eff_options);
+    }
+    ConvertLegacyToGeneric(program, runtime_info);
+    const std::vector<u32> spirv = EmitSPIRV(profile, runtime_info, program, bindings);
+    if (emitted) {
+        stage_cache->CountReuse(true);
+    } else {
+        auto entry = std::make_shared<Cache::Emitted>();
+        entry->runtime_key = std::move(runtime_key);
+        entry->spirv = spirv;
+        entry->program = Cache::Summary(program);
+        entry->bindings_out = bindings;
+        if (stage_reuse.reused[slot]) {
+            stage_cache->AddEmitted(*stage_reuse.reused[slot], std::move(entry));
+            stage_cache->CountReuse(false);
+        } else if (stage_reuse.recorded[slot]) {
+            stage_reuse.new_translations.emplace_back(stage_reuse.recorded[slot],
+                                                      std::move(entry));
+        }
+    }
+    return FromSpirv(spirv, program, stage, eff_options);
+}
+
 std::optional<StageProgram> PipelineTranslator::FromSpirv(std::span<const u32> spirv,
                                                           const Shader::IR::Program& program,
                                                           ShaderTranslate::Stage stage,
                                                           const ShaderTranslate::Options& options) {
-    ShaderTranslate::Result result = ShaderTranslate::SpirvToMsl(spirv, stage, options);
+    const std::optional<u128> cache_key =
+        msl_cache != nullptr ? MakeStageMslKey(spirv, stage, options) : std::nullopt;
+    std::optional<ShaderTranslate::Result> cached =
+        cache_key ? msl_cache->Find(*cache_key) : std::nullopt;
+    ShaderTranslate::Result result =
+        cached ? std::move(*cached) : ShaderTranslate::SpirvToMsl(spirv, stage, options);
+    if (!cached && cache_key && !result.source.empty()) {
+        msl_cache->Insert(*cache_key, result);
+    }
     if (!result.source.empty() && patch_key != nullptr) {
         PatchRasterState(result.source, stage, *patch_key);
+        if (!result.source_without_reduction.empty()) {
+            PatchRasterState(result.source_without_reduction, stage, *patch_key);
+        }
     }
     if (result.source.empty()) {
         static std::atomic<u32> logged{};
@@ -544,7 +846,11 @@ bool PipelineTranslator::TranslatePrograms(const GraphicsPipelineKey& key,
     const u64 hash = key.Hash();
     static std::atomic<u32> unsupported_logged{};
     pools.ReleaseContents();
+    stage_reuse = {};
     const bool uses_vertex_a = key.unique_hashes[0] != 0;
+    const bool use_stage_cache =
+        stage_cache != nullptr && stage_cache->Enabled() && !uses_vertex_a &&
+        !VisualWorkaroundEnabled() && key.unique_hashes[4] == 0;
     size_t env_index = 0;
     bool task = false;
     mesh_index = 0;
@@ -579,12 +885,43 @@ bool PipelineTranslator::TranslatePrograms(const GraphicsPipelineKey& key,
             geometry_env = &env;
         }
         const u32 cfg_offset = static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader));
-        Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
-        if (!uses_vertex_a || index != 1) {
-            programs[index] = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+        if (use_stage_cache && stage != Shader::Stage::Task && stage != Shader::Stage::Mesh) {
+            using Cache = VideoCommon::StageCache;
+            std::vector<u8> signature = Cache::Signature(env, key.unique_hashes[index], index);
+            stage_reuse.reused[index] = stage_cache->Find(signature, env);
+            if (stage_reuse.reused[index]) {
+                // Standard vertex + fragment without XFB/expand/tessellation can skip IR
+                // translation completely when FindEmitted hits; if FindEmitted misses, we
+                // translate lazily only then!
+                const bool can_skip_ir = !task && mesh_index == 0 && key.unique_hashes[2] == 0 &&
+                                         key.unique_hashes[3] == 0 && !key.xfb.Active() &&
+                                         key.expand == 0 && !stage_cache->Verify();
+                if (can_skip_ir) {
+                    programs[index] = stage_reuse.reused[index]->program;
+                    continue;
+                }
+                Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+                programs[index] = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+            } else {
+                Cache::Recorder recorder{env};
+                Shader::Maxwell::Flow::CFG cfg(recorder, pools.flow_block, cfg_offset, index == 0);
+                programs[index] =
+                    TranslateProgram(pools.inst, pools.block, recorder, cfg, host_info);
+                stage_cache->CountTranslated();
+                auto translation = std::make_shared<Cache::Translation>();
+                translation->signature = std::move(signature);
+                translation->reads = recorder.TakeReads();
+                translation->program = Cache::Summary(programs[index]);
+                stage_reuse.recorded[index] = std::move(translation);
+            }
         } else {
-            auto program_vb = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
-            programs[index] = MergeDualVertexPrograms(programs[0], program_vb, env, host_info);
+            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+            if (!uses_vertex_a || index != 1) {
+                programs[index] = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+            } else {
+                auto program_vb = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+                programs[index] = MergeDualVertexPrograms(programs[0], program_vb, env, host_info);
+            }
         }
         ApplyVisualWorkaround(programs[index], key.unique_hashes[index]);
         if (VideoCommon::FeatureCensus::Enabled()) {
@@ -761,8 +1098,19 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
             }
         }
     } else {
-        vertex = Translate(programs[1], ShaderTranslate::Stage::Vertex, bindings, vertex_info,
-                           &vertex_options);
+        if (stage_reuse.reused[1] && programs[1].blocks.empty()) {
+            const std::vector<u8> rt_key =
+                VideoCommon::StageCache::RuntimeKey(vertex_info, bindings);
+            if (!stage_cache->FindEmitted(*stage_reuse.reused[1], rt_key)) {
+                Shader::Environment& v_env = *envs[0];
+                const u32 cfg_offset =
+                    static_cast<u32>(v_env.StartAddress() + sizeof(Shader::ProgramHeader));
+                Shader::Maxwell::Flow::CFG cfg(v_env, pools.flow_block, cfg_offset, false);
+                programs[1] = TranslateProgram(pools.inst, pools.block, v_env, cfg, host_info);
+            }
+        }
+        vertex = TranslateCached(1, programs[1], ShaderTranslate::Stage::Vertex, bindings,
+                                 vertex_info, &vertex_options);
     }
     if (!vertex) {
         return std::nullopt;
@@ -774,13 +1122,31 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
         fragment_info.previous_stage_legacy_stores_mapping =
             programs[1].info.legacy_stores_mapping;
         ApplyFragmentState(fragment_info, key);
+        if (stage_reuse.reused[5] && programs[5].blocks.empty()) {
+            const std::vector<u8> rt_key =
+                VideoCommon::StageCache::RuntimeKey(fragment_info, bindings);
+            if (!stage_cache->FindEmitted(*stage_reuse.reused[5], rt_key)) {
+                Shader::Environment& f_env = *envs.back();
+                const u32 cfg_offset =
+                    static_cast<u32>(f_env.StartAddress() + sizeof(Shader::ProgramHeader));
+                Shader::Maxwell::Flow::CFG cfg(f_env, pools.flow_block, cfg_offset, false);
+                programs[5] = TranslateProgram(pools.inst, pools.block, f_env, cfg, host_info);
+            }
+        }
         auto translated =
-            Translate(programs[5], ShaderTranslate::Stage::Fragment, bindings, fragment_info);
+            TranslateCached(5, programs[5], ShaderTranslate::Stage::Fragment, bindings,
+                            fragment_info);
         if (!translated) {
             return std::nullopt;
         }
         fragment = std::move(*translated);
     }
+    if (stage_cache != nullptr) {
+        for (auto& [translation, emitted] : stage_reuse.new_translations) {
+            stage_cache->Insert(std::move(translation), std::move(emitted));
+        }
+    }
+    stage_reuse = {};
     return TranslatedPipeline{
         .vertex = std::move(*vertex),
         .fragment = std::move(fragment),
@@ -1711,6 +2077,51 @@ std::optional<StageProgram> PipelineTranslator::Compute(u64 unique_hash,
     cause.clear();
     detail.clear();
     pools.ReleaseContents();
+    using Cache = VideoCommon::StageCache;
+    const bool use_stage_cache =
+        stage_cache != nullptr && stage_cache->Enabled() && !VisualWorkaroundEnabled();
+    if (use_stage_cache) {
+        std::vector<u8> signature = Cache::Signature(env, unique_hash, 5);
+        std::shared_ptr<const Cache::Translation> reused = stage_cache->Find(signature, env);
+        const Shader::RuntimeInfo runtime_info{};
+        Shader::Backend::Bindings bindings{};
+        std::vector<u8> runtime_key = Cache::RuntimeKey(runtime_info, bindings);
+        if (reused && !stage_cache->Verify()) {
+            if (const auto emitted = stage_cache->FindEmitted(*reused, runtime_key)) {
+                stage_cache->CountReuse(true);
+                return FromSpirv(emitted->spirv, emitted->program, ShaderTranslate::Stage::Compute,
+                                 translate_options);
+            }
+        }
+        Cache::Recorder recorder{env};
+        Shader::Environment& active_env = reused ? env : static_cast<Shader::Environment&>(recorder);
+        Shader::Maxwell::Flow::CFG cfg{active_env, pools.flow_block, env.StartAddress()};
+        auto program = TranslateProgram(pools.inst, pools.block, active_env, cfg, host_info);
+        if (!reused) {
+            stage_cache->CountTranslated();
+        }
+        if (VideoCommon::FeatureCensus::Enabled()) {
+            VideoCommon::FeatureCensus::NoteProgram(unique_hash, program);
+        }
+        const std::vector<u32> spirv = EmitSPIRV(profile, program);
+        auto entry = std::make_shared<Cache::Emitted>();
+        entry->runtime_key = std::move(runtime_key);
+        entry->spirv = spirv;
+        entry->program = Cache::Summary(program);
+        entry->bindings_out = bindings;
+        if (reused) {
+            stage_cache->AddEmitted(*reused, std::move(entry));
+            stage_cache->CountReuse(false);
+        } else {
+            auto translation = std::make_shared<Cache::Translation>();
+            translation->signature = std::move(signature);
+            translation->reads = recorder.TakeReads();
+            translation->program = entry->program;
+            stage_cache->Insert(std::move(translation), std::move(entry));
+        }
+        return FromSpirv(spirv, program, ShaderTranslate::Stage::Compute, translate_options);
+    }
+
     Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
     auto program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
     ApplyVisualWorkaround(program, unique_hash);
@@ -1718,32 +2129,103 @@ std::optional<StageProgram> PipelineTranslator::Compute(u64 unique_hash,
         VideoCommon::FeatureCensus::NoteProgram(unique_hash, program);
     }
     const std::vector<u32> spirv = EmitSPIRV(profile, program);
-    ShaderTranslate::Result result =
-        ShaderTranslate::SpirvToMsl(spirv, ShaderTranslate::Stage::Compute, translate_options);
-    if (result.source.empty()) {
-        static std::atomic<u32> logged{};
-        Refuse(logged, unique_hash, "SPIR-V to MSL failed", result.error);
-        return std::nullopt;
-    }
-    // Every field FromSpirv sets: without the spill tables' slots a kernel's spilled buffers
-    // and samplers were never bound.
-    return StageProgram{
-        .stage = ShaderTranslate::Stage::Compute,
-        .msl = std::move(result.source),
-        .msl_without_reduction = std::move(result.source_without_reduction),
-        .entry_point = std::move(result.entry_point),
-        .slots = std::move(result.slots),
-        .info = program.info,
-        .reduction_slot = result.reduction_slot,
-        .spill_slot = result.spill_slot,
-        .sampler_spill_slot = result.sampler_spill_slot,
-        .array_spill_slot = result.array_spill_slot,
-        .array_spill_entries = result.array_spill_entries,
-    };
+    return FromSpirv(spirv, program, ShaderTranslate::Stage::Compute, translate_options);
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Metal, "Metal: {}", exception.what());
     cause = "shader recompiler exception";
     detail = exception.what();
+    return std::nullopt;
+}
+
+std::optional<StageProgram> PipelineTranslator::WarmSingleStage(const GraphicsPipelineKey& key,
+                                                                size_t slot,
+                                                                Shader::Environment& env) try {
+    if (slot != 1 && slot != 5) {
+        return std::nullopt;
+    }
+    cause.clear();
+    detail.clear();
+    pools.ReleaseContents();
+    stage_reuse = {};
+    patch_key = &key;
+    expand_active = false;
+    struct ClearKey {
+        const GraphicsPipelineKey*& key;
+        ~ClearKey() {
+            key = nullptr;
+        }
+    } clear_key{patch_key};
+
+    const u64 unique_hash = key.unique_hashes[slot];
+    const Shader::Stage guest_stage = env.ShaderStage();
+    if ((slot == 1 && guest_stage != Shader::Stage::VertexB) ||
+        (slot == 5 && guest_stage != Shader::Stage::Fragment)) {
+        return std::nullopt;
+    }
+
+    Shader::RuntimeInfo runtime_info;
+    ShaderTranslate::Options options = translate_options;
+    const ShaderTranslate::Stage msl_stage =
+        slot == 1 ? ShaderTranslate::Stage::Vertex : ShaderTranslate::Stage::Fragment;
+    if (slot == 1) {
+        runtime_info.previous_stage_stores.mask.set();
+        runtime_info.input_topology =
+            InputTopology(static_cast<Maxwell::PrimitiveTopology>(key.topology));
+        for (size_t attr = 0; attr < runtime_info.generic_input_types.size(); ++attr) {
+            constexpr std::array types{Shader::AttributeType::Disabled,
+                                       Shader::AttributeType::Float,
+                                       Shader::AttributeType::SignedInt,
+                                       Shader::AttributeType::UnsignedInt};
+            runtime_info.generic_input_types[attr] = types[(key.attribute_types >> (attr * 2)) & 3];
+        }
+        ApplyVertexState(runtime_info, key);
+        options.point_size_builtin =
+            static_cast<Maxwell::PrimitiveTopology>(key.topology) ==
+            Maxwell::PrimitiveTopology::Points;
+    } else {
+        runtime_info.previous_stage_stores.mask.set();
+        ApplyFragmentState(runtime_info, key);
+    }
+
+    Shader::Backend::Bindings bindings{};
+    const u32 cfg_offset = static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader));
+    using Cache = VideoCommon::StageCache;
+    if (stage_cache != nullptr && stage_cache->Enabled() && !VisualWorkaroundEnabled()) {
+        std::vector<u8> signature = Cache::Signature(env, unique_hash, slot);
+        stage_reuse.reused[slot] = stage_cache->Find(signature, env);
+        const std::vector<u8> rt_key = Cache::RuntimeKey(runtime_info, bindings);
+        if (stage_reuse.reused[slot] && !stage_cache->Verify() &&
+            stage_cache->FindEmitted(*stage_reuse.reused[slot], rt_key)) {
+            Shader::IR::Program summary = stage_reuse.reused[slot]->program;
+            return TranslateCached(slot, summary, msl_stage, bindings, runtime_info, &options);
+        }
+        Cache::Recorder recorder{env};
+        Shader::Environment& active_env =
+            stage_reuse.reused[slot] ? env : static_cast<Shader::Environment&>(recorder);
+        Shader::Maxwell::Flow::CFG cfg(active_env, pools.flow_block, cfg_offset, false);
+        Shader::IR::Program program =
+            TranslateProgram(pools.inst, pools.block, active_env, cfg, host_info);
+        if (!stage_reuse.reused[slot]) {
+            stage_cache->CountTranslated();
+            auto translation = std::make_shared<Cache::Translation>();
+            translation->signature = std::move(signature);
+            translation->reads = recorder.TakeReads();
+            translation->program = Cache::Summary(program);
+            stage_reuse.recorded[slot] = std::move(translation);
+        }
+        auto out = TranslateCached(slot, program, msl_stage, bindings, runtime_info, &options);
+        for (auto& [translation, emitted] : stage_reuse.new_translations) {
+            stage_cache->Insert(std::move(translation), std::move(emitted));
+        }
+        stage_reuse = {};
+        return out;
+    }
+
+    Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, false);
+    Shader::IR::Program program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+    ApplyVisualWorkaround(program, unique_hash);
+    return Translate(program, msl_stage, bindings, runtime_info, &options);
+} catch (const Shader::Exception&) {
     return std::nullopt;
 }
 

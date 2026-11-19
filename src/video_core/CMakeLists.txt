@@ -204,6 +204,7 @@ add_library(video_core STATIC
     renderer_vulkan/pipeline_build.h
     renderer_vulkan/pipeline_cache_dir.cpp
     renderer_vulkan/pipeline_cache_dir.h
+    renderer_vulkan/pipeline_eviction_policy.h
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
     renderer_vulkan/pipeline_shader_emission.h
@@ -534,6 +535,49 @@ endif()
 
 # Shader precache builder: game archives use zstd (also with dictionaries) and zlib.
 target_link_libraries(video_core PRIVATE zstd::zstd ZLIB::ZLIB)
+
+# Shader precache marker: a hash of every source that shapes the SPIR-V or MSL built from guest
+# code (the native lowering, the rest of the recompiler without its OpenGL backends, the shader
+# environment that hands it the recorded values and the Vulkan/Metal emission wrappers), so a build
+# that may emit other shader code runs the precache once more (ShaderWarm::EmissionStamp).
+cmake_path(GET CMAKE_CURRENT_SOURCE_DIR PARENT_PATH lowering_source_dir)
+file(GLOB_RECURSE lowering_sources CONFIGURE_DEPENDS RELATIVE "${lowering_source_dir}"
+     "${lowering_source_dir}/shader_recompiler/frontend/ampere/*")
+file(GLOB_RECURSE emission_sources CONFIGURE_DEPENDS RELATIVE "${lowering_source_dir}"
+     "${lowering_source_dir}/shader_recompiler/*.cpp" "${lowering_source_dir}/shader_recompiler/*.h"
+     "${lowering_source_dir}/shader_recompiler/*.inc")
+list(FILTER emission_sources EXCLUDE REGEX "^shader_recompiler/backend/(glasm|glsl)/")
+list(APPEND emission_sources ${lowering_sources}
+     video_core/renderer_vulkan/pipeline_shader_emission.h
+     video_core/renderer_metal/metal_pipeline_translate.cpp
+     video_core/renderer_metal/metal_pipeline_translate.h
+     video_core/renderer_metal/metal_shader_translate.cpp
+     video_core/renderer_metal/metal_shader_translate.h
+     video_core/shader_environment.cpp
+     video_core/shader_environment.h)
+list(REMOVE_DUPLICATES emission_sources)
+list(SORT emission_sources)
+list(TRANSFORM emission_sources PREPEND "${lowering_source_dir}/" OUTPUT_VARIABLE emission_inputs)
+# Too many paths for a Windows command line: they go through a file, one per line.
+list(JOIN emission_sources "\n" emission_text)
+set(emission_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/video_core/shader_warm")
+set(emission_list "${emission_dir}/emission_sources.txt")
+file(CONFIGURE OUTPUT "${emission_list}" CONTENT "${emission_text}\n" @ONLY)
+set(emission_stamp "${emission_dir}/emission_stamp.h")
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/shader_emission_stamp.h"
+     CONTENT "#pragma once\n#include \"video_core/shader_warm/emission_stamp.h\"\n")
+add_custom_command(
+    OUTPUT "${emission_stamp}"
+    COMMAND ${CMAKE_COMMAND} "-DSOURCE_DIR=${lowering_source_dir}" "-DFILES_FROM=${emission_list}"
+            "-DOUTPUT=${emission_stamp}" "-DNAMESPACE=VideoCommon::ShaderWarm"
+            "-DNAME=GeneratedEmissionStamp"
+            -P "${PROJECT_SOURCE_DIR}/CMakeModules/GenerateShaderLoweringStamp.cmake"
+    DEPENDS ${emission_inputs} "${emission_list}"
+            "${PROJECT_SOURCE_DIR}/CMakeModules/GenerateShaderLoweringStamp.cmake"
+    VERBATIM)
+target_sources(video_core PRIVATE "${emission_stamp}")
+target_include_directories(video_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
 target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
 if (ENABLE_OPENGL)
     target_link_libraries(video_core PUBLIC glad)

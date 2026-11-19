@@ -1011,8 +1011,12 @@ void BufferCache<P>::ClearDownload(DAddr device_addr, u64 size) {
 }
 
 template <class P>
-bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount,
-                             bool inline_grid_copy) {
+bool BufferCache<P>::DMACopy(
+    GPUVAddr src_address, GPUVAddr dest_address, u64 amount, bool inline_grid_copy,
+    boost::container::small_vector<std::pair<DAddr, size_t>, 4>* gpu_written_dest) {
+    if (gpu_written_dest) {
+        gpu_written_dest->clear();
+    }
     const std::optional<DAddr> cpu_src_address = gpu_memory->GpuToCpuAddress(src_address);
     const std::optional<DAddr> cpu_dest_address = gpu_memory->GpuToCpuAddress(dest_address);
     if (!cpu_src_address || !cpu_dest_address) {
@@ -1078,6 +1082,9 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     src_buffer.MarkUsage(copy.src_offset, copy.size);
     dest_buffer.MarkUsage(copy.dst_offset, copy.size);
     runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
+    if (gpu_written_dest) {
+        *gpu_written_dest = tmp_intervals;
+    }
     if (has_new_downloads && !inline_grid_copy) {
         if (memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount)) {
             NoteHotPagesWritten(*cpu_dest_address, amount);
@@ -2545,9 +2552,11 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                     runtime, device_memory, stage, index, binding_index, device_addr, size,
                     VideoCore::Nx2Debug::Experiment(17) != 0,
                     // No write to a hot page is seen, nor to a CPU-modified one (its protection
-                    // is off, later writes don't trap): serial 0 makes the bind compare its bytes.
+                    // is off, later writes don't trap), nor to one with collected CPU writes
+                    // waiting for InvalidateGPUCache: serial 0 makes the bind compare its bytes.
                     memory_tracker.IsRegionHot(device_addr, size) ||
-                            memory_tracker.IsRegionCpuModified(device_addr, size)
+                            memory_tracker.IsRegionCpuModified(device_addr, size) ||
+                            (size != 0 && Core::g_collected_write_pages.Any(device_addr, size))
                         ? 0
                         : cb_write_serial,
                     UboPageGen(device_addr, size), [this, device_addr, size](u64& gen) {
@@ -3260,16 +3269,21 @@ void BufferCache<P>::UpdateIndexBuffer() {
     const u32 draw_size = (index_buffer_ref.count + index_buffer_ref.first) * u32(index_buffer_ref.FormatSizeInBytes());
     IndexBufferMemo& memo = index_buffer_memo;
     const u64 map_serial = gpu_memory->MapSerial();
+    const u64 translation_gen = DeviceTranslationGeneration();
     const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
     const u32 size = (std::min)(address_size, draw_size);
     const bool memo_hit = memo.channel == channel_state && memo.memory == gpu_memory &&
                           memo.begin == gpu_addr_begin && memo.end == gpu_addr_end &&
-                          memo.map_serial == map_serial && memo.deletions == binding_epoch &&
+                          memo.map_serial == map_serial &&
+                          memo.translation_gen == translation_gen &&
+                          memo.deletions == binding_epoch &&
                           size != 0 && size <= memo.found_size &&
                           !Settings::IsGPUFenceBehaviorAccurate();
     if (memo_hit && !Nx2Perf::Verify()) {
         channel_state->index_buffer = Binding{
             .device_addr = memo.device_addr,
+            .gpu_addr = gpu_addr_begin,
+            .map_serial = map_serial,
             .size = size,
             .buffer_id = memo.buffer_id,
         };
@@ -3307,6 +3321,7 @@ void BufferCache<P>::UpdateIndexBuffer() {
         .begin = gpu_addr_begin,
         .end = gpu_addr_end,
         .map_serial = map_serial,
+        .translation_gen = translation_gen,
         .deletions = binding_epoch,
         .device_addr = *device_addr,
         .found_size = size,
@@ -3330,6 +3345,7 @@ bool BufferCache<P>::ReuseGeometry(const GeometryMemo& memo, GPUVAddr begin, GPU
            memo.end == end && memo.extra == extra &&
            memo.channel == static_cast<const void*>(channel_state) &&
            memo.as_id == gpu_memory->GetID() && memo.map_serial == gpu_memory->MapSerial() &&
+           memo.translation_gen == DeviceTranslationGeneration() &&
            !fence_behavior_accurate;
 }
 
@@ -3338,7 +3354,8 @@ void BufferCache<P>::StoreGeometry(GeometryMemo& memo, GPUVAddr begin, GPUVAddr 
                                    const Binding& binding) {
     memo = GeometryMemo{
         .epoch = binding_epoch,
-        .map_serial = gpu_memory->MapSerial(),
+        .map_serial = binding.map_serial,
+        .translation_gen = DeviceTranslationGeneration(),
         .as_id = gpu_memory->GetID(),
         .channel = channel_state,
         .begin = begin,
@@ -3356,8 +3373,10 @@ bool BufferCache<P>::ReuseIndirectDraw(const IndirectDrawMemo& memo, GPUVAddr gp
         return false;
     }
     const u64 map_serial = gpu_memory->MapSerial();
+    const u64 translation_gen = DeviceTranslationGeneration();
     if (memo.epoch != binding_epoch || memo.channel != static_cast<const void*>(channel_state) ||
         memo.as_id != gpu_memory->GetID() || memo.map_serial != map_serial ||
+        memo.translation_gen != translation_gen ||
         gpu_addr < memo.gpu_begin || gpu_addr > memo.gpu_end || size > memo.gpu_end - gpu_addr) {
         return false;
     }
@@ -3373,7 +3392,8 @@ bool BufferCache<P>::ReuseIndirectDraw(const IndirectDrawMemo& memo, GPUVAddr gp
 
 template <class P>
 void BufferCache<P>::StoreIndirectDraw(IndirectDrawMemo& memo, GPUVAddr gpu_addr, u32 size,
-                                       DAddr device_addr, BufferId buffer_id, u64 map_serial) {
+                                       DAddr device_addr, BufferId buffer_id, u64 map_serial,
+                                       u64 translation_gen) {
     if (size == 0 || buffer_id == NULL_BUFFER_ID || gpu_addr > ~GPUVAddr{0} - size) {
         return;
     }
@@ -3397,9 +3417,15 @@ void BufferCache<P>::StoreIndirectDraw(IndirectDrawMemo& memo, GPUVAddr gpu_addr
             }
         }
     }
+    if (gpu_memory->MapSerial() != map_serial ||
+        DeviceTranslationGeneration() != translation_gen) {
+        memo.epoch = 0;
+        return;
+    }
     memo = IndirectDrawMemo{
         .epoch = binding_epoch,
         .map_serial = map_serial,
+        .translation_gen = translation_gen,
         .as_id = gpu_memory->GetID(),
         .channel = channel_state,
         .gpu_begin = gpu_begin,
@@ -3530,13 +3556,14 @@ void BufferCache<P>::UpdateDrawIndirect() {
             binding = cached;
             return;
         }
+        const u64 map_serial = gpu_memory->MapSerial();
+        const u64 translation_gen = DeviceTranslationGeneration();
         const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
         if (!device_addr || size > (std::numeric_limits<u32>::max)()) {
             binding = NULL_BINDING;
             return;
         }
         const u32 byte_size = static_cast<u32>(size);
-        const u64 map_serial = gpu_memory->MapSerial();
         const BufferId buffer_id = FindBuffer(*device_addr, byte_size, false);
         binding = Binding{
             .device_addr = *device_addr,
@@ -3558,7 +3585,8 @@ void BufferCache<P>::UpdateDrawIndirect() {
             }
             return;
         }
-        StoreIndirectDraw(memo, gpu_addr, byte_size, *device_addr, buffer_id, map_serial);
+        StoreIndirectDraw(memo, gpu_addr, byte_size, *device_addr, buffer_id, map_serial,
+                          translation_gen);
     };
     if (current_draw_indirect->include_count) {
         update(current_draw_indirect->count_start_address, sizeof(u32),
@@ -3605,13 +3633,14 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
         return;
     }
     const u64 start_epoch = binding_epoch;
+    const u64 start_map_serial = gpu_memory->MapSerial();
     ForEachEnabledBit(enabled, [&](u32 index) {
         Binding& binding = channel_state->storage_buffers[stage][index];
         const bool is_written = ((written >> index) & 1) != 0;
         ResolveStorageBinding(stage, index, binding, is_written, graphics_segments);
     });
     StoreStorageResolve(cache, channel_state->storage_buffers[stage], enabled, written,
-                        graphics_segments, start_epoch);
+                        graphics_segments, start_epoch, start_map_serial);
 }
 
 template <class P>
@@ -3624,10 +3653,12 @@ void BufferCache<P>::ResolveStorageBinding(size_t memo_stage, u32 index, Binding
                           !fence_behavior_accurate;
     // Before the lookup: a mapping change during it leaves a memo that never matches.
     const u64 map_serial = gpu_memory->MapSerial();
+    const u64 translation_gen = DeviceTranslationGeneration();
     const size_t as_id = gpu_memory->GetID();
     if (use_memo && memo.epoch == binding_epoch && memo.device_addr == binding.device_addr &&
         memo.gpu_addr == binding.gpu_addr && memo.size == binding.size &&
-        memo.is_written == is_written && memo.map_serial == map_serial && memo.as_id == as_id &&
+        memo.is_written == is_written && memo.map_serial == map_serial &&
+        memo.translation_gen == translation_gen && memo.as_id == as_id &&
         memo.channel == static_cast<const void*>(channel_state)) {
         binding.buffer_id = memo.buffer_id;
         binding.segment_first = 0;
@@ -3637,11 +3668,13 @@ void BufferCache<P>::ResolveStorageBinding(size_t memo_stage, u32 index, Binding
     binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
     ResolveMultiRangeStorage(binding, is_written, pool);
     memo.epoch = 0;
-    if (use_memo && binding.segment_count == 0) {
+    if (use_memo && binding.segment_count == 0 && gpu_memory->MapSerial() == map_serial &&
+        DeviceTranslationGeneration() == translation_gen) {
         // binding_epoch after the lookup: a buffer it created is part of what the memo holds.
         memo = StorageBindingMemo{
             .epoch = binding_epoch,
             .map_serial = map_serial,
+            .translation_gen = translation_gen,
             .as_id = as_id,
             .channel = channel_state,
             .device_addr = binding.device_addr,
@@ -3660,6 +3693,7 @@ bool BufferCache<P>::ReuseStorageResolve(StorageResolveCache& cache, std::span<B
     if (cache.epoch != binding_epoch || cache.enabled != enabled || cache.written != written ||
         cache.channel != static_cast<const void*>(channel_state) ||
         cache.as_id != gpu_memory->GetID() || cache.map_serial != gpu_memory->MapSerial() ||
+        cache.translation_gen != DeviceTranslationGeneration() ||
         fence_behavior_accurate) {
         return false;
     }
@@ -3689,9 +3723,10 @@ template <class P>
 void BufferCache<P>::StoreStorageResolve(StorageResolveCache& cache,
                                          std::span<const Binding> bindings, u64 enabled,
                                          u64 written, const std::vector<MultiRangeSegment>& pool,
-                                         u64 start_epoch) {
+                                         u64 start_epoch, u64 start_map_serial) {
     cache.epoch = 0;
-    if (binding_epoch != start_epoch) {
+    const u64 translation_gen = DeviceTranslationGeneration();
+    if (binding_epoch != start_epoch || gpu_memory->MapSerial() != start_map_serial) {
         return;
     }
     cache.segments.clear();
@@ -3710,14 +3745,15 @@ void BufferCache<P>::StoreStorageResolve(StorageResolveCache& cache,
         }
         cache.bindings[index] = binding;
     });
-    if (!valid) {
+    if (!valid || DeviceTranslationGeneration() != translation_gen) {
         return;
     }
     cache.enabled = enabled;
     cache.written = written;
     cache.channel = channel_state;
     cache.as_id = gpu_memory->GetID();
-    cache.map_serial = gpu_memory->MapSerial();
+    cache.map_serial = start_map_serial;
+    cache.translation_gen = translation_gen;
     cache.epoch = binding_epoch;
 }
 
@@ -3779,15 +3815,19 @@ void BufferCache<P>::UpdateComputeUniformBuffers() {
             binding = memo.binding;
             return;
         }
+        const u64 map_serial = gpu_memory->MapSerial();
         if (enabled) {
             const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(cbuf_addr);
             if (device_addr) {
                 binding.device_addr = *device_addr;
+                binding.gpu_addr = cbuf_addr;
+                binding.map_serial = map_serial;
                 binding.size = cbuf_size;
             }
         }
         binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
-        if (enabled) {
+        if (enabled && gpu_memory->MapSerial() == map_serial) {
+            binding.map_serial = map_serial;
             StoreGeometry(memo, cbuf_addr, cbuf_addr + cbuf_size, 2, binding);
         }
     });
@@ -3805,6 +3845,7 @@ void BufferCache<P>::UpdateComputeStorageBuffers() {
         return;
     }
     const u64 start_epoch = binding_epoch;
+    const u64 start_map_serial = gpu_memory->MapSerial();
     ForEachEnabledBit(enabled, [&](u32 index) {
         // Resolve buffer
         Binding& binding = channel_state->compute_storage_buffers[index];
@@ -3812,7 +3853,7 @@ void BufferCache<P>::UpdateComputeStorageBuffers() {
         ResolveStorageBinding(NUM_STAGES, index, binding, is_written, compute_segments);
     });
     StoreStorageResolve(compute_storage_resolve, channel_state->compute_storage_buffers, enabled,
-                        written, compute_segments, start_epoch);
+                        written, compute_segments, start_epoch, start_map_serial);
 }
 
 template <class P>
@@ -5441,11 +5482,13 @@ Binding BufferCache<P>::BindCachedStorageBuffer(size_t memo_stage, size_t ssbo_i
                                      (table_pointer ? 8U : 0U));
     const size_t as_id = gpu_memory->GetID();
     const u64 map_serial = gpu_memory->MapSerial();
+    const u64 translation_gen = DeviceTranslationGeneration();
     SsboBindMemo& memo = ssbo_bind_memo[memo_stage][ssbo_index];
 
     if (use_memo && memo.flags == flags &&
         memo.channel == static_cast<const void*>(channel_state) && memo.as_id == as_id &&
-        memo.map_serial == map_serial && memo.cbuf_slot_addr == cbuf_slot_addr &&
+        memo.map_serial == map_serial && memo.translation_gen == translation_gen &&
+        memo.cbuf_slot_addr == cbuf_slot_addr &&
         memo.indirect_offset == indirect_offset && memo.cbuf_host != nullptr) [[likely]] {
         u64 q0 = 0;
         std::memcpy(&q0, memo.cbuf_host, sizeof(u64));
@@ -5505,11 +5548,13 @@ Binding BufferCache<P>::BindCachedStorageBuffer(size_t memo_stage, size_t ssbo_i
     }
 
     if (table_pointer && cbuf_qword0 == 0) {
-        if (cbuf_host != nullptr) {
+        if (cbuf_host != nullptr && gpu_memory->MapSerial() == map_serial &&
+            DeviceTranslationGeneration() == translation_gen) {
             memo = SsboBindMemo{
                 .channel = channel_state,
                 .as_id = as_id,
                 .map_serial = map_serial,
+                .translation_gen = translation_gen,
                 .cbuf_slot_addr = cbuf_slot_addr,
                 .indirect_offset = indirect_offset,
                 .flags = flags,
@@ -5555,11 +5600,14 @@ Binding BufferCache<P>::BindCachedStorageBuffer(size_t memo_stage, size_t ssbo_i
     if (out_pointer != nullptr) {
         *out_pointer = resolved;
     }
-    if (cbuf_host != nullptr && (!table_pointer || entry_host != nullptr)) {
+    if (cbuf_host != nullptr && (!table_pointer || entry_host != nullptr) &&
+        gpu_memory->MapSerial() == map_serial &&
+        DeviceTranslationGeneration() == translation_gen) {
         memo = SsboBindMemo{
             .channel = channel_state,
             .as_id = as_id,
             .map_serial = map_serial,
+            .translation_gen = translation_gen,
             .cbuf_slot_addr = cbuf_slot_addr,
             .indirect_offset = indirect_offset,
             .flags = flags,

@@ -13,6 +13,7 @@
 #include <exception>
 #include <stdexcept>
 #endif
+#include <atomic>
 #include <compare>
 #include <cstddef>
 #include <filesystem>
@@ -446,6 +447,7 @@ void RestoreGlobalState(bool is_powered_on) {
 
     // Reset per-game flags
     values.use_squashed_iterated_blend = false;
+    SetAppliedOcarinaRenderScale(std::nullopt);
 }
 
 static bool configuring_global = true;
@@ -631,6 +633,34 @@ bool GameDlssNetworkChosen() {
 bool OcarinaFsrChosen() {
     const auto upscaler = values.upscaler.GetValue();
     return upscaler == Upscaler::Fsr3 || upscaler == Upscaler::Fsr4;
+}
+
+namespace {
+std::atomic<u32> applied_ocarina_render_scale{};
+} // namespace
+
+std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale() {
+    const auto quality = values.nvidia_dlss_quality.GetValue();
+    const bool upscaler_uses_quality = NvidiaDlssChosen() || AmdFsr4Chosen();
+    if (!upscaler_uses_quality || !IsDockedMode() ||
+        (quality != NvidiaDlssQuality::Balanced && quality != NvidiaDlssQuality::Performance &&
+         quality != NvidiaDlssQuality::UltraPerformance)) {
+        return std::nullopt;
+    }
+    return quality;
+}
+
+void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality) {
+    applied_ocarina_render_scale.store(quality ? static_cast<u32>(*quality) + 1 : 0,
+                                       std::memory_order_relaxed);
+}
+
+std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale() {
+    const u32 value = applied_ocarina_render_scale.load(std::memory_order_relaxed);
+    if (value == 0) {
+        return std::nullopt;
+    }
+    return static_cast<NvidiaDlssQuality>(value - 1);
 }
 
 void SetSpeedMode(const SpeedMode& mode) {

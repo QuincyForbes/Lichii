@@ -90,7 +90,7 @@ void CurrFilter(AU2 pos)
         FsrRcasF(c.r, c.g, c.b, c.a, pos, constants[0]);
         frag_color = c;
     #else
-        AH3 c;
+        AH4 c;
         FsrRcasH(c.r, c.g, c.b, c.a, pos, constants[0]);
         frag_color = c;
     #endif

@@ -751,10 +751,15 @@ struct Values {
     // Precache shaders before the game starts: the compute programs in the game files and the
     // cached graphics pipelines the boot leaves for later are built on the loading screen, so the
     // driver's cache holds them before the game first uses them.
-    // Ask: the desktop app asks at launch while the game has no finished precache; where nothing
-    // asks, as Off.
+    // Ask (desktop default): asks at first launch while the game has no finished precache; Off on
+    // mobile where memory/battery constraints favour an explicit Build Shaders tap.
     SwitchableSetting<PrecacheShaders> precache_shaders{linkage,
+#if defined(__ANDROID__) || defined(ANDROID) || defined(__IOS__) || \
+    (defined(__APPLE__) && TARGET_OS_IPHONE)
                                                         PrecacheShaders::Off,
+#else
+                                                        PrecacheShaders::Ask,
+#endif
                                                         "precache_shaders",
                                                         Category::RendererAdvanced,
                                                         Specialization::Default,
@@ -1271,6 +1276,15 @@ bool MetalFxTemporalChosen();
 bool GameDlssNetworkChosen();
 // AMD FSR 3.1 or AMD FSR 4 in place of Ocarina of Time's upscale pass.
 bool OcarinaFsrChosen();
+
+using NvidiaDlssQuality = DlssQuality;
+
+/// The DLSS quality whose render scale Ocarina of Time's built-in patch applies when the game
+/// starts: Balanced, Performance or Ultra Performance with NVIDIA DLSS (or AMD FSR 4) on, docked.
+std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale();
+/// The quality whose render-scale patch the running game's main module got (none: unpatched).
+void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality);
+std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale();
 
 void SetSpeedMode(const SpeedMode &mode);
 void ToggleStandardMode();

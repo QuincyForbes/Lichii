@@ -266,7 +266,8 @@ public:
         const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
         const Tegra::Engines::Fermi2D::Surface& motion_vectors,
         const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
-        std::array<f32, 2> motion_scale, bool use_history = true) {
+        std::array<f32, 2> motion_scale, bool use_history = true,
+        std::optional<std::array<u32, 2>> render_region = std::nullopt) {
         return false;
     }
 
@@ -304,8 +305,11 @@ public:
 
     /// Records a health check of a game's DLSS network output (dst) against its input (src) and
     /// returns the result of an earlier check once the GPU has finished it.
+    /// `src_region` is the part of src the game rendered, from its top-left corner (a dynamic
+    /// resolution network's render region); without it, the whole of src.
     [[nodiscard]] virtual std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
-        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
+        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
+        std::optional<std::array<u32, 2>> src_region = std::nullopt) {
         return std::nullopt;
     }
 

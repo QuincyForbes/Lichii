@@ -9,10 +9,10 @@ layout(location = 0) in vec2 tex_coord;
 layout(location = 0) out vec4 frag_color;
 layout(binding = 0) uniform sampler2D tex;
 
-#define src(x, y) texture(tex, coord + vec2(x, y) * 1.0 / source_size)
+#define src(x, y) texture(tex, clamp(coord + vec2(x, y) * inv_size, min_uv, max_uv))
 
 float luma(vec4 col) {
-    return dot(col.rgb, vec3(0.2126, 0.7152, 0.0722)) * (1.0 - col.a);
+    return (dot(col.rgb, vec3(0.2126, 0.7152, 0.0722)) + 0.001) * col.a;
 }
 
 bool same(vec4 B, vec4 A0) {
@@ -50,8 +50,10 @@ bool none_eq4(vec4 B, vec4 A0, vec4 A1, vec4 A2, vec4 A3) {
 void main()
 {
     vec2 source_size = vec2(textureSize(tex, 0));
-    vec2 pos = fract(tex_coord * source_size) - vec2(0.5, 0.5);
-    vec2 coord = tex_coord - pos / source_size;
+    vec2 inv_size = 1.0 / source_size;
+    vec2 min_uv = 0.5 * inv_size;
+    vec2 max_uv = (source_size - 0.5) * inv_size;
+    vec2 coord = (floor(tex_coord * source_size) + 0.5) * inv_size;
 
     vec4 E = src(0.0,0.0);
 
@@ -75,7 +77,7 @@ void main()
 
     if(same(E,A) && same(E,B) && same(E,C) && same(E,D) && same(E,F) && same(E,G) && same(E,H) && same(E,I)) return;
 
-    vec4 P  = src(0.0,2.0);
+    vec4 P  = src(0.0,-2.0);
     vec4 Q  = src(-2.0,0.0);
     vec4 R  = src(2.0,0.0);
     vec4 S  = src(0.0,2.0);
@@ -108,7 +110,7 @@ void main()
         }
 
         if (notsame(B,I) && notsame(B,G) && notsame(B,E)) {
-            if (all_eq3(B,A,F,R) && none_eq2(B,D,src(2.0,1.0))) J=mix(K, L, 0.5);
+            if (all_eq3(B,A,F,R) && none_eq2(B,D,src(2.0,1.0))) J=mix(K, J, 0.5);
             if (all_eq3(B,C,D,Q) && none_eq2(B,F,src(-2.0,1.0))) K=mix(J, K, 0.5);
         }
     }
@@ -116,7 +118,7 @@ void main()
     if (notsame(F,D)) {
         if (notsame(D,I) && notsame(D,E) && notsame(D,C)) {
             if (all_eq3(D,A,H,S) && none_eq2(D,B,src(1.0,2.0))) J=mix(L, J, 0.5);
-            if (all_eq3(D,G,B,P) && none_eq2(D,H,src(1.0,2.0))) L=mix(J, L, 0.5);
+            if (all_eq3(D,G,B,P) && none_eq2(D,H,src(1.0,-2.0))) L=mix(J, L, 0.5);
         }
 
         if (notsame(F,E) && notsame(F,A) && notsame(F,G)) {

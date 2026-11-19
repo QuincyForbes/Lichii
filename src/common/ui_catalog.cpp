@@ -353,7 +353,18 @@ const Setting kSettings[] = {
                                               "{choice:nvidia_dlss_quality.Performance}, "
                                               "{choice:nvidia_dlss_quality.UltraPerformance} and "
                                               "{choice:nvidia_dlss_quality.Dlaa} select that DLSS "
-                                              "Super Resolution mode directly."),
+                                              "Super Resolution mode directly.\n"
+                                              "In The Legend of Zelda: Ocarina of Time (docked, with "
+                                              "the Max Resolution add-on), "
+                                              "{choice:nvidia_dlss_quality.Balanced}, "
+                                              "{choice:nvidia_dlss_quality.Performance} and "
+                                              "{choice:nvidia_dlss_quality.UltraPerformance} lower the "
+                                              "game's render resolution from 2560x1440 to 2276x1280, "
+                                              "1920x1080 and 1280x720 when the game starts before "
+                                              "reconstructing 4K.\n"
+                                              "In other games, explicit modes apply when the game's "
+                                              "render size is within NVIDIA's supported range; "
+                                              "Apply/OK updates the mode while playing."),
      Desktop,
      QT_TRANSLATE_NOOP("ConfigurationShared", "NVIDIA DLSS runs on desktop PCs only.")},
     {"nvidia_dlss_preset",

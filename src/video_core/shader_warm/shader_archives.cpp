@@ -87,6 +87,7 @@ struct Record {
     ProgramStage stage;
     Bytes code;
     Bytes control;
+    bool maxwell{};
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -416,7 +417,8 @@ Record GraphicsRecord(Bytes code, Bytes control) {
     return {GraphicsStages[stage - 1], code, control};
 }
 
-/// Every stage program of every variation in a BNSH file, task and mesh included. Throws when the
+/// Every stage program of every variation in a BNSH file, task and mesh included, for both
+/// Switch 2 (NVN2 Ampere, api 4.200) and Switch 1 (NVN1 Maxwell, api 4.<200). Throws when the
 /// version, layout or a stage's header does not check out.
 std::vector<Record> ParseBnsh(Bytes data) {
     Extent(data, 0, 0x98);
@@ -429,13 +431,20 @@ std::vector<Record> ParseBnsh(Bytes data) {
     if (Le<u32>(data, 0x1c) != data.size()) {
         throw ArchiveError("invalid BNSH file size");
     }
+    const u16 api_type = Le<u16>(data, 0x70);
+    const u16 api_version = Le<u16>(data, 0x72);
+    if (api_type != 4 || api_version == 0 || api_version > 200) {
+        throw ArchiveError("unsupported BNSH API");
+    }
+    const bool maxwell = api_version < 200;
     const std::array<u8, 4> version{data[8], data[9], data[10], data[11]};
     constexpr std::array<u8, 4> v0420{0, 4, 2, 0}, v1320{1, 3, 2, 0}, v1420{1, 4, 2, 0};
-    if (version != v0420 && version != v1320 && version != v1420) {
+    if (maxwell) {
+        if (Le<u16>(data, 10) != 2) {
+            throw ArchiveError("unsupported BNSH version");
+        }
+    } else if (version != v0420 && version != v1320 && version != v1420) {
         throw ArchiveError("unsupported BNSH version");
-    }
-    if (Le<u16>(data, 0x70) != 4 || Le<u16>(data, 0x72) != 200) {
-        throw ArchiveError("unsupported BNSH API");
     }
     const u32 count = Le<u32>(data, 0x7c);
     const u64 variations = Le<u64>(data, 0x80);
@@ -454,7 +463,7 @@ std::vector<Record> ParseBnsh(Bytes data) {
             {0x08, ProgramStage::Vertex},   {0x10, ProgramStage::TessControl},
             {0x18, ProgramStage::TessEval}, {0x20, ProgramStage::Geometry},
             {0x28, ProgramStage::Fragment}, {0x30, ProgramStage::Compute}};
-        if (version == v1420 && Le<u64>(data, program) == 2) {
+        if (!maxwell && version == v1420 && Le<u64>(data, program) == 2) {
             Extent(data, program, 0x50);
             slots.emplace_back(0x40, ProgramStage::Task);
             slots.emplace_back(0x48, ProgramStage::Mesh);
@@ -475,7 +484,18 @@ std::vector<Record> ParseBnsh(Bytes data) {
             }
             const auto code = Extent(data, code_offset, code_size);
             const auto control = Extent(data, control_offset, control_size);
-            if (stage != ProgramStage::Compute) {
+            if (maxwell) {
+                if (control.size() < 0x760 || Le<u32>(control, 0) != 0x98761234) {
+                    throw ArchiveError("unsupported Maxwell BNSH control section");
+                }
+                if (stage != ProgramStage::Compute) {
+                    if (code.size() <= 0x80 || (code.size() - 0x80) % 8 ||
+                        Le<u32>(code, 0) != 0x12345678 ||
+                        HeaderType(code.subspan(0x30)) != index + 1) {
+                        throw ArchiveError("Maxwell BNSH graphics stage disagrees with SPH");
+                    }
+                }
+            } else if (stage != ProgramStage::Compute) {
                 if (code.size() <= 128 || (code.size() - 128) % 16) {
                     throw ArchiveError("invalid native graphics code size");
                 }
@@ -493,7 +513,7 @@ std::vector<Record> ParseBnsh(Bytes data) {
                     throw ArchiveError("BNSH graphics stage disagrees with native header");
                 }
             }
-            result.push_back({stage, code, control});
+            result.push_back({stage, code, control, maxwell});
         }
     }
     return result;
@@ -653,7 +673,53 @@ std::vector<Record> ParseShn(Bytes data, std::vector<u8>& metadata, std::vector<
     return result;
 }
 
-/// NVN2 AGL BAHS v11 with its separate metadata and code pools.
+/// Switch 1 AGL BAHS (v7..v10): 16-byte binary descriptors `{u64 code_rel, u32 ctrl_size,
+/// s32 ctrl_rel}` in the metadata area before the code pool.
+std::vector<Record> ParseMaxwellBahs(Bytes data, u64 pool, u64 pool_size) {
+    if (pool < 48 || pool > data.size() || pool_size != data.size() - pool) {
+        throw ArchiveError("invalid Maxwell BAHS code pool");
+    }
+    std::vector<Record> records;
+    for (u64 desc = 32; desc + 16 <= pool;) {
+        const u64 code_rel = Le<u64>(data, desc);
+        const u32 ctrl_size = Le<u32>(data, desc + 8);
+        const s64 ctrl_rel = Le<s32>(data, desc + 12);
+        const s64 ctrl_off = static_cast<s64>(desc) + ctrl_rel;
+        if (ctrl_size >= 0x760 && ctrl_size <= 0x2000 && ctrl_off >= 32 &&
+            static_cast<u64>(ctrl_off) + ctrl_size <= pool && code_rel < pool_size) {
+            const auto control =
+                data.subspan(static_cast<size_t>(ctrl_off), static_cast<size_t>(ctrl_size));
+            if (Le<u32>(control, 0) == 0x98761234 && Le<u32>(control, 4) < 0xc9) {
+                const u64 code_len = Le<u32>(control, 0x704);
+                if (code_len != 0 && code_len % 8 == 0 && code_rel + code_len <= pool_size) {
+                    const auto code = Extent(data, pool + code_rel, code_len);
+                    const u32 magic = Le<u32>(code, 0);
+                    if (magic == 0x12345678 && code.size() > 0x80) {
+                        const u32 type = HeaderType(code.subspan(0x30));
+                        if (type >= 1 && type <= 5) {
+                            records.push_back({GraphicsStages[type - 1], code, control, true});
+                            desc += 16;
+                            continue;
+                        }
+                    } else if (magic == 0x12345679 ||
+                               (Le<u32>(control, 0x748) != 0 && Le<u32>(control, 0x74c) != 0 &&
+                                Le<u32>(control, 0x750) != 0)) {
+                        records.push_back({ProgramStage::Compute, code, control, true});
+                        desc += 16;
+                        continue;
+                    }
+                }
+            }
+        }
+        desc += 4;
+    }
+    if (records.empty()) {
+        throw ArchiveError("Maxwell BAHS contains no supported shader records");
+    }
+    return records;
+}
+
+/// NVN2 AGL BAHS v11 (or Switch 1 BAHS v7..v10) with its separate metadata and code pools.
 std::vector<Record> ParseBahs(Bytes data) {
     Extent(data, 0, 32);
     const u32 version = Le<u32>(data, 4);
@@ -663,6 +729,9 @@ std::vector<Record> ParseBahs(Bytes data) {
     const u64 metadata_base = Le<u32>(data, 20);
     const u64 pool_size = Le<u32>(data, 24);
     const u64 pool = Le<u32>(data, 28);
+    if (Is(data, 0, "BAHS") && size == data.size() && version >= 7 && version <= 10) {
+        return ParseMaxwellBahs(data, pool, pool_size);
+    }
     if (!Is(data, 0, "BAHS") || version != 11 || platform != 5 || flags != 0 ||
         size != data.size()) {
         throw ArchiveError("unsupported BAHS version, platform or file size");
@@ -778,7 +847,7 @@ struct Walker {
     /// Passes every record to the caller's record callback.
     void Emit(const std::vector<Record>& records) const {
         for (const auto& record : records) {
-            on_record(ShaderRecord{record.stage, record.code, record.control});
+            on_record(ShaderRecord{record.stage, record.code, record.control, record.maxwell});
         }
     }
 
@@ -818,9 +887,12 @@ struct Walker {
             for (const auto& [offset, bnsh] : FindBnsh(data)) {
                 Walk(bnsh, name + fmt::format("!BNSH@{:x}", offset), depth + 1);
             }
-        } else if (Is(data, 0, std::string_view{"YB\x05\0", 4}) && IsEffectSet(Lower(name))) {
-            for (const auto& [offset, bnsh] : FindEmbeddedBnsh(data)) {
-                Walk(bnsh, name + fmt::format("!BNSH@{:x}", offset), depth + 1);
+        } else if (data.size() >= 4 && Is(data, 0, "YB") && data[2] <= 7 && data[3] == 0 &&
+                   IsEffectSet(Lower(name))) {
+            if (HasEmbeddedBnsh(data)) {
+                for (const auto& [offset, bnsh] : FindEmbeddedBnsh(data)) {
+                    Walk(bnsh, name + fmt::format("!BNSH@{:x}", offset), depth + 1);
+                }
             }
         } else if (Is(data, 0, "VFXB")) {
             // Particle effect binaries (Fire Emblem's Effect/Particle/*.ptcl): the GPU particle
@@ -839,10 +911,23 @@ struct Walker {
             Emit(ParseShn(data, metadata, code));
         } else if (Is(data, 0, "BAHS")) {
             Emit(ParseBahs(data));
+        } else if (Is(data, 0, "AKPK") || Is(data, 0, "GDPC")) {
+            // Non-shader audio/asset .pck containers (Wwise, Godot).
+            return;
         } else {
             const auto lower = Lower(name);
+            if ((EndsWith(lower, ".pck") || EndsWith(lower, ".pck!zstd") ||
+                 EndsWith(lower, ".blarc") || EndsWith(lower, ".blarc!zstd")) &&
+                HasEmbeddedBnsh(data)) {
+                for (const auto& [offset, bnsh] : FindEmbeddedBnsh(data)) {
+                    Walk(bnsh, name + fmt::format("!BNSH@{:x}", offset), depth + 1);
+                }
+                return;
+            }
             for (const std::string_view skip :
-                 {".json", ".presetb", ".meminfo", ".tex", ".byml", ".yaml", ".raw"}) {
+                 {".json", ".presetb", ".meminfo", ".tex", ".byml", ".yaml", ".raw", ".ndsr",
+                  ".bflyt", ".bflan", ".bntx", ".bffnt", ".bfctr", ".bfgrp", ".bflim", ".bfttf",
+                  ".bfotf", ".bfres", ".bgenv", ".baglmf", ".bglpbd", ".txt", ".xml", ".bin"}) {
                 if (EndsWith(lower, skip)) {
                     return;
                 }
@@ -904,20 +989,22 @@ GameFileKind ClassifyGameFile(std::string_view path) {
     if (path == "Pack/ZsDic.pack.zs") {
         return GameFileKind::ZstdDictionaries;
     }
-    std::string lower = Lower(path);
+    const std::string lower_raw = Lower(path);
+    std::string lower = lower_raw;
+    const bool zstd_ext = EndsWith(lower, ".zst") || EndsWith(lower, ".zs");
     if (EndsWith(lower, ".zst")) {
         lower.resize(lower.size() - 4);
     } else if (EndsWith(lower, ".zs")) {
         lower.resize(lower.size() - 3);
     }
     for (const std::string_view extension :
-         {".bfsha", ".sarc", ".bnsh", ".cgsb", ".shn", ".sharcb"}) {
+         {".bfsha", ".sarc", ".bnsh", ".cgsb", ".shn", ".sharcb", ".blarc", ".pck"}) {
         if (EndsWith(lower, extension)) {
             return GameFileKind::ShaderArchive;
         }
     }
-    if (path.starts_with("Effect/") && path.find('/', 7) == std::string_view::npos &&
-        (EndsWith(path, ".vsetb.byml.zs") || EndsWith(path, ".esetb.byml.zs"))) {
+    if (zstd_ext && lower_raw.starts_with("effect/") &&
+        (EndsWith(lower, ".vsetb.byml") || EndsWith(lower, ".esetb.byml"))) {
         return GameFileKind::Effect;
     }
     if (EndsWith(lower, ".ptcl")) {

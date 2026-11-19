@@ -2560,6 +2560,22 @@ public:
             return (reg_array[MeshControl] & 1) != 0;
         }
 
+        // Mesh draws are issued as point draws; the rasterizer uses SET_MESH_SHADER_A's output
+        // topology instead (Mesa's NVK mesh shading notes).
+        PrimitiveTopology RasterTopology(PrimitiveTopology draw_topology) const {
+            if (!IsMeshEnabled()) {
+                return draw_topology;
+            }
+            switch (reg_array[MeshShaderA] & 0xf) {
+            case 0:
+                return PrimitiveTopology::Points;
+            case 1:
+                return PrimitiveTopology::Lines;
+            default:
+                return PrimitiveTopology::Triangles;
+            }
+        }
+
         struct ConstantBuffer {
             u32 size;
             u32 address_high;
@@ -3091,6 +3107,7 @@ public:
             f32 src_y1;
             u32 src_sampler;
             u32 src_texture;
+            bool active{};
         };
         struct IndirectParams {
             bool is_byte_count;
@@ -3101,6 +3118,8 @@ public:
             size_t buffer_size;
             size_t max_draw_counts;
             size_t stride;
+            /// The arguments are a GPU-written record the host GPU reads (FrontTakeIndirectRecord).
+            bool from_record{};
         };
         void ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument);
         void Clear(Maxwell3D& maxwell3d, u32 layer_count);
@@ -3275,6 +3294,12 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
+    /// Split front, before an entry holding the remaining 5 parameters (at `record`) of the
+    /// pending macro call: true when that macro is DrawIndexedIndirect with a topology the host
+    /// draws indirectly. The host GPU then reads the record itself (the words may still be
+    /// written by queued GPU work: culling): the caller needs neither to wait for the back nor
+    /// to read the words fresh.
+    bool FrontTakeIndirectRecord(u32 parameter_method, GPUVAddr record);
     /// Nx2Perf FrontRun: FrontCallMethod for `count` words of one command below the macro
     /// range, `methods_pending` of the command's words left at the first one.
     void FrontCallMethodRun(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -3533,6 +3558,15 @@ private:
                               const u32* words, u32 count);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                       u32 count);
+    /// Whether the native macro `method` starts is NVN's DrawIndexedIndirect (parameters:
+    /// topology, then a 5-word VkDrawIndexedIndirectCommand-style record), told by a dry run.
+    bool IsIndirectDrawMacro(FrontState& state, u32 method);
+    /// Front: draws the pending DrawIndexedIndirect call from its record (FrontTakeIndirectRecord).
+    void FrontRunIndirectRecord(Core::System& system, VideoCommon::GpuSplit& split,
+                                FrontState& state, GPUVAddr record);
+    /// Back: one indexed draw whose count, instances, first index, base vertex and base instance
+    /// the host GPU reads from the guest record at `record` (as HLE_DrawIndexedIndirect).
+    void BackDrawIndexedIndirect(Core::System& system, u32 topology, GPUVAddr record);
     bool FrontRunOotMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
                           u32 method, OotMacros::Id id, std::span<const u32>& borrowed);
     struct OotContext;

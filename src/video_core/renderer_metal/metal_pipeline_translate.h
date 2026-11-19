@@ -10,10 +10,15 @@
 
 #include <array>
 #include <atomic>
+#include <filesystem>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "common/common_types.h"
@@ -32,6 +37,7 @@
 #include "video_core/renderer_metal/metal_object.h"
 #include "video_core/renderer_metal/metal_shader_translate.h"
 #include "video_core/renderer_metal/metal_xfb.h"
+#include "video_core/stage_cache.h"
 
 namespace Metal {
 
@@ -321,12 +327,48 @@ struct TranslatedPipeline {
     std::optional<GeometryCompute> geometry;
 };
 
+/// Persistent disk + in-memory cache of SPIR-V -> MSL translations (<ShaderDir>/<title_id>/
+/// metal_stages.v1.bin). Thread-safe across translation, boot and offline warm workers.
+class StageMslCache {
+public:
+    StageMslCache() = default;
+
+    void Open(const std::filesystem::path& file_path, u64 build_stamp);
+    void Save();
+
+    [[nodiscard]] std::optional<ShaderTranslate::Result> Find(const u128& key) const;
+    void Insert(const u128& key, const ShaderTranslate::Result& result);
+
+    [[nodiscard]] size_t Size() const;
+
+private:
+    struct KeyHasher {
+        size_t operator()(const u128& k) const noexcept {
+            return static_cast<size_t>(k[0] ^ (k[1] * 0x9E3779B97F4A7C15ULL));
+        }
+    };
+
+    mutable std::shared_mutex mutex;
+    std::filesystem::path path;
+    u64 stamp{};
+    bool open{};
+    bool dirty{};
+    std::unordered_map<u128, ShaderTranslate::Result, KeyHasher> entries;
+};
+
 class PipelineTranslator {
 public:
     /// `ios`: MSL for iOS (ShaderTranslate::Options::ios). `apple_family`: the GPU's
     /// MTLGPUFamilyApple number, 0 when it has none (Options::apple_family). `native_mesh`: the
     /// device has Metal 3 mesh pipelines (and NativeMeshEnabled()).
-    explicit PipelineTranslator(bool ios, u32 apple_family, bool native_mesh = false);
+    explicit PipelineTranslator(bool ios, u32 apple_family, bool native_mesh = false,
+                                VideoCommon::StageCache* stage_cache = nullptr,
+                                StageMslCache* msl_cache = nullptr);
+
+    void SetCaches(VideoCommon::StageCache* stage_cache_, StageMslCache* msl_cache_) noexcept {
+        stage_cache = stage_cache_;
+        msl_cache = msl_cache_;
+    }
 
     /// Fills everything of the key but its programs from the registers and the draw's topology.
     /// Programs EDEN_NX2_OOT_VISUAL_WORKAROUND edited so far (the offline replay's report).
@@ -341,6 +383,12 @@ public:
         const GraphicsPipelineKey& key, std::span<Shader::Environment* const> envs);
 
     [[nodiscard]] std::optional<StageProgram> Compute(u64 unique_hash, Shader::Environment& env);
+
+    /// Single-stage vertex (slot 1) or fragment (slot 5) translation for `warm-graphics.bin`,
+    /// populating StageCache and StageMslCache (`metal_stages.v1.bin`).
+    [[nodiscard]] std::optional<StageProgram> WarmSingleStage(const GraphicsPipelineKey& key,
+                                                              size_t slot,
+                                                              Shader::Environment& env);
 
     /// Why the last Graphics or Compute call gave nothing, and what the failing step said.
     [[nodiscard]] std::string_view Cause() const noexcept {
@@ -416,6 +464,20 @@ private:
         Shader::Backend::Bindings& bindings, const Shader::RuntimeInfo& runtime_info,
         const ShaderTranslate::Options* options = nullptr);
 
+    [[nodiscard]] std::optional<StageProgram> TranslateCached(
+        size_t slot, Shader::IR::Program& program, ShaderTranslate::Stage stage,
+        Shader::Backend::Bindings& bindings, const Shader::RuntimeInfo& runtime_info,
+        const ShaderTranslate::Options* options = nullptr);
+
+    struct StageReuse {
+        using Cache = VideoCommon::StageCache;
+        std::array<std::shared_ptr<const Cache::Translation>, 6> reused{};
+        std::array<std::shared_ptr<Cache::Translation>, 6> recorded{};
+        std::vector<std::pair<std::shared_ptr<Cache::Translation>,
+                              std::shared_ptr<const Cache::Emitted>>>
+            new_translations;
+    } stage_reuse;
+
     /// The key Graphics is translating: its raster state patches the MSL Translate makes.
     const GraphicsPipelineKey* patch_key{};
     /// The pipeline being translated is expanded: its pixel program reads the line coordinate.
@@ -431,6 +493,8 @@ private:
                                                         std::span<const u32> spirv,
                                                         const Shader::IR::Program& vertex);
 
+    VideoCommon::StageCache* stage_cache{};
+    StageMslCache* msl_cache{};
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
     ShaderTranslate::Options translate_options;

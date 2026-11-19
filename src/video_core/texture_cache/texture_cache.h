@@ -1958,12 +1958,6 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
         const SubresourceRange view_range = image_view.range;
         {
             const ImageBase& image_base = slot_images[image_id];
-            // Rescaled and multisampled targets keep the loop; copy them when a game needs it.
-            if (True(image_base.flags & (ImageFlagBits::Rescaled | ImageFlagBits::Unbacked |
-                                         ImageFlagBits::TrimmedLevels)) ||
-                image_base.info.num_samples != 1) {
-                continue;
-            }
             bool is_target = false;
             for (const WrittenRt& rt : written_rts) {
                 if (!image_base.OverlapsGPU(rt.addr, 1)) {
@@ -1996,6 +1990,15 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
                 break;
             }
             if (!is_target) {
+                continue;
+            }
+            // Rescaled and multisampled targets keep the loop; notify hazard tracking if supported.
+            if (True(image_base.flags & (ImageFlagBits::Rescaled | ImageFlagBits::Unbacked |
+                                         ImageFlagBits::TrimmedLevels)) ||
+                image_base.info.num_samples != 1) {
+                if constexpr (requires { runtime.FeedbackBarrier(); }) {
+                    runtime.FeedbackBarrier();
+                }
                 continue;
             }
         }
@@ -2142,23 +2145,39 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
 
 template <class P>
 void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
-    if (views.empty() || !Settings::values.barrier_feedback_loops.GetValue()) {
-        return;
-    }
     const auto& regs = maxwell3d->regs;
     const bool writes_depth_stencil =
         regs.zeta_enable != 0 &&
         ((regs.depth_test_enable != 0 && regs.depth_write_enabled != 0) ||
          (regs.stencil_enable != 0 && regs.stencil_front_mask != 0));
-    const auto barrier = [&] {
-        if (feedback_depth_dirty) {
-            runtime.BarrierFeedbackLoop();
-            feedback_depth_dirty = false;
+    u8 written_color_mask = 0;
+    for (size_t i = 0; i < NUM_RT; ++i) {
+        if (IsColorTargetWritten(i)) {
+            written_color_mask |= static_cast<u8>(1u << i);
         }
-    };
+    }
     SCOPE_EXIT {
         if (writes_depth_stencil) {
             feedback_depth_dirty = true;
+        }
+        feedback_color_dirty |= written_color_mask;
+    };
+    if (views.empty() || !Settings::values.barrier_feedback_loops.GetValue()) {
+        return;
+    }
+    const auto barrier = [&](bool depth_hit, u8 color_hit_mask) {
+        const bool dirty = (depth_hit && feedback_depth_dirty) ||
+                           ((color_hit_mask & (feedback_color_dirty | written_color_mask)) != 0);
+        if (dirty) {
+            if (depth_hit && color_hit_mask == 0) {
+                runtime.BarrierFeedbackLoop();
+            } else {
+                NotifyFeedbackBarrier();
+            }
+            if (depth_hit) {
+                feedback_depth_dirty = false;
+            }
+            feedback_color_dirty &= ~color_hit_mask;
         }
     };
 
@@ -2171,73 +2190,52 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
     }
     if (render_targets_serial == last_feedback_loop_serial &&
         views_key == last_feedback_texture_serial) {
-        if (last_feedback_loop_result) {
-            barrier();
+        if (last_feedback_loop_result || last_feedback_color_mask != 0) {
+            barrier(last_feedback_loop_result, last_feedback_color_mask);
         }
         return;
-    }
-    if (render_targets_serial != last_feedback_loop_serial) {
-        feedback_depth_dirty = false;
     }
 
     if (rt_active_mask == 0) {
         last_feedback_loop_serial = render_targets_serial;
         last_feedback_texture_serial = views_key;
         last_feedback_loop_result = false;
+        last_feedback_color_mask = 0;
         return;
     }
     const u32 color_mask = rt_active_mask & ((1u << NUM_RT) - 1);
     const u32 depth_bit = 1u << NUM_RT;
     const bool depth_active = (rt_active_mask & depth_bit) != 0;
 
-    const bool requires_barrier = [&] {
-        for (const auto& view : views) {
-            if (!view.id) {
-                continue;
-            }
-
-            {
-                bool is_continue = false;
-                for (u32 m = color_mask; m != 0; m &= m - 1) {
-                    const size_t i = static_cast<size_t>(std::countr_zero(m));
-                    if (view.id == render_targets.color_buffer_ids[i]) {
-                        is_continue = true;
-                        break;
-                    }
-                }
-                if (is_continue)
-                    continue;
-            }
-
-            if (depth_active && view.id == render_targets.depth_buffer_id)
-                continue;
-
-            const ImageId view_image_id = slot_image_views[view.id].image_id;
-            {
-                bool is_continue = false;
-                for (u32 m = color_mask; m != 0; m &= m - 1) {
-                    const size_t i = static_cast<size_t>(std::countr_zero(m));
-                    if (view_image_id == rt_image_id[i]) {
-                        is_continue = true;
-                        break;
-                    }
-                }
-                if (is_continue)
-                    continue;
-            }
-            if (depth_active && view_image_id == rt_depth_image_id) {
-                return true;
+    bool depth_loop = false;
+    u8 color_loop_mask = 0;
+    for (const auto& view : views) {
+        if (!view.id || view.id == NULL_IMAGE_VIEW_ID || !slot_image_views.contains(view.id)) {
+            continue;
+        }
+        const ImageViewBase& image_view = slot_image_views[view.id];
+        if (image_view.IsBuffer() || !image_view.image_id ||
+            image_view.image_id == NULL_IMAGE_ID) {
+            continue;
+        }
+        const ImageId view_image_id = image_view.image_id;
+        for (u32 m = color_mask; m != 0; m &= m - 1) {
+            const size_t i = static_cast<size_t>(std::countr_zero(m));
+            if (view_image_id == rt_image_id[i]) {
+                color_loop_mask |= static_cast<u8>(1u << i);
             }
         }
-
-        return false;
-    }();
+        if (depth_active && view_image_id == rt_depth_image_id) {
+            depth_loop = true;
+        }
+    }
 
     last_feedback_loop_serial = render_targets_serial;
     last_feedback_texture_serial = views_key;
-    last_feedback_loop_result = requires_barrier;
-    if (requires_barrier) {
-        barrier();
+    last_feedback_loop_result = depth_loop;
+    last_feedback_color_mask = color_loop_mask;
+    if (depth_loop || color_loop_mask != 0) {
+        barrier(depth_loop, color_loop_mask);
     }
 }
 
@@ -2949,6 +2947,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
             PrepareImageView(color_buffer_id, true, IsFullClear(color_buffer_id));
             if (color_buffer_id) {
                 rt_prepared.modified_mask |= 1u << rt;
+                feedback_color_dirty |= static_cast<u8>(1u << rt);
             }
         }
         if (depth_modified) {
@@ -2956,6 +2955,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
             PrepareImageView(depth_buffer_id, true, IsFullClear(depth_buffer_id));
             if (depth_buffer_id) {
                 rt_prepared.modified_mask |= 1u << NUM_RT;
+                feedback_depth_dirty = true;
             }
         }
         NoteFullClears();
@@ -3093,6 +3093,8 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         rt_prepared.valid = false;
         rt_prepared.modified_mask = 0;
         rt_cleared_undrawn_mask = 0;
+        feedback_depth_dirty = false;
+        feedback_color_dirty = 0;
     }
 
     flags[Dirty::DepthBiasGlobal] = true;
@@ -3104,6 +3106,32 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     } else {
         note_draw_after_clear();
         touch_draw_targets();
+    }
+}
+
+template <class P>
+void TextureCache<P>::DrawTexture() {
+    const auto mark_rt = [this](size_t index) {
+        if (index >= NUM_RT) {
+            return;
+        }
+        const ImageViewId id = render_targets.color_buffer_ids[index];
+        if (!id || id == NULL_IMAGE_VIEW_ID) {
+            return;
+        }
+        const ImageViewBase& view = slot_image_views[id];
+        if (!view.IsBuffer() && view.image_id && view.image_id != NULL_IMAGE_ID) {
+            PrepareImageView(id, true, false);
+            slot_images[view.image_id].modification_tick = ++modification_tick;
+            feedback_color_dirty |= static_cast<u8>(1u << index);
+        }
+    };
+    mark_rt(0);
+    if (maxwell3d != nullptr && maxwell3d->regs.rt_control.count > 0) {
+        const u32 mapped = maxwell3d->regs.rt_control.Map(0);
+        if (mapped != 0) {
+            mark_rt(mapped);
+        }
     }
 }
 
@@ -3277,40 +3305,125 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
 }
 
 template <class P>
-void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
+void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size, bool keep_gpu_written) {
     ClearStale(cpu_addr, size);
     bool invalidate_prepared = false;
-    ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size, &invalidate_prepared](ImageId image_id, Image& image) {
-        if (False(image.flags & ImageFlagBits::CpuModified)) {
-            // Each branch below leaves it CPU modified: binding memos of it need the upload.
-            BumpBindingSerial(image_id);
+    ForEachImageInRegion(
+        cpu_addr, size,
+        [this, cpu_addr, size, keep_gpu_written, &invalidate_prepared](ImageId image_id,
+                                                                       Image& image) {
+            if (keep_gpu_written && True(image.flags & ImageFlagBits::GpuModified)) {
+                return;
+            }
+            MarkImageWritten(image_id, image, cpu_addr, size, invalidate_prepared);
+        });
+    if (invalidate_prepared) {
+        for (size_t c : active_channel_ids) {
+            channel_storage[c].graphics_image_table.InvalidatePrepared();
+            channel_storage[c].compute_image_table.InvalidatePrepared();
         }
-        if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
-            // Written at last: a backed image replaces it where it is used next.
-            image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
-            ++bindings_epoch;
-            return;
-        }
-        if (True(image.flags & ImageFlagBits::SparseTiles)) {
-            image.cpu_modification_tick = ++modification_tick;
-            MarkRangeWritten(image, image_id, cpu_addr, size);
-            return;
-        }
-        image.cpu_modification_tick = ++modification_tick;
-        if (UploadsByLayer(image)) {
-            MarkLayersWritten(image, image_id, cpu_addr, size);
-            ++bindings_epoch;
-            invalidate_prepared |= !image.image_view_ids.empty();
-            return;
-        }
-        if (True(image.flags & ImageFlagBits::CpuModified)) {
-            return;
-        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::MarkImageWritten(ImageId image_id, Image& image, DAddr cpu_addr,
+                                       size_t size, bool& invalidate_prepared) {
+    if (False(image.flags & ImageFlagBits::CpuModified)) {
+        // Each branch below leaves it CPU modified: binding memos of it need the upload.
+        BumpBindingSerial(image_id);
+    }
+    if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
+        // Written at last: a backed image replaces it where it is used next.
+        image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
         ++bindings_epoch;
-        image.flags |= ImageFlagBits::CpuModified;
+        return;
+    }
+    if (True(image.flags & ImageFlagBits::SparseTiles)) {
+        image.cpu_modification_tick = ++modification_tick;
+        MarkRangeWritten(image, image_id, cpu_addr, size);
+        return;
+    }
+    image.cpu_modification_tick = ++modification_tick;
+    if (UploadsByLayer(image)) {
+        MarkLayersWritten(image, image_id, cpu_addr, size);
+        ++bindings_epoch;
         invalidate_prepared |= !image.image_view_ids.empty();
-        if (True(image.flags & ImageFlagBits::Tracked)) {
-            UntrackImage(image, image_id);
+        return;
+    }
+    if (True(image.flags & ImageFlagBits::CpuModified)) {
+        return;
+    }
+    ++bindings_epoch;
+    image.flags |= ImageFlagBits::CpuModified;
+    invalidate_prepared |= !image.image_view_ids.empty();
+    if (True(image.flags & ImageFlagBits::Tracked)) {
+        UntrackImage(image, image_id);
+    }
+}
+
+template <class P>
+void TextureCache<P>::WriteGpuMemory(GPUVAddr gpu_addr, size_t size) {
+    for (const auto& [piece_addr, piece_size] : gpu_memory->GetSubmappedRange(gpu_addr, size)) {
+        if (const auto device_addr = gpu_memory->GpuToCpuAddress(piece_addr)) {
+            WriteMemory(*device_addr, piece_size, true);
+        }
+    }
+}
+
+template <class P>
+bool TextureCache<P>::IsGpuMemoryGpuModified(GPUVAddr gpu_addr, size_t size) {
+    for (const auto& [piece_addr, piece_size] : gpu_memory->GetSubmappedRange(gpu_addr, size)) {
+        const auto device_addr = gpu_memory->GpuToCpuAddress(piece_addr);
+        if (device_addr && IsRegionGpuModified(*device_addr, piece_size)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class P>
+void TextureCache<P>::WriteDmaCopy(GPUVAddr src_addr, GPUVAddr dest_addr, size_t size,
+                                   std::span<const std::pair<DAddr, size_t>> gpu_written_dest) {
+    const std::optional<DAddr> src = gpu_memory->GpuToCpuAddress(src_addr);
+    const std::optional<DAddr> dest = gpu_memory->GpuToCpuAddress(dest_addr);
+    if (!src || !dest) {
+        return;
+    }
+    // Destination bytes guest memory doesn't hold yet: the buffer cache's GPU writes and the
+    // bytes of images the GPU wrote over the source.
+    boost::container::small_vector<std::pair<DAddr, size_t>, 8> unheld(gpu_written_dest.begin(),
+                                                                       gpu_written_dest.end());
+    ForEachImageInRegion(*src, size, [&](ImageId, Image& image) {
+        if (False(image.flags & ImageFlagBits::GpuModified)) {
+            return;
+        }
+        const DAddr begin = (std::max)(static_cast<DAddr>(image.cpu_addr), *src);
+        const DAddr end = (std::min)(static_cast<DAddr>(image.cpu_addr_end), *src + size);
+        unheld.emplace_back(*dest + (begin - *src), end - begin);
+    });
+    std::ranges::sort(unheld);
+    DAddr held = *dest;
+    for (const auto& [begin, length] : unheld) {
+        if (begin > held) {
+            ClearStale(held, begin - held);
+        }
+        held = (std::max)(held, begin + length);
+    }
+    const DAddr dest_end = *dest + size;
+    if (held < dest_end) {
+        ClearStale(held, dest_end - held);
+    }
+    bool invalidate_prepared = false;
+    ForEachImageInRegion(*dest, size, [&](ImageId image_id, Image& image) {
+        // An upload would take bytes guest memory doesn't hold.
+        const bool takes_unheld = std::ranges::any_of(unheld, [&image](const auto& range) {
+            return range.first < image.cpu_addr_end && image.cpu_addr < range.first + range.second;
+        });
+        // GPU-written contents outside the copy are only in the image.
+        const bool keeps_gpu_contents = True(image.flags & ImageFlagBits::GpuModified) &&
+                                        (image.cpu_addr < *dest || image.cpu_addr_end > dest_end);
+        if (!takes_unheld && !keeps_gpu_contents) {
+            MarkImageWritten(image_id, image, *dest, size, invalidate_prepared);
         }
     });
     if (invalidate_prepared) {
@@ -3610,7 +3723,8 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
 
 template <class P>
 std::optional<VideoCore::GameDlssProbe> TextureCache<P>::ProbeGameDlssOutput(
-    const Tegra::Engines::Fermi2D::Surface& dst, const Tegra::Engines::Fermi2D::Surface& src) {
+    const Tegra::Engines::Fermi2D::Surface& dst, const Tegra::Engines::Fermi2D::Surface& src,
+    std::optional<std::array<u32, 2>> src_region) {
     if constexpr (FRAMEBUFFER_BLITS) {
         return std::nullopt;
     } else {
@@ -3656,8 +3770,15 @@ std::optional<VideoCore::GameDlssProbe> TextureCache<P>::ProbeGameDlssOutput(
         if (!src_view || !dst_view) {
             return std::nullopt;
         }
-        return runtime.ProbeGameDlssOutput(slot_image_views[*src_view],
-                                           slot_image_views[*dst_view]);
+        auto& src_image_view = slot_image_views[*src_view];
+        auto& dst_image_view = slot_image_views[*dst_view];
+        if constexpr (requires {
+                          runtime.ProbeGameDlssOutput(src_image_view, dst_image_view, src_region);
+                      }) {
+            return runtime.ProbeGameDlssOutput(src_image_view, dst_image_view, src_region);
+        } else {
+            return runtime.ProbeGameDlssOutput(src_image_view, dst_image_view);
+        }
     }
 }
 
@@ -3769,7 +3890,8 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
                                       const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                                       const Tegra::Texture::TICEntry* depth,
                                       std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,
-                                      bool use_history) {
+                                      bool use_history,
+                                      std::optional<std::array<u32, 2>> render_region) {
     if constexpr (FRAMEBUFFER_BLITS) {
         return false;
     } else {
@@ -3846,10 +3968,13 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         if (src_size.width != src.width || src_size.height != src.height) {
             return false;
         }
+        // The game may render only part of its colour target.
+        const std::array<u32, 2> guest_size =
+            render_region.value_or(std::array{src_size.width, src_size.height});
         const std::array<u32, 2> render_size =
-            rescaled(src_id) ? std::array{Settings::values.resolution_info.ScaleUp(src_size.width),
-                                          Settings::values.resolution_info.ScaleUp(src_size.height)}
-                             : std::array{src_size.width, src_size.height};
+            rescaled(src_id) ? std::array{Settings::values.resolution_info.ScaleUp(guest_size[0]),
+                                          Settings::values.resolution_info.ScaleUp(guest_size[1])}
+                             : guest_size;
         // The jitter is in the input's guest pixels.
         if (rescaled(src_id)) {
             const f32 factor = Settings::values.resolution_info.up_factor;
@@ -3884,11 +4009,26 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         }
         // After the views: creating them may reallocate the framebuffer slots.
         Framebuffer* const dst_framebuffer = &slot_framebuffers[dst_view->first];
-        return runtime.TemporalUpscale(
-            dst_framebuffer, slot_image_views[dst_view->second], slot_image_views[src_view->second],
-            slot_image_views[motion_view->second],
-            depth_view ? &slot_image_views[depth_view] : nullptr, render_size, jitter,
-            motion_scale, use_history);
+        auto& dst_image_view = slot_image_views[dst_view->second];
+        auto& src_image_view = slot_image_views[src_view->second];
+        auto& motion_image_view = slot_image_views[motion_view->second];
+        auto* const depth_image_view = depth_view ? &slot_image_views[depth_view] : nullptr;
+        const std::optional<std::array<u32, 2>> host_render_region =
+            render_region ? std::optional{render_size} : std::nullopt;
+        if constexpr (requires {
+                          runtime.TemporalUpscale(dst_framebuffer, dst_image_view, src_image_view,
+                                                  motion_image_view, depth_image_view, render_size,
+                                                  jitter, motion_scale, use_history,
+                                                  host_render_region);
+                      }) {
+            return runtime.TemporalUpscale(dst_framebuffer, dst_image_view, src_image_view,
+                                           motion_image_view, depth_image_view, render_size, jitter,
+                                           motion_scale, use_history, host_render_region);
+        } else {
+            return runtime.TemporalUpscale(dst_framebuffer, dst_image_view, src_image_view,
+                                           motion_image_view, depth_image_view, render_size, jitter,
+                                           motion_scale, use_history);
+        }
     }
 }
 
@@ -4984,6 +5124,19 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     if (!image.info.rescaleable) {
         return false;
     }
+    const u32 max_scaled_extent = [this]() noexcept {
+        if constexpr (requires { runtime.GetMaxScaledExtent(); }) {
+            return runtime.GetMaxScaledExtent();
+        } else {
+            return (std::numeric_limits<u32>::max)();
+        }
+    }();
+    // Past the device's limits the scaled image is invalid. Ocarina of Time's 12288x12288
+    // sun shadow map is 18432 wide at 1.5x and 24576 at 2x, over AMD's 16384, and drawing
+    // into it hangs the GPU (#1885).
+    if (!ScaledImageFits(image.info, Settings::values.resolution_info, max_scaled_extent)) {
+        return false;
+    }
     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
         return false;
     }
@@ -5025,9 +5178,17 @@ void TextureCache<P>::NoteRescaleTrace(ImageBase& image, std::string_view role) 
     } else if (Settings::values.resolution_info.downscale && !info.downscaleable) {
         state = "native: too small to downscale";
     } else if (!ImageCanRescale(image)) {
-        bool host_limited = false;
+        const u32 max_scaled_extent = [this]() noexcept {
+            if constexpr (requires { runtime.GetMaxScaledExtent(); }) {
+                return runtime.GetMaxScaledExtent();
+            } else {
+                return (std::numeric_limits<u32>::max)();
+            }
+        }();
+        bool host_limited =
+            !ScaledImageFits(info, Settings::values.resolution_info, max_scaled_extent);
         if constexpr (requires { runtime.CanRescaleImage(info); }) {
-            host_limited = !runtime.CanRescaleImage(info);
+            host_limited |= !runtime.CanRescaleImage(info);
         }
         state = host_limited ? "native: scaled size exceeds host limit"
                              : "native: an alias can't rescale";
