@@ -35,6 +35,15 @@ namespace Metal::BindMemo {
     return enabled;
 }
 
+/// EDEN_NX2_METAL_BINDMEMO_SCRATCH=0: Resolve allocates its per-call lists afresh.
+[[nodiscard]] inline bool ScratchEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_BINDMEMO_SCRATCH");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 /// Vulkan's BindingKind: what a binding's resolution depends on besides its view and sampler.
 namespace Kind {
 constexpr u32 TextureBuffer = 1;
@@ -83,19 +92,43 @@ void Resolve(Cache& cache, bool compute, bool blacklist, std::span<const u32> ki
              std::span<VideoCommon::SamplerId> samplers, Counts& counts) {
     using Memo = typename Cache::BindingMemo;
     const auto lookup = cache.BeginBindingLookup(compute);
-    std::vector<Memo*> memos(views.size());
     struct Miss {
         u32 view;
         u32 sampler;
     };
-    std::vector<Miss> misses;
+    // EDEN_NX2_METAL_BINDMEMO_SCRATCH: the lists keep their storage (per thread) between calls;
+    // a nested call (none is made) would find them taken and allocate its own.
+    struct Scratch {
+        std::vector<Memo*> memos;
+        std::vector<Miss> misses;
+        std::vector<typename Cache::BindingProbe> probes;
+        std::vector<u32> tsc_indices;
+        bool taken = false;
+    };
+    static thread_local Scratch scratch;
+    Scratch local;
+    const bool use_scratch = ScratchEnabled() && !scratch.taken;
+    Scratch& lists = use_scratch ? scratch : local;
+    lists.taken = true;
+    struct Release {
+        Scratch& lists;
+        ~Release() {
+            lists.taken = false;
+        }
+    } release{lists};
+    std::vector<Memo*>& memos = lists.memos;
+    memos.assign(views.size(), nullptr);
+    std::vector<Miss>& misses = lists.misses;
+    misses.clear();
     bool aliased_hit = false;
     static const bool batch = [] {
         const char* const value = VulkanSwitch("EDEN_NX2_BINDMEMO_BATCH");
         return value == nullptr || value[0] != '0';
     }();
-    std::vector<typename Cache::BindingProbe> probes;
-    std::vector<u32> tsc_indices(views.size());
+    std::vector<typename Cache::BindingProbe>& probes = lists.probes;
+    probes.clear();
+    std::vector<u32>& tsc_indices = lists.tsc_indices;
+    tsc_indices.assign(views.size(), 0U);
     u32 sampler_index = 0;
     for (size_t index = 0; index < views.size(); ++index) {
         const bool is_texture = (kinds[index] & Kind::ClassMask) == Kind::Texture;

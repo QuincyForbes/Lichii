@@ -685,6 +685,15 @@ private:
         std::vector<u32> binding_kinds;
         std::array<std::vector<Binding>, 5> stage_bindings;
     } draw_scratch;
+    /// EDEN_NX2_METAL_BIND_SCRATCH: BindStageResources' slot lists and tables, their storage
+    /// kept between calls.
+    struct BindScratch {
+        std::vector<u32> texture_slots;
+        std::vector<u32> sampler_slots;
+        std::vector<u64> spill_table;
+        std::vector<u64> sampler_table;
+        std::vector<u64> array_table;
+    } bind_scratch;
     /// Why PrepareDraw skipped the draw; empty for a draw of nothing.
     std::string_view prepare_refusal;
     /// Why PrepareDraw skipped a draw of nothing, when it says (EDEN_NX2_METAL_DRAW_TRACE).

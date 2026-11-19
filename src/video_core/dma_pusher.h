@@ -171,6 +171,8 @@ struct CommandList final {
     /// that waited behind one, reads memory instead: games write the commands it runs before they
     /// release the acquire.
     u64 snapshot_suspensions = 0;
+    /// How often the words were copied from memory again after the submit (RefreshSnapshot).
+    u32 refreshes = 0;
 };
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
@@ -287,6 +289,23 @@ public:
     bool DrawFromGpuArguments(const CommandListHeader& header);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+
+    /// Where the words of an entry being parsed came from (EDEN_NX2_LIST_VALIDATE's log line).
+    enum class EntrySource : u32 { Submitted, SubmittedRefreshed, GpuWrittenCopy, Memory };
+    /// EDEN_NX2_LIST_VALIDATE (on by default; 0 = off): `words`, the words of the entry about to
+    /// be parsed from its start, checked to parse as a command stream. When they don't, the
+    /// queued work is drained (writers of GPU-written lists, unmaps and their downloads), the
+    /// entry read from memory again, and the first of that and the submit-time copy that parses
+    /// is returned instead (in recovered_words); otherwise `words`.
+    std::span<const CommandHeader> CheckEntryWords(const CommandListHeader& header,
+                                                   std::span<const CommandHeader> words,
+                                                   const CommandList& list, EntrySource source);
+    /// RefreshSnapshot's copy of one entry, which opens with `carry` words of an earlier entry's
+    /// method. `guard`: keeps the submit-time words when the words read now don't parse and those
+    /// do (memory the game already refilled). Returns the words of a method left for the next.
+    size_t RefreshEntry(CommandList& list, size_t index, bool guard, size_t carry);
+    std::vector<CommandHeader> recovered_words;
+    std::vector<CommandHeader> refresh_words;
 
 private:
 

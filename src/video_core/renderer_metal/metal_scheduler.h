@@ -513,14 +513,18 @@ public:
     /// program reads it through an address: ShaderTranslate::Options::spill_buffers); returns the
     /// address `offset` bytes into it.
     [[nodiscard]] u64 UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset);
-    void BindTexture(ShaderStage stage, u32 slot, TextureHandle texture);
+    /// on_buffer=false: `texture` is known not to be a view of a buffer (a texture cache image
+    /// view or a placeholder): render stages skip noting a buffer under it for the segment
+    /// (EDEN_NX2_METAL_IMAGE_NOTE_SKIP).
+    void BindTexture(ShaderStage stage, u32 slot, TextureHandle texture, bool on_buffer = true);
     void BindSampler(ShaderStage stage, u32 slot, void* sampler);
     /// The sampler's MTLResourceID, what a program reads from a table of spilled samplers
     /// (ShaderTranslate::Result::sampler_spill_slot). 0 for none.
     [[nodiscard]] static u64 SamplerResourceId(void* sampler) noexcept;
     /// A texture read (or written) through a table of resource IDs: made resident for the stage
     /// on the current encoder, its MTLResourceID returned (0 for none).
-    [[nodiscard]] u64 UseTexture(ShaderStage stage, TextureHandle texture, bool write);
+    [[nodiscard]] u64 UseTexture(ShaderStage stage, TextureHandle texture, bool write,
+                                 bool on_buffer = true);
 
     /// primitive: MTLPrimitiveType.
     void Draw(u32 primitive, u32 first_vertex, u32 vertex_count, u32 instance_count,

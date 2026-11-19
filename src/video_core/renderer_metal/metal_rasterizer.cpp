@@ -83,6 +83,20 @@ bool DrawScratchEnabled() {
     return enabled;
 }
 
+// EDEN_NX2_METAL_BIND_SCRATCH=0: BindStageResources allocates its slot lists and tables afresh
+// for each stage of each draw and dispatch.
+bool BindScratchEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_BIND_SCRATCH");
+        const bool on = value == nullptr || value[0] != '0';
+        LOG_INFO(Render_Metal, "Metal: stage binding lists reuse their storage: {} "
+                               "(EDEN_NX2_METAL_BIND_SCRATCH)",
+                 on ? "on" : "off");
+        return on;
+    }();
+    return enabled;
+}
+
 template <typename T>
 void ClearScratch(std::vector<T>& list) {
     list.clear();
@@ -100,7 +114,8 @@ void ClearScratch(std::array<std::vector<T>, N>& lists) {
 template <typename T>
 class ScratchList {
 public:
-    explicit ScratchList(T& pool_) : pool{DrawScratchEnabled() ? &pool_ : nullptr} {
+    explicit ScratchList(T& pool_, bool enabled = DrawScratchEnabled())
+        : pool{enabled ? &pool_ : nullptr} {
         if (pool != nullptr) {
             std::swap(value, *pool);
             ClearScratch(value);
@@ -1864,25 +1879,36 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                                          std::span<const VideoCommon::SamplerId> samplers,
                                          u32 render_width, u32 render_height) {
     const Shader::Info& info = program.info;
-    std::vector<u32> texture_slots;
-    std::vector<u32> sampler_slots;
-    std::vector<u64> spill_table;
-    std::vector<u64> sampler_table;
+    // EDEN_NX2_METAL_BIND_SCRATCH: the lists keep their storage between calls (a nested call
+    // finds them taken and allocates its own).
+    const bool scratch = BindScratchEnabled();
+    ScratchList scratch_texture_slots{bind_scratch.texture_slots, scratch};
+    ScratchList scratch_sampler_slots{bind_scratch.sampler_slots, scratch};
+    ScratchList scratch_spill_table{bind_scratch.spill_table, scratch};
+    ScratchList scratch_sampler_table{bind_scratch.sampler_table, scratch};
+    ScratchList scratch_array_table{bind_scratch.array_table, scratch};
+    std::vector<u32>& texture_slots = scratch_texture_slots.value;
+    std::vector<u32>& sampler_slots = scratch_sampler_slots.value;
+    std::vector<u64>& spill_table = scratch_spill_table.value;
+    std::vector<u64>& sampler_table = scratch_sampler_table.value;
     /// Marks a sampler_slots entry as an entry of the spilled samplers' table.
     constexpr u32 SpilledSamplerFlag = 0x8000'0000U;
     /// Marks a texture_slots or sampler_slots entry as an entry of the array table.
     constexpr u32 ArrayEntryFlag = 0x4000'0000U;
-    std::vector<u64> array_table(program.array_spill_slot != ~0U ? program.array_spill_entries
-                                                                 : 0U);
-    const auto bind_texture = [&](u32 slot_value, TextureHandle texture, bool write) {
+    std::vector<u64>& array_table = scratch_array_table.value;
+    array_table.assign(program.array_spill_slot != ~0U ? program.array_spill_entries : 0U, 0);
+    // on_buffer=false: a texture cache view or placeholder, never a view of a buffer.
+    const auto bind_texture = [&](u32 slot_value, TextureHandle texture, bool write,
+                                  bool on_buffer) {
         if ((slot_value & ArrayEntryFlag) != 0) {
             const u32 entry = slot_value & ~ArrayEntryFlag;
             if (entry < array_table.size()) {
-                array_table[entry] = scheduler.UseTexture(metal_stage, texture, write);
+                array_table[entry] =
+                    scheduler.UseTexture(metal_stage, texture, write, on_buffer);
             }
             return;
         }
-        scheduler.BindTexture(metal_stage, slot_value, texture);
+        scheduler.BindTexture(metal_stage, slot_value, texture, on_buffer);
     };
     size_t next_buffer = 0;
     for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
@@ -1953,7 +1979,7 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     for (size_t element = 0; element < texel_buffers && element < texture_slots.size(); ++element) {
         bind_texture(texture_slots[element],
                      element < texel_buffer_views.size() ? texel_buffer_views[element] : nullptr,
-                     false);
+                     false, true);
     }
     size_t texture_slot = texel_buffers;
     size_t view = texel_buffers;
@@ -1967,7 +1993,7 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                              OrPlaceholder(image_view,
                                            image_view.SampledHandle(desc.type, desc.is_multisample),
                                            desc.type),
-                             false);
+                             false, false);
             }
             ++texture_slot;
             if (sampler < sampler_slots.size()) {
@@ -2017,7 +2043,7 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                                  : OrPlaceholder(image_view,
                                                  image_view.StorageHandle(desc.type, desc.format),
                                                  desc.type),
-                             desc.is_written);
+                             desc.is_written, false);
             }
             ++texture_slot;
         }
@@ -2140,9 +2166,26 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         const Shader::Info& info = programs[index]->info;
         buffer_cache.UnbindGraphicsStorageBuffers(stage);
         size_t ssbo_index = 0;
+        // A storage buffer whose pointer the program reads through another pointer (a list
+        // picked from a pointer array: Ocarina's foliage lists, read by the grass and vine glow
+        // task programs) is bound at the pointer read from memory, as Vulkan and compute
+        // dispatches bind it. Without, the pointer array itself was bound, the task programs
+        // read no work and launched no mesh workgroups (EDEN_NX2_METAL_SSBO_INDIRECT=0: as
+        // before).
+        static const bool indirect_ssbos = EnvironmentOn("EDEN_NX2_METAL_SSBO_INDIRECT");
         for (const auto& desc : info.storage_buffers_descriptors) {
+            if (desc.indirect_offset != ~0U && DrawTraceEnabled() &&
+                DrawTraceFirst(0, pipeline.Key().Hash() ^ (u64{0x55B0} << 48) ^ ssbo_index)) {
+                LOG_WARNING(Render_Metal,
+                            "Metal: draw trace: pipeline {:016x} stage {} storage buffer {} "
+                            "through a pointer (cbuf {} +{:#x}, pointer at +{:#x}), bound {}",
+                            pipeline.Key().Hash(), stage, ssbo_index, desc.cbuf_index,
+                            desc.cbuf_offset, desc.indirect_offset,
+                            indirect_ssbos ? "through it" : "at the pointer array (old)");
+            }
             buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index++, desc.cbuf_index,
-                                                   desc.cbuf_offset, desc.is_written);
+                                                   desc.cbuf_offset, desc.is_written,
+                                                   indirect_ssbos ? desc.indirect_offset : ~0U);
         }
         const auto& cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
         const auto read_handle = [&](const auto& desc, u32 element) {
@@ -6071,7 +6114,23 @@ void RasterizerMetal::QueryFallback(GPUVAddr gpu_addr, VideoCommon::QueryType ty
 
 void RasterizerMetal::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                 u32 size) {
-    std::scoped_lock lock{buffer_cache.mutex};
+    // EDEN_NX2_METAL_UNIFORM_BIND_NOLOCK=0: the buffer cache's mutex taken for each constant
+    // buffer bind. Otherwise none, as RasterizerVulkan::BindGraphicsUniformBuffer: it records the
+    // channel's binding (resolved under the mutex at the draw) on the thread that draws, where
+    // the profile found the lock contended with other threads' cache work.
+    static const bool lock_bind = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_UNIFORM_BIND_NOLOCK");
+        const bool on = value != nullptr && value[0] == '0';
+        LOG_INFO(Render_Metal, "Metal: constant buffer binds take the buffer cache lock: {} "
+                               "(EDEN_NX2_METAL_UNIFORM_BIND_NOLOCK={})",
+                 on ? "on" : "off", on ? 0 : 1);
+        return on;
+    }();
+    if (lock_bind) {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.BindGraphicsUniformBuffer(stage, index, gpu_addr, size);
+        return;
+    }
     buffer_cache.BindGraphicsUniformBuffer(stage, index, gpu_addr, size);
 }
 

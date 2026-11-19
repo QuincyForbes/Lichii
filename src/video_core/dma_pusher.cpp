@@ -169,6 +169,66 @@ bool WritesMemory(Engines::EngineInterface* engine, Engines::EngineTypes type, u
     return false;
 }
 
+// EDEN_NX2_LIST_VALIDATE (on unless 0): entries are checked to parse before they run
+// (DmaPusher::CheckEntryWords, RefreshEntry).
+bool ListValidateEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_LIST_VALIDATE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// Whether an entry's words (the first `carry` the data of a method an earlier entry opened) parse
+// as commands a driver writes: no old-style or undefined header modes, and no host method (below
+// 0x40) written with more words than the host methods have (non-incrementing NOPs excepted).
+// Another list's commands read at the wrong offsets (memory refilled for a later frame, or not
+// yet written by the GPU) fail this almost at once: their data words read as such headers
+// (0x3f800000: 8064 words to BindObject on subchannel 0).
+bool PlausibleCommandWords(std::span<const CommandHeader> words, size_t carry,
+                           size_t* carry_out = nullptr) {
+    if (carry_out != nullptr) {
+        *carry_out = carry > words.size() ? carry - words.size() : 0;
+    }
+    constexpr u32 host_methods = static_cast<u32>(BufferMethods::NonPullerMethods);
+    constexpr u32 max_host_words = 16;
+    for (size_t index = std::min(carry, words.size()); index < words.size();) {
+        const CommandHeader header = words[index];
+        if (header.argument == 0) {
+            ++index;
+            continue;
+        }
+        const u32 method = header.method;
+        const u32 count = header.method_count;
+        switch (header.mode) {
+        case SubmissionMode::Inline:
+            ++index;
+            continue;
+        case SubmissionMode::Increasing:
+        case SubmissionMode::IncreaseOnce:
+        case SubmissionMode::NonIncreasing:
+            if (method < host_methods) {
+                const bool nop = header.mode == SubmissionMode::NonIncreasing &&
+                                 method == static_cast<u32>(BufferMethods::Nop);
+                const bool past_host = header.mode == SubmissionMode::Increasing &&
+                                       method + count > host_methods;
+                if (!nop && (count > max_host_words || past_host)) {
+                    return false;
+                }
+            }
+            // Data may run on into the next entry.
+            index += 1 + size_t{count};
+            if (carry_out != nullptr && index > words.size()) {
+                *carry_out = index - words.size();
+            }
+            continue;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
 // EDEN_NX2_LIST_CHANGE_TRACE=1: per GPU-written command list address, how often its words differ
 // from the last read of the same address (a wait that only guards unchanged words could go).
 // Logged every 2 s with the first words of each list.
@@ -448,10 +508,14 @@ bool DmaPusher::Step() {
             use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
                                                      header.size * sizeof(u32)));
         if (submitted) {
-            const std::span<const CommandHeader> commands{
-                command_list.submitted_words.data() +
-                    command_list.submitted_offsets[dma_pushbuffer_subindex],
-                header.size};
+            const std::span<const CommandHeader> commands = CheckEntryWords(
+                header,
+                {command_list.submitted_words.data() +
+                     command_list.submitted_offsets[dma_pushbuffer_subindex],
+                 header.size},
+                command_list,
+                command_list.refreshes != 0 ? EntrySource::SubmittedRefreshed
+                                            : EntrySource::Submitted);
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Submitted);
             command_resume_offset += ProcessCommands(commands, 0);
@@ -502,7 +566,11 @@ bool DmaPusher::Step() {
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
             command_resume_offset += ProcessCommands(commands, 0);
         } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
-            const std::span<const CommandHeader> commands{command_headers.data(), header.size};
+            std::span<const CommandHeader> commands{command_headers.data(), header.size};
+            if (command_resume_offset == 0) {
+                commands = CheckEntryWords(header, commands, command_list,
+                                           EntrySource::GpuWrittenCopy);
+            }
             if (ListChangeTrace* const trace = ListChangeTrace::Get()) [[unlikely]] {
                 const u32 sub = dma_state.subchannel;
                 trace->Note(dma_state.dma_get, commands, dma_state.method, sub,
@@ -517,7 +585,10 @@ bool DmaPusher::Step() {
         } else {
             FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
-            const std::span<const CommandHeader> commands{headers.data(), headers.size()};
+            std::span<const CommandHeader> commands{headers.data(), headers.size()};
+            if (command_resume_offset == 0) {
+                commands = CheckEntryWords(header, commands, command_list, EntrySource::Memory);
+            }
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Slow);
             command_resume_offset +=
@@ -997,17 +1068,138 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
 
 void DmaPusher::RefreshSnapshot(CommandList& list, u64 now, size_t first_entry) {
     list.snapshot_suspensions = now;
+    ++list.refreshes;
+    // Entries still deferred hold zeros, not a submit-time copy worth keeping. `carry`: the
+    // words of a method an earlier entry opened (unknown for the first: none assumed).
+    const bool guard = ListValidateEnabled();
+    size_t carry = 0;
     for (size_t i = first_entry;
          i < list.command_lists.size() && i < list.submitted_offsets.size(); ++i) {
-        const CommandListHeader& entry = list.command_lists[i];
-        const u32 offset = list.submitted_offsets[i];
-        if (offset + entry.size > list.submitted_words.size()) {
-            continue;
-        }
-        memory_manager.ReadBlockUnsafe(entry.addr, list.submitted_words.data() + offset,
-                                       entry.size * sizeof(u32));
+        carry = RefreshEntry(list, i,
+                             guard && !std::ranges::binary_search(list.deferred_entries,
+                                                                  static_cast<u32>(i)),
+                             carry);
     }
     list.deferred_entries.clear();
+}
+
+size_t DmaPusher::RefreshEntry(CommandList& list, size_t index, bool guard, size_t carry) {
+    const CommandListHeader& entry = list.command_lists[index];
+    const u32 offset = list.submitted_offsets[index];
+    if (entry.size == 0 || offset + entry.size > list.submitted_words.size()) {
+        return carry;
+    }
+    CommandHeader* const words = list.submitted_words.data() + offset;
+    size_t carry_out = 0;
+    if (!guard) {
+        memory_manager.ReadBlockUnsafe(entry.addr, words, entry.size * sizeof(u32));
+        PlausibleCommandWords({words, entry.size}, carry, &carry_out);
+        return carry_out;
+    }
+    // The game may already have refilled a queued list's memory for a later frame (the present
+    // returns frames ahead, nx2_gsv.h): those words, read now, are another list's commands at
+    // other offsets.
+    refresh_words.resize(entry.size);
+    memory_manager.ReadBlockUnsafe(entry.addr, refresh_words.data(), entry.size * sizeof(u32));
+    const std::span<const CommandHeader> old_words{words, entry.size};
+    if (!std::ranges::equal(old_words, refresh_words,
+                            [](CommandHeader a, CommandHeader b) { return a.argument == b.argument; }) &&
+        !PlausibleCommandWords(refresh_words, carry) &&
+        PlausibleCommandWords(old_words, carry, &carry_out) &&
+        std::ranges::any_of(old_words, [](CommandHeader w) { return w.argument != 0; })) {
+        static std::atomic<u32> logged{};
+        static std::atomic<u64> kept{};
+        const u64 count = kept.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16 || (count & 0x3ff) == 0) {
+            LOG_WARNING(HW_GPU,
+                        "List validate: refresh of entry {:#x}+{:#x} (list refresh {}) read words "
+                        "that don't parse (first {:08x} {:08x}), kept the submit-time words "
+                        "(first {:08x} {:08x}); {} kept so far",
+                        u64{entry.addr}, u64{entry.size}, list.refreshes,
+                        refresh_words[0].argument,
+                        entry.size > 1 ? refresh_words[1].argument : 0, old_words[0].argument,
+                        entry.size > 1 ? old_words[1].argument : 0, count);
+        }
+        return carry_out;
+    }
+    std::memcpy(words, refresh_words.data(), entry.size * sizeof(u32));
+    PlausibleCommandWords(old_words, carry, &carry_out);
+    return carry_out;
+}
+
+std::span<const CommandHeader> DmaPusher::CheckEntryWords(const CommandListHeader& header,
+                                                          std::span<const CommandHeader> words,
+                                                          const CommandList& list,
+                                                          EntrySource source) {
+    const size_t carry = dma_state.method_count;
+    if (!ListValidateEnabled() || words.empty() || PlausibleCommandWords(words, carry)) {
+        return words;
+    }
+    const GPUVAddr address = header.addr;
+    const size_t size = header.size;
+    const bool written_before = IsGpuWrittenCommands(address, size * sizeof(u32));
+    // Everything queued runs first: the copies and dispatches that write GPU-written lists, the
+    // GMMU maps and unmaps (and the downloads those make), then GPU-written pages are flushed.
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (split.Active()) {
+        split.Drain(VideoCommon::DrainSite::ListFlush);
+    }
+    const bool written_after = IsGpuWrittenCommands(address, size * sizeof(u32));
+    if (written_after) {
+        FlushGpuWrittenCommands(address, size * sizeof(u32));
+    }
+    recovered_words.resize(size);
+    memory_manager.ReadBlockUnsafe(address, recovered_words.data(), size * sizeof(u32));
+    const std::span<const CommandHeader> memory{recovered_words.data(), size};
+    const auto same = [](std::span<const CommandHeader> a, std::span<const CommandHeader> b) {
+        return std::ranges::equal(a, b, [](CommandHeader x, CommandHeader y) {
+            return x.argument == y.argument;
+        });
+    };
+    const bool memory_differs = !same(memory, words);
+    const bool memory_valid = memory_differs && PlausibleCommandWords(memory, carry);
+    // The submit-time copy, when the words parsed were not that copy.
+    std::span<const CommandHeader> submitted;
+    const size_t index = dma_pushbuffer_subindex;
+    if (index < list.submitted_offsets.size() &&
+        list.submitted_offsets[index] + size <= list.submitted_words.size() &&
+        !std::ranges::binary_search(list.deferred_entries, static_cast<u32>(index))) {
+        submitted = {list.submitted_words.data() + list.submitted_offsets[index], size};
+    }
+    const bool submitted_valid = !submitted.empty() && !same(submitted, words) &&
+                                 PlausibleCommandWords(submitted, carry);
+    std::span<const CommandHeader> result = words;
+    const char* used = "the same words (neither alternative parses)";
+    if (memory_valid) {
+        result = memory;
+        used = "memory read after the drain";
+    } else if (submitted_valid) {
+        result = submitted;
+        used = "the submit-time copy";
+    }
+    static constexpr std::array source_names{"submit-time copy", "submit copy refreshed from memory",
+                                             "GPU-written list copy", "guest memory"};
+    static std::atomic<u32> logged{};
+    static std::atomic<u64> seen{};
+    const u64 count = seen.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 24 || (count & 0x3ff) == 0) {
+        LOG_WARNING(HW_GPU,
+                    "List validate: entry {:#x}+{:#x} (ch {}, {} of {}, carry {}) read from the {} "
+                    "(list refreshed {}x) doesn't parse, first words {:08x} {:08x}; GPU-written "
+                    "page {} -> {} after the drain; memory now {} ({:08x} {:08x}), submit copy "
+                    "{}; used {}; {} so far",
+                    u64{address}, u64{size}, channel_state.bind_id, index,
+                    list.command_lists.size(), carry, source_names[static_cast<u32>(source)],
+                    list.refreshes, words[0].argument, size > 1 ? words[1].argument : 0,
+                    written_before, written_after,
+                    !memory_differs ? "unchanged" : (memory_valid ? "parses" : "differs, doesn't parse"),
+                    memory[0].argument, size > 1 ? memory[1].argument : 0,
+                    submitted.empty() ? "none"
+                    : same(submitted, words) ? "same words"
+                    : (submitted_valid ? "parses" : "doesn't parse"),
+                    used, count);
+    }
+    return result;
 }
 
 void DmaPusher::RefreshDeferredEntries(CommandList& list) {

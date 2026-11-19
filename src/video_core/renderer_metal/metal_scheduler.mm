@@ -815,6 +815,105 @@ bool StaticLabelsEnabled() {
     return enabled;
 }
 
+// EDEN_NX2_METAL_CB_PREMAKE=0: every command buffer is made on the recording thread when it is
+// needed. Otherwise a serial queue keeps a few made ahead (commandBufferWithDescriptor and the
+// system's frame pacing hook on it run there): the GPU thread takes one, uncommitted and not
+// enqueued, so the commit order stays the recording thread's. With constant labels only.
+bool CommandBufferPremakeEnabled() {
+    static const bool enabled =
+        SwitchOn("EDEN_NX2_METAL_CB_PREMAKE", "command buffers made ahead off the GPU thread");
+    return enabled;
+}
+
+/// Command buffers made ahead on a serial queue (EDEN_NX2_METAL_CB_PREMAKE). They hold slots of
+/// the queue's 64 until taken; Count of them at most.
+class CommandBufferPremake {
+public:
+    static constexpr size_t Count = 3;
+
+    ~CommandBufferPremake() {
+        if (refill_queue != nil) {
+            stopping.store(true, std::memory_order_relaxed);
+            dispatch_sync(refill_queue, ^{
+                          });
+        }
+        std::scoped_lock lock{mutex};
+        ready.clear();
+    }
+
+    /// One made ahead (nil when none is ready); a refill is started either way.
+    id<MTLCommandBuffer> Take(id<MTLCommandQueue> queue, MTLCommandBufferDescriptor* descriptor) {
+        id<MTLCommandBuffer> buffer = nil;
+        {
+            std::scoped_lock lock{mutex};
+            if (!ready.empty()) {
+                buffer = ready.front();
+                ready.pop_front();
+            }
+        }
+        if (buffer != nil) {
+            hits.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            misses.fetch_add(1, std::memory_order_relaxed);
+        }
+        Refill(queue, descriptor);
+        return buffer;
+    }
+
+    std::atomic<u64> hits{};
+    std::atomic<u64> misses{};
+
+private:
+    void Refill(id<MTLCommandQueue> queue, MTLCommandBufferDescriptor* descriptor) {
+        if (refill_pending.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        if (refill_queue == nil) {
+            const dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(
+                DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+            refill_queue = dispatch_queue_create("Lichii command buffers", attr);
+        }
+        CommandBufferPremake* const self = this;
+        dispatch_async(refill_queue, ^{
+          for (;;) {
+              {
+                  std::scoped_lock lock{self->mutex};
+                  if (self->ready.size() >= Count ||
+                      self->stopping.load(std::memory_order_relaxed)) {
+                      break;
+                  }
+              }
+              id<MTLCommandBuffer> made = nil;
+              @autoreleasepool {
+                  made = [queue commandBufferWithDescriptor:descriptor];
+              }
+              if (made == nil) {
+                  break;
+              }
+              std::scoped_lock lock{self->mutex};
+              self->ready.push_back(made);
+          }
+          self->refill_pending.store(false, std::memory_order_release);
+        });
+    }
+
+    std::mutex mutex;
+    std::deque<id<MTLCommandBuffer>> ready;
+    std::atomic<bool> refill_pending{};
+    std::atomic<bool> stopping{};
+    dispatch_queue_t refill_queue = nil;
+};
+
+// EDEN_NX2_METAL_IMAGE_NOTE_SKIP=0: a draw's texture cache views are noted for the segment as
+// texel buffer views are (NoteSegmentTexture walks each one's parents for a buffer under it,
+// once per segment). Otherwise only views that may be on a buffer are: the texture cache makes
+// its images with newTextureWithDescriptor (device or heap), never on a buffer.
+bool ImageNoteSkipEnabled() {
+    static const bool enabled =
+        SwitchOn("EDEN_NX2_METAL_IMAGE_NOTE_SKIP", "image views not noted as buffer views");
+    return enabled;
+}
+
 // EDEN_NX2_METAL_SEGMENT_NOTE_CACHE=0: every texture bind of in-order work walks the texture's
 // parents for the buffer under it (NoteSegmentTexture), even when the segment noted it already.
 bool SegmentNoteCacheEnabled() {
@@ -1049,8 +1148,12 @@ struct Scheduler::Impl {
             if (!StaticLabelsEnabled()) {
                 descriptor = [MTLCommandBufferDescriptor new];
                 descriptor.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+            } else if (CommandBufferPremakeEnabled()) {
+                buffer = premade.Take(queue, descriptor);
             }
-            buffer = [queue commandBufferWithDescriptor:descriptor];
+            if (buffer == nil) {
+                buffer = [queue commandBufferWithDescriptor:descriptor];
+            }
         } else {
             buffer = [queue commandBuffer];
         }
@@ -2298,6 +2401,8 @@ struct Scheduler::Impl {
 
     const Device& device;
     id<MTLCommandQueue> queue;
+    /// EDEN_NX2_METAL_CB_PREMAKE; after `queue`: destroyed (its refills drained) before it.
+    CommandBufferPremake premade;
     id<MTLDepthStencilState> depth_write_always = nil;
     /// By ClearPipeline's formats, mask and sample count.
     std::unordered_map<u64, id<MTLRenderPipelineState>> clear_pipelines;
@@ -4191,14 +4296,14 @@ void Scheduler::BindBytes(ShaderStage stage, u32 slot, const void* data, u32 siz
     }
 }
 
-void Scheduler::BindTexture(ShaderStage stage, u32 slot, TextureHandle texture) {
+void Scheduler::BindTexture(ShaderStage stage, u32 slot, TextureHandle texture, bool on_buffer) {
     if (!SlotFits(slot, TextureSlots, "texture")) {
         return;
     }
     if (stage == ShaderStage::Compute) {
         impl->ComputeTexture(texture);
         impl->LogComputeBind(ComputeBind::Kind::Texture, slot, texture, 0, true);
-    } else if (impl->render != nil) {
+    } else if (impl->render != nil && (on_buffer || !ImageNoteSkipEnabled())) {
         impl->NoteSegmentTexture(texture, true);
     }
     switch (stage) {
@@ -4232,14 +4337,14 @@ void Scheduler::BindTexture(ShaderStage stage, u32 slot, TextureHandle texture) 
     }
 }
 
-u64 Scheduler::UseTexture(ShaderStage stage, TextureHandle texture, bool write) {
+u64 Scheduler::UseTexture(ShaderStage stage, TextureHandle texture, bool write, bool on_buffer) {
     if (texture == nullptr) {
         return 0;
     }
     if (stage == ShaderStage::Compute) {
         impl->ComputeTexture(texture);
         impl->LogComputeBind(ComputeBind::Kind::UseTexture, 0, texture, 0, write);
-    } else if (impl->render != nil) {
+    } else if (impl->render != nil && (on_buffer || !ImageNoteSkipEnabled())) {
         impl->NoteSegmentTexture(texture, write);
     }
     const id<MTLTexture> metal_texture = AsTexture(texture);
@@ -4672,6 +4777,10 @@ std::string Scheduler::TakeCommitLine(double frames) {
                         static_cast<double>(impl->empty_flushes.exchange(0)) / per,
                         static_cast<double>(impl->empty_skipped.exchange(0)) / per,
                         static_cast<double>(std::exchange(impl->list_ends_deferred, 0)) / per);
+    // EDEN_NX2_METAL_CB_PREMAKE.
+    line += fmt::format(" (command buffers made ahead {:.1f}/frame, made when needed {:.1f}/frame)",
+                        static_cast<double>(impl->premade.hits.exchange(0)) / per,
+                        static_cast<double>(impl->premade.misses.exchange(0)) / per);
     return line;
 }
 
