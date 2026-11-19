@@ -123,6 +123,16 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v5
 
+      # The Metal renderer's depth bounds test, sparse texture tier check and sampler LOD bias /
+      # reduction need the macOS 26 SDK; the runners default to Xcode 16.
+      - name: Select Xcode 26
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$xcode" ]; then sudo xcode-select -s "$xcode/Contents/Developer"; fi
+          xcodebuild -version
+
       - name: Install Linux dependencies
         if: startsWith(matrix.platform, 'linux')
         shell: bash

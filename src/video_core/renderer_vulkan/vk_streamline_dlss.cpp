@@ -51,21 +51,6 @@ sl::DLSSMode ModeFor(VkExtent2D render, VkExtent2D upscale) {
     return sl::DLSSMode::eUltraPerformance;
 }
 
-sl::DLSSMode ConfiguredMode(VkExtent2D render, VkExtent2D upscale) {
-    switch (Settings::values.nvidia_dlss_quality.GetValue()) {
-    case Settings::DlssQuality::Performance:
-        return sl::DLSSMode::eMaxPerformance;
-    case Settings::DlssQuality::Balanced:
-        return sl::DLSSMode::eBalanced;
-    case Settings::DlssQuality::Quality:
-        return sl::DLSSMode::eMaxQuality;
-    case Settings::DlssQuality::DLAA:
-        return sl::DLSSMode::eDLAA;
-    default:
-        return ModeFor(render, upscale);
-    }
-}
-
 // Preset K for every mode: NVIDIA's defaults for Performance/Ultra Performance (M, L) draw thin
 // horizontal lines in Fire Emblem at 2x resolution scale. EDEN_NX2_DLSS_PRESET=J|K|L|M picks
 // another model, EDEN_NX2_DLSS_PRESET=default leaves the choice to NVIDIA.
@@ -256,8 +241,8 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                                 in.render_size.height != render_extent.height ||
                                 in.upscale_size.width != upscale_extent.width ||
                                 in.upscale_size.height != upscale_extent.height;
-    const bool options_changed = extent_changed || in.hdr != hdr_input;
-    const bool reset = in.reset || options_changed;
+    bool options_changed = extent_changed || in.hdr != hdr_input;
+    bool reset = in.reset || options_changed;
     if (extent_changed) {
         CreateOutput(in.upscale_size);
         render_extent = in.render_size;
@@ -268,7 +253,9 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     // Keep the existing HDR controls for linear input such as Fortune's Weave. Tonemapped
     // input such as Ocarina's already has its exposure applied.
     sl::DLSSOptions options{};
-    options.mode = ConfiguredMode(in.render_size, in.upscale_size);
+    // Lichii picks the mode from the render/output ratio (Ocarina's resolution setting chooses it;
+    // upstream's nvidia_dlss_quality setting isn't here).
+    options.mode = ModeFor(in.render_size, in.upscale_size);
     options.outputWidth = in.upscale_size.width;
     options.outputHeight = in.upscale_size.height;
     static const bool env_hdr = EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0;
