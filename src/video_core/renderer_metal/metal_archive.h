@@ -64,8 +64,12 @@ public:
     /// Writes the archive when pipelines were added since it was opened or last saved.
     void Save();
 
-    /// The MTLBinaryArchive (id<MTLBinaryArchive>), or null when closed.
+    /// The active writable MTLBinaryArchive (id<MTLBinaryArchive>), or null when closed.
     [[nodiscard]] void* Handle() const noexcept;
+
+    /// NSArray<id<MTLBinaryArchive>>* of all populated archive shards for fast multi-shard lookup,
+    /// or null when closed / empty. Must be accessed under shared BuildMutex.
+    [[nodiscard]] void* LookupHandles() const noexcept;
 
     /// Held shared while a pipeline is built with the archive attached, and alone while one is
     /// added to it or the file is written (boot builds on several threads).
@@ -77,9 +81,9 @@ public:
     void NoteBuild(bool hit, u64 nanoseconds) noexcept;
     void NoteAdded(bool added) noexcept;
 
-    /// Queues an archive addition (it compiles the pipeline again into the archive) for one
-    /// background thread, so builders never wait on it or block one another; the function
-    /// returns whether the addition succeeded. It runs alone against BuildMutex.
+    /// Queues an archive addition onto the current active shard (rolling over to a new <= 128-PSO
+    /// shard automatically so FlatBuffers serialization stays < 150 ms). Runs alone under BuildMutex.
+    void DeferAdd(std::function<bool(void* archive_handle)> add);
     void DeferAdd(std::function<bool()> add);
 
     /// Counts since the last call (the renderer's 10 s report).

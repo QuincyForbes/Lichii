@@ -132,79 +132,6 @@ bool IsCameraCut(const VideoCommon::OcarinaMatrix& m) {
     return jumped(0.95f) || jumped(1.0f);
 }
 
-constexpr std::string_view OcarinaLinearMsl = R"(
-#include <metal_stdlib>
-using namespace metal;
-
-static inline float3 sanitize_finite(float3 v) {
-    uint3 exp_bits = as_type<uint3>(v) & uint3(0x7f800000u);
-    bool3 ok = exp_bits != uint3(0x7f800000u);
-    return select(float3(0.0f), v, ok);
-}
-
-static inline float3 encode_srgb(float3 linear_val) {
-    linear_val = max(linear_val, float3(0.0f));
-    float3 hi = 1.055f * pow(linear_val, float3(1.0f / 2.4f)) - 0.055f;
-    float3 lo = 12.92f * linear_val;
-    return select(hi, lo, linear_val < float3(0.0031308f));
-}
-
-kernel void ocarina_linear_color(
-    texture2d<float, access::sample> guest_color [[texture(0)]],
-    texture2d<float, access::write> dlss_color [[texture(1)]],
-    uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= dlss_color.get_width() || gid.y >= dlss_color.get_height()) {
-        return;
-    }
-    float3 c = max(sanitize_finite(guest_color.read(gid, 0).rgb), float3(0.0f));
-    float3 linear_c = min(c * c, float3(65504.0f));
-    dlss_color.write(float4(linear_c, 1.0f), gid);
-}
-
-kernel void ocarina_linear_output(
-    texture2d<float, access::sample> dlss_color [[texture(0)]],
-    texture2d<float, access::write> guest_color [[texture(1)]],
-    sampler samp [[sampler(0)]],
-    uint2 gid [[thread_position_in_grid]]) {
-    uint w = guest_color.get_width();
-    uint h = guest_color.get_height();
-    if (gid.x >= w || gid.y >= h) {
-        return;
-    }
-    float2 uv = (float2(gid) + 0.5f) / float2(float(w), float(h));
-    float3 sampled = dlss_color.sample(samp, uv, level(0.0f)).rgb;
-    float3 linear_c = max(sanitize_finite(sampled), float3(0.0f));
-    guest_color.write(float4(linear_c, 1.0f), gid);
-}
-
-kernel void ocarina_linear_4k_composite(
-    texture2d<float, access::sample> dlss_scene [[texture(0)]],
-    texture2d<float, access::sample> native_scene [[texture(1)]],
-    texture2d<float, access::sample> native_composite [[texture(2)]],
-    texture2d<float, access::write> output_color [[texture(3)]],
-    sampler samp [[sampler(0)]],
-    constant uint& use_dlss [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= output_color.get_width() || gid.y >= output_color.get_height()) {
-        return;
-    }
-    float2 uv = (float2(gid) + 0.5f) * float2(1.0f / 3840.0f, 1.0f / 2160.0f);
-    float3 comp = native_composite.sample(samp, uv, level(0.0f)).rgb;
-    if (use_dlss != 0u) {
-        float3 reference = native_scene.sample(samp, uv, level(0.0f)).rgb;
-        float3 overlay = comp - reference;
-        float difference = max(max(abs(overlay.r), abs(overlay.g)), abs(overlay.b));
-        if (difference < 0.12f) {
-            float3 linear_scene = max(sanitize_finite(dlss_scene.read(gid, 0).rgb), float3(0.0f));
-            float3 scene = encode_srgb(linear_scene);
-            float coverage = smoothstep(0.025f, 0.12f, difference);
-            comp = mix(scene + overlay, comp, coverage);
-        }
-    }
-    output_color.write(float4(clamp(comp, 0.0f, 1.0f), 1.0f), gid);
-}
-)";
-
 /// One of the host compute shaders through the translator into `pass` (OcarinaTemporal::Pass).
 template <typename PassT>
 bool BuildPass(const Device& device, PassT& pass, std::span<const u32> code, std::string& error,
@@ -544,43 +471,6 @@ bool OcarinaTemporal::Prepare() {
         !BuildPass(device, output_pass, OCARINA_DLSS_OUTPUT_COMP_SPV, error) || !sampler ||
         !point_sampler) {
         LOG_WARNING(Render_Metal, "Metal: Ocarina temporal upscale unavailable: {}", error);
-        return false;
-    }
-    linear_library = CreateLibrary(device, OcarinaLinearMsl, error);
-    const auto build_msl_pass = [&](Pass& pass, std::string_view entry,
-                                    std::vector<ShaderTranslate::ResourceSlot> pass_slots) {
-        pass.function = linear_library ? CreateFunction(linear_library.Get(), entry) : Object{};
-        pass.state = pass.function
-                         ? CreateComputePipelineState(device, pass.function.Get(), error, nullptr,
-                                                      GroupSize * GroupSize)
-                         : Object{};
-        pass.slots = std::move(pass_slots);
-        return static_cast<bool>(pass.state);
-    };
-    using ShaderTranslate::PushConstantSet;
-    using ShaderTranslate::ResourceKind;
-    if (!build_msl_pass(linear_color_pass, "ocarina_linear_color",
-                        {
-                            {.set = 0, .binding = 0, .kind = ResourceKind::Texture, .index = 0},
-                            {.set = 0, .binding = 1, .kind = ResourceKind::Texture, .index = 1},
-                        }) ||
-        !build_msl_pass(linear_output_pass, "ocarina_linear_output",
-                        {
-                            {.set = 0, .binding = 0, .kind = ResourceKind::Texture, .index = 0},
-                            {.set = 0, .binding = 1, .kind = ResourceKind::Texture, .index = 1},
-                            {.set = 0, .binding = 0, .kind = ResourceKind::Sampler, .index = 0},
-                        }) ||
-        !build_msl_pass(
-            linear_composite_pass, "ocarina_linear_4k_composite",
-            {
-                {.set = PushConstantSet, .binding = 0, .kind = ResourceKind::Buffer, .index = 0},
-                {.set = 0, .binding = 0, .kind = ResourceKind::Texture, .index = 0},
-                {.set = 0, .binding = 1, .kind = ResourceKind::Texture, .index = 1},
-                {.set = 0, .binding = 2, .kind = ResourceKind::Texture, .index = 2},
-                {.set = 0, .binding = 3, .kind = ResourceKind::Texture, .index = 3},
-                {.set = 0, .binding = 0, .kind = ResourceKind::Sampler, .index = 0},
-            })) {
-        LOG_WARNING(Render_Metal, "Metal: Ocarina linear temporal shaders unavailable: {}", error);
         return false;
     }
     prepared = true;
@@ -1060,7 +950,7 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
 
     TextureHandle output = nullptr;
     if (backend == UpscaleBackend::Dlss) {
-        Run(linear_color_pass, frame.color, color.Get(), {}, frame.extent);
+        Run(color_pass, frame.color, color.Get(), {}, frame.extent);
         TextureHandle depth_input = frame.depth;
         if (frame.depth_size[0] != 0 && frame.depth_size != frame.extent) {
             if (cropped_depth_size != frame.extent || !cropped_depth) {
@@ -1104,7 +994,7 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
                 .motion_vector_scale = {1.0f, 1.0f},
                 .reset = reset,
                 .depth_reversed = false,
-                .auto_exposure = true,
+                .auto_exposure = false,
                 .reactive = reactive_mask,
             });
         if (output != nullptr) {
@@ -1167,9 +1057,7 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
     last_upscaled = output;
     if (frame.target != nullptr) {
         const bool same_size = output_size == frame.target_size;
-        const Pass& out_pass =
-            backend == UpscaleBackend::Dlss ? linear_output_pass : output_pass;
-        Run(out_pass, output, frame.target, {}, frame.target_size, !same_size);
+        Run(output_pass, output, frame.target, {}, frame.target_size, !same_size);
     }
     last_evaluation = now;
     last_frame = frame.frame;
@@ -1218,8 +1106,7 @@ TextureHandle OcarinaTemporal::Composite4k(TextureHandle native_composite, u64 f
         return nullptr;
     }
     constexpr std::array<u32, 2> CompositeExtent{3840, 2160};
-    const bool linear_scene = last_backend == VideoCommon::OcarinaUpscaleBackend::Dlss;
-    if (!linear_scene && !composite_pass.state) {
+    if (!composite_pass.state) {
         std::string error;
         if (!BuildPass(device, composite_pass, OCARINA_DLSS_4K_COMPOSITE_COMP_SPV, error)) {
             LOG_WARNING(Render_Metal, "Metal: Ocarina 4K composite pass unavailable: {}", error);
@@ -1241,7 +1128,7 @@ TextureHandle OcarinaTemporal::Composite4k(TextureHandle native_composite, u64 f
     }
     const std::array<TextureHandle, 3> inputs{last_upscaled, native_scene.Get(), native_composite};
     const u32 use_dlss = !failed ? 1U : 0U;
-    Run(linear_scene ? linear_composite_pass : composite_pass, inputs, composite.Get(),
+    Run(composite_pass, inputs, composite.Get(),
         std::span(reinterpret_cast<const u8*>(&use_dlss), sizeof(use_dlss)), CompositeExtent,
         true);
     composited_frame = frame;

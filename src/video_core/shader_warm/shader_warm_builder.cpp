@@ -843,6 +843,10 @@ bool DeleteWarmFiles(u64 title_id, std::string* error) {
             }
         }
     }
+    for (size_t shard = 1; shard < 64; ++shard) {
+        std::error_code ec;
+        fs::remove(dir / fmt::format("metal_pipelines.s{:02d}.bin", shard), ec);
+    }
     return ok;
 }
 

@@ -475,23 +475,25 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
         }
         descriptor.vertexDescriptor = vertex;
 
-        const id<MTLBinaryArchive> binary =
-            archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
+        const bool use_archive = archive != nullptr && archive->IsOpen() &&
+                                 (!archive->IsReadOnly() || archive->HasEntries());
         const auto start = std::chrono::steady_clock::now();
         id<MTLRenderPipelineState> state = nil;
         std::shared_lock<std::shared_mutex> building;
-        if (binary != nil) {
+        if (use_archive && archive->HasEntries()) {
             building = std::shared_lock{archive->BuildMutex()};
-            descriptor.binaryArchives = @[ binary ];
-            state = [device.GetDevice()
-                newRenderPipelineStateWithDescriptor:descriptor
-                                             options:MTLPipelineOptionFailOnBinaryArchiveMiss
-                                          reflection:nil
-                                               error:nil];
+            NSArray<id<MTLBinaryArchive>>* const archives =
+                (__bridge NSArray<id<MTLBinaryArchive>>*)archive->LookupHandles();
+            if (archives != nil && archives.count > 0) {
+                descriptor.binaryArchives = archives;
+                state = [device.GetDevice()
+                    newRenderPipelineStateWithDescriptor:descriptor
+                                                 options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                              reflection:nil
+                                                   error:nil];
+            }
         }
         if (building.owns_lock()) {
-            // Release right after the probe: holding the archive lock across the fallback compile
-            // (and the writer-preferring lock of an addition) serialized every builder.
             building.unlock();
         }
         const bool hit = state != nil;
@@ -503,13 +505,10 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
             state = [device.GetDevice() newRenderPipelineStateWithDescriptor:descriptor
                                                                        error:&ns_error];
         }
-        if (building.owns_lock()) {
-            building.unlock();
-        }
         if (state == nil) {
             error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
         }
-        if (binary != nil && state != nil) {
+        if (use_archive && state != nil) {
             archive->NoteBuild(
                 hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                           std::chrono::steady_clock::now() - start)
@@ -517,10 +516,13 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
             // A pipeline with no fragment function (depth only) is not archived: Metal then refuses
             // to serialize the whole archive ("expecting 'fragment' stage in pipeline no. N"), so
             // nothing was ever saved.
-            if (!hit && descriptor.fragmentFunction != nil && descriptor.rasterizationEnabled) {
+            if (!hit && !archive->IsReadOnly() && descriptor.fragmentFunction != nil &&
+                descriptor.rasterizationEnabled) {
                 MTLRenderPipelineDescriptor* const copy = [descriptor copy];
-                archive->DeferAdd([binary, copy] {
-                    return [binary addRenderPipelineFunctionsWithDescriptor:copy error:nil] == YES;
+                archive->DeferAdd([copy](void* bin_ptr) {
+                    const id<MTLBinaryArchive> binary = (__bridge id<MTLBinaryArchive>)bin_ptr;
+                    return binary != nil &&
+                           [binary addRenderPipelineFunctionsWithDescriptor:copy error:nil] == YES;
                 });
             }
         }
@@ -568,29 +570,30 @@ Object CreateMeshRenderPipelineState(const Device& device, const RenderPipelineD
         }
         SetTargets(descriptor, desc);
 
-        const id<MTLBinaryArchive> binary =
-            archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
         bool archived = false;
         if (@available(iOS 18.0, macOS 15.0, *)) {
-            archived = binary != nil;
+            archived = archive != nullptr && archive->IsOpen() &&
+                       (!archive->IsReadOnly() || archive->HasEntries());
         }
         const auto start = std::chrono::steady_clock::now();
         id<MTLRenderPipelineState> state = nil;
         std::shared_lock<std::shared_mutex> building;
-        if (archived) {
+        if (archived && archive->HasEntries()) {
             if (@available(iOS 18.0, macOS 15.0, *)) {
                 building = std::shared_lock{archive->BuildMutex()};
-                descriptor.binaryArchives = @[ binary ];
-                state = [device.GetDevice()
-                    newRenderPipelineStateWithMeshDescriptor:descriptor
-                                                     options:MTLPipelineOptionFailOnBinaryArchiveMiss
-                                                  reflection:nil
-                                                       error:nil];
+                NSArray<id<MTLBinaryArchive>>* const archives =
+                    (__bridge NSArray<id<MTLBinaryArchive>>*)archive->LookupHandles();
+                if (archives != nil && archives.count > 0) {
+                    descriptor.binaryArchives = archives;
+                    state = [device.GetDevice()
+                        newRenderPipelineStateWithMeshDescriptor:descriptor
+                                                         options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                                      reflection:nil
+                                                           error:nil];
+                }
             }
         }
         if (building.owns_lock()) {
-            // Release right after the probe: holding the archive lock across the fallback compile
-            // (and the writer-preferring lock of an addition) serialized every builder.
             building.unlock();
         }
         const bool hit = state != nil;
@@ -604,9 +607,6 @@ Object CreateMeshRenderPipelineState(const Device& device, const RenderPipelineD
                                                                       reflection:nil
                                                                            error:&ns_error];
         }
-        if (building.owns_lock()) {
-            building.unlock();
-        }
         if (state == nil) {
             error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
         }
@@ -615,11 +615,14 @@ Object CreateMeshRenderPipelineState(const Device& device, const RenderPipelineD
                 hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                           std::chrono::steady_clock::now() - start)
                                           .count()));
-            if (!hit && descriptor.fragmentFunction != nil && descriptor.rasterizationEnabled) {
+            if (!hit && !archive->IsReadOnly() && descriptor.fragmentFunction != nil &&
+                descriptor.rasterizationEnabled) {
                 if (@available(iOS 18.0, macOS 15.0, *)) {
                     MTLMeshRenderPipelineDescriptor* const copy = [descriptor copy];
-                    archive->DeferAdd([binary, copy] {
-                        return [binary addMeshRenderPipelineFunctionsWithDescriptor:copy
+                    archive->DeferAdd([copy](void* bin_ptr) {
+                        const id<MTLBinaryArchive> binary = (__bridge id<MTLBinaryArchive>)bin_ptr;
+                        return binary != nil &&
+                               [binary addMeshRenderPipelineFunctionsWithDescriptor:copy
                                                                               error:nil] == YES;
                     });
                 }

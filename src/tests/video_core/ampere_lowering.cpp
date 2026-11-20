@@ -254,4 +254,35 @@ TEST_CASE("Ampere guarded uniform comparisons keep the output when the guard is 
     REQUIRE(static_cast<bool>(selected));
     CHECK(selected.instructions.front() == 0x5ca000000df70403ULL);
 }
+
+TEST_CASE("Ampere FFMA 0x623 negates the upper register on bit 75 and the constant on bit 63",
+          "[video_core][ampere]") {
+    // Ocarina depth linearization (@P0 FFMA R2, R0, -R1, c[3][0x0]): bit 75 negates R1 (copied
+    // into R251 and XORed with 0x80000000), while c[3][0x0] (loaded into R252) stays positive.
+    const std::array<Instruction, 2> reg_neg{{
+        {{0x00020623, 0x00c00000, 0x00010801, 0x001fe200}},
+        EXIT,
+    }};
+    const auto lowered = LowerToMaxwell(reg_neg);
+    INFO(lowered.error);
+    REQUIRE(static_cast<bool>(lowered));
+    REQUIRE(lowered.instructions.size() >= 4);
+    CHECK(lowered.instructions[0] == 0x5c980780001000fbULL); // @P0 MOV R251, R1
+    CHECK(lowered.instructions[1] == 0x044800000000fbfbULL); // @P0 LOP32I.XOR R251, R251, 0x80000000
+    CHECK(lowered.instructions[2] == 0x4c98078c000000fcULL); // @P0 LDC R252, c[3][0x0]
+    CHECK(lowered.instructions[3] == 0x59a07e000fb00002ULL); // @P0 FFMA.FTZ R2, R0, R251, R252
+
+    // Constant-buffer addend negation (@P0 FFMA R2, R0, R1, -c[3][0x0]) uses bit 63.
+    const std::array<Instruction, 2> cbuf_neg{{
+        {{0x00020623, 0x80c00000, 0x00010001, 0x001fe200}},
+        EXIT,
+    }};
+    const auto cbuf_lowered = LowerToMaxwell(cbuf_neg);
+    INFO(cbuf_lowered.error);
+    REQUIRE(static_cast<bool>(cbuf_lowered));
+    REQUIRE(cbuf_lowered.instructions.size() >= 3);
+    CHECK(cbuf_lowered.instructions[0] == 0x4c98078c000000fcULL); // @P0 LDC R252, c[3][0x0]
+    CHECK(cbuf_lowered.instructions[1] == 0x044800000000fcfcULL); // @P0 LOP32I.XOR R252, R252, 0x80000000
+    CHECK(cbuf_lowered.instructions[2] == 0x59a07e0000100002ULL); // @P0 FFMA.FTZ R2, R0, R1, R252
+}
 } // namespace

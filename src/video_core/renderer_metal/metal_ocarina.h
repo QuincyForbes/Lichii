@@ -328,10 +328,6 @@ private:
     Pass motion_pass;
     Pass color_pass;
     Pass output_pass;
-    Object linear_library;
-    Pass linear_color_pass;
-    Pass linear_output_pass;
-    Pass linear_composite_pass;
     Pass effects_base_pass;
     Pass effects_mark_pass;
     Pass effects_bias_pass;

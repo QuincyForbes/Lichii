@@ -4,8 +4,13 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <span>
 #include <vector>
+
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 
 #include "audio_core/common/common.h"
 #include "audio_core/sink/cubeb_sink.h"
@@ -52,6 +57,21 @@ public:
         if (!ctx) {
             return;
         }
+#ifdef __APPLE__
+#if TARGET_OS_IPHONE
+        if (type == StreamType::In) {
+            return;
+        }
+#else
+        static const bool apple_mic_enabled = [] {
+            const char* const env = std::getenv("EDEN_NX2_APPLE_MIC");
+            return env != nullptr && env[0] == '1';
+        }();
+        if (type == StreamType::In && !apple_mic_enabled && name != "Microphone test") {
+            return;
+        }
+#endif
+#endif
 
         cubeb_stream_params params{};
         params.rate = TargetSampleRate;

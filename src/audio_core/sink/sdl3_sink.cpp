@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <span>
 #include <vector>
 
@@ -105,6 +106,16 @@ public:
         if (type == StreamType::In) {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
             return;
+#elif defined(__APPLE__)
+            static const bool apple_mic_enabled = [] {
+                const char* const env = std::getenv("EDEN_NX2_APPLE_MIC");
+                return env != nullptr && env[0] == '1';
+            }();
+            if (!apple_mic_enabled && name_ != "Microphone test") {
+                return;
+            }
+            device_name = input_device;
+            capture = true;
 #else
             device_name = input_device;
             capture = true;

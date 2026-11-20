@@ -936,16 +936,25 @@ PipelineCache::~PipelineCache() {
     ClearSharedLibraryCache();
     files.SaveUsed();
     msl_cache.Save();
+    archive.Save();
 }
 
 namespace {
-[[nodiscard]] bool BinaryArchiveEnabled() {
+/// Sharded MTLBinaryArchive (<= 128 PSOs per shard) for actual gameplay & boot pipelines:
+/// enabled by default so compiled GPU machine code persists across runs and OS reboots.
+[[nodiscard]] bool GameplayArchiveEnabled() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_METAL_ARCHIVE");
-        // Opt-in only: macOS 26/27 -[_MTLBinaryArchive initWithOptions:device:url:error:] runs a
-        // single-threaded FlatBuffers deduplication pass that stalls for minutes on multi-thousand
-        // shader archives, whereas macOS's built-in Metal compiler cache + StageMslCache v2 open
-        // in milliseconds.
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// Offline speculative warm (40k+ extracted shaders): opt-in for binary archives so disk isn't
+/// filled with tens of thousands of unused speculative PSOs.
+[[nodiscard]] bool WarmArchiveEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_WARM_ARCHIVE");
         return value != nullptr && value[0] == '1';
     }();
     return enabled;
@@ -961,11 +970,8 @@ void PipelineCache::OpenArchive(u64 title_id) {
     std::scoped_lock lock{lifecycle_mutex};
     msl_cache.Open(title_dir / "metal_stages.v2.bin", VideoCommon::ShaderWarm::EmissionStamp());
     const auto archive_path = title_dir / "metal_pipelines.bin";
-    if (BinaryArchiveEnabled()) {
+    if (GameplayArchiveEnabled()) {
         archive.Open(device, archive_path, false);
-    } else {
-        std::error_code ec;
-        std::filesystem::remove(archive_path, ec);
     }
 }
 
@@ -2311,7 +2317,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     } else {
         msl_cache.Save();
     }
-    ClearSharedLibraryCache();
+    archive.Save();
     archive.SetReadOnly(restore_read_only);
     files.EndBoot();
     const PipelineArchive::Counts counts = archive.Totals();
@@ -2776,23 +2782,18 @@ bool MetalWarmPending(u64 title_id) {
 
     const u64 prev_program_id = Settings::GetCurrentProgramID();
     const auto prev_resolution_info = Settings::values.resolution_info;
-    const bool switched_program = prev_program_id != title_id;
-    if (switched_program) {
-        Settings::SetCurrentProgramID(title_id);
-        Settings::UpdateRescalingInfo();
-    }
+    Settings::SetCurrentProgramID(title_id);
+    Settings::UpdateRescalingInfo();
     SCOPE_EXIT {
-        if (switched_program) {
-            Settings::SetCurrentProgramID(prev_program_id);
-            Settings::values.resolution_info = prev_resolution_info;
-        }
+        Settings::SetCurrentProgramID(prev_program_id);
+        Settings::values.resolution_info = prev_resolution_info;
     };
 
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
     const auto title_dir = shader_dir / fmt::format("{:016x}", title_id);
     const auto stages_path = title_dir / "metal_stages.v2.bin";
     const auto pipelines_path = title_dir / "metal_pipelines.bin";
-    const bool archive_enabled = BinaryArchiveEnabled();
+    const bool archive_enabled = WarmArchiveEnabled();
 
     std::optional<bool> stages_valid;
     const auto has_stages = [&] {
@@ -2877,11 +2878,8 @@ OfflineWarmSummary CompileWarmShadersOffline(
     msl_cache.Open(title_dir / "metal_stages.v2.bin", ShaderWarm::EmissionStamp());
     PipelineArchive archive;
     const auto pipelines_path = title_dir / "metal_pipelines.bin";
-    if (BinaryArchiveEnabled()) {
+    if (WarmArchiveEnabled()) {
         static_cast<void>(archive.Open(device, pipelines_path, false));
-    } else {
-        std::error_code remove_ec;
-        std::filesystem::remove(pipelines_path, remove_ec);
     }
     WarmLedger ledger;
     ledger.Open(title_dir / "metal_warm_ledger.v1.bin",

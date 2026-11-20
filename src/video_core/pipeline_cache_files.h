@@ -18,8 +18,8 @@
 
 namespace VideoCommon {
 
-inline constexpr u32 OpenGLPipelineCacheVersion = 48;
-inline constexpr u32 VulkanPipelineCacheVersion = 55; // 55: FixedPipelineState line stipple & depth bounds
+inline constexpr u32 OpenGLPipelineCacheVersion = 49;
+inline constexpr u32 VulkanPipelineCacheVersion = 56; // 56: FFMA 0x623 register negate (bit 75)
 
 // Official Eglantine (cache version 18 at c0cb3325) and this fork (a different version) both
 // used <shader dir>/<title>/vulkan.bin and vulkan_pipelines.bin. Each build deletes a file

@@ -30,8 +30,9 @@ public:
     /// The records hold GraphicsPipelineKey's bytes: 2 added the transform feedback layout; 3
     /// drops programs lowered before the FFMA constant-negate fix; 4 drops those translated
     /// before handle table arrays (EDEN_NX2_DYNAMIC_HANDLE_ARRAYS); 5 drops those translated
-    /// before mixed FMA, spilled texture arrays and native mesh fixes.
-    static constexpr u32 RecordsVersion = 5;
+    /// before mixed FMA, spilled texture arrays and native mesh fixes; 6 drops programs lowered
+    /// with the inverted FFMA 0x623 bit-75 operand negation.
+    static constexpr u32 RecordsVersion = 6;
     static constexpr u32 StatesVersion = 2;
     /// Runs a pipeline stays on the used list without being used, and is still built at boot
     /// (Vulkan on MoltenVK builds what the last 8 runs used).

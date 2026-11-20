@@ -828,23 +828,25 @@ Object CreateFunction(const void* library, std::string_view name) {
 Object CreateComputeState(const Device& device, MTLComputePipelineDescriptor* descriptor,
                           std::string& error, PipelineArchive* archive) {
     @autoreleasepool {
-        const id<MTLBinaryArchive> binary =
-            archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
+        const bool use_archive = archive != nullptr && archive->IsOpen() &&
+                                 (!archive->IsReadOnly() || archive->HasEntries());
         const auto start = std::chrono::steady_clock::now();
         id<MTLComputePipelineState> state = nil;
         std::shared_lock<std::shared_mutex> building;
-        if (binary != nil) {
+        if (use_archive && archive->HasEntries()) {
             building = std::shared_lock{archive->BuildMutex()};
-            descriptor.binaryArchives = @[ binary ];
-            state = [device.GetDevice()
-                newComputePipelineStateWithDescriptor:descriptor
-                                              options:MTLPipelineOptionFailOnBinaryArchiveMiss
-                                           reflection:nil
-                                                error:nil];
+            NSArray<id<MTLBinaryArchive>>* const archives =
+                (__bridge NSArray<id<MTLBinaryArchive>>*)archive->LookupHandles();
+            if (archives != nil && archives.count > 0) {
+                descriptor.binaryArchives = archives;
+                state = [device.GetDevice()
+                    newComputePipelineStateWithDescriptor:descriptor
+                                                  options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                               reflection:nil
+                                                    error:nil];
+            }
         }
         if (building.owns_lock()) {
-            // Release right after the probe: holding the archive lock across the fallback compile
-            // (and the writer-preferring lock of an addition) serialized every builder.
             building.unlock();
         }
         const bool hit = state != nil;
@@ -858,22 +860,21 @@ Object CreateComputeState(const Device& device, MTLComputePipelineDescriptor* de
                                                                    reflection:nil
                                                                         error:&ns_error];
         }
-        if (building.owns_lock()) {
-            building.unlock();
-        }
         if (state == nil) {
             error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
             return {};
         }
-        if (binary != nil) {
+        if (use_archive) {
             archive->NoteBuild(
                 hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                           std::chrono::steady_clock::now() - start)
                                           .count()));
-            if (!hit) {
-                auto* const copy = [descriptor copy];
-                archive->DeferAdd([binary, copy] {
-                    return [binary addComputePipelineFunctionsWithDescriptor:copy error:nil] == YES;
+            if (!hit && !archive->IsReadOnly()) {
+                MTLComputePipelineDescriptor* const copy = [descriptor copy];
+                archive->DeferAdd([copy](void* bin_ptr) {
+                    const id<MTLBinaryArchive> binary = (__bridge id<MTLBinaryArchive>)bin_ptr;
+                    return binary != nil &&
+                           [binary addComputePipelineFunctionsWithDescriptor:copy error:nil] == YES;
                 });
             }
         }
@@ -930,19 +931,23 @@ void CreateComputeStateAsync(const Device& device, const void* library, std::str
         descriptor.computeFunction = function;
         ConfigureComputeDescriptor(descriptor, workgroup_threads, immutable_buffers);
 
-        const id<MTLBinaryArchive> binary =
-            archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
+        const bool use_archive = archive != nullptr && archive->IsOpen() &&
+                                 (!archive->IsReadOnly() || archive->HasEntries());
         const auto start = std::chrono::steady_clock::now();
-        if (binary != nil && archive->HasEntries()) {
+        if (use_archive && archive->HasEntries()) {
             id<MTLComputePipelineState> hit_state = nil;
             {
                 std::shared_lock building{archive->BuildMutex()};
-                descriptor.binaryArchives = @[ binary ];
-                hit_state = [device.GetDevice()
-                    newComputePipelineStateWithDescriptor:descriptor
-                                                  options:MTLPipelineOptionFailOnBinaryArchiveMiss
-                                               reflection:nil
-                                                    error:nil];
+                NSArray<id<MTLBinaryArchive>>* const archives =
+                    (__bridge NSArray<id<MTLBinaryArchive>>*)archive->LookupHandles();
+                if (archives != nil && archives.count > 0) {
+                    descriptor.binaryArchives = archives;
+                    hit_state = [device.GetDevice()
+                        newComputePipelineStateWithDescriptor:descriptor
+                                                      options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                                   reflection:nil
+                                                        error:nil];
+                }
             }
             descriptor.binaryArchives = nil;
             if (hit_state != nil) {
@@ -958,7 +963,8 @@ void CreateComputeStateAsync(const Device& device, const void* library, std::str
             }
         }
 
-        MTLComputePipelineDescriptor* const copy = binary != nil ? [descriptor copy] : nil;
+        const bool defer_add = use_archive && !archive->IsReadOnly();
+        MTLComputePipelineDescriptor* const copy = defer_add ? [descriptor copy] : nil;
         auto callback =
             std::make_shared<std::function<void(Object, std::string)>>(std::move(on_done));
         [device.GetDevice()
@@ -974,7 +980,7 @@ void CreateComputeStateAsync(const Device& device, const void* library, std::str
                                                             ns_error.localizedDescription != nil
                                                         ? ns_error.localizedDescription.UTF8String
                                                         : "unknown error";
-                                        } else if (binary != nil && archive != nullptr) {
+                                        } else if (use_archive && archive != nullptr) {
                                             archive->NoteBuild(
                                                 false,
                                                 static_cast<u64>(
@@ -982,14 +988,19 @@ void CreateComputeStateAsync(const Device& device, const void* library, std::str
                                                         std::chrono::nanoseconds>(
                                                         std::chrono::steady_clock::now() - start)
                                                         .count()));
-                                            archive->DeferAdd([binary, copy] {
-                                                return [binary
-                                                           addComputePipelineFunctionsWithDescriptor:
-                                                               copy
-                                                                                               error:
-                                                                                                   nil] ==
-                                                       YES;
-                                            });
+                                            if (defer_add && copy != nil) {
+                                                archive->DeferAdd([copy](void* bin_ptr) {
+                                                    const id<MTLBinaryArchive> binary =
+                                                        (__bridge id<MTLBinaryArchive>)bin_ptr;
+                                                    return binary != nil &&
+                                                           [binary
+                                                               addComputePipelineFunctionsWithDescriptor:
+                                                                   copy
+                                                                                                   error:
+                                                                                                       nil] ==
+                                                               YES;
+                                                });
+                                            }
                                         }
                                         Object retained = Retain(state);
                                         if (*callback) {

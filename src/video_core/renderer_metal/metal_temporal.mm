@@ -25,6 +25,7 @@ struct ScalerKey {
     MTLPixelFormat reactive{};
     NSUInteger input_width{};
     NSUInteger input_height{};
+    std::array<u32, 2> render{};
     std::array<u32, 2> output{};
     bool auto_exposure{};
 
@@ -128,6 +129,7 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
             .reactive = reactive != nil ? reactive.pixelFormat : MTLPixelFormatInvalid,
             .input_width = color.width,
             .input_height = color.height,
+            .render = inputs.render_size,
             .output = inputs.output_size,
             .auto_exposure = inputs.auto_exposure,
         };
@@ -152,11 +154,17 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
             descriptor.outputWidth = key.output[0];
             descriptor.outputHeight = key.output[1];
             descriptor.autoExposureEnabled = key.auto_exposure ? YES : NO;
-            // Dynamic Resolution Scaling updates inputContentWidth/Height per frame without
-            // rebuilding the scaler or resetting history.
-            descriptor.inputContentPropertiesEnabled = YES;
-            descriptor.inputContentMinScale = min_scale;
-            descriptor.inputContentMaxScale = max_scale;
+            // Match Vulkan's MetalFxTemporalUpscaler: enable inputContentProperties only when
+            // rendering into a sub-rectangle of larger textures, and pin [minScale, maxScale] to
+            // the active scale so MetalFX selects its fixed-scale kernel instead of the wide-DRS
+            // fallback kernel (which adds temporal ghosting behind moving actors).
+            const bool content_properties =
+                key.render[0] != key.input_width || key.render[1] != key.input_height;
+            if (content_properties) {
+                descriptor.inputContentPropertiesEnabled = YES;
+                descriptor.inputContentMinScale = std::min(scale_x, scale_y);
+                descriptor.inputContentMaxScale = std::max(scale_x, scale_y);
+            }
             if (key.reactive != MTLPixelFormatInvalid) {
                 if (@available(iOS 17.4, macOS 14.4, *)) {
                     descriptor.reactiveMaskTextureEnabled = YES;

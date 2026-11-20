@@ -126,7 +126,8 @@ std::string QtMcpHost::BootGame(const std::string& path) {
         if (window.emulation_running) {
             return "a game is already running; stop it first";
         }
-        window.BootGame(QString::fromStdString(path), window.ApplicationAppletParameters());
+        window.BootGame(QString::fromStdString(path), window.ApplicationAppletParameters(),
+                        StartGameType::Normal, false);
         return window.emulation_running ? std::string{} : "boot failed (see the timeline/logs)";
     });
 }
