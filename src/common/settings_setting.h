@@ -18,6 +18,11 @@
 #include <vector>
 #include <fmt/ranges.h>
 #include "common/common_types.h"
+
+#ifdef LoadString
+#undef LoadString
+#endif
+
 #include "common/settings_common.h"
 #include "common/settings_enums.h"
 

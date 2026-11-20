@@ -191,6 +191,9 @@ void RecommendApple(const Device& device, Profile& p) {
         p.note = "6 GB device: larger games may run out of memory.";
     }
 
+    Add(p, v.renderer_backend, RendererBackend::Metal,
+        "Metal: Lichii's native Apple GPU renderer (Metal 3 mesh shaders, MetalFX upscaling and "
+        "offline shader cache without MoltenVK translation).");
     Add(p, v.resolution_setup, row != nullptr ? row->resolution : ResolutionSetup::Res1_2X,
         "Games other than Ocarina of Time: the tier's scale (1x from 8 GB, 0.75x at 6 GB, "
         "1.5x on 16 GB M-series iPads). Higher costs GPU time and memory the phone can't spare.");
@@ -239,7 +242,8 @@ void RecommendApple(const Device& device, Profile& p) {
     Add(p, v.precache_shaders, PrecacheShaders::Off,
         "Off: memory and battery on mobile favour the explicit Build Shaders action.");
     Add(p, v.moltenvk_driver, MoltenVkDriver::Legacy,
-        "Legacy MoltenVK until a device run proves the native mesh shader one.");
+        "Legacy MoltenVK when Graphics API is set to Vulkan, until a device run proves the native "
+        "mesh shader one.");
     Add(p, v.guest_wait_backoff, true,
         "On: a game thread that yields or polls the clock for 2 ms sleeps instead of holding one "
         "of the two performance cores (nxnative measured 78 -> 19 % of a core in Fire Emblem: "
@@ -357,6 +361,16 @@ void RecommendDesktop(const Device& device, Profile& p) {
                                                 (device.vram_mib != 0 && device.vram_mib < 6000));
     const bool small_mac = device.os == Os::MacOS && device.memory_mib < 12000;
 
+    if (device.os == Os::MacOS) {
+        Add(p, v.renderer_backend, RendererBackend::Metal,
+            "Metal: Lichii's native Apple GPU renderer (Metal 3 mesh shaders, MetalFX upscaling "
+            "and offline shader cache without MoltenVK translation).");
+#if !defined(__sun__) && !defined(__managarm__)
+    } else {
+        Add(p, v.renderer_backend, RendererBackend::Vulkan,
+            "Vulkan: the recommended graphics renderer on Windows, Linux and Android.");
+#endif
+    }
     if (device.recommended_vulkan_device.has_value()) {
         Add(p, v.vulkan_device, *device.recommended_vulkan_device,
             "Discrete GPU instead of the integrated graphics adapter.");
@@ -389,7 +403,8 @@ void RecommendDesktop(const Device& device, Profile& p) {
         Add(p, v.use_reactive_flushing, false,
             "Off: on unified memory the readback is still a fence wait.");
         Add(p, v.moltenvk_driver, MoltenVkDriver::Legacy,
-            "Legacy MoltenVK until a run proves the native mesh shader one.");
+            "Legacy MoltenVK when Graphics API is set to Vulkan, until a run proves the native "
+            "mesh shader one.");
     } else {
         Add(p, v.use_reactive_flushing, true, "On: readbacks some games need.");
         Add(p, v.astc_recompression, AstcRecompression::Bc3,

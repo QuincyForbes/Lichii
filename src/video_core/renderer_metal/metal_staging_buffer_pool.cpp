@@ -83,7 +83,7 @@ StagingBufferRef StagingBufferPool::Take(size_t index, size_t size, bool deferre
 
 StagingBufferRef StagingBufferPool::Request(size_t size, bool deferred, bool host_to_device) {
     if (!deferred && host_to_device && size <= (1ULL << 20)) {
-        return Stream(size, 256);
+        return RequestUpload(size, 256);
     }
     const u64 rounded = std::bit_ceil((std::max)(size, size_t{4096}));
     size_t empty = entries.size();
@@ -197,6 +197,39 @@ StagingBufferRef StagingBufferPool::Stream(size_t size, size_t alignment) {
         .buffer = stream.Get(),
         .offset = offset,
         .mapped_span = std::span<u8>(stream_contents + offset, size),
+        .index = (std::numeric_limits<size_t>::max)(),
+    };
+}
+
+StagingBufferRef StagingBufferPool::RequestUpload(size_t size, size_t alignment) {
+    size = (std::max<size_t>)(size, 1);
+    if (size > stream_region_size) {
+        return Request(size);
+    }
+    if (!upload_stream) {
+        upload_stream = CreateBuffer(device, stream_size, true, &upload_stream_contents, true);
+        ASSERT_MSG(upload_stream && upload_stream_contents != nullptr,
+                   "Metal upload stream buffer failed");
+    }
+    u64 offset = Common::AlignUp(upload_stream_offset, (std::max)(alignment, size_t{16}));
+    const u64 region = offset / stream_region_size;
+    if (region >= StreamRegions || (offset + size - 1) / stream_region_size != region) {
+        offset = region + 1 >= StreamRegions ? 0 : (region + 1) * stream_region_size;
+    }
+    const u64 first = offset / stream_region_size;
+    const u64 tick = scheduler.CurrentTick();
+    if (offset % stream_region_size == 0) {
+        if (upload_stream_ticks[first] == tick) {
+            return Request(size);
+        }
+        scheduler.Wait(upload_stream_ticks[first]);
+    }
+    upload_stream_ticks[first] = tick;
+    upload_stream_offset = offset + size;
+    return StagingBufferRef{
+        .buffer = upload_stream.Get(),
+        .offset = offset,
+        .mapped_span = std::span<u8>(upload_stream_contents + offset, size),
         .index = (std::numeric_limits<size_t>::max)(),
     };
 }

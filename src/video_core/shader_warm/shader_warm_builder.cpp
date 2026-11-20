@@ -58,6 +58,20 @@ bool MetalWarmPending(u64 title_id);
 } // namespace Metal
 #endif
 
+namespace Vulkan {
+struct OfflineWarmSummary {
+    bool ok{};
+    size_t built{};
+    size_t skipped{};
+    size_t failed{};
+    std::string error;
+};
+OfflineWarmSummary CompileWarmShadersOffline(
+    u64 title_id, std::stop_token stop,
+    const std::function<void(size_t done, size_t total, std::string_view stage)>& on_progress = {});
+bool VulkanWarmPending(u64 title_id);
+} // namespace Vulkan
+
 namespace VideoCommon::ShaderWarm {
 namespace {
 
@@ -633,12 +647,14 @@ bool WarmPending(u64 title_id) {
 }
 
 bool OfflineGpuWarmPending(u64 title_id) {
+    const auto backend = Settings::values.renderer_backend.GetValue();
+    if (backend == Settings::RendererBackend::Vulkan) {
+        return ::Vulkan::VulkanWarmPending(title_id);
+    }
 #if defined(__APPLE__) && defined(LICHII_METAL_RENDERER)
-    if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Metal) {
+    if (backend == Settings::RendererBackend::Metal) {
         return ::Metal::MetalWarmPending(title_id);
     }
-#else
-    static_cast<void>(title_id);
 #endif
     return false;
 }
@@ -832,22 +848,22 @@ bool DeleteWarmFiles(u64 title_id, std::string* error) {
 
 GpuWarmSummary CompileWarmShadersOffline(u64 title_id, std::stop_token stop,
                                          const std::function<void(const Progress&)>& on_progress) {
-#if defined(__APPLE__) && defined(LICHII_METAL_RENDERER)
-    if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Metal) {
-        std::function<void(size_t, size_t, std::string_view)> metal_progress;
-        if (on_progress) {
-            metal_progress = [&on_progress](size_t done, size_t total, std::string_view stage) {
-                on_progress(Progress{
-                    .stage = std::string{stage},
-                    .done = done,
-                    .total = total,
-                    .fraction =
-                        total != 0 ? static_cast<double>(done) / static_cast<double>(total) : 0.0,
-                });
-            };
-        }
+    std::function<void(size_t, size_t, std::string_view)> gpu_progress;
+    if (on_progress) {
+        gpu_progress = [&on_progress](size_t done, size_t total, std::string_view stage) {
+            on_progress(Progress{
+                .stage = std::string{stage},
+                .done = done,
+                .total = total,
+                .fraction =
+                    total != 0 ? static_cast<double>(done) / static_cast<double>(total) : 0.0,
+            });
+        };
+    }
+    const auto backend = Settings::values.renderer_backend.GetValue();
+    if (backend == Settings::RendererBackend::Vulkan) {
         const auto summary =
-            ::Metal::CompileWarmShadersOffline(title_id, std::move(stop), metal_progress);
+            ::Vulkan::CompileWarmShadersOffline(title_id, std::move(stop), gpu_progress);
         return GpuWarmSummary{
             .supported = true,
             .ok = summary.ok,
@@ -857,10 +873,19 @@ GpuWarmSummary CompileWarmShadersOffline(u64 title_id, std::stop_token stop,
             .error = summary.error,
         };
     }
-#else
-    static_cast<void>(title_id);
-    static_cast<void>(stop);
-    static_cast<void>(on_progress);
+#if defined(__APPLE__) && defined(LICHII_METAL_RENDERER)
+    if (backend == Settings::RendererBackend::Metal) {
+        const auto summary =
+            ::Metal::CompileWarmShadersOffline(title_id, std::move(stop), gpu_progress);
+        return GpuWarmSummary{
+            .supported = true,
+            .ok = summary.ok,
+            .built = summary.built,
+            .skipped = summary.skipped,
+            .failed = summary.failed,
+            .error = summary.error,
+        };
+    }
 #endif
     return GpuWarmSummary{.supported = false};
 }

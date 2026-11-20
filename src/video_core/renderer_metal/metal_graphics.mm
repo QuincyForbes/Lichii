@@ -394,7 +394,8 @@ Object CreateStageInComputePipelineState(const Device& device, const void* funct
 }
 
 Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc& desc,
-                                 std::string& error, PipelineArchive* archive) {
+                                 std::string& error, PipelineArchive* archive,
+                                 u32 vertex_immutable, u32 fragment_immutable) {
     if (PipelineCheckEnabled()) {
         // What Metal answers with an assertion instead of an error (metal_pipeline_check.cpp).
         error = CheckPipeline(desc, DevicePipelineLimits(device));
@@ -406,6 +407,14 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
         MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
         descriptor.vertexFunction = (__bridge id<MTLFunction>)desc.vertex_function;
         descriptor.fragmentFunction = (__bridge id<MTLFunction>)desc.fragment_function;
+        for (u32 slot = 0; slot < 31; ++slot) {
+            if (((vertex_immutable >> slot) & 1U) != 0) {
+                descriptor.vertexBuffers[slot].mutability = MTLMutabilityImmutable;
+            }
+            if (((fragment_immutable >> slot) & 1U) != 0) {
+                descriptor.fragmentBuffers[slot].mutability = MTLMutabilityImmutable;
+            }
+        }
         SetTargets(descriptor, desc);
         if (desc.tessellation != 0) {
             // The control kernel writes half-precision factors, one set per patch.
@@ -546,6 +555,17 @@ Object CreateMeshRenderPipelineState(const Device& device, const RenderPipelineD
             descriptor.maxTotalThreadsPerObjectThreadgroup = functions.object_threads;
         }
         descriptor.maxTotalThreadsPerMeshThreadgroup = functions.mesh_threads;
+        for (u32 slot = 0; slot < 31; ++slot) {
+            if (((functions.object_immutable >> slot) & 1U) != 0) {
+                descriptor.objectBuffers[slot].mutability = MTLMutabilityImmutable;
+            }
+            if (((functions.mesh_immutable >> slot) & 1U) != 0) {
+                descriptor.meshBuffers[slot].mutability = MTLMutabilityImmutable;
+            }
+            if (((functions.fragment_immutable >> slot) & 1U) != 0) {
+                descriptor.fragmentBuffers[slot].mutability = MTLMutabilityImmutable;
+            }
+        }
         SetTargets(descriptor, desc);
 
         const id<MTLBinaryArchive> binary =

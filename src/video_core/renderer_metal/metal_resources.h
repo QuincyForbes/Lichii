@@ -158,7 +158,10 @@ struct SparseTexture {
                                              u32 bytes_per_texel, u32 format, bool writable);
 
 /// A buffer in shared (CPU-visible, `contents` set) or private storage.
-[[nodiscard]] Object CreateBuffer(const Device& device, u64 size, bool shared, u8** contents);
+/// With `shared && untracked_write_combined`, uses write-combined CPU cache mode and untracked
+/// hazard tracking (for append-only CPU upload rings never written by the GPU).
+[[nodiscard]] Object CreateBuffer(const Device& device, u64 size, bool shared, u8** contents,
+                                  bool untracked_write_combined = false);
 
 /// What a sampler state takes besides the guest's descriptor: Vulkan's sampler variants
 /// (vk_texture_cache.cpp, Sampler::MakeKey) for the view it samples.
@@ -207,13 +210,16 @@ void CreateLibraryAsync(const Device& device, std::string_view msl,
 /// is looked up there first and added on a miss.
 [[nodiscard]] Object CreateComputePipelineState(const Device& device, const void* function,
                                                 std::string& error,
-                                                PipelineArchive* archive = nullptr);
+                                                PipelineArchive* archive = nullptr,
+                                                u32 workgroup_threads = 0,
+                                                u32 immutable_buffers = 0);
 
 /// Asynchronous MTLComputePipelineState build: checks `archive` synchronously first when it has
 /// entries, and submits an asynchronous XPC build + `archive->DeferAdd` on a miss.
 void CreateComputeStateAsync(const Device& device, const void* library, std::string_view entry_name,
                              u32 workgroup_threads, PipelineArchive* archive,
-                             std::function<void(Object, std::string)> on_done);
+                             std::function<void(Object, std::string)> on_done,
+                             u32 immutable_buffers = 0);
 
 /// What a texture is, for checks before Metal is given it.
 struct TextureFacts {

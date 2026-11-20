@@ -124,10 +124,16 @@ fragment float4 present_fragment(PresentOut in [[stage_in]], texture2d<float> sr
 class SpatialUpscaler {
 public:
     /// The upscaled picture (output_width x output_height, the drawable's format), or nullptr
-    /// when MetalFX can't run (the layer is presented as it is).
+    /// when MetalFX can't run (the layer is presented as it is). When `direct_target` is
+    /// compatible with MetalFX's output requirements, encodes directly into it and sets
+    /// `wrote_direct`.
     TextureHandle Upscale(const Device& device, Scheduler& scheduler, TextureHandle source,
                           const std::array<s32, 4>& source_rect, u32 output_width,
-                          u32 output_height) {
+                          u32 output_height, TextureHandle direct_target = nullptr,
+                          bool* wrote_direct = nullptr) {
+        if (wrote_direct != nullptr) {
+            *wrote_direct = false;
+        }
         if (device_unsupported || source == nullptr || output_width == 0 || output_height == 0) {
             return nullptr;
         }
@@ -157,19 +163,48 @@ public:
                     return nullptr;
                 }
             }
-            // The crop (with its flips) into an input of exactly its size.
-            const bool copied = scheduler.Blit(BlitPass{
-                .src = source,
-                .src_rect = source_rect,
-                .dst = {.texture = (__bridge void*)input},
-                .dst_format = static_cast<u32>(format),
-                .dst_rect = {0, 0, static_cast<s32>(input_width), static_cast<s32>(input_height)},
-                .dst_width = input_width,
-                .dst_height = input_height,
-                .linear = format != src_format,
-                .keep_dst = false,
-            });
-            if (!copied) {
+            id<MTLFXSpatialScaler> spatial = scaler;
+            const bool can_use_src_directly =
+                format == src_format && source_rect[0] == 0 && source_rect[1] == 0 &&
+                source_rect[2] == static_cast<s32>(input_width) &&
+                source_rect[3] == static_cast<s32>(input_height) &&
+                src_tex.width == input_width && src_tex.height == input_height &&
+                src_tex.storageMode == MTLStorageModePrivate &&
+                (src_tex.usage & spatial.colorTextureUsage) == spatial.colorTextureUsage;
+            id<MTLTexture> color_input = src_tex;
+            if (!can_use_src_directly) {
+                if (!EnsureInputTexture(device, scheduler, format, input_width, input_height,
+                                        spatial.colorTextureUsage)) {
+                    return nullptr;
+                }
+                // The crop (with its flips) into an input of exactly its size.
+                const bool copied = scheduler.Blit(BlitPass{
+                    .src = source,
+                    .src_rect = source_rect,
+                    .dst = {.texture = (__bridge void*)input},
+                    .dst_format = static_cast<u32>(format),
+                    .dst_rect = {0, 0, static_cast<s32>(input_width),
+                                 static_cast<s32>(input_height)},
+                    .dst_width = input_width,
+                    .dst_height = input_height,
+                    .linear = format != src_format,
+                    .keep_dst = false,
+                });
+                if (!copied) {
+                    return nullptr;
+                }
+                color_input = input;
+            }
+            id<MTLTexture> dst_tex = direct_target != nullptr ? AsTexture(direct_target) : nil;
+            const bool can_write_direct =
+                dst_tex != nil && dst_tex != color_input && dst_tex.width == output_width &&
+                dst_tex.height == output_height &&
+                dst_tex.pixelFormat == static_cast<MTLPixelFormat>(DrawableFormat()) &&
+                dst_tex.storageMode == MTLStorageModePrivate &&
+                (dst_tex.usage & spatial.outputTextureUsage) == spatial.outputTextureUsage;
+            if (!can_write_direct &&
+                !EnsureOutputTexture(device, scheduler, output_width, output_height,
+                                     spatial.outputTextureUsage)) {
                 return nullptr;
             }
             const id<MTLCommandBuffer> command_buffer =
@@ -177,9 +212,9 @@ public:
             if (command_buffer == nil) {
                 return nullptr;
             }
-            id<MTLFXSpatialScaler> spatial = scaler;
-            spatial.colorTexture = input;
-            spatial.outputTexture = output;
+            id<MTLTexture> color_output = can_write_direct ? dst_tex : output;
+            spatial.colorTexture = color_input;
+            spatial.outputTexture = color_output;
             spatial.inputContentWidth = input_width;
             spatial.inputContentHeight = input_height;
             @try {
@@ -191,7 +226,10 @@ public:
                 scaler = nil;
                 return nullptr;
             }
-            return (__bridge void*)output;
+            if (can_write_direct && wrote_direct != nullptr) {
+                *wrote_direct = true;
+            }
+            return (__bridge void*)color_output;
         }
         device_unsupported = true;
         return nullptr;
@@ -215,6 +253,49 @@ private:
         }
     }
 
+    static id<MTLTexture> MakePrivateTexture(const Device& device, u32 width, u32 height,
+                                             MTLPixelFormat texture_format,
+                                             MTLTextureUsage usage) {
+        MTLTextureDescriptor* texture =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:texture_format
+                                                               width:width
+                                                              height:height
+                                                           mipmapped:NO];
+        texture.storageMode = MTLStorageModePrivate;
+        texture.usage = usage;
+        return [device.GetDevice() newTextureWithDescriptor:texture];
+    }
+
+    bool EnsureInputTexture(const Device& device, Scheduler& scheduler, MTLPixelFormat format,
+                            u32 input_width, u32 input_height, MTLTextureUsage scaler_usage) {
+        if (input != nil && input.width == input_width && input.height == input_height &&
+            input.pixelFormat == format) {
+            return true;
+        }
+        if (input != nil) {
+            scheduler.Finish();
+        }
+        input = MakePrivateTexture(device, input_width, input_height, format,
+                                   scaler_usage | MTLTextureUsageRenderTarget |
+                                       MTLTextureUsageShaderRead);
+        return input != nil;
+    }
+
+    bool EnsureOutputTexture(const Device& device, Scheduler& scheduler, u32 output_width,
+                             u32 output_height, MTLTextureUsage scaler_usage) {
+        const MTLPixelFormat out_fmt = static_cast<MTLPixelFormat>(DrawableFormat());
+        if (output != nil && output.width == output_width && output.height == output_height &&
+            output.pixelFormat == out_fmt) {
+            return true;
+        }
+        if (output != nil) {
+            scheduler.Finish();
+        }
+        output = MakePrivateTexture(device, output_width, output_height, out_fmt,
+                                    scaler_usage | MTLTextureUsageShaderRead);
+        return output != nil;
+    }
+
     bool Prepare(const Device& device, Scheduler& scheduler, MTLPixelFormat format,
                  u32 input_width, u32 input_height, u32 output_width,
                  u32 output_height) API_AVAILABLE(ios(16.0), macos(13.0)) {
@@ -225,6 +306,8 @@ private:
         }
         if (input != nil || output != nil) {
             scheduler.Finish();
+            input = nil;
+            output = nil;
         }
         MTLFXSpatialScalerDescriptor* descriptor = [[MTLFXSpatialScalerDescriptor alloc] init];
         descriptor.inputWidth = input_width;
@@ -253,30 +336,7 @@ private:
             }
             return false;
         }
-        const auto make = [&](u32 width, u32 height, MTLPixelFormat texture_format,
-                              MTLTextureUsage usage) {
-            MTLTextureDescriptor* texture = [MTLTextureDescriptor
-                texture2DDescriptorWithPixelFormat:texture_format
-                                             width:width
-                                            height:height
-                                         mipmapped:NO];
-            texture.storageMode = MTLStorageModePrivate;
-            texture.usage = usage;
-            return [device.GetDevice() newTextureWithDescriptor:texture];
-        };
-        id<MTLTexture> new_input =
-            make(input_width, input_height, format,
-                 spatial.colorTextureUsage | MTLTextureUsageRenderTarget |
-                     MTLTextureUsageShaderRead);
-        id<MTLTexture> new_output =
-            make(output_width, output_height, static_cast<MTLPixelFormat>(DrawableFormat()),
-                 spatial.outputTextureUsage | MTLTextureUsageShaderRead);
-        if (new_input == nil || new_output == nil) {
-            return false;
-        }
         scaler = spatial;
-        input = new_input;
-        output = new_output;
         in_width = input_width;
         in_height = input_height;
         out_width = output_width;
@@ -631,10 +691,6 @@ RendererMetal::RendererMetal(Core::Frontend::EmuWindow& emu_window,
     // The post-processing chain the settings name, as Vulkan's renderer loads it.
     VideoCore::FxChain::Instance().LoadFromSettings();
 #endif
-    LOG_WARNING(Render_Metal,
-                "Metal renderer (experimental): draws, compute dispatches, occlusion queries, "
-                "tessellation, mesh shaders and transform feedback (emulated) run on Metal; "
-                "geometry shaders do not yet");
 }
 
 RendererMetal::~RendererMetal() = default;
@@ -739,9 +795,19 @@ bool RendererMetal::Impl::DrawLayers(std::span<const Tegra::FramebufferConfig> f
             filter == Settings::ScalingFilter::MetalFxSpatial) {
             const u32 out_width = screen.right - screen.left;
             const u32 out_height = screen.bottom - screen.top;
-            if (TextureHandle upscaled = spatial.Upscale(
-                    device, scheduler, texture, src_rect, out_width,
-                    out_height)) {
+            const bool full_target = target.texture != nullptr && target.level == 0 &&
+                                     target.slice == 0 && target.depth_plane == 0 &&
+                                     target_format == DrawableFormat() && screen.left == 0 &&
+                                     screen.top == 0 && out_width == layout.width &&
+                                     out_height == layout.height;
+            bool wrote_direct = false;
+            if (TextureHandle upscaled =
+                    spatial.Upscale(device, scheduler, texture, src_rect, out_width, out_height,
+                                    full_target ? target.texture : nullptr, &wrote_direct)) {
+                if (wrote_direct) {
+                    drawn = true;
+                    continue;
+                }
                 texture = upscaled;
                 src_rect = {0, 0, static_cast<s32>(out_width),
                             static_cast<s32>(out_height)};
@@ -953,6 +1019,10 @@ void RendererMetal::Impl::RunAsyncPresentWorker() {
     pthread_setname_np("MetalPresent");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     const id<MTLSharedEvent> shared_event = (__bridge id<MTLSharedEvent>)scheduler.SharedEvent();
+    MTLRenderPassDescriptor* const reusable_pass = [MTLRenderPassDescriptor new];
+    MTLRenderPassColorAttachmentDescriptor* const pass_color0 = reusable_pass.colorAttachments[0];
+    pass_color0.loadAction = MTLLoadActionDontCare;
+    pass_color0.storeAction = MTLStoreActionStore;
     for (;;) {
         PresentJob job{};
         {
@@ -987,21 +1057,21 @@ void RendererMetal::Impl::RunAsyncPresentWorker() {
                     if (shared_event != nil && job.ready_tick != 0) {
                         [cb encodeWaitForEvent:shared_event value:job.ready_tick];
                     }
-                    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-                    pass.colorAttachments[0].texture = dst_tex;
-                    pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-                    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-                    pass.renderTargetWidth = dst_w;
-                    pass.renderTargetHeight = dst_h;
-                    const id<MTLRenderCommandEncoder> enc =
-                        [cb renderCommandEncoderWithDescriptor:pass];
+                    pass_color0.texture = dst_tex;
+                    reusable_pass.renderTargetWidth = dst_w;
+                    reusable_pass.renderTargetHeight = dst_h;
+                    const id<MTLRenderCommandEncoder> __unsafe_unretained enc =
+                        [cb renderCommandEncoderWithDescriptor:reusable_pass];
+                    pass_color0.texture = nil;
                     if (enc != nil) {
                         enc.label = @"Present Blit";
                         [enc setRenderPipelineState:async_present_pipeline];
                         [enc setViewport:MTLViewport{0.0, 0.0, static_cast<f64>(dst_w),
                                                      static_cast<f64>(dst_h), 0.0, 1.0}];
                         [enc setScissorRect:MTLScissorRect{0, 0, dst_w, dst_h}];
-                        [enc setFragmentTexture:AsTexture(job.texture) atIndex:0];
+                        [enc setFragmentTexture:(__bridge __unsafe_unretained id<MTLTexture>)
+                                                    job.texture
+                                        atIndex:0];
                         [enc setFragmentSamplerState:job.nearest ? async_present_nearest_sampler
                                                                  : async_present_sampler
                                              atIndex:0];

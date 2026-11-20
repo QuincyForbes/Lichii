@@ -39,6 +39,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/pipeline_cache_policy.h"
 #include "video_core/renderer_metal/metal_bind_memo.h"
 #include "video_core/renderer_metal/metal_draw_desc.h"
 #include "video_core/renderer_metal/metal_pipeline_cache.h"
@@ -140,15 +141,80 @@ void ClearSharedLibraryCache() {
     }
 }
 
+[[nodiscard]] u64 SharedLibraryKey(const Device& device, std::string_view source) noexcept {
+    const u64 device_bits =
+        static_cast<u64>(reinterpret_cast<std::uintptr_t>(DeviceHandle(device)));
+    return Common::CityHash64(source.data(), source.size()) ^ (u64{source.size()} << 40) ^
+           (device_bits * 0x9E3779B97F4A7C15ULL);
+}
+
+void EvictSharedLibrariesLocked(SharedLibraryState& state,
+                                std::vector<std::shared_ptr<SharedLibraryEntry>>& evicted) {
+    constexpr size_t MaxCachedLibraries = 8192;
+    if (state.cache.size() < MaxCachedLibraries) {
+        return;
+    }
+    const size_t target_remove = MaxCachedLibraries / 4;
+    evicted.reserve(target_remove);
+    for (auto it = state.cache.begin();
+         it != state.cache.end() && evicted.size() < target_remove;) {
+        if (!it->second) {
+            it = state.cache.erase(it);
+            continue;
+        }
+        std::scoped_lock entry_lock{it->second->mutex};
+        if (!it->second->done) {
+            ++it;
+            continue;
+        }
+        evicted.push_back(std::move(it->second));
+        it = state.cache.erase(it);
+    }
+}
+
+/// Kicks off an asynchronous XPC MTLLibrary build into the shared cache if `source` is not
+/// already cached or in flight, so multi-stage pipelines overlap Vertex/Mesh and Fragment compiles.
+void PrefetchSharedLibraryAsync(const Device& device, const StageProgram& program,
+                                bool plain_first) {
+    const std::string& source =
+        (plain_first && ReductionVariantsEnabled() && program.reduction_slot != ~0U &&
+         !program.msl.empty() && !program.msl_without_reduction.empty())
+            ? program.msl_without_reduction
+            : program.msl;
+    if (source.empty()) {
+        return;
+    }
+    SharedLibraryState& state = GetSharedLibraryState();
+    const u64 key = SharedLibraryKey(device, source);
+    std::shared_ptr<SharedLibraryEntry> entry;
+    std::vector<std::shared_ptr<SharedLibraryEntry>> evicted;
+    {
+        std::scoped_lock lock{state.mutex};
+        if (const auto found = state.cache.find(key); found != state.cache.end() && found->second) {
+            return;
+        }
+        EvictSharedLibrariesLocked(state, evicted);
+        entry = std::make_shared<SharedLibraryEntry>();
+        state.cache[key] = entry;
+    }
+    evicted.clear();
+    CreateLibraryAsync(device, source, [entry](Object library, std::string build_error) {
+        {
+            std::scoped_lock lock{entry->mutex};
+            entry->library = std::move(library);
+            entry->error = std::move(build_error);
+            entry->done = true;
+        }
+        entry->done_cv.notify_all();
+    });
+}
+
 /// Libraries by MSL text, shared by every pipeline using the same program (a fragment program
 /// is often part of dozens of pipelines) so the slow source compile runs once; concurrent
 /// builders of the same text wait for the first one.
 Object SharedLibrary(const Device& device, const std::string& source, std::string& error) {
     SharedLibraryState& state = GetSharedLibraryState();
-    const u64 device_bits =
-        static_cast<u64>(reinterpret_cast<std::uintptr_t>(DeviceHandle(device)));
-    const u64 key = Common::CityHash64(source.data(), source.size()) ^ (u64{source.size()} << 40) ^
-                    (device_bits * 0x9E3779B97F4A7C15ULL);
+    const u64 key = SharedLibraryKey(device, source);
     std::shared_ptr<SharedLibraryEntry> entry;
     std::vector<std::shared_ptr<SharedLibraryEntry>> evicted;
     bool owner = false;
@@ -158,21 +224,7 @@ Object SharedLibrary(const Device& device, const std::string& source, std::strin
         if (found != state.cache.end() && found->second) {
             entry = found->second;
         } else {
-            if (state.cache.size() >= 512) {
-                evicted.reserve(state.cache.size());
-                // Bound the cache; pipelines keep their own references.
-                std::erase_if(state.cache, [&](auto& item) {
-                    if (!item.second) {
-                        return true;
-                    }
-                    std::scoped_lock entry_lock{item.second->mutex};
-                    if (!item.second->done) {
-                        return false;
-                    }
-                    evicted.push_back(std::move(item.second));
-                    return true;
-                });
-            }
+            EvictSharedLibrariesLocked(state, evicted);
             entry = std::make_shared<SharedLibraryEntry>();
             state.cache[key] = entry;
             owner = true;
@@ -538,7 +590,13 @@ void* GraphicsPipeline::KernelState(const Device& device, MeshKernel& kernel) {
     program.function =
         program.library ? CreateFunction(program.library.Get(), program.entry_point) : Object{};
     if (program.function) {
-        kernel.state = CreateComputePipelineState(device, program.function.Get(), error, archive);
+        const u32 wg_threads =
+            kernel.workgroup_size[0] != 0
+                ? (std::max)(1U, kernel.workgroup_size[0] * (std::max)(1U, kernel.workgroup_size[1]) *
+                                     (std::max)(1U, kernel.workgroup_size[2]))
+                : 0U;
+        kernel.state = CreateComputePipelineState(device, program.function.Get(), error, archive,
+                                                  wg_threads, program.immutable_buffer_mask);
         ReleaseSource(program);
     }
     if (!kernel.state) {
@@ -568,8 +626,20 @@ void GraphicsPipeline::FailNative(std::string_view reason) {
 }
 
 bool GraphicsPipeline::BuildNativeFunctions(const Device& device) {
-    for (StageProgram* const stage :
-         {&native_mesh->object, &native_mesh->mesh, &native_mesh->fragment}) {
+    const std::array<StageProgram*, 3> stages{
+        &native_mesh->object, &native_mesh->mesh, &native_mesh->fragment};
+    bool first_pending = true;
+    for (StageProgram* const stage : stages) {
+        if (stage->function || stage->entry_point.empty()) {
+            continue;
+        }
+        if (first_pending) {
+            first_pending = false;
+            continue;
+        }
+        PrefetchSharedLibraryAsync(device, *stage, stage == &native_mesh->fragment);
+    }
+    for (StageProgram* const stage : stages) {
         if (stage->function || stage->entry_point.empty()) {
             continue;
         }
@@ -600,7 +670,20 @@ bool GraphicsPipeline::BuildFunctions(const Device& device) {
         return false;
     }
     StageProgram* const expansion = xfb && xfb->expand ? &xfb->render : nullptr;
-    for (StageProgram* const stage : {&vertex, &fragment, expansion}) {
+    const std::array<StageProgram*, 3> stages{&vertex, &fragment, expansion};
+    bool first_pending = true;
+    for (StageProgram* const stage : stages) {
+        if (stage == nullptr || stage->function || stage->entry_point.empty() ||
+            stage->build_failed) {
+            continue;
+        }
+        if (first_pending) {
+            first_pending = false;
+            continue;
+        }
+        PrefetchSharedLibraryAsync(device, *stage, stage != expansion);
+    }
+    for (StageProgram* const stage : stages) {
         if (stage == nullptr || stage->function || stage->entry_point.empty()) {
             continue;
         }
@@ -648,6 +731,9 @@ std::optional<MeshFunctions> GraphicsPipeline::NativeFunctions(u32 reducing) con
         .payload_bytes = native_mesh->payload_bytes,
         .object_threads = native_mesh->object_threads,
         .mesh_threads = native_mesh->mesh_threads,
+        .object_immutable = native_mesh->object.immutable_buffer_mask,
+        .mesh_immutable = native_mesh->mesh.immutable_buffer_mask,
+        .fragment_immutable = frag.immutable_buffer_mask,
     };
 }
 
@@ -695,7 +781,9 @@ void* GraphicsPipeline::RenderState(const Device& device, RenderPipelineDesc& de
         LOG_INFO(Render_Metal, "Metal: render pipeline {:016x} fragment {:016x}: {}",
                  key.unique_hashes[1], key.unique_hashes[5], Describe(desc));
     }
-    Object state = CreateRenderPipelineState(device, desc, error, archive);
+    const u32 v_imm = desc.expand != 0 && xfb && xfb->expand ? 0U : vertex.immutable_buffer_mask;
+    Object state = CreateRenderPipelineState(device, desc, error, archive, v_imm,
+                                             fragment.immutable_buffer_mask);
     return AdoptState(hash, desc, std::move(state), error, false);
 }
 
@@ -741,8 +829,12 @@ void* ComputePipeline::State(const Device& device) {
     BuildProgramLibrary(device, program, error, true);
     program.function =
         program.library ? CreateFunction(program.library.Get(), program.entry_point) : Object{};
+    const u32 wg_threads =
+        (std::max)(1U, key.workgroup_size[0] * (std::max)(1U, key.workgroup_size[1]) *
+                           (std::max)(1U, key.workgroup_size[2]));
     if (program.function) {
-        state = CreateComputePipelineState(device, program.function.Get(), error, archive);
+        state = CreateComputePipelineState(device, program.function.Get(), error, archive,
+                                           wg_threads, program.immutable_buffer_mask);
         ReleaseSource(program);
     }
     program.function.Reset();
@@ -770,8 +862,12 @@ void* ComputePipeline::ReducingState(const Device& device) {
             ? CreateFunction(program.reducing_library.Get(), program.entry_point)
             : Object{};
     if (program.reducing_function) {
+        const u32 wg_threads =
+            (std::max)(1U, key.workgroup_size[0] * (std::max)(1U, key.workgroup_size[1]) *
+                               (std::max)(1U, key.workgroup_size[2]));
         reducing_state =
-            CreateComputePipelineState(device, program.reducing_function.Get(), error, archive);
+            CreateComputePipelineState(device, program.reducing_function.Get(), error, archive,
+                                       wg_threads, program.immutable_buffer_mask);
     }
     program.reducing_function.Reset();
     program.reducing_library.Reset();
@@ -972,10 +1068,13 @@ void PipelineCache::EvictUnusedPipelines() {
 }
 
 namespace {
+constexpr u64 MetalStageCanonicalVersion = 3ULL;
+
 [[nodiscard]] u64 MetalWarmVariant(u32 apple_family, bool mesh_shaders) {
     const auto& resolution = Settings::values.resolution_info;
-    const std::array<u64, 8> inputs{
+    const std::array<u64, 9> inputs{
         VideoCommon::ShaderWarm::EmissionStamp(),
+        MetalStageCanonicalVersion,
         u64{apple_family},
         mesh_shaders ? 1ULL : 0ULL,
         TranslateForIos ? 1ULL : 0ULL,
@@ -1194,7 +1293,8 @@ private:
         const char* const v = std::getenv("EDEN_NX2_METAL_SAFE_MATH");
         return v != nullptr && v[0] == '1';
     }();
-    const std::array<u64, 4> inputs{
+    const std::array<u64, 5> inputs{
+        MetalStageCanonicalVersion,
         u64{apple_family},
         TranslateForIos ? 1ULL : 0ULL,
         full_fast_math ? 1ULL : 0ULL,
@@ -1453,7 +1553,9 @@ void SubmitWarmComputeAsync(const Device& device, StageProgram&& program,
     SplitWarmStageMsl(program, primary_msl, fallback_msl);
     std::string entry_point = std::move(program.entry_point);
     const u32 workgroup_threads =
-        (std::max)(1U, key.workgroup_size[0] * key.workgroup_size[1] * key.workgroup_size[2]);
+        (std::max)(1U, key.workgroup_size[0] * (std::max)(1U, key.workgroup_size[1]) *
+                           (std::max)(1U, key.workgroup_size[2]));
+    const u32 immutable_mask = program.immutable_buffer_mask;
     const u64 ledger_key = MakeComputeLedgerKey(primary_msl, entry_point, ledger_variant);
     if (!ledger.TryBegin(ledger_key)) {
         skipped.fetch_add(1, std::memory_order_relaxed);
@@ -1464,10 +1566,10 @@ void SubmitWarmComputeAsync(const Device& device, StageProgram&& program,
     CreateLibraryAsync(
         device, primary_msl,
         [&device, &archive, &ledger, &gate, &built, &failed, ledger_key, workgroup_threads,
-         entry = std::move(entry_point), fallback = std::move(fallback_msl),
+         immutable_mask, entry = std::move(entry_point), fallback = std::move(fallback_msl),
          dump = std::move(dump_copy)](Object library, std::string error) mutable {
             auto finish_pso = [&device, &archive, &ledger, &gate, &built, &failed, ledger_key,
-                               workgroup_threads](Object lib, const std::string& ep) {
+                               workgroup_threads, immutable_mask](Object lib, const std::string& ep) {
                 const void* const lib_handle = lib.Get();
                 auto lib_keep = std::make_shared<Object>(std::move(lib));
                 CreateComputeStateAsync(
@@ -1481,7 +1583,8 @@ void SubmitWarmComputeAsync(const Device& device, StageProgram&& program,
                         ledger.Complete(ledger_key, ok);
                         (ok ? built : failed).fetch_add(1, std::memory_order_relaxed);
                         gate.Release();
-                    });
+                    },
+                    immutable_mask);
             };
             if (library) {
                 finish_pso(std::move(library), entry);
@@ -1596,6 +1699,9 @@ WarmGraphicsResult WarmGraphicsStages(
                             ++reader.read;
                             reader.position = reader.file.tellg();
                             std::tie(metal_key, slot) = MetalKeyFromWarmKey(raw_key);
+                            if (slot == 1) {
+                                metal_key.attribute_types &= VideoCommon::VertexAttributeMaskOf(env);
+                            }
                             if (slot != 0) {
                                 duplicate = !reader.seen_keys.insert(metal_key.Hash()).second;
                             }
@@ -2076,13 +2182,30 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 finish();
             });
         };
+        static const bool boot_used_only = [] {
+            const char* const value = std::getenv("EDEN_NX2_METAL_BOOT_USED_ONLY");
+            return value != nullptr && value[0] == '1';
+        }();
+        const auto mask_disk_key = [](GraphicsPipelineKey& key,
+                                      std::span<const VideoCommon::FileEnvironment> envs) {
+            std::array<u64, MaxPrograms> masks;
+            masks.fill(~u64{0});
+            size_t env_idx = 0;
+            for (size_t stage = 0; stage < MaxPrograms; ++stage) {
+                if (key.unique_hashes[stage] != 0 && env_idx < envs.size()) {
+                    masks[stage] = VideoCommon::VertexAttributeMaskOf(envs[env_idx++]);
+                }
+            }
+            key.attribute_types =
+                VideoCommon::KeyedAttributeTypes(key.attribute_types, key.unique_hashes, masks);
+        };
         const auto load_compute = [&](std::ifstream& file, VideoCommon::FileEnvironment env) {
             ComputePipelineKey key;
             file.read(reinterpret_cast<char*>(&key), sizeof(key));
             if (!disk_compute.insert(key).second || !build) {
                 return;
             }
-            if (!precache && !files.BuildAtBoot(key.Hash())) {
+            if (boot_used_only && !precache && !files.BuildAtBoot(key.Hash())) {
                 ++unlisted;
                 return;
             }
@@ -2090,16 +2213,22 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         };
         const auto load_graphics = [&](std::ifstream& file,
                                        std::vector<VideoCommon::FileEnvironment> envs) {
-            GraphicsPipelineKey key;
-            file.read(reinterpret_cast<char*>(&key), sizeof(key));
+            GraphicsPipelineKey orig_key;
+            file.read(reinterpret_cast<char*>(&orig_key), sizeof(orig_key));
+            GraphicsPipelineKey key = orig_key;
+            mask_disk_key(key, envs);
             if (!disk_graphics.insert(key).second || !build || envs.size() > MaxPrograms) {
                 return;
             }
-            if (!precache && !files.BuildAtBoot(key.Hash())) {
+            if (boot_used_only && !precache && !files.BuildAtBoot(key.Hash()) &&
+                !files.BuildAtBoot(orig_key.Hash())) {
                 ++unlisted;
                 return;
             }
-            const auto found = states.find(key);
+            auto found = states.find(key);
+            if (found == states.end() && !(key == orig_key)) {
+                found = states.find(orig_key);
+            }
             const std::vector<RenderPipelineDesc>* const descs =
                 found != states.end() ? &found->second : nullptr;
             {
@@ -2174,7 +2303,6 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
         workers.WaitForRequests(stop_loading);
     }
-    ClearSharedLibraryCache();
     if (!build) {
         return;
     }
@@ -2216,6 +2344,8 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         return nullptr;
     }
     PipelineTranslator::RefreshKey(graphics_key, maxwell3d->regs, DrawTopology(*maxwell3d));
+    graphics_key.attribute_types = VideoCommon::KeyedAttributeTypes(
+        graphics_key.attribute_types, graphics_key.unique_hashes, vertex_attribute_masks);
     const u64 current_frame = frame_count.load(std::memory_order_relaxed);
     if (current_pipeline != nullptr && current_pipeline->Key() == graphics_key) {
         current_pipeline->SetLastUse(current_frame);
@@ -2448,6 +2578,11 @@ void* PipelineCache::RenderState(GraphicsPipeline& pipeline, RenderPipelineDesc&
         auto build = std::make_shared<StateBuild>();
         build->desc = desc;
         build->native = pipeline.NativeFunctions(reducing);
+        build->vertex_immutable =
+            desc.expand != 0 && pipeline.Xfb() && pipeline.Xfb()->expand
+                ? 0U
+                : pipeline.Vertex().immutable_buffer_mask;
+        build->fragment_immutable = pipeline.Fragment().immutable_buffer_mask;
         StateBuild* const raw = build.get();
         build->job = std::make_shared<PipelineBuildJob>([this, raw](PipelineTranslator&) {
             InAutoreleasePool([&] {
@@ -2455,7 +2590,9 @@ void* PipelineCache::RenderState(GraphicsPipeline& pipeline, RenderPipelineDesc&
                                                                          *raw->native, raw->error,
                                                                          &archive)
                                          : CreateRenderPipelineState(device, raw->desc,
-                                                                     raw->error, &archive);
+                                                                     raw->error, &archive,
+                                                                     raw->vertex_immutable,
+                                                                     raw->fragment_immutable);
             });
         });
         builders->QueueWork([build](PipelineTranslator* worker) { build->job->Run(*worker); });

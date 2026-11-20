@@ -82,8 +82,19 @@ public:
     const std::filesystem::path path;
 };
 
+constexpr Settings::RendererBackend ExpectedDefaultBackend() {
+#if defined(__APPLE__)
+    return Settings::RendererBackend::Metal;
+#elif defined(__sun__) || defined(__managarm__)
+    return Settings::RendererBackend::OpenGL_GLSL;
+#else
+    return Settings::RendererBackend::Vulkan;
+#endif
+}
+
 void CheckFreshProfile() {
     const auto& values = Settings::values;
+    CHECK(values.renderer_backend.GetValue() == ExpectedDefaultBackend());
     CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::Fsr3);
     CHECK(values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::Low);
     CHECK(values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);
@@ -95,6 +106,7 @@ void CheckFreshProfile() {
 // values became the defaults too.
 void CheckLegacyProfile() {
     const auto& values = Settings::values;
+    CHECK(values.renderer_backend.GetValue() == ExpectedDefaultBackend());
     CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::ScaleForce);
     CHECK(values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::Low);
     CHECK(values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);
@@ -176,7 +188,7 @@ TEST_CASE("Absent global config receives the first-run profile and persists it",
     file.close();
     CHECK_FALSE(saved.GetBoolValue("Renderer", "scaling_filter\\default", true));
     // Seeded with their defaults, so they are saved as defaults.
-    for (const char* key : {"gpu_accuracy", "nvdec_emulation", "async_presentation",
+    for (const char* key : {"backend", "gpu_accuracy", "nvdec_emulation", "async_presentation",
                             "use_asynchronous_shaders"}) {
         CHECK(saved.GetBoolValue("Renderer", (std::string{key} + "\\default").c_str(), false));
     }

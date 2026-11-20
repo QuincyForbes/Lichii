@@ -17,7 +17,9 @@
 #include <unordered_set>
 #include <memory>
 #include <mutex>
+#include <stop_token>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include "common/container/unordered_map.h"
 #include <vector>
@@ -138,6 +140,25 @@ struct ComputePipelineCacheEntry {
 /// missing. 0 waits for every pipeline, 1 skips by the legacy heuristic alone, 2 (the default)
 /// skips only draws into render targets the frame clears and redraws.
 [[nodiscard]] int AsyncDiscardMode();
+
+struct OfflineWarmSummary {
+    bool ok{};
+    size_t built{};
+    size_t skipped{};
+    size_t failed{};
+    std::string error;
+};
+
+/// Headless offline precompilation of extracted `warm-compute.bin` and `warm-graphics.bin` into
+/// the title's Vulkan pipeline cache and host GPU driver shader cache without booting the game.
+OfflineWarmSummary CompileWarmShadersOffline(
+    u64 title_id, std::stop_token stop,
+    const std::function<void(size_t done, size_t total, std::string_view stage)>& on_progress = {});
+
+/// Whether `title_id` has Vulkan warm shader work pending (missing/stale warm files, missing or
+/// mismatched `.done` stamp for the current Vulkan device/driver and settings variant, or missing
+/// driver pipeline cache file when enabled).
+[[nodiscard]] bool VulkanWarmPending(u64 title_id);
 
 class PipelineCache : public VideoCommon::ShaderCache {
 public:

@@ -72,9 +72,9 @@ u32 ActorDepthTolerance() {
 // The passes Vulkan's TryOcarinaBilinear takes: 2560x1440 (menus, gameplay), the gameplay one
 // when the scene is under half the target (above 0.4 of it, and 0.4 and below: oot_resolution
 // 40 % and 33 %) and the 0xe40f5efb5480e692 one.
-constexpr std::array<u64, 5> BilinearShaders{0x4c1ae2fe58f30a97ULL, 0x9302bc0d6d1d9bc1ULL,
-                                             0x03bf0ffc7d2d0bedULL, 0x31c0acb7c5e87c89ULL,
-                                             0xe40f5efb5480e692ULL};
+[[maybe_unused]] constexpr std::array<u64, 5> BilinearShaders{
+    0x4c1ae2fe58f30a97ULL, 0x9302bc0d6d1d9bc1ULL, 0x03bf0ffc7d2d0bedULL, 0x31c0acb7c5e87c89ULL,
+    0xe40f5efb5480e692ULL};
 // Vulkan's ComputePipeline::CanReplaceOcarinaUpscale passes but the full-size and 3/4 ones only
 // FSR 3.1 replaces; the first five scale to 2560x1440 (TryOcarinaUpscale's upscale_4k).
 constexpr std::array<u64, 6> TemporalShaders{
@@ -120,8 +120,11 @@ bool BuildPass(const Device& device, PassT& pass, std::span<const u32> code, std
     }
     pass.library = CreateLibrary(device, msl.source, error);
     pass.function = pass.library ? CreateFunction(pass.library.Get(), msl.entry_point) : Object{};
-    pass.state = pass.function ? CreateComputePipelineState(device, pass.function.Get(), error)
-                               : Object{};
+    pass.state =
+        pass.function
+            ? CreateComputePipelineState(device, pass.function.Get(), error, nullptr,
+                                         GroupSize * GroupSize)
+            : Object{};
     pass.slots = msl.slots;
     return static_cast<bool>(pass.state);
 }
@@ -160,7 +163,9 @@ bool OcarinaUpscale::Prepare() {
     if (!msl.source.empty()) {
         library = CreateLibrary(device, msl.source, error);
         function = library ? CreateFunction(library.Get(), msl.entry_point) : Object{};
-        state = function ? CreateComputePipelineState(device, function.Get(), error) : Object{};
+        state = function ? CreateComputePipelineState(device, function.Get(), error, nullptr,
+                                                      GroupSize * GroupSize)
+                         : Object{};
     }
     sampler = CreateLinearClampSampler(device);
     if (!state || !sampler) {
@@ -196,7 +201,7 @@ bool OcarinaUpscale::Bilinear(TextureHandle color, std::array<u32, 2> color_size
             break;
         case ShaderTranslate::ResourceKind::Texture:
             scheduler.BindTexture(ShaderStage::Compute, slot.index,
-                                  slot.binding == 0 ? color : target);
+                                  slot.binding == 0 ? color : target, false, slot.binding != 0);
             break;
         case ShaderTranslate::ResourceKind::Sampler:
             scheduler.BindSampler(ShaderStage::Compute, slot.index, sampler.Get());
@@ -266,7 +271,9 @@ bool CameraMotionPass::Prepare() {
     if (!msl.source.empty()) {
         library = CreateLibrary(device, msl.source, error);
         function = library ? CreateFunction(library.Get(), msl.entry_point) : Object{};
-        state = function ? CreateComputePipelineState(device, function.Get(), error) : Object{};
+        state = function ? CreateComputePipelineState(device, function.Get(), error, nullptr,
+                                                      GroupSize * GroupSize)
+                         : Object{};
     }
     // The shader fetches texels (Vulkan binds a nearest sampler for it).
     sampler = CreateLinearClampSampler(device);
@@ -314,7 +321,8 @@ bool CameraMotionPass::Record(TextureHandle depth, std::array<u32, 2> extent,
             break;
         case ShaderTranslate::ResourceKind::Texture:
             scheduler.BindTexture(ShaderStage::Compute, slot.index,
-                                  slot.binding == 0 ? depth : motion.Get());
+                                  slot.binding == 0 ? depth : motion.Get(), false,
+                                  slot.binding != 0);
             break;
         case ShaderTranslate::ResourceKind::Sampler:
             scheduler.BindSampler(ShaderStage::Compute, slot.index, sampler.Get());
@@ -605,7 +613,8 @@ void OcarinaTemporal::Run(const Pass& pass, std::span<const TextureHandle> input
             break;
         case ShaderTranslate::ResourceKind::Texture:
             scheduler.BindTexture(ShaderStage::Compute, slot.index,
-                                  slot.binding < inputs.size() ? inputs[slot.binding] : output);
+                                  slot.binding < inputs.size() ? inputs[slot.binding] : output,
+                                  false, slot.binding >= inputs.size());
             break;
         case ShaderTranslate::ResourceKind::Sampler:
             scheduler.BindSampler(ShaderStage::Compute, slot.index, sampler.Get());
@@ -721,7 +730,7 @@ bool OcarinaTemporal::DrawActor(TextureHandle depth, std::array<u32, 2> extent,
             scheduler.BindBuffer(ShaderStage::Vertex, resource.index,
                                  resource.binding == 0 ? slot->current.Get()
                                                        : slot->previous.Get(),
-                                 0);
+                                 0, false);
         } else if (resource.binding == 2) {
             scheduler.BindBytes(ShaderStage::Vertex, resource.index, &transforms,
                                 static_cast<u32>(sizeof(transforms)));
@@ -740,7 +749,7 @@ bool OcarinaTemporal::DrawActor(TextureHandle depth, std::array<u32, 2> extent,
             }
             break;
         case ShaderTranslate::ResourceKind::Texture:
-            scheduler.BindTexture(ShaderStage::Fragment, resource.index, depth);
+            scheduler.BindTexture(ShaderStage::Fragment, resource.index, depth, false, false);
             break;
         case ShaderTranslate::ResourceKind::Sampler:
             scheduler.BindSampler(ShaderStage::Fragment, resource.index, sampler.Get());
@@ -965,7 +974,8 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
                 break;
             case ShaderTranslate::ResourceKind::Texture:
                 scheduler.BindTexture(ShaderStage::Compute, slot.index,
-                                      slot.binding == 0 ? output : frame.target);
+                                      slot.binding == 0 ? output : frame.target, false,
+                                      slot.binding != 0);
                 break;
             case ShaderTranslate::ResourceKind::Sampler:
                 scheduler.BindSampler(ShaderStage::Compute, slot.index, out_sampler);

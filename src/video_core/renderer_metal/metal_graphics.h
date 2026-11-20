@@ -263,7 +263,9 @@ struct DepthStencilDesc {
 /// With `archive`, the pipeline's GPU code is looked up there first and added on a miss.
 [[nodiscard]] Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc& desc,
                                                std::string& error,
-                                               PipelineArchive* archive = nullptr);
+                                               PipelineArchive* archive = nullptr,
+                                               u32 vertex_immutable = 0,
+                                               u32 fragment_immutable = 0);
 
 /// The functions of a Metal 3 mesh pipeline (NativeMesh) and what else its descriptor takes
 /// besides desc's targets and blending.
@@ -274,6 +276,9 @@ struct MeshFunctions {
     u32 payload_bytes;
     u32 object_threads;
     u32 mesh_threads;
+    u32 object_immutable{};
+    u32 mesh_immutable{};
+    u32 fragment_immutable{};
 };
 
 /// An MTLRenderPipelineState from an MTLMeshRenderPipelineDescriptor: desc's targets, blending,

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -406,12 +407,14 @@ std::optional<SparseTexture> CreateSparseTexture(const Device& device, const Tex
 }
 
 u64 SparseHeapUsedBytes(const void* heap) {
-    return heap != nullptr ? static_cast<u64>(((__bridge id<MTLHeap>)heap).usedSize) : 0;
+    const id<MTLHeap> __unsafe_unretained mtl_heap = (__bridge __unsafe_unretained id<MTLHeap>)heap;
+    return mtl_heap != nil ? static_cast<u64>(mtl_heap.usedSize) : 0;
 }
 
 Object CreateTextureView(TextureHandle texture, u32 format, TextureKind kind, u32 base_level,
                          u32 levels, u32 base_layer, u32 layers, std::array<u8, 4> swizzle) {
-    const id<MTLTexture> base = AsTexture(texture);
+    const id<MTLTexture> __unsafe_unretained base =
+        (__bridge __unsafe_unretained id<MTLTexture>)texture;
     if (base == nil) {
         return {};
     }
@@ -468,7 +471,8 @@ u32 TextureBufferAlignment(const Device& device, u32 format) {
 
 Object CreateTextureBufferView(BufferHandle buffer, u64 offset, u32 elements, u32 bytes_per_texel,
                                u32 format, bool writable) {
-    const id<MTLBuffer> object = AsBuffer(buffer);
+    const id<MTLBuffer> __unsafe_unretained object =
+        (__bridge __unsafe_unretained id<MTLBuffer>)buffer;
     if (object == nil || elements == 0) {
         return {};
     }
@@ -488,11 +492,16 @@ Object CreateTextureBufferView(BufferHandle buffer, u64 offset, u32 elements, u3
     }
 }
 
-Object CreateBuffer(const Device& device, u64 size, bool shared, u8** contents) {
+Object CreateBuffer(const Device& device, u64 size, bool shared, u8** contents,
+                    bool untracked_write_combined) {
     @autoreleasepool {
-        const MTLResourceOptions options =
-            shared ? (MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache)
-                   : MTLResourceStorageModePrivate;
+        MTLResourceOptions options = MTLResourceStorageModePrivate;
+        if (shared) {
+            options = untracked_write_combined
+                          ? (MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined |
+                             MTLResourceHazardTrackingModeUntracked)
+                          : (MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache);
+        }
         const id<MTLBuffer> buffer =
             [device.GetDevice() newBufferWithLength:(std::max)(size, u64{16}) options:options];
         if (contents != nullptr) {
@@ -688,10 +697,31 @@ namespace {
     } else {
         options.fastMathEnabled = YES;
     }
+    if (@available(iOS 17.0, macOS 14.0, *)) {
+        if (options.languageVersion < MTLLanguageVersion3_1) {
+            options.languageVersion = MTLLanguageVersion3_1;
+        }
+    }
     if (@available(iOS 14.0, macOS 11.0, *)) {
         options.preserveInvariance = YES;
     }
     return options;
+}
+
+void ConfigureComputeDescriptor(MTLComputePipelineDescriptor* descriptor, u32 workgroup_threads,
+                                u32 immutable_buffers) {
+    if (workgroup_threads > 0) {
+        const u32 clamped = (std::min)(workgroup_threads, 1024U);
+        descriptor.maxTotalThreadsPerThreadgroup = clamped;
+        descriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth =
+            (clamped >= 32 && (clamped % 32) == 0) ? YES : NO;
+    }
+    u32 mask = immutable_buffers & ((1U << 31) - 1U);
+    while (mask != 0) {
+        const u32 slot = static_cast<u32>(std::countr_zero(mask));
+        mask &= mask - 1U;
+        descriptor.buffers[slot].mutability = MTLMutabilityImmutable;
+    }
 }
 } // Anonymous namespace
 
@@ -743,7 +773,8 @@ void CreateLibraryAsync(const Device& device, std::string_view msl,
 }
 
 Object CreateFunction(const void* library, std::string_view name) {
-    const id<MTLLibrary> object = (__bridge id<MTLLibrary>)library;
+    const id<MTLLibrary> __unsafe_unretained object =
+        (__bridge __unsafe_unretained id<MTLLibrary>)library;
     if (object == nil) {
         return {};
     }
@@ -809,20 +840,41 @@ Object CreateComputeState(const Device& device, MTLComputePipelineDescriptor* de
 }
 
 Object CreateComputePipelineState(const Device& device, const void* function, std::string& error,
-                                  PipelineArchive* archive) {
+                                  PipelineArchive* archive, u32 workgroup_threads,
+                                  u32 immutable_buffers) {
+    const id<MTLFunction> __unsafe_unretained mtl_function =
+        (__bridge __unsafe_unretained id<MTLFunction>)function;
+    if (mtl_function == nil) {
+        error = "compute function is null";
+        return {};
+    }
     @autoreleasepool {
+        if (workgroup_threads == 0 && immutable_buffers == 0 && archive == nullptr) {
+            NSError* ns_error = nil;
+            const id<MTLComputePipelineState> state =
+                [device.GetDevice() newComputePipelineStateWithFunction:mtl_function
+                                                                  error:&ns_error];
+            if (state == nil) {
+                error =
+                    ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
+                return {};
+            }
+            return Retain(state);
+        }
         MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
-        descriptor.computeFunction = (__bridge id<MTLFunction>)function;
+        descriptor.computeFunction = mtl_function;
+        ConfigureComputeDescriptor(descriptor, workgroup_threads, immutable_buffers);
         return CreateComputeState(device, descriptor, error, archive);
     }
 }
 
 void CreateComputeStateAsync(const Device& device, const void* library, std::string_view entry_name,
                              u32 workgroup_threads, PipelineArchive* archive,
-                             std::function<void(Object, std::string)> on_done) {
-    static_cast<void>(workgroup_threads);
+                             std::function<void(Object, std::string)> on_done,
+                             u32 immutable_buffers) {
     @autoreleasepool {
-        const id<MTLLibrary> mtl_lib = (__bridge id<MTLLibrary>)library;
+        const id<MTLLibrary> __unsafe_unretained mtl_lib =
+            (__bridge __unsafe_unretained id<MTLLibrary>)library;
         NSString* const ns_entry = mtl_lib != nil ? ToNSString(entry_name) : nil;
         const id<MTLFunction> function =
             mtl_lib != nil && ns_entry != nil ? [mtl_lib newFunctionWithName:ns_entry] : nil;
@@ -834,6 +886,7 @@ void CreateComputeStateAsync(const Device& device, const void* library, std::str
         }
         MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
         descriptor.computeFunction = function;
+        ConfigureComputeDescriptor(descriptor, workgroup_threads, immutable_buffers);
 
         const id<MTLBinaryArchive> binary =
             archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
@@ -910,7 +963,8 @@ u64 DeviceAllocatedSize(const Device& device) {
 }
 
 TextureFacts DescribeTexture(TextureHandle texture) {
-    const id<MTLTexture> object = AsTexture(texture);
+    const id<MTLTexture> __unsafe_unretained object =
+        (__bridge __unsafe_unretained id<MTLTexture>)texture;
     if (object == nil) {
         return {.format = 0};
     }
@@ -928,12 +982,14 @@ TextureFacts DescribeTexture(TextureHandle texture) {
 }
 
 u64 AllocatedSize(const void* resource) {
-    const id<MTLResource> object = (__bridge id<MTLResource>)resource;
+    const id<MTLResource> __unsafe_unretained object =
+        (__bridge __unsafe_unretained id<MTLResource>)resource;
     return object != nil ? object.allocatedSize : 0;
 }
 
 void SetLabel(const void* resource, std::string_view label) {
-    const id<MTLResource> object = (__bridge id<MTLResource>)resource;
+    const id<MTLResource> __unsafe_unretained object =
+        (__bridge __unsafe_unretained id<MTLResource>)resource;
     if (object != nil) {
         @autoreleasepool {
             object.label = ToNSString(label);

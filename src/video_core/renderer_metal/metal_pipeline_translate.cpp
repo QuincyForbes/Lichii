@@ -315,7 +315,7 @@ static_assert(std::is_trivially_copyable_v<ShaderTranslate::ResourceSlot>);
 static_assert(std::is_trivially_copyable_v<ShaderTranslate::TessellationSlots>);
 
 constexpr std::array<char, 8> StageMslMagic{'M', 'T', 'L', 'S', 'T', 'G', '0', '2'};
-constexpr u32 StageMslVersion = 2;
+constexpr u32 StageMslVersion = 3;
 constexpr u32 MaxMslSourceBytes = 16U << 20;
 constexpr u32 MaxStageRecordBytes = 40U << 20;
 
@@ -382,6 +382,7 @@ static_assert(sizeof(StageRecordHeader) == 24);
     put_u32(res.sampler_spill_slot);
     put_u32(res.array_spill_slot);
     put_u32(res.array_spill_entries);
+    put_u32(res.immutable_buffer_mask);
     return buf;
 }
 
@@ -436,7 +437,8 @@ static_assert(sizeof(StageRecordHeader) == 24);
     if (!get_bytes(&res.tessellation_slots, sizeof(res.tessellation_slots)) ||
         !get_u32(res.reduction_slot) || !get_u32(res.spill_slot) ||
         !get_u32(res.sampler_spill_slot) || !get_u32(res.array_spill_slot) ||
-        !get_u32(res.array_spill_entries) || cursor != data.size() || res.source.empty()) {
+        !get_u32(res.array_spill_entries) || !get_u32(res.immutable_buffer_mask) ||
+        cursor != data.size() || res.source.empty()) {
         return std::nullopt;
     }
     return res;
@@ -981,6 +983,14 @@ PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_m
     });
     translate_options.ios = ios;
     translate_options.apple_family = apple_family;
+#if (defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000) || \
+    (defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 170000)
+    if (apple_family >= 8) {
+        // MSL 3.1 enables native hardware texture atomics on Apple8+ (A15/M2/M3/M4+) instead of
+        // SPIRV-Cross synthesizing auxiliary atomic buffers.
+        translate_options.msl_minor = 1;
+    }
+#endif
     translate_options.sampler_reduction = ShaderTranslate::SamplerReductionEnabled();
     translate_options.spill_buffers = true;
 }
@@ -1111,6 +1121,7 @@ std::optional<StageProgram> PipelineTranslator::FromSpirv(std::span<const u32> s
         .sampler_spill_slot = result.sampler_spill_slot,
         .array_spill_slot = result.array_spill_slot,
         .array_spill_entries = result.array_spill_entries,
+        .immutable_buffer_mask = result.immutable_buffer_mask,
     };
 }
 
@@ -1319,7 +1330,7 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
         return Tessellated(key, programs);
     }
 
-    Shader::Backend::Bindings bindings;
+    Shader::Backend::Bindings vertex_bindings;
     Shader::RuntimeInfo vertex_info;
     vertex_info.previous_stage_stores.mask.set();
     vertex_info.input_topology = InputTopology(static_cast<Maxwell::PrimitiveTopology>(key.topology));
@@ -1328,6 +1339,13 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
                                    Shader::AttributeType::SignedInt,
                                    Shader::AttributeType::UnsignedInt};
         vertex_info.generic_input_types[attribute] = types[(key.attribute_types >> (attribute * 2)) & 3];
+    }
+    if (!programs[1].info.loads.Legacy() && !programs[1].info.passthrough.mask.any()) {
+        for (size_t attribute = 0; attribute < vertex_info.generic_input_types.size(); ++attribute) {
+            if (!programs[1].info.loads.Generic(attribute)) {
+                vertex_info.generic_input_types[attribute] = Shader::AttributeType::Disabled;
+            }
+        }
     }
     ApplyVertexState(vertex_info, key);
     // Only a draw of points takes a point size.
@@ -1341,7 +1359,7 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
     if (key.xfb.Active() || expands) {
         // The vertex program once more as capture kernels, from the same SPIR-V.
         ConvertLegacyToGeneric(programs[1], vertex_info);
-        const std::vector<u32> spirv = EmitSPIRV(profile, vertex_info, programs[1], bindings);
+        const std::vector<u32> spirv = EmitSPIRV(profile, vertex_info, programs[1], vertex_bindings);
         vertex = FromSpirv(spirv, programs[1], ShaderTranslate::Stage::Vertex, vertex_options);
         xfb = XfbPrograms(key, spirv, programs[1]);
         if (!xfb) {
@@ -1374,7 +1392,7 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
     } else {
         if (stage_reuse.reused[1] && programs[1].blocks.empty()) {
             const std::vector<u8> rt_key =
-                VideoCommon::StageCache::RuntimeKey(vertex_info, bindings);
+                VideoCommon::StageCache::RuntimeKey(vertex_info, vertex_bindings);
             if (!stage_cache->FindEmitted(*stage_reuse.reused[1], rt_key)) {
                 Shader::Environment& v_env = *envs[0];
                 const u32 cfg_offset =
@@ -1383,7 +1401,7 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
                 programs[1] = TranslateProgram(pools.inst, pools.block, v_env, cfg, host_info);
             }
         }
-        vertex = TranslateCached(1, programs[1], ShaderTranslate::Stage::Vertex, bindings,
+        vertex = TranslateCached(1, programs[1], ShaderTranslate::Stage::Vertex, vertex_bindings,
                                  vertex_info, &vertex_options);
     }
     if (!vertex) {
@@ -1391,14 +1409,24 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
     }
     StageProgram fragment{};
     if (key.unique_hashes[5] != 0) {
+        // Metal binds each stage's descriptors independently starting from slot 0, so reset
+        // Bindings and canonicalize previous_stage_stores when all loaded varyings are written.
+        // That lets StageMslCache and macOS's MTLLibrary cache hit WarmSingleStage across all
+        // vertex shaders.
+        Shader::Backend::Bindings fragment_bindings;
         Shader::RuntimeInfo fragment_info;
-        fragment_info.previous_stage_stores = programs[1].info.stores;
-        fragment_info.previous_stage_legacy_stores_mapping =
-            programs[1].info.legacy_stores_mapping;
+        if (!programs[5].info.loads.Legacy() && !programs[5].info.passthrough.mask.any() &&
+            (programs[5].info.loads.mask & ~programs[1].info.stores.mask).none()) {
+            fragment_info.previous_stage_stores.mask.set();
+        } else {
+            fragment_info.previous_stage_stores = programs[1].info.stores;
+            fragment_info.previous_stage_legacy_stores_mapping =
+                programs[1].info.legacy_stores_mapping;
+        }
         ApplyFragmentState(fragment_info, key);
         if (stage_reuse.reused[5] && programs[5].blocks.empty()) {
             const std::vector<u8> rt_key =
-                VideoCommon::StageCache::RuntimeKey(fragment_info, bindings);
+                VideoCommon::StageCache::RuntimeKey(fragment_info, fragment_bindings);
             if (!stage_cache->FindEmitted(*stage_reuse.reused[5], rt_key)) {
                 Shader::Environment& f_env = *envs.back();
                 const u32 cfg_offset =
@@ -1408,7 +1436,7 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
             }
         }
         auto translated =
-            TranslateCached(5, programs[5], ShaderTranslate::Stage::Fragment, bindings,
+            TranslateCached(5, programs[5], ShaderTranslate::Stage::Fragment, fragment_bindings,
                             fragment_info);
         if (!translated) {
             return std::nullopt;
@@ -2031,7 +2059,6 @@ std::optional<NativeMesh> PipelineTranslator::NativeMeshPipeline(
         cause = saved_cause;
         detail = saved_detail;
     };
-    Shader::Backend::Bindings bindings;
     NativeMesh native{
         .mesh_stage = static_cast<u32>(mesh_index - 1),
         .payload_bytes = has_task ? task->mesh.payload_words * 4 : 0U,
@@ -2043,16 +2070,18 @@ std::optional<NativeMesh> PipelineTranslator::NativeMeshPipeline(
     // As Vulkan's MakeRuntimeInfo for native task and mesh programs; the mesh program writes its
     // outputs directly (RuntimeInfo::mesh_direct_outputs), as on MoltenVK.
     if (has_task) {
+        Shader::Backend::Bindings object_bindings;
         Shader::RuntimeInfo task_info;
         task_info.previous_stage_stores.mask.set();
         task_info.y_negate = (key.state & StateLowerLeftOrigin) != 0;
-        auto object = Translate(*task, ShaderTranslate::Stage::Object, bindings, task_info);
+        auto object = Translate(*task, ShaderTranslate::Stage::Object, object_bindings, task_info);
         if (!object) {
             keep_cause();
             return std::nullopt;
         }
         native.object = std::move(*object);
     }
+    Shader::Backend::Bindings mesh_bindings;
     Shader::RuntimeInfo mesh_info;
     mesh_info.previous_stage_stores.mask.set();
     mesh_info.y_negate = (key.state & StateLowerLeftOrigin) != 0;
@@ -2061,16 +2090,22 @@ std::optional<NativeMesh> PipelineTranslator::NativeMeshPipeline(
         mesh_info.fixed_state_point_size = std::bit_cast<float>(key.point_size);
     }
     mesh_info.mesh_direct_outputs = true;
-    auto mesh_function = Translate(mesh, ShaderTranslate::Stage::Mesh, bindings, mesh_info);
+    auto mesh_function = Translate(mesh, ShaderTranslate::Stage::Mesh, mesh_bindings, mesh_info);
     if (!mesh_function) {
         keep_cause();
         return std::nullopt;
     }
     native.mesh = std::move(*mesh_function);
     if (key.unique_hashes[5] != 0) {
+        Shader::Backend::Bindings fragment_bindings;
         Shader::RuntimeInfo fragment_info;
-        fragment_info.previous_stage_stores = mesh.info.stores;
-        fragment_info.previous_stage_legacy_stores_mapping = mesh.info.legacy_stores_mapping;
+        if (!programs[5].info.loads.Legacy() && !programs[5].info.passthrough.mask.any() &&
+            (programs[5].info.loads.mask & ~mesh.info.stores.mask).none()) {
+            fragment_info.previous_stage_stores.mask.set();
+        } else {
+            fragment_info.previous_stage_stores = mesh.info.stores;
+            fragment_info.previous_stage_legacy_stores_mapping = mesh.info.legacy_stores_mapping;
+        }
         for (const u32 line : mesh.mesh.primitive_lines) {
             const auto attribute = static_cast<Shader::IR::Attribute>(line);
             if (Shader::IR::IsGeneric(attribute)) {
@@ -2083,7 +2118,7 @@ std::optional<NativeMesh> PipelineTranslator::NativeMeshPipeline(
         fragment_info.flat_per_primitive_inputs = true;
         ApplyFragmentState(fragment_info, key);
         auto fragment =
-            Translate(programs[5], ShaderTranslate::Stage::Fragment, bindings, fragment_info);
+            Translate(programs[5], ShaderTranslate::Stage::Fragment, fragment_bindings, fragment_info);
         if (!fragment) {
             keep_cause();
             return std::nullopt;
@@ -2458,17 +2493,30 @@ std::optional<StageProgram> PipelineTranslator::WarmSingleStage(const GraphicsPi
         ApplyFragmentState(runtime_info, key);
     }
 
+    const auto mask_unused_vertex_inputs = [&](const Shader::Info& info) {
+        if (slot != 1 || info.loads.Legacy() || info.passthrough.mask.any()) {
+            return;
+        }
+        for (size_t attr = 0; attr < runtime_info.generic_input_types.size(); ++attr) {
+            if (!info.loads.Generic(attr)) {
+                runtime_info.generic_input_types[attr] = Shader::AttributeType::Disabled;
+            }
+        }
+    };
+
     Shader::Backend::Bindings bindings{};
     const u32 cfg_offset = static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader));
     using Cache = VideoCommon::StageCache;
     if (stage_cache != nullptr && stage_cache->Enabled() && !VisualWorkaroundEnabled()) {
         std::vector<u8> signature = Cache::Signature(env, unique_hash, slot);
         stage_reuse.reused[slot] = stage_cache->Find(signature, env);
-        const std::vector<u8> rt_key = Cache::RuntimeKey(runtime_info, bindings);
-        if (stage_reuse.reused[slot] && !stage_cache->Verify() &&
-            stage_cache->FindEmitted(*stage_reuse.reused[slot], rt_key)) {
-            Shader::IR::Program summary = stage_reuse.reused[slot]->program;
-            return TranslateCached(slot, summary, msl_stage, bindings, runtime_info, &options);
+        if (stage_reuse.reused[slot] && !stage_cache->Verify()) {
+            mask_unused_vertex_inputs(stage_reuse.reused[slot]->program.info);
+            const std::vector<u8> rt_key = Cache::RuntimeKey(runtime_info, bindings);
+            if (stage_cache->FindEmitted(*stage_reuse.reused[slot], rt_key)) {
+                Shader::IR::Program summary = stage_reuse.reused[slot]->program;
+                return TranslateCached(slot, summary, msl_stage, bindings, runtime_info, &options);
+            }
         }
         Cache::Recorder recorder{env};
         Shader::Environment& active_env =
@@ -2476,6 +2524,7 @@ std::optional<StageProgram> PipelineTranslator::WarmSingleStage(const GraphicsPi
         Shader::Maxwell::Flow::CFG cfg(active_env, pools.flow_block, cfg_offset, false);
         Shader::IR::Program program =
             TranslateProgram(pools.inst, pools.block, active_env, cfg, host_info);
+        mask_unused_vertex_inputs(program.info);
         if (!stage_reuse.reused[slot]) {
             auto translation = std::make_shared<Cache::Translation>();
             translation->signature = std::move(signature);
@@ -2493,6 +2542,7 @@ std::optional<StageProgram> PipelineTranslator::WarmSingleStage(const GraphicsPi
 
     Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, false);
     Shader::IR::Program program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+    mask_unused_vertex_inputs(program.info);
     ApplyVisualWorkaround(program, unique_hash);
     return Translate(program, msl_stage, bindings, runtime_info, &options);
 } catch (const Shader::Exception&) {

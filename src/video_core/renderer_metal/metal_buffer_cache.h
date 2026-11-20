@@ -51,19 +51,47 @@ public:
 
     [[nodiscard]] bool IsRegionUsed(u64 offset, u64 size) const noexcept;
 
+    [[nodiscard]] u8* HostPtr() noexcept {
+        return host_ptr;
+    }
+
+    [[nodiscard]] const u8* HostPtr() const noexcept {
+        return host_ptr;
+    }
+
+    [[nodiscard]] std::span<const u8> Mapped() const noexcept {
+        return host_ptr != nullptr ? std::span<const u8>(host_ptr, SizeBytes())
+                                   : std::span<const u8>{};
+    }
+
+    [[nodiscard]] u64 LastUsageTick() const noexcept {
+        return last_usage_tick;
+    }
+
+    [[nodiscard]] bool IsInFlight() const noexcept;
+
+    void NoteUsed() const noexcept;
+
 private:
+    friend BufferCacheRuntime;
+
     BufferCacheRuntime* runtime{};
     Object buffer;
+    u8* host_ptr{};
     u64 bytes{};
     VideoCommon::UsageTracker tracker;
     /// The scheduler segment the tracker holds the uses of.
     u64 usage_serial{};
+    mutable u64 last_usage_tick{};
+    mutable bool freshly_zeroed{};
+    bool skip_next_clear_usage{};
 };
 
 /// One resource the next draw or dispatch binds, in binding order.
 struct Binding {
     enum class Kind : u8 { Buffer, TexelBuffer };
     Kind kind{Kind::Buffer};
+    bool is_written{};
     BufferHandle buffer{};
     u32 offset{};
     u32 size{};
@@ -120,9 +148,9 @@ public:
         return 0;
     }
 
-    /// Satisfies Metal's constant buffer offset rule on every Apple, Intel and AMD GPU.
+    /// 16 bytes on Apple Silicon GPUs (Apple7+), 256 bytes on Intel / AMD macOS GPUs.
     [[nodiscard]] u32 GetUniformBufferAlignment() const noexcept {
-        return 256;
+        return uniform_buffer_alignment;
     }
 
     [[nodiscard]] u32 GetStorageBufferAlignment() const noexcept {
@@ -173,6 +201,7 @@ public:
     void PostCopyBarrier() {}
 
     void ClearBuffer(BufferHandle dest_buffer, u32 offset, size_t size, u32 value);
+    void ClearBuffer(Buffer& dest_buffer, u32 offset, size_t size, u32 value);
 
     [[nodiscard]] BufferHandle Nx2MeshMirror();
 
@@ -203,23 +232,27 @@ public:
     }
 
     void RebindStreamUniform(const StreamUniformRef& ref, u32 size) {
-        bindings.push_back({Binding::Kind::Buffer, ref.buffer, ref.offset, size, {}});
+        bindings.push_back({Binding::Kind::Buffer, false, ref.buffer, ref.offset, size, {}});
     }
 
     void BindUniformBuffer(const Buffer& buffer, u32 offset, u32 size) {
-        bindings.push_back({Binding::Kind::Buffer, buffer.Handle(), offset, size, {}});
+        buffer.NoteUsed();
+        bindings.push_back({Binding::Kind::Buffer, false, buffer.Handle(), offset, size, {}});
     }
 
     void BindStorageBuffer(const Buffer& buffer, u32 offset, u32 size, bool is_written) {
+        buffer.NoteUsed();
         if (is_written && write_hook != nullptr && size != 0) {
             write_hook(write_hook_user, buffer.Handle(), offset, size);
         }
-        bindings.push_back({Binding::Kind::Buffer, buffer.Handle(), offset, size, {}});
+        bindings.push_back({Binding::Kind::Buffer, is_written, buffer.Handle(), offset, size, {}});
     }
 
     void BindTextureBuffer(Buffer& buffer, u32 offset, u32 size,
                            VideoCore::Surface::PixelFormat format) {
-        bindings.push_back({Binding::Kind::TexelBuffer, buffer.Handle(), offset, size, format});
+        buffer.NoteUsed();
+        bindings.push_back(
+            {Binding::Kind::TexelBuffer, false, buffer.Handle(), offset, size, format});
     }
 
     /// A storage buffer whose guest range spans several mappings (BufferCache's multi-range
@@ -237,6 +270,7 @@ public:
     }
 
     void PushMultiRangeSource(const Buffer& buffer, u32 offset, u32 size) {
+        buffer.NoteUsed();
         PushMultiRangeSource(buffer.Handle(), offset, size);
     }
 
@@ -316,6 +350,12 @@ private:
 
     Object nx2_mesh_mirror;
     u64 allocated_bytes{};
+    u32 uniform_buffer_alignment{256};
+    bool shared_buffers{};
+    char upload_scratch_tag{};
+    std::vector<u8> upload_scratch;
+    size_t upload_scratch_size{};
+    u64 upload_scratch_large_frame{};
     StreamUniformRef last_stream_uniform{};
     WriteHook write_hook{};
     void* write_hook_user{};

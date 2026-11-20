@@ -437,6 +437,8 @@ private:
     struct StateBuild {
         RenderPipelineDesc desc;
         std::optional<MeshFunctions> native; ///< A mesh pipeline state
+        u32 vertex_immutable{};
+        u32 fragment_immutable{};
         Object state;
         std::string error;
         std::shared_ptr<PipelineBuildJob> job;

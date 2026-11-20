@@ -36,8 +36,26 @@ void SetConflictingPreferences(Settings::Values& settings, bool per_game) {
     set(settings.anti_aliasing, Settings::AntiAliasing::Smaa);
 }
 
+Settings::RendererBackend ExpectedPresetBackend(u64 program_id) {
+    if (const auto* preset = Settings::FindGamePreset(program_id)) {
+        for (const auto& rec : preset->settings) {
+            if (rec.key == "backend") {
+                return static_cast<Settings::RendererBackend>(std::stoul(rec.value));
+            }
+        }
+    }
+#if defined(__APPLE__)
+    return Settings::RendererBackend::Metal;
+#else
+    return Settings::RendererBackend::Vulkan;
+#endif
+}
+
 void CheckPreset(const Settings::Values& settings, u64 program_id) {
-    CHECK(settings.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan);
+    const auto expected_backend = ExpectedPresetBackend(program_id);
+    CHECK((expected_backend == Settings::RendererBackend::Metal ||
+           expected_backend == Settings::RendererBackend::Vulkan));
+    CHECK(settings.renderer_backend.GetValue() == expected_backend);
     CHECK(settings.resolution_setup.GetValue() == Settings::ResolutionSetup::Res1X);
     CHECK(settings.gpu_accuracy.GetValue() == Settings::GpuAccuracy::Low);
     CHECK(settings.use_asynchronous_shaders.GetValue());
@@ -70,6 +88,19 @@ TEST_CASE("Display filter defaults use ScaleForce and FXAA", "[game_presets]") {
     auto settings = std::make_unique<Settings::Values>();
     CHECK(settings->scaling_filter.GetDefault() == Settings::ScalingFilter::ScaleForce);
     CHECK(settings->anti_aliasing.GetDefault() == Settings::AntiAliasing::Fxaa);
+}
+
+TEST_CASE("Renderer backend default uses Metal on Apple and Vulkan elsewhere", "[game_presets]") {
+    auto settings = std::make_unique<Settings::Values>();
+#if defined(__APPLE__)
+    CHECK(settings->renderer_backend.GetDefault() == Settings::RendererBackend::Metal);
+    CHECK(settings->renderer_backend.GetValue() == Settings::RendererBackend::Metal);
+#elif defined(__sun__) || defined(__managarm__)
+    CHECK(settings->renderer_backend.GetDefault() == Settings::RendererBackend::OpenGL_GLSL);
+#else
+    CHECK(settings->renderer_backend.GetDefault() == Settings::RendererBackend::Vulkan);
+    CHECK(settings->renderer_backend.GetValue() == Settings::RendererBackend::Vulkan);
+#endif
 }
 
 TEST_CASE("Catalogue recommendations refer to valid per-game settings", "[game_presets]") {
@@ -120,7 +151,7 @@ TEST_CASE("Accepted recommended settings replace visible global preferences", "[
     CheckPreset(*settings, program_id);
     CHECK(settings->renderer_backend.UsingGlobal());
     CHECK(settings->gpu_accuracy.UsingGlobal());
-    CHECK(settings->renderer_backend.GetValue(true) == Settings::RendererBackend::Vulkan);
+    CHECK(settings->renderer_backend.GetValue(true) == ExpectedPresetBackend(program_id));
     CHECK(settings->gpu_accuracy.GetValue(true) == Settings::GpuAccuracy::Low);
 }
 

@@ -42,10 +42,14 @@ public:
 
     void FreeDeferred(StagingBufferRef& ref);
 
-    /// A slice of one ring buffer for data used by the command buffer being recorded (streamed
-    /// uniforms): no rounding to powers of two, no padding past `size`. A slice larger than a
-    /// sixteenth of the ring is a buffer of its own (Request).
+    /// A slice of one ring buffer for GPU scratch or CPU-readable data used by the command buffer
+    /// being recorded: no rounding to powers of two, no padding past `size`. A slice larger than
+    /// a sixteenth of the ring is a buffer of its own (Request).
     [[nodiscard]] StagingBufferRef Stream(size_t size, size_t alignment);
+
+    /// A slice of the write-combined, hazard-untracked CPU upload ring (append-only CPU writes,
+    /// never written by the GPU). Falls back to Request when larger than a region or on a full lap.
+    [[nodiscard]] StagingBufferRef RequestUpload(size_t size, size_t alignment = 16);
 
     [[nodiscard]] u64 StreamSize() const noexcept {
         return stream_size;
@@ -103,6 +107,10 @@ private:
     u64 stream_offset{};
     /// The last tick that used each region of the ring.
     std::array<u64, StreamRegions> stream_ticks{};
+    Object upload_stream;
+    u8* upload_stream_contents{};
+    u64 upload_stream_offset{};
+    std::array<u64, StreamRegions> upload_stream_ticks{};
     u64 frame{};
     u64 held_bytes{};
     /// 0: not bounded.

@@ -46,11 +46,23 @@ QString StageText(const std::string& stage) {
     if (stage == "Writing") {
         return ShaderWarmDialog::tr("Writing the precache file");
     }
+    if (stage == "Preparing Metal shader cache") {
+        return ShaderWarmDialog::tr("Preparing Metal shader cache");
+    }
     if (stage == "Compiling Metal compute shaders") {
         return ShaderWarmDialog::tr("Compiling Metal compute shaders");
     }
     if (stage == "Compiling Metal graphics stages") {
         return ShaderWarmDialog::tr("Compiling Metal graphics stages");
+    }
+    if (stage == "Preparing Vulkan shader cache") {
+        return ShaderWarmDialog::tr("Preparing Vulkan shader cache");
+    }
+    if (stage == "Compiling Vulkan compute shaders") {
+        return ShaderWarmDialog::tr("Compiling Vulkan compute shaders");
+    }
+    if (stage == "Compiling Vulkan graphics stages") {
+        return ShaderWarmDialog::tr("Compiling Vulkan graphics stages");
     }
     return QString::fromStdString(stage);
 }

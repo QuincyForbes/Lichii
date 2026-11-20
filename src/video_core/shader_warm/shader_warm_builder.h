@@ -96,7 +96,8 @@ void DropStaleWarmMarker(const std::filesystem::path& warm_file,
 /// marker written for an older driver is checked by the renderer at boot.
 bool WarmPending(u64 title_id);
 
-/// True when offline host GPU shader compilation (Metal on Apple) is pending for `title_id`.
+/// True when offline host GPU shader compilation (Vulkan, or Metal on Apple) is pending for
+/// `title_id`.
 bool OfflineGpuWarmPending(u64 title_id);
 
 /// Whether this boot precaches before the game starts: Always, or Ask when the frontend asked and
@@ -186,7 +187,7 @@ struct GpuWarmSummary {
 };
 
 /// Compiles extracted warm shaders offline into the host GPU stage/pipeline cache when supported
-/// by the active backend (Metal on Apple); returns `.supported = false` otherwise.
+/// by the active backend (Vulkan, or Metal on Apple); returns `.supported = false` otherwise.
 GpuWarmSummary CompileWarmShadersOffline(
     u64 title_id, std::stop_token stop = {},
     const std::function<void(const Progress&)>& on_progress = {});

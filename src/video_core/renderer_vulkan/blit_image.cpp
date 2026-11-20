@@ -1518,6 +1518,8 @@ void BlitImageHelper::ConvertDepthStencil(VkPipeline pipeline, const Framebuffer
     scheduler.InvalidateState();
 }
 
+namespace {
+
 [[nodiscard]] vk::Pipeline CreateBlitGraphicsPipeline(
     const Device& device, VkShaderModule vertex_shader, VkShaderModule fragment_shader,
     VkPipelineLayout layout, VkRenderPass renderpass,
@@ -1564,6 +1566,8 @@ template <typename Key, typename Builder>
     pipelines.push_back(builder());
     return *pipelines.back();
 }
+
+} // Anonymous namespace
 
 VkPipeline BlitImageHelper::FindOrEmplaceColorPipeline(const BlitImagePipelineKey& key) {
     return FindOrEmplacePipeline(blit_color_keys, blit_color_pipelines, key, [&] {

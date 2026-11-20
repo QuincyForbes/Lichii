@@ -272,15 +272,15 @@ const Setting kSettings[] = {
      Desktop | IOS},
     {"backend",
      QT_TRANSLATE_NOOP("ConfigurationShared", "Graphics API"),
-     QT_TRANSLATE_NOOP("ConfigurationShared", "{choice:backend.Vulkan} is the renderer games are made "
-                                              "to work with (through MoltenVK on Apple devices). "
-                                              "{choice:backend.Metal} (Apple only, experimental) is "
-                                              "Lichii's own Metal renderer, still being built: it runs "
-                                              "draws, compute, occlusion queries, tessellation and "
-                                              "mesh shaders, but not geometry shaders or transform "
-                                              "feedback, so expect missing or wrong graphics (a "
-                                              "dark-blue screen means no frame reached it). OpenGL "
-                                              "(desktop) and {choice:backend.Null} are for testing.\n"
+     QT_TRANSLATE_NOOP("ConfigurationShared", "{choice:backend.Metal} (Direct Metal) is recommended "
+                                              "on macOS and Apple Silicon: native Apple GPU "
+                                              "execution, Metal 3 mesh shaders, MetalFX upscaling "
+                                              "and ahead-of-time shader caching without MoltenVK "
+                                              "translation overhead. {choice:backend.Vulkan} is "
+                                              "recommended on Windows, Linux and Android, and "
+                                              "remains available on Apple devices through MoltenVK. "
+                                              "OpenGL (desktop) and {choice:backend.Null} are for "
+                                              "testing.\n"
                                               "Applies the next time a game starts."),
      Desktop | IOS},
     {"vulkan_device",
@@ -377,7 +377,9 @@ const Setting kSettings[] = {
      QT_TRANSLATE_NOOP("ConfigurationShared", "NVIDIA DLSS needs an NVIDIA RTX GPU on Windows.")},
     {"moltenvk_driver",
      QT_TRANSLATE_NOOP("ConfigurationShared", "Graphics Driver"),
-     QT_TRANSLATE_NOOP("ConfigurationShared", "Which MoltenVK runs Vulkan on Metal. "
+     QT_TRANSLATE_NOOP("ConfigurationShared", "Which MoltenVK runs {choice:backend.Vulkan} on Metal "
+                                              "(only used when {setting:backend} is "
+                                              "{choice:backend.Vulkan}). "
                                               "{choice:moltenvk_driver.Mesh} draws mesh shaders "
                                               "(Ocarina of Time's foliage) with Metal's own mesh "
                                               "shaders; {choice:moltenvk_driver.Legacy} emulates them "
@@ -1676,11 +1678,11 @@ const Choice kChoices[] = {
     CHOICE(FramePacingMode, Unlocked, QT_TRANSLATE_NOOP("ConfigurationShared", "Unlocked")),
     CHOICE(VramUsageMode, Conservative, QT_TRANSLATE_NOOP("ConfigurationShared", "Conservative")),
     CHOICE(VramUsageMode, Aggressive, QT_TRANSLATE_NOOP("ConfigurationShared", "Aggressive")),
+    CHOICE(RendererBackend, Metal, QT_TRANSLATE_NOOP("ConfigurationShared", "Metal")),
     CHOICE(RendererBackend, Vulkan, QT_TRANSLATE_NOOP("ConfigurationShared", "Vulkan")),
     CHOICE_ON(RendererBackend, OpenGL_GLSL, QT_TRANSLATE_NOOP("ConfigurationShared", "OpenGL GLSL"), Desktop),
     CHOICE_ON(RendererBackend, OpenGL_GLASM, QT_TRANSLATE_NOOP("ConfigurationShared", "OpenGL GLASM"), Desktop),
     CHOICE_ON(RendererBackend, OpenGL_SPIRV, QT_TRANSLATE_NOOP("ConfigurationShared", "OpenGL SPIR-V"), Desktop),
-    CHOICE(RendererBackend, Metal, QT_TRANSLATE_NOOP("ConfigurationShared", "Metal")),
     CHOICE_ON(RendererBackend, Null, QT_TRANSLATE_NOOP("ConfigurationShared", "Null"), Desktop),
     CHOICE(GpuAccuracy, Low, QT_TRANSLATE_NOOP("ConfigurationShared", "Fast")),
     CHOICE(GpuAccuracy, High, QT_TRANSLATE_NOOP("ConfigurationShared", "Accurate")),

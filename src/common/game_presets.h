@@ -35,11 +35,18 @@ struct GamePreset {
     std::vector<RecommendedSetting> settings;
 };
 
+inline constexpr RendererBackend DefaultPresetBackend =
+#if defined(__APPLE__)
+    RendererBackend::Metal;
+#else
+    RendererBackend::Vulkan;
+#endif
+
 // Keys are registered setting labels; values use the same encoding as configuration files.
 inline const std::map<u64, GamePreset> game_presets{
     {MarioKartWorldProgramId,
      {"Mario Kart World",
-      {{"backend", RendererBackend::Vulkan},
+      {{"backend", DefaultPresetBackend},
        {"resolution_setup", ResolutionSetup::Res1X},
        {"gpu_accuracy", GpuAccuracy::Low},
        {"use_asynchronous_shaders", true},
@@ -52,7 +59,7 @@ inline const std::map<u64, GamePreset> game_presets{
        {"anti_aliasing", AntiAliasing::Fxaa}}}},
     {OcarinaOfTimeProgramId,
      {"Ocarina of Time",
-      {{"backend", RendererBackend::Vulkan},
+      {{"backend", DefaultPresetBackend},
        {"resolution_setup", ResolutionSetup::Res1X},
        {"gpu_accuracy", GpuAccuracy::Low},
        {"use_asynchronous_shaders", true},

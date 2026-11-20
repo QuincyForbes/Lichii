@@ -32,7 +32,13 @@
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#include <boost/container/static_vector.hpp>
+#include <sirit/sirit.h>
+
+#include "common/alignment.h"
+#include "common/bit_field.h"
 #include "common/cityhash.h"
+#include "common/driver_shader_cache.h"
 #include "common/nx2_poll.h"
 #include "common/platform_events.h"
 #include "common/scope_exit.h"
@@ -67,8 +73,10 @@
 #include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
+#include "video_core/renderer_vulkan/pipeline_optimization.h"
 #include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
+#include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/renderer_vulkan/pipeline_cache_dir.h"
 #include "video_core/renderer_vulkan/pipeline_eviction_policy.h"
@@ -78,6 +86,7 @@
 #include "video_core/renderer_vulkan/vk_driver_build_report.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_translate_queue.h"
+#include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -89,9 +98,16 @@
 #include "video_core/shader_warm/warm_records.h"
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/vulkan_common/vulkan_instance.h"
 #include "video_core/vulkan_common/vulkan_library.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+
+namespace Common {
+template <typename... Empty>
+    requires(sizeof...(Empty) == 0)
+inline void EnsureDriverShaderCacheCapacity(Empty..., ...) noexcept {}
+} // namespace Common
 
 #ifdef __ANDROID__
 #include "../../android/app/src/main/jni/android_settings.h"
@@ -765,34 +781,27 @@ std::chrono::seconds UsedPipelinesSaveInterval(const Device& device) {
     }();
     return std::chrono::seconds{seconds >= 0 ? seconds : device.IsMoltenVK() ? 10 : 0};
 }
-} // Anonymous namespace
 
-PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
-                             const Device& device_, Scheduler& scheduler_,
-                             DescriptorPool& descriptor_pool_,
-                             GuestDescriptorQueue& guest_descriptor_queue_,
-                             DescriptorBufferRing& descriptor_buffer_ring_,
-                             RenderPassCache& render_pass_cache_, BufferCache& buffer_cache_,
-                             TextureCache& texture_cache_, VideoCore::ShaderNotify& shader_notify_)
-    : VideoCommon::ShaderCache{device_memory_}, device{device_}, scheduler{scheduler_},
-      descriptor_pool{descriptor_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
-      descriptor_buffer_ring{descriptor_buffer_ring_},
-      render_pass_cache{render_pass_cache_}, buffer_cache{buffer_cache_},
-      texture_cache{texture_cache_}, shader_notify{shader_notify_},
-      use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
-      use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
-                                !DriverCachesPipelines(device_)},
-      oot_visual_workaround{[] {
-          const char* value = std::getenv("EDEN_NX2_OOT_VISUAL_WORKAROUND");
-          return value != nullptr && std::string_view{value} == "1";
-      }()},
-      num_pipeline_workers{device.HasBrokenParallelShaderCompiling() ? 1ULL
-                                                                   : GetTotalPipelineWorkers()},
-      emission_budget{num_pipeline_workers},
-      workers(num_pipeline_workers,
-              "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
-      serialization_thread(1, "VkPipelineSerialization", {},
-                           Common::ThreadPlacement::Background) {
+bool OotVisualWorkaroundEnabled() {
+    const char* value = std::getenv("EDEN_NX2_OOT_VISUAL_WORKAROUND");
+    return value != nullptr && std::string_view{value} == "1";
+}
+
+std::filesystem::path DriverPipelineCachePath(const std::filesystem::path& base_dir,
+                                              const Device& device) {
+    const bool mvk_mesh{device.IsMoltenVK() && device.IsExtMeshShaderSupported()};
+    return VideoCommon::VersionedPipelineCachePath(
+        base_dir, mvk_mesh ? "vulkan_pipelines_mvk_mesh" : "vulkan_pipelines", CACHE_VERSION);
+}
+
+struct DeviceShaderProfiles {
+    Shader::Profile profile;
+    Shader::Profile compute_profile;
+    Shader::HostTranslateInfo host_info;
+};
+
+DeviceShaderProfiles MakeDeviceShaderProfiles(const Device& device, bool log_details) {
+    DeviceShaderProfiles out{};
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -814,7 +823,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     if (driver_id == VK_DRIVER_ID_MESA_TURNIP) {
         supported_subgroup_stages &= ~(1u << static_cast<u32>(Shader::Stage::Geometry));
     }
-    profile = Shader::Profile{
+    out.profile = Shader::Profile{
         .supported_spirv = device.SupportedSpirvVersion(),
         .unified_descriptor_binding = true,
         .support_descriptor_aliasing = device.IsDescriptorAliasingSupported(),
@@ -877,9 +886,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             device.IsUniformTexelBufferArrayNonUniformIndexingSupported(),
         .support_storage_texel_buffer_array_nonuniform_indexing =
             device.IsStorageTexelBufferArrayNonUniformIndexingSupported(),
-
         .warp_size_potentially_larger_than_guest = device.IsWarpSizePotentiallyBiggerThanGuest(),
-
         .lower_left_origin_mode = false,
         .need_declared_frag_colors = false,
         .need_gather_subpixel_offset = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
@@ -889,7 +896,6 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                                        driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA ||
                                        driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
                                        driver_id == VK_DRIVER_ID_MESA_TURNIP,
-
         .has_broken_spirv_clamp = driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS,
         .has_broken_spirv_position_input = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
         .has_broken_unsigned_image_offsets = false,
@@ -909,7 +915,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
-        .max_user_clip_distances = device.GetMaxUserClipDistances()
+        .max_user_clip_distances = device.GetMaxUserClipDistances(),
     };
     // MoltenVK runs with MVK_CONFIG_FAST_MATH_ENABLED=2 (vulkan_library.cpp): Metal fast math
     // unless a shader declares SignedZeroInfNanPreserve. When MoltenVK does not report
@@ -923,33 +929,25 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             const char* const value = std::getenv("EDEN_NX2_MVK_NAN_PRESERVE");
             return value == nullptr || value[0] != '0';
         }();
-        LOG_INFO(Render_Vulkan,
-                 "MoltenVK float controls: extension {}, SignedZeroInfNanPreserve fp16 {} fp32 "
-                 "{}; NaN-preserving shaders (EDEN_NX2_MVK_NAN_PRESERVE) {}",
-                 device.IsKhrShaderFloatControlsSupported(),
-                 profile.support_fp16_signed_zero_nan_preserve,
-                 profile.support_fp32_signed_zero_nan_preserve, nan_preserve ? "on" : "off");
-        if (nan_preserve) {
-            profile.support_float_controls = true;
-            profile.support_fp32_signed_zero_nan_preserve = true;
-            profile.support_fp16_signed_zero_nan_preserve =
-                profile.support_fp16_signed_zero_nan_preserve || device.IsFloat16Supported();
+        if (log_details) {
+            LOG_INFO(Render_Vulkan,
+                     "MoltenVK float controls: extension {}, SignedZeroInfNanPreserve fp16 {} fp32 "
+                     "{}; NaN-preserving shaders (EDEN_NX2_MVK_NAN_PRESERVE) {}",
+                     device.IsKhrShaderFloatControlsSupported(),
+                     out.profile.support_fp16_signed_zero_nan_preserve,
+                     out.profile.support_fp32_signed_zero_nan_preserve,
+                     nan_preserve ? "on" : "off");
         }
-    }
-    // MoltenVK's SPIRV-Cross writes every NoContraction OpFAdd/OpFSub/OpFMul (every guest FADD,
-    // FMUL and FFMA) as a call to a [[clang::optnone]] spvFAdd/spvFMul helper: optnone is also
-    // noinline, so each arithmetic operation became a real call with its arguments spilled, and
-    // nothing (folding, CSE, scheduling) crossed it (13 -> 10 ms on OoT's scene pass on the Metal
-    // backend once inlined, metal_shader_translate.cpp InlinePreciseHelpers).
-    // EDEN_NX2_MVK_PRECISE selects what MoltenVK gets instead:
-    //   unset/"mixed": fragment and compute stages drop NoContraction (Metal may fuse a multiply
-    //     and an add, which only adds precision); vertex, tessellation, geometry and mesh stages
-    //     write each operation as one fma (fma(1, a, b), fma(a, b, +0)): still rounded once,
-    //     bit-exact across programs for depth-equal passes, but plain inlined fma() in MSL.
-    //   "fma": the fma form in every stage (exact everywhere).
-    //   "strip": fragment and compute drop NoContraction, other stages keep the decoration.
-    // EDEN_NX2_MVK_PRECISE_ALL=1 (or EDEN_NX2_MVK_PRECISE=all): decorated everywhere, as before.
-    if (driver_id == VK_DRIVER_ID_MOLTENVK) {
+        if (nan_preserve) {
+            out.profile.support_float_controls = true;
+            out.profile.support_fp32_signed_zero_nan_preserve = true;
+            out.profile.support_fp16_signed_zero_nan_preserve =
+                out.profile.support_fp16_signed_zero_nan_preserve || device.IsFloat16Supported();
+        }
+
+        // MoltenVK's SPIRV-Cross writes every NoContraction OpFAdd/OpFSub/OpFMul (every guest FADD,
+        // FMUL and FFMA) as a call to a [[clang::optnone]] spvFAdd/spvFMul helper; EDEN_NX2_MVK_PRECISE
+        // selects mixed (default), fma, strip, or all.
         enum class PreciseMode { All, Mixed, Fma, Strip };
         static const PreciseMode precise_mode = [] {
             if (const char* const all = std::getenv("EDEN_NX2_MVK_PRECISE_ALL");
@@ -969,56 +967,56 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             }
             return PreciseMode::Mixed;
         }();
-        profile.fp_no_contraction_as_fma =
+        out.profile.fp_no_contraction_as_fma =
             precise_mode == PreciseMode::Mixed || precise_mode == PreciseMode::Fma;
-        profile.fp_contraction_in_fragment_compute =
+        out.profile.fp_contraction_in_fragment_compute =
             precise_mode == PreciseMode::Mixed || precise_mode == PreciseMode::Strip;
-        static constexpr std::array<const char*, 4> mode_names{"all decorated", "mixed", "fma",
-                                                               "strip"};
-        LOG_INFO(Render_Vulkan, "MoltenVK NoContraction (EDEN_NX2_MVK_PRECISE): {}",
-                 mode_names[static_cast<size_t>(precise_mode)]);
+        if (log_details) {
+            static constexpr std::array<const char*, 4> mode_names{"all decorated", "mixed", "fma",
+                                                                   "strip"};
+            LOG_INFO(Render_Vulkan, "MoltenVK NoContraction (EDEN_NX2_MVK_PRECISE): {}",
+                     mode_names[static_cast<size_t>(precise_mode)]);
+        }
     }
-    profile.support_cooperative_hmma =
+    out.profile.support_cooperative_hmma =
         device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
-    profile.support_cooperative_hmma_16x16x16 =
-        !profile.support_cooperative_hmma && device.IsCooperativeHmma16x16x16Supported();
-    if (profile.support_cooperative_hmma_16x16x16) {
+    out.profile.support_cooperative_hmma_16x16x16 =
+        !out.profile.support_cooperative_hmma && device.IsCooperativeHmma16x16x16Supported();
+    if (log_details && out.profile.support_cooperative_hmma_16x16x16) {
         LOG_INFO(Render_Vulkan, "Guest tensor operations run on 16x16x16 cooperative matrices");
     }
 
-    // MoltenVK compute programs are emitted with one type per storage buffer, as the native Metal
-    // backend emits every program (support_descriptor_aliasing = false there). With aliasing, a
-    // buffer the program reads and writes as words, floats and vectors becomes several typed MSL
-    // pointers to the same memory, which Metal's compiler may treat as not aliasing: the
-    // reductions, histograms and accumulations of the luminance, bloom, fog and lighting passes
-    // could read a word before the store through another type landed (OoT's Kokiri Forest blew
-    // out to white on MoltenVK only). Graphics pipelines keep aliasing (~10 fps in OoT).
-    // EDEN_NX2_MVK_COMPUTE_ALIASING=1 keeps aliasing in compute programs too (A/B).
-    compute_profile = profile;
-    if (device.IsMoltenVK() && profile.support_descriptor_aliasing) {
+    // MoltenVK compute programs are emitted with one type per storage buffer unless
+    // EDEN_NX2_MVK_COMPUTE_ALIASING=1 is set.
+    out.compute_profile = out.profile;
+    if (device.IsMoltenVK() && out.profile.support_descriptor_aliasing) {
         static const bool keep_compute_aliasing = [] {
             const char* const value = std::getenv("EDEN_NX2_MVK_COMPUTE_ALIASING");
             return value != nullptr && value[0] == '1';
         }();
         if (!keep_compute_aliasing) {
-            compute_profile.support_descriptor_aliasing = false;
+            out.compute_profile.support_descriptor_aliasing = false;
         }
-        LOG_INFO(Render_Vulkan,
-                 "MoltenVK compute programs: descriptor aliasing {} "
-                 "(EDEN_NX2_MVK_COMPUTE_ALIASING)",
-                 keep_compute_aliasing ? "kept" : "off, one type per storage buffer");
+        if (log_details) {
+            LOG_INFO(Render_Vulkan,
+                     "MoltenVK compute programs: descriptor aliasing {} "
+                     "(EDEN_NX2_MVK_COMPUTE_ALIASING)",
+                     keep_compute_aliasing ? "kept" : "off, one type per storage buffer");
+        }
     }
 
-    host_info = Shader::HostTranslateInfo{
+    out.host_info = Shader::HostTranslateInfo{
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
         .max_per_stage_descriptor_sampled_images = device.GetMaxPerStageDescriptorSampledImages(),
         .max_per_stage_resources = device.GetMaxPerStageResources(),
         .max_per_stage_descriptor_storage_buffers = device.GetMaxPerStageDescriptorStorageBuffers(),
         .max_descriptor_set_samplers = device.GetMaxDescriptorSetSamplers(),
         .max_descriptor_set_uniform_buffers = device.GetMaxDescriptorSetUniformBuffers(),
-        .max_descriptor_set_uniform_buffers_dynamic = device.GetMaxDescriptorSetUniformBuffersDynamic(),
+        .max_descriptor_set_uniform_buffers_dynamic =
+            device.GetMaxDescriptorSetUniformBuffersDynamic(),
         .max_descriptor_set_storage_buffers = device.GetMaxDescriptorSetStorageBuffers(),
-        .max_descriptor_set_storage_buffers_dynamic = device.GetMaxDescriptorSetStorageBuffersDynamic(),
+        .max_descriptor_set_storage_buffers_dynamic =
+            device.GetMaxDescriptorSetStorageBuffersDynamic(),
         .max_descriptor_set_sampled_images = device.GetMaxDescriptorSetSampledImages(),
         .max_descriptor_set_storage_images = device.GetMaxDescriptorSetStorageImages(),
         .max_descriptor_set_input_attachements = device.GetMaxDescriptorSetInputAttachments(),
@@ -1033,29 +1031,25 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_viewport_mask = device.IsNvViewportArray2Supported(),
         .support_geometry_shader_passthrough = device.IsNvGeometryShaderPassthroughSupported(),
         .support_conditional_barrier = device.SupportsConditionalBarriers(),
-        .single_lane_geometry_subgroups = !profile.SupportsSubgroupStage(Shader::Stage::Geometry),
+        .single_lane_geometry_subgroups =
+            !out.profile.SupportsSubgroupStage(Shader::Stage::Geometry),
         .support_byte_addressed_r16 = true,
     };
-    // MoltenVK allows 16 samplers a stage, but more in sets from update-after-bind pools, which
-    // it puts in Metal argument buffers. Layouts over the core limits take such a pool
-    // (DescriptorLayoutBuilder; zortos293/Lichii#1862): OoT's character shaders use 17-25.
     if (const auto limits = device.UpdateAfterBindSampledLimits()) {
-        host_info.max_per_stage_descriptor_sampled_images = limits->per_stage_sampled_images;
-        host_info.max_per_stage_resources = limits->per_stage_resources;
-        host_info.max_descriptor_set_samplers = limits->set_samplers;
-        host_info.max_descriptor_set_sampled_images = limits->set_sampled_images;
-        LOG_INFO(Render_Vulkan,
-                 "Descriptor sets over the core limits ({} samplers a stage) use update-after-bind "
-                 "pools: up to {} samplers and {} sampled images a stage",
-                 device.CoreSampledLimits().per_stage_samplers, limits->per_stage_samplers,
-                 limits->per_stage_sampled_images);
+        out.host_info.max_per_stage_descriptor_sampled_images = limits->per_stage_sampled_images;
+        out.host_info.max_per_stage_resources = limits->per_stage_resources;
+        out.host_info.max_descriptor_set_samplers = limits->set_samplers;
+        out.host_info.max_descriptor_set_sampled_images = limits->set_sampled_images;
+        if (log_details) {
+            LOG_INFO(Render_Vulkan,
+                     "Descriptor sets over the core limits ({} samplers a stage) use "
+                     "update-after-bind pools: up to {} samplers and {} sampled images a stage",
+                     device.CoreSampledLimits().per_stage_samplers, limits->per_stage_samplers,
+                     limits->per_stage_sampled_images);
+        }
     }
-    host_info.ApplyDescriptorLimitPolicy();
+    out.host_info.ApplyDescriptorLimitPolicy();
     {
-        // EDEN_NX2_DYNAMIC_HANDLE_ARRAYS: a handle read from a table at a per-invocation index
-        // becomes a sampled image array the shader indexes (Ocarina's clustered light shadow
-        // maps). It needs nonuniform indexing (MoltenVK indexes its argument buffers either way)
-        // and room for the array's samplers in a stage.
         const u32 requested = Shader::HostTranslateInfo::DynamicHandleArraySize();
         const auto uab_limits = device.UpdateAfterBindSampledLimits();
         const u32 stage_samplers = uab_limits ? uab_limits->per_stage_samplers
@@ -1063,13 +1057,88 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         const bool nonuniform =
             device.IsSampledImageArrayNonUniformIndexingSupported() || device.IsMoltenVK();
         const bool room = stage_samplers >= requested + 32;
-        host_info.handle_table_size = requested > 1 && nonuniform && room ? requested : 0;
-        LOG_INFO(Render_Vulkan,
-                 "Dynamic handle arrays (EDEN_NX2_DYNAMIC_HANDLE_ARRAYS): {} elements{} "
-                 "(nonuniform indexing {}, {} samplers a stage)",
-                 host_info.handle_table_size,
-                 requested <= 1 ? ", off" : host_info.handle_table_size == 0 ? ", unsupported" : "",
-                 nonuniform ? "yes" : "no", stage_samplers);
+        out.host_info.handle_table_size = requested > 1 && nonuniform && room ? requested : 0;
+        if (log_details) {
+            LOG_INFO(Render_Vulkan,
+                     "Dynamic handle arrays (EDEN_NX2_DYNAMIC_HANDLE_ARRAYS): {} elements{} "
+                     "(nonuniform indexing {}, {} samplers a stage)",
+                     out.host_info.handle_table_size,
+                     requested <= 1                     ? ", off"
+                     : out.host_info.handle_table_size == 0 ? ", unsupported"
+                                                        : "",
+                     nonuniform ? "yes" : "no", stage_samplers);
+        }
+    }
+    return out;
+}
+
+DynamicFeatures MakeDynamicFeatures(const Device& device) {
+    DynamicFeatures features{};
+    features.driver_id = device.GetDriverID();
+    features.driver_version = device.GetDriverVersion();
+
+    features.has_extended_dynamic_state = device.IsExtExtendedDynamicStateSupported();
+    features.has_extended_dynamic_state_2 = device.IsExtExtendedDynamicState2Supported();
+    features.has_extended_dynamic_state_2_logic_op =
+        device.IsExtExtendedDynamicState2ExtrasSupported();
+    features.has_extended_dynamic_state_2_patch_control_points = false;
+
+    features.has_extended_dynamic_state_3_blend =
+        device.IsExtExtendedDynamicState3BlendingSupported();
+    features.has_extended_dynamic_state_3_enables =
+        device.IsExtExtendedDynamicState3EnablesSupported();
+    features.has_color_write_enable = device.IsExtColorWriteEnableSupported();
+    features.has_dynamic_state3_depth_clamp_enable =
+        features.has_extended_dynamic_state_3_enables &&
+        device.SupportsDynamicState3DepthClampEnable();
+    features.has_dynamic_state3_logic_op_enable =
+        features.has_extended_dynamic_state_3_enables && device.SupportsDynamicState3LogicOpEnable();
+    features.has_dynamic_state3_line_stipple_enable =
+        features.has_extended_dynamic_state_3_enables &&
+        device.SupportsDynamicState3LineStippleEnable();
+
+    features.has_dynamic_vertex_input = device.IsExtVertexInputDynamicStateSupported() &&
+                                        Settings::values.vertex_input_dynamic_state.GetValue();
+    features.has_static_vertex_repack =
+        StaticVertexRepackEnabled(device.GetMinVertexInputBindingStrideAlignment());
+
+    features.has_provoking_vertex = device.IsExtProvokingVertexSupported();
+    features.has_provoking_vertex_first_mode = device.SupportsProvokingVertexFirstMode();
+    features.has_provoking_vertex_last_mode = device.SupportsProvokingVertexLastMode();
+    features.has_provoking_vertex_tf_preserve =
+        device.SupportsTransformFeedbackProvokingVertexPreservation();
+    return features;
+}
+} // Anonymous namespace
+
+PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+                             const Device& device_, Scheduler& scheduler_,
+                             DescriptorPool& descriptor_pool_,
+                             GuestDescriptorQueue& guest_descriptor_queue_,
+                             DescriptorBufferRing& descriptor_buffer_ring_,
+                             RenderPassCache& render_pass_cache_, BufferCache& buffer_cache_,
+                             TextureCache& texture_cache_, VideoCore::ShaderNotify& shader_notify_)
+    : VideoCommon::ShaderCache{device_memory_}, device{device_}, scheduler{scheduler_},
+      descriptor_pool{descriptor_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
+      descriptor_buffer_ring{descriptor_buffer_ring_},
+      render_pass_cache{render_pass_cache_}, buffer_cache{buffer_cache_},
+      texture_cache{texture_cache_}, shader_notify{shader_notify_},
+      use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
+      use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
+                                !DriverCachesPipelines(device_)},
+      oot_visual_workaround{OotVisualWorkaroundEnabled()},
+      num_pipeline_workers{device.HasBrokenParallelShaderCompiling() ? 1ULL
+                                                                   : GetTotalPipelineWorkers()},
+      emission_budget{num_pipeline_workers},
+      workers(num_pipeline_workers,
+              "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
+      serialization_thread(1, "VkPipelineSerialization", {},
+                           Common::ThreadPlacement::Background) {
+    {
+        auto shader_profiles = MakeDeviceShaderProfiles(device, true);
+        profile = std::move(shader_profiles.profile);
+        compute_profile = std::move(shader_profiles.compute_profile);
+        host_info = std::move(shader_profiles.host_info);
     }
 
     if (device.GetMaxVertexInputAttributes() < Maxwell::NumVertexAttributes) {
@@ -1087,56 +1156,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                  ? "native"
                  : "compare-exchange loop");
 
-    dynamic_features = {};
-    dynamic_features.driver_id = device.GetDriverID();
-    dynamic_features.driver_version = device.GetDriverVersion();
-
-    // User granularity enforced in vulkan_device.cpp switch statement:
-    //   Level 0: Core Dynamic States only
-    //   Level 1: Core + EDS1
-    //   Level 2: Core + EDS1 + EDS2 (accumulative)
-    //   Level 3: Core + EDS1 + EDS2 + EDS3 (accumulative)
-    // Here we only verify if extensions were successfully loaded by the device
-
-    dynamic_features.has_extended_dynamic_state =
-        device.IsExtExtendedDynamicStateSupported();
-
-    dynamic_features.has_extended_dynamic_state_2 =
-        device.IsExtExtendedDynamicState2Supported();
-    dynamic_features.has_extended_dynamic_state_2_logic_op =
-        device.IsExtExtendedDynamicState2ExtrasSupported();
-    dynamic_features.has_extended_dynamic_state_2_patch_control_points = false;
-
-    dynamic_features.has_extended_dynamic_state_3_blend =
-        device.IsExtExtendedDynamicState3BlendingSupported();
-    dynamic_features.has_extended_dynamic_state_3_enables =
-        device.IsExtExtendedDynamicState3EnablesSupported();
-    dynamic_features.has_color_write_enable =
-        device.IsExtColorWriteEnableSupported();
-    dynamic_features.has_dynamic_state3_depth_clamp_enable =
-        dynamic_features.has_extended_dynamic_state_3_enables &&
-        device.SupportsDynamicState3DepthClampEnable();
-    dynamic_features.has_dynamic_state3_logic_op_enable =
-        dynamic_features.has_extended_dynamic_state_3_enables &&
-        device.SupportsDynamicState3LogicOpEnable();
-    dynamic_features.has_dynamic_state3_line_stipple_enable =
-        dynamic_features.has_extended_dynamic_state_3_enables &&
-        device.SupportsDynamicState3LineStippleEnable();
-
-    // VIDS: Independent toggle (not affected by dyna_state levels)
-    dynamic_features.has_dynamic_vertex_input =
-        device.IsExtVertexInputDynamicStateSupported() &&
-        Settings::values.vertex_input_dynamic_state.GetValue();
-    dynamic_features.has_static_vertex_repack =
-        StaticVertexRepackEnabled(device.GetMinVertexInputBindingStrideAlignment());
-
-    dynamic_features.has_provoking_vertex = device.IsExtProvokingVertexSupported();
-    dynamic_features.has_provoking_vertex_first_mode =
-        device.SupportsProvokingVertexFirstMode();
-    dynamic_features.has_provoking_vertex_last_mode =
-        device.SupportsProvokingVertexLastMode();
-    dynamic_features.has_provoking_vertex_tf_preserve =
-        device.SupportsTransformFeedbackProvokingVertexPreservation();
+    dynamic_features = MakeDynamicFeatures(device);
 
     if (const size_t threads = PipelineHoldBoostThreads(); threads != 0) {
         held_workers = std::make_unique<Common::ThreadWorker>(threads, "VkPipelineHeld");
@@ -2643,9 +2663,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     if (use_vulkan_pipeline_cache) {
         // MoltenVK with mesh shaders (Settings moltenvk_driver) has its own file: each MoltenVK
         // rejects the other's (another git revision in the cache UUID) and would overwrite it.
-        const bool mvk_mesh{device.IsMoltenVK() && device.IsExtMeshShaderSupported()};
-        vulkan_pipeline_cache_filename = VideoCommon::VersionedPipelineCachePath(
-            base_dir, mvk_mesh ? "vulkan_pipelines_mvk_mesh" : "vulkan_pipelines", CACHE_VERSION);
+        vulkan_pipeline_cache_filename = DriverPipelineCachePath(base_dir, device);
         vulkan_pipeline_cache =
             LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, CACHE_VERSION);
     }
@@ -3078,14 +3096,6 @@ namespace {
 constexpr u32 PrecacheSlowMagic = 0x31534C57U; // "WLS1"
 constexpr std::chrono::seconds PrecacheSaveInterval{25};
 
-constexpr u64 UnwrapEmissionStamp(u64 value) noexcept {
-    return value;
-}
-
-inline u64 UnwrapEmissionStamp(u64 (*fn)()) {
-    return fn();
-}
-
 u64 PackDynamicFeatures(const DynamicFeatures& f) noexcept {
     u64 bits = 0;
     bits |= (f.has_extended_dynamic_state ? 1ULL : 0ULL) << 0;
@@ -3112,7 +3122,7 @@ u64 PackDynamicFeatures(const DynamicFeatures& f) noexcept {
 u64 WarmVariant(const Device& device, const DynamicFeatures& dynamic_features) {
     const auto& resolution = Settings::values.resolution_info;
     const std::array<u64, 11> inputs{
-        UnwrapEmissionStamp(VideoCommon::ShaderWarm::EmissionStamp),
+        VideoCommon::ShaderWarm::EmissionStamp(),
         resolution.active ? 1ULL : 0ULL,
         resolution.up_scale,
         resolution.down_shift,
@@ -3647,12 +3657,1114 @@ static_assert(offsetof(GraphicsPipelineCacheKey, state) +
                   offsetof(FixedPipelineState, attribute_types) ==
               VideoCommon::ShaderWarm::AttributeTypesOffset);
 
+namespace {
+
+bool CanAllocateDescriptorBuffer(const Device& device, VkDescriptorSetLayout layout) {
+    if (!layout || !device.IsExtDescriptorBufferSupported() ||
+        !device.IsBufferDeviceAddressSupported()) {
+        return false;
+    }
+    const auto& props = device.DescriptorBufferProperties();
+    const VkDeviceSize alignment = std::max<VkDeviceSize>(props.descriptorBufferOffsetAlignment, 1);
+    const VkDeviceSize max_bound = (std::min)({props.maxSamplerDescriptorBufferRange,
+                                               props.maxResourceDescriptorBufferRange,
+                                               props.samplerDescriptorBufferAddressSpaceSize,
+                                               props.resourceDescriptorBufferAddressSpaceSize,
+                                               props.descriptorBufferAddressSpaceSize});
+    const VkDeviceSize frame_size =
+        device.IsTiler() ? VkDeviceSize{2 * 1024 * 1024} : VkDeviceSize{4 * 1024 * 1024};
+    const VkDeviceSize chunk_size = Common::AlignDown((std::min)(frame_size, max_bound), alignment);
+    if (chunk_size <= alignment) {
+        return false;
+    }
+    const VkDeviceSize chunk_capacity = chunk_size - alignment;
+    const VkDeviceSize size = device.GetLogical().GetDescriptorSetLayoutSizeEXT(layout);
+    return Common::AlignUp(size, alignment) <= chunk_capacity;
+}
+
+VkShaderStageFlagBits WarmSlotStage(size_t index) {
+    static constexpr std::array stages{
+        VK_SHADER_STAGE_VERTEX_BIT,
+        VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+        VK_SHADER_STAGE_GEOMETRY_BIT,
+        VK_SHADER_STAGE_FRAGMENT_BIT,
+    };
+    return stages.at(index);
+}
+
+u32 DonorFragmentKey(const FixedPipelineState& state) noexcept {
+    u32 key = 0;
+    for (u32 i = 0; i < 8; ++i) {
+        const auto format = static_cast<Tegra::RenderTargetFormat>(state.color_formats[i]);
+        if (format == Tegra::RenderTargetFormat::NONE) {
+            continue;
+        }
+        u32 kind = 1;
+        if (const auto pf = VideoCore::Surface::TryPixelFormatFromRenderTargetFormat(format);
+            pf && VideoCore::Surface::IsPixelFormatInteger(*pf)) {
+            kind = VideoCore::Surface::IsPixelFormatSignedInteger(*pf) ? 2U : 3U;
+        }
+        key |= kind << (i * 2);
+    }
+    if (state.attachment0_dual_source_blend != 0 && (key & 3U) != 0) {
+        key |= 1U << 16;
+    }
+    return key;
+}
+
+std::vector<u32> EmitDonorVertexSpirv(u32 supported_spirv, u32 generic_mask,
+                                      bool write_point_size) {
+    Sirit::Module module{supported_spirv};
+    module.AddCapability(spv::Capability::Shader);
+    module.SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
+
+    const Sirit::Id void_type{module.TypeVoid()};
+    const Sirit::Id f32_type{module.TypeFloat(32)};
+    const Sirit::Id vec4_type{module.TypeVector(f32_type, 4)};
+    const Sirit::Id zero_f{module.Constant(f32_type, 0.0f)};
+    const Sirit::Id one_f{module.Constant(f32_type, 1.0f)};
+    const Sirit::Id zero_vec4{module.ConstantComposite(
+        vec4_type, std::array<Sirit::Id, 4>{zero_f, zero_f, zero_f, zero_f})};
+    const Sirit::Id pos_vec4{module.ConstantComposite(
+        vec4_type, std::array<Sirit::Id, 4>{zero_f, zero_f, zero_f, one_f})};
+
+    const Sirit::Id out_vec4_ptr{module.TypePointer(spv::StorageClass::Output, vec4_type)};
+    const Sirit::Id out_f32_ptr{module.TypePointer(spv::StorageClass::Output, f32_type)};
+
+    std::vector<Sirit::Id> interfaces;
+    const Sirit::Id position{module.AddGlobalVariable(out_vec4_ptr, spv::StorageClass::Output)};
+    module.Decorate(position, spv::Decoration::BuiltIn, spv::BuiltIn::Position);
+    interfaces.push_back(position);
+
+    Sirit::Id point_size{};
+    if (write_point_size) {
+        point_size = module.AddGlobalVariable(out_f32_ptr, spv::StorageClass::Output);
+        module.Decorate(point_size, spv::Decoration::BuiltIn, spv::BuiltIn::PointSize);
+        interfaces.push_back(point_size);
+    }
+
+    std::array<Sirit::Id, 32> generics{};
+    for (u32 loc = 0; loc < 32; ++loc) {
+        if (((generic_mask >> loc) & 1U) == 0) {
+            continue;
+        }
+        generics[loc] = module.AddGlobalVariable(out_vec4_ptr, spv::StorageClass::Output);
+        module.Decorate(generics[loc], spv::Decoration::Location, loc);
+        interfaces.push_back(generics[loc]);
+    }
+
+    const Sirit::Id main_fn{module.OpFunction(void_type, spv::FunctionControlMask::MaskNone,
+                                              module.TypeFunction(void_type))};
+    module.AddLabel();
+    module.OpStore(position, pos_vec4);
+    if (write_point_size) {
+        module.OpStore(point_size, one_f);
+    }
+    for (u32 loc = 0; loc < 32; ++loc) {
+        if (Sirit::ValidId(generics[loc])) {
+            module.OpStore(generics[loc], zero_vec4);
+        }
+    }
+    module.OpReturn();
+    module.OpFunctionEnd();
+    module.AddEntryPoint(spv::ExecutionModel::Vertex, main_fn, "main", interfaces);
+    return module.Assemble();
+}
+
+std::vector<u32> EmitDonorFragmentSpirv(u32 supported_spirv, u32 rt_types_key) {
+    Sirit::Module module{supported_spirv};
+    module.AddCapability(spv::Capability::Shader);
+    module.SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
+
+    const Sirit::Id void_type{module.TypeVoid()};
+    const Sirit::Id f32_type{module.TypeFloat(32)};
+    const Sirit::Id s32_type{module.TypeInt(32, true)};
+    const Sirit::Id u32_type{module.TypeInt(32, false)};
+    const Sirit::Id fvec4_type{module.TypeVector(f32_type, 4)};
+    const Sirit::Id svec4_type{module.TypeVector(s32_type, 4)};
+    const Sirit::Id uvec4_type{module.TypeVector(u32_type, 4)};
+
+    const Sirit::Id zero_f{module.Constant(f32_type, 0.0f)};
+    const Sirit::Id zero_s{module.Constant(s32_type, 0)};
+    const Sirit::Id zero_u{module.Constant(u32_type, 0U)};
+    const Sirit::Id zero_fvec4{module.ConstantComposite(
+        fvec4_type, std::array<Sirit::Id, 4>{zero_f, zero_f, zero_f, zero_f})};
+    const Sirit::Id zero_svec4{module.ConstantComposite(
+        svec4_type, std::array<Sirit::Id, 4>{zero_s, zero_s, zero_s, zero_s})};
+    const Sirit::Id zero_uvec4{module.ConstantComposite(
+        uvec4_type, std::array<Sirit::Id, 4>{zero_u, zero_u, zero_u, zero_u})};
+
+    const Sirit::Id out_fvec4_ptr{module.TypePointer(spv::StorageClass::Output, fvec4_type)};
+    const Sirit::Id out_svec4_ptr{module.TypePointer(spv::StorageClass::Output, svec4_type)};
+    const Sirit::Id out_uvec4_ptr{module.TypePointer(spv::StorageClass::Output, uvec4_type)};
+
+    std::vector<Sirit::Id> interfaces;
+    struct OutputVar {
+        Sirit::Id var{};
+        Sirit::Id zero{};
+    };
+    std::vector<OutputVar> outputs;
+    const bool dual_source = (rt_types_key & (1U << 16)) != 0;
+    for (u32 i = 0; i < 8; ++i) {
+        u32 kind = (rt_types_key >> (i * 2)) & 3U;
+        if (dual_source && i == 1) {
+            kind = rt_types_key & 3U;
+        }
+        if (kind == 0) {
+            continue;
+        }
+        const Sirit::Id ptr_type =
+            kind == 2 ? out_svec4_ptr : (kind == 3 ? out_uvec4_ptr : out_fvec4_ptr);
+        const Sirit::Id zero_val =
+            kind == 2 ? zero_svec4 : (kind == 3 ? zero_uvec4 : zero_fvec4);
+        const Sirit::Id var = module.AddGlobalVariable(ptr_type, spv::StorageClass::Output);
+        if (dual_source && i <= 1) {
+            module.Decorate(var, spv::Decoration::Location, 0U);
+            module.Decorate(var, spv::Decoration::Index, i);
+        } else {
+            module.Decorate(var, spv::Decoration::Location, i);
+        }
+        interfaces.push_back(var);
+        outputs.push_back({var, zero_val});
+    }
+
+    const Sirit::Id main_fn{module.OpFunction(void_type, spv::FunctionControlMask::MaskNone,
+                                              module.TypeFunction(void_type))};
+    module.AddLabel();
+    for (const auto& out : outputs) {
+        module.OpStore(out.var, out.zero);
+    }
+    module.OpReturn();
+    module.OpFunctionEnd();
+    module.AddEntryPoint(spv::ExecutionModel::Fragment, main_fn, "main", interfaces);
+    module.AddExecutionMode(main_fn, spv::ExecutionMode::OriginUpperLeft);
+    return module.Assemble();
+}
+
+/// Per-thread cache of minimal Sirit-generated partner modules for monolithic graphics stage
+/// warming on non-GPL drivers (macOS MoltenVK, AMD without GPL).
+class DonorShaderCache {
+public:
+    explicit DonorShaderCache(const Device& device_) : device{device_} {}
+
+    VkShaderModule GetVertex(u32 generic_mask, bool write_point_size) {
+        const u64 key = u64{generic_mask} | (write_point_size ? (1ULL << 32) : 0ULL);
+        auto [it, inserted] = vertex_modules.try_emplace(key);
+        if (inserted) {
+            const auto spv =
+                EmitDonorVertexSpirv(device.SupportedSpirvVersion(), generic_mask, write_point_size);
+            it->second = BuildShader(device, spv);
+        }
+        return *it->second;
+    }
+
+    VkShaderModule GetFragment(u32 rt_types_key) {
+        auto [it, inserted] = fragment_modules.try_emplace(rt_types_key);
+        if (inserted) {
+            const auto spv = EmitDonorFragmentSpirv(device.SupportedSpirvVersion(), rt_types_key);
+            it->second = BuildShader(device, spv);
+        }
+        return *it->second;
+    }
+
+private:
+    const Device& device;
+    std::unordered_map<u64, vk::ShaderModule> vertex_modules;
+    std::unordered_map<u32, vk::ShaderModule> fragment_modules;
+};
+
+template <class StencilFace>
+VkStencilOpState WarmStencilFaceState(const StencilFace& face) {
+    return {
+        .failOp = MaxwellToVK::StencilOp(face.ActionStencilFail()),
+        .passOp = MaxwellToVK::StencilOp(face.ActionDepthPass()),
+        .depthFailOp = MaxwellToVK::StencilOp(face.ActionDepthFail()),
+        .compareOp = MaxwellToVK::ComparisonOp(face.TestFunc()),
+        .compareMask = 0,
+        .writeMask = 0,
+        .reference = 0,
+    };
+}
+
+bool WarmSupportsPrimitiveRestart(VkPrimitiveTopology topology) {
+    static constexpr std::array unsupported_topologies{
+        VK_PRIMITIVE_TOPOLOGY_POINT_LIST,
+        VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
+        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY,
+        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY,
+        VK_PRIMITIVE_TOPOLOGY_PATCH_LIST,
+    };
+    return std::ranges::find(unsupported_topologies, topology) == unsupported_topologies.end();
+}
+
+bool WarmIsLineTopology(VkPrimitiveTopology topology) {
+    return topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ||
+           topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+}
+
+VkViewportSwizzleNV WarmUnpackViewportSwizzle(u16 swizzle) {
+    union Swizzle {
+        u32 raw;
+        BitField<0, 3, Maxwell::ViewportSwizzle> x;
+        BitField<4, 3, Maxwell::ViewportSwizzle> y;
+        BitField<8, 3, Maxwell::ViewportSwizzle> z;
+        BitField<12, 3, Maxwell::ViewportSwizzle> w;
+    };
+    const Swizzle unpacked{swizzle};
+    return VkViewportSwizzleNV{
+        .x = MaxwellToVK::ViewportSwizzle(unpacked.x),
+        .y = MaxwellToVK::ViewportSwizzle(unpacked.y),
+        .z = MaxwellToVK::ViewportSwizzle(unpacked.z),
+        .w = MaxwellToVK::ViewportSwizzle(unpacked.w),
+    };
+}
+
+RenderPassKey MakeWarmRenderPassKey(const FixedPipelineState& state, const Device& device) {
+    RenderPassKey key{};
+    for (size_t i = 0; i < key.color_formats.size(); ++i) {
+        const auto format = static_cast<Tegra::RenderTargetFormat>(state.color_formats[i]);
+        key.color_formats[i] =
+            format == Tegra::RenderTargetFormat::NONE
+                ? VideoCore::Surface::PixelFormat::Invalid
+                : VideoCore::Surface::PixelFormatFromRenderTargetFormat(format);
+    }
+    if (state.depth_enabled != 0) {
+        const auto depth_format = static_cast<Tegra::DepthFormat>(state.depth_format.Value());
+        key.depth_format = VideoCore::Surface::PixelFormatFromDepthFormat(depth_format);
+    } else {
+        key.depth_format = VideoCore::Surface::PixelFormat::Invalid;
+    }
+    key.samples = MaxwellToVK::MsaaMode(state.msaa_mode);
+    const bool has_color = std::ranges::any_of(key.color_formats, [](auto format) {
+        return format != VideoCore::Surface::PixelFormat::Invalid;
+    });
+    key.resolve_color = key.samples != VK_SAMPLE_COUNT_1_BIT && has_color && device.IsTiler();
+    return key;
+}
+
+struct WarmPipelineStates {
+    FixedPipelineState::DynamicState dynamic{};
+    boost::container::static_vector<VkVertexInputBindingDescription, 32> vertex_bindings;
+    boost::container::static_vector<VkVertexInputBindingDivisorDescriptionEXT, 32>
+        vertex_binding_divisors;
+    boost::container::static_vector<VkVertexInputAttributeDescription, 32> vertex_attributes;
+    VkPipelineVertexInputStateCreateInfo vertex_input_ci{};
+    VkPipelineVertexInputDivisorStateCreateInfoEXT input_divisor_ci{};
+    VkPipelineInputAssemblyStateCreateInfo input_assembly_ci{};
+    VkPipelineTessellationStateCreateInfo tessellation_ci{};
+    std::array<VkViewportSwizzleNV, Maxwell::NumViewports> swizzles{};
+    VkPipelineViewportSwizzleStateCreateInfoNV swizzle_ci{};
+    VkPipelineViewportDepthClipControlCreateInfoEXT ndc_info{};
+    VkPipelineViewportStateCreateInfo viewport_ci{};
+    VkPipelineRasterizationStateCreateInfo rasterization_ci{};
+    VkPipelineRasterizationLineStateCreateInfoEXT line_state{};
+    VkPipelineRasterizationConservativeStateCreateInfoEXT conservative_raster{};
+    VkPipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex{};
+    VkPipelineMultisampleStateCreateInfo multisample_ci{};
+    VkPipelineDepthStencilStateCreateInfo depth_stencil_ci{};
+    boost::container::static_vector<VkPipelineColorBlendAttachmentState, Maxwell::NumRenderTargets>
+        cb_attachments;
+    VkPipelineColorBlendStateCreateInfo color_blend_ci{};
+    boost::container::static_vector<VkDynamicState, 34> dynamic_states;
+    VkPipelineDynamicStateCreateInfo dynamic_state_ci{};
+};
+
+void FillWarmPipelineStates(
+    const Device& device, const GraphicsPipelineCacheKey& key,
+    const std::array<Shader::Info, Maxwell::MaxShaderStage>& stage_infos, WarmPipelineStates& s) {
+    FixedPipelineState::DynamicState& dynamic = s.dynamic;
+    if (!key.state.extended_dynamic_state) {
+        dynamic = key.state.dynamic_state;
+    } else {
+        dynamic.raw1 = key.state.dynamic_state.raw1;
+    }
+    if (!key.state.dynamic_vertex_input) {
+        const size_t num_vertex_arrays = (std::min)(
+            Maxwell::NumVertexArrays, static_cast<size_t>(device.GetMaxVertexInputBindings()));
+        for (size_t index = 0; index < num_vertex_arrays; ++index) {
+            const bool instanced = key.state.binding_divisors[index] != 0;
+            const auto rate =
+                instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
+            s.vertex_bindings.push_back({
+                .binding = static_cast<u32>(index),
+                .stride = key.state.vertex_strides[index],
+                .inputRate = rate,
+            });
+            if (instanced) {
+                s.vertex_binding_divisors.push_back({
+                    .binding = static_cast<u32>(index),
+                    .divisor = key.state.binding_divisors[index],
+                });
+            }
+        }
+        for (size_t index = 0; index < key.state.attributes.size(); ++index) {
+            const auto& attribute = key.state.attributes[index];
+            if (!attribute.enabled || !stage_infos[0].loads.Generic(index)) {
+                continue;
+            }
+            const VkFormat format =
+                attribute.Type() ==
+                        Maxwell::VertexAttribute::Type::UnusedEnumDoNotUseBecauseItWillGoAway
+                    ? VK_FORMAT_UNDEFINED
+                    : MaxwellToVK::VertexFormat(device, attribute.Type(), attribute.Size());
+            const bool bound = std::ranges::any_of(s.vertex_bindings, [&](const auto& binding) {
+                return binding.binding == attribute.buffer;
+            });
+            if (format == VK_FORMAT_UNDEFINED || !bound) {
+                continue;
+            }
+            s.vertex_attributes.push_back({
+                .location = static_cast<u32>(index),
+                .binding = attribute.buffer,
+                .format = format,
+                .offset = attribute.offset,
+            });
+        }
+    }
+    s.vertex_input_ci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .vertexBindingDescriptionCount = static_cast<u32>(s.vertex_bindings.size()),
+        .pVertexBindingDescriptions = s.vertex_bindings.data(),
+        .vertexAttributeDescriptionCount = static_cast<u32>(s.vertex_attributes.size()),
+        .pVertexAttributeDescriptions = s.vertex_attributes.data(),
+    };
+    s.input_divisor_ci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .vertexBindingDivisorCount = static_cast<u32>(s.vertex_binding_divisors.size()),
+        .pVertexBindingDivisors = s.vertex_binding_divisors.data(),
+    };
+    if (!s.vertex_binding_divisors.empty()) {
+        s.vertex_input_ci.pNext = &s.input_divisor_ci;
+    }
+
+    auto input_assembly_topology = MaxwellToVK::PrimitiveTopology(device, key.state.topology);
+    if (input_assembly_topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
+        input_assembly_topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    }
+    s.input_assembly_ci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .topology = input_assembly_topology,
+        .primitiveRestartEnable =
+            device.IsMoltenVK()
+                ? VK_TRUE
+                : (dynamic.primitive_restart_enable != 0 &&
+                           (device.IsTopologyListPrimitiveRestartSupported() ||
+                            WarmSupportsPrimitiveRestart(input_assembly_topology))
+                       ? VK_TRUE
+                       : VK_FALSE),
+    };
+    s.tessellation_ci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .patchControlPoints = std::min(key.state.patch_control_points_minus_one.Value() + 1,
+                                       device.GetMaxTessellationPatchSize()),
+    };
+    std::ranges::transform(key.state.viewport_swizzles, s.swizzles.begin(),
+                           WarmUnpackViewportSwizzle);
+    s.swizzle_ci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_SWIZZLE_STATE_CREATE_INFO_NV,
+        .pNext = nullptr,
+        .flags = 0,
+        .viewportCount = Maxwell::NumViewports,
+        .pViewportSwizzles = s.swizzles.data(),
+    };
+    s.ndc_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .negativeOneToOne = key.state.ndc_minus_one_to_one.Value() != 0 ? VK_TRUE : VK_FALSE,
+    };
+    const u32 num_viewports = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
+    s.viewport_ci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .viewportCount = num_viewports,
+        .pViewports = nullptr,
+        .scissorCount = num_viewports,
+        .pScissors = nullptr,
+    };
+    if (device.IsNvViewportSwizzleSupported()) {
+        s.swizzle_ci.pNext = std::exchange(s.viewport_ci.pNext, &s.swizzle_ci);
+    }
+    if (device.IsExtDepthClipControlSupported()) {
+        s.ndc_info.pNext = std::exchange(s.viewport_ci.pNext, &s.ndc_info);
+    }
+
+    s.rasterization_ci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .depthClampEnable =
+            static_cast<VkBool32>(dynamic.depth_clamp_disabled == 0 ? VK_TRUE : VK_FALSE),
+        .rasterizerDiscardEnable =
+            static_cast<VkBool32>(dynamic.rasterize_enable == 0 ? VK_TRUE : VK_FALSE),
+        .polygonMode =
+            MaxwellToVK::PolygonMode(FixedPipelineState::UnpackPolygonMode(key.state.polygon_mode)),
+        .cullMode = static_cast<VkCullModeFlags>(
+            dynamic.cull_enable ? MaxwellToVK::CullFace(dynamic.CullFace()) : VK_CULL_MODE_NONE),
+        .frontFace = MaxwellToVK::FrontFace(dynamic.FrontFace()),
+        .depthBiasEnable = dynamic.depth_bias_enable != 0 ? VK_TRUE : VK_FALSE,
+        .depthBiasConstantFactor = 0.0f,
+        .depthBiasClamp = 0.0f,
+        .depthBiasSlopeFactor = 0.0f,
+        .lineWidth = 1.0f,
+    };
+    const bool smooth_lines_supported =
+        device.IsExtLineRasterizationSupported() && device.SupportsSmoothLines();
+    const bool stippled_lines_supported =
+        device.IsExtLineRasterizationSupported() && device.SupportsStippledRectangularLines();
+    s.line_state = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .lineRasterizationMode = key.state.smooth_lines != 0 && smooth_lines_supported
+                                     ? VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_EXT
+                                     : VK_LINE_RASTERIZATION_MODE_RECTANGULAR_EXT,
+        .stippledLineEnable =
+            (dynamic.line_stipple_enable && stippled_lines_supported) ? VK_TRUE : VK_FALSE,
+        .lineStippleFactor = key.state.line_stipple_factor,
+        .lineStipplePattern = static_cast<uint16_t>(key.state.line_stipple_pattern),
+    };
+    s.conservative_raster = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .flags = 0,
+        .conservativeRasterizationMode = key.state.conservative_raster_enable != 0
+                                             ? VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT
+                                             : VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT,
+        .extraPrimitiveOverestimationSize = 0.0f,
+    };
+    const bool supports_provoking_first_mode = device.SupportsProvokingVertexFirstMode();
+    const bool supports_provoking_last_mode = device.SupportsProvokingVertexLastMode();
+    const bool requested_provoking_last_mode = key.state.provoking_vertex_last != 0;
+    const VkProvokingVertexModeEXT provoking_vertex_mode =
+        requested_provoking_last_mode
+            ? (supports_provoking_last_mode ? VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT
+                                            : VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT)
+            : (supports_provoking_first_mode ? VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT
+                                             : VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT);
+    s.provoking_vertex = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .provokingVertexMode = provoking_vertex_mode,
+    };
+    if (WarmIsLineTopology(input_assembly_topology) && device.IsExtLineRasterizationSupported()) {
+        s.line_state.pNext = std::exchange(s.rasterization_ci.pNext, &s.line_state);
+    }
+    if (device.IsExtConservativeRasterizationSupported()) {
+        s.conservative_raster.pNext =
+            std::exchange(s.rasterization_ci.pNext, &s.conservative_raster);
+    }
+    if (device.IsExtProvokingVertexSupported()) {
+        s.provoking_vertex.pNext = std::exchange(s.rasterization_ci.pNext, &s.provoking_vertex);
+    }
+
+    const bool supports_alpha_output = stage_infos[4].stores_frag_color[0];
+    const bool alpha_to_one_supported = device.SupportsAlphaToOne();
+    s.multisample_ci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .rasterizationSamples = MaxwellToVK::MsaaMode(key.state.msaa_mode),
+        .sampleShadingEnable = Settings::values.sample_shading.GetValue() > 0 ? VK_TRUE : VK_FALSE,
+        .minSampleShading = f32(Settings::values.sample_shading.GetValue()) / 100.0f,
+        .pSampleMask = nullptr,
+        .alphaToCoverageEnable =
+            supports_alpha_output && key.state.alpha_to_coverage_enabled != 0 ? VK_TRUE : VK_FALSE,
+        .alphaToOneEnable = supports_alpha_output && alpha_to_one_supported &&
+                                    key.state.alpha_to_one_enabled != 0
+                                ? VK_TRUE
+                                : VK_FALSE,
+    };
+    s.depth_stencil_ci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .depthTestEnable = dynamic.depth_test_enable,
+        .depthWriteEnable = dynamic.depth_write_enable,
+        .depthCompareOp = dynamic.depth_test_enable
+                              ? MaxwellToVK::ComparisonOp(dynamic.DepthTestFunc())
+                              : VK_COMPARE_OP_ALWAYS,
+        .depthBoundsTestEnable = dynamic.depth_bounds_enable && device.IsDepthBoundsSupported(),
+        .stencilTestEnable = dynamic.stencil_enable,
+        .front = WarmStencilFaceState(dynamic.front),
+        .back = WarmStencilFaceState(dynamic.back),
+        .minDepthBounds = f32(key.state.depth_bounds_min),
+        .maxDepthBounds = f32(key.state.depth_bounds_max),
+    };
+
+    size_t num_attachments = 0;
+    for (size_t index = 0; index < Maxwell::NumRenderTargets; ++index) {
+        if (static_cast<Tegra::RenderTargetFormat>(key.state.color_formats[index]) !=
+            Tegra::RenderTargetFormat::NONE) {
+            num_attachments = index + 1;
+        }
+    }
+    for (size_t index = 0; index < num_attachments; ++index) {
+        static constexpr std::array mask_table{
+            VK_COLOR_COMPONENT_R_BIT,
+            VK_COLOR_COMPONENT_G_BIT,
+            VK_COLOR_COMPONENT_B_BIT,
+            VK_COLOR_COMPONENT_A_BIT,
+        };
+        const auto& blend = key.state.attachments[index];
+        const std::array mask = blend.Mask();
+        VkColorComponentFlags write_mask{};
+        for (size_t i = 0; i < mask_table.size(); ++i) {
+            write_mask |= mask[i] ? mask_table[i] : 0;
+        }
+        write_mask &= VkColorComponentFlags{stage_infos[4].frag_color_components[index] & 0xFU};
+        bool blend_enable = blend.enable != 0;
+        if (blend_enable) {
+            const auto is_src1 = [](Maxwell::Blend::Factor factor) {
+                const VkBlendFactor vk = MaxwellToVK::BlendFactor(factor);
+                return vk == VK_BLEND_FACTOR_SRC1_COLOR ||
+                       vk == VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR ||
+                       vk == VK_BLEND_FACTOR_SRC1_ALPHA ||
+                       vk == VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+            };
+            const auto rt_format = VideoCore::Surface::TryPixelFormatFromRenderTargetFormat(
+                static_cast<Tegra::RenderTargetFormat>(key.state.color_formats[index]));
+            const bool integer = rt_format && VideoCore::Surface::IsPixelFormatInteger(*rt_format);
+            const bool src1_elsewhere =
+                index != 0 &&
+                (is_src1(blend.SourceRGBFactor()) || is_src1(blend.DestRGBFactor()) ||
+                 is_src1(blend.SourceAlphaFactor()) || is_src1(blend.DestAlphaFactor()));
+            if (integer || src1_elsewhere) {
+                blend_enable = false;
+            }
+        }
+        s.cb_attachments.push_back({
+            .blendEnable = blend_enable,
+            .srcColorBlendFactor = MaxwellToVK::BlendFactor(blend.SourceRGBFactor()),
+            .dstColorBlendFactor = MaxwellToVK::BlendFactor(blend.DestRGBFactor()),
+            .colorBlendOp = MaxwellToVK::BlendEquation(blend.EquationRGB()),
+            .srcAlphaBlendFactor = MaxwellToVK::BlendFactor(blend.SourceAlphaFactor()),
+            .dstAlphaBlendFactor = MaxwellToVK::BlendFactor(blend.DestAlphaFactor()),
+            .alphaBlendOp = MaxwellToVK::BlendEquation(blend.EquationAlpha()),
+            .colorWriteMask = write_mask,
+        });
+    }
+    s.color_blend_ci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .logicOpEnable = dynamic.logic_op_enable != 0,
+        .logicOp = static_cast<VkLogicOp>(dynamic.logic_op.Value()),
+        .attachmentCount = static_cast<u32>(s.cb_attachments.size()),
+        .pAttachments = s.cb_attachments.data(),
+        .blendConstants = {},
+    };
+
+    s.dynamic_states.assign({
+        VK_DYNAMIC_STATE_VIEWPORT,           VK_DYNAMIC_STATE_SCISSOR,
+        VK_DYNAMIC_STATE_DEPTH_BIAS,         VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+        VK_DYNAMIC_STATE_DEPTH_BOUNDS,       VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+        VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        VK_DYNAMIC_STATE_LINE_WIDTH,
+    });
+    if (key.state.extended_dynamic_state) {
+        static constexpr std::array extended{
+            VK_DYNAMIC_STATE_CULL_MODE_EXT,
+            VK_DYNAMIC_STATE_FRONT_FACE_EXT,
+            VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE_EXT,
+            VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE_EXT,
+            VK_DYNAMIC_STATE_DEPTH_COMPARE_OP_EXT,
+            VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE_EXT,
+            VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE_EXT,
+            VK_DYNAMIC_STATE_STENCIL_OP_EXT,
+            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY_EXT,
+        };
+        s.dynamic_states.insert(s.dynamic_states.end(), extended.begin(), extended.end());
+        if (!key.state.dynamic_vertex_input) {
+            s.dynamic_states.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT);
+        }
+    }
+    if (key.state.dynamic_vertex_input) {
+        s.dynamic_states.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_EXT);
+    }
+    if (key.state.extended_dynamic_state_2) {
+        static constexpr std::array extended2{
+            VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE_EXT,
+            VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE_EXT,
+            VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE_EXT,
+        };
+        s.dynamic_states.insert(s.dynamic_states.end(), extended2.begin(), extended2.end());
+    }
+    if (key.state.extended_dynamic_state_2_logic_op) {
+        s.dynamic_states.push_back(VK_DYNAMIC_STATE_LOGIC_OP_EXT);
+    }
+    if (key.state.extended_dynamic_state_3_blend) {
+        static constexpr std::array extended3{
+            VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT,
+            VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
+            VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT,
+        };
+        s.dynamic_states.insert(s.dynamic_states.end(), extended3.begin(), extended3.end());
+    }
+    if (!key.state.extended_dynamic_state_3_blend && key.state.color_write_enable_dynamic) {
+        s.dynamic_states.push_back(VK_DYNAMIC_STATE_COLOR_WRITE_ENABLE_EXT);
+    }
+    if (key.state.extended_dynamic_state_3_enables) {
+        if (device.SupportsDynamicState3DepthClampEnable()) {
+            s.dynamic_states.push_back(VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT);
+        }
+        if (device.SupportsDynamicState3LogicOpEnable()) {
+            s.dynamic_states.push_back(VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT);
+        }
+        if (device.SupportsDynamicState3LineRasterizationMode()) {
+            s.dynamic_states.push_back(VK_DYNAMIC_STATE_LINE_RASTERIZATION_MODE_EXT);
+        }
+        if (device.SupportsDynamicState3ConservativeRasterizationMode()) {
+            s.dynamic_states.push_back(VK_DYNAMIC_STATE_CONSERVATIVE_RASTERIZATION_MODE_EXT);
+        }
+        if (device.SupportsDynamicState3LineStippleEnable()) {
+            s.dynamic_states.push_back(VK_DYNAMIC_STATE_LINE_STIPPLE_ENABLE_EXT);
+        }
+        if (device.SupportsDynamicState3AlphaToCoverageEnable()) {
+            s.dynamic_states.push_back(VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT);
+        }
+        if (device.SupportsDynamicState3AlphaToOneEnable()) {
+            s.dynamic_states.push_back(VK_DYNAMIC_STATE_ALPHA_TO_ONE_ENABLE_EXT);
+        }
+    }
+    s.dynamic_state_ci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .dynamicStateCount = static_cast<u32>(s.dynamic_states.size()),
+        .pDynamicStates = s.dynamic_states.data(),
+    };
+}
+
+bool WarmComputeStage(const Device& device, const vk::PipelineCache& vk_cache,
+                      const DeviceShaderProfiles& profiles, u64 title_id,
+                      bool oot_visual_workaround, ShaderPools& pools,
+                      const ComputePipelineCacheKey& key, Shader::Environment& env) try {
+    if (device.HasBrokenCompute()) {
+        return false;
+    }
+    pools.ReleaseContents();
+    Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
+    auto program{TranslateProgram(pools.inst, pools.block, env, cfg, profiles.host_info)};
+    if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
+            program, title_id, key.unique_hash, oot_visual_workaround)) {
+        LOG_WARNING(Render_Vulkan,
+                    "TEMPORARY OoT visual workaround: shader {:016x}, {} scalar edits",
+                    key.unique_hash, *edits);
+    }
+    const VkDriverIdKHR driver_id = device.GetDriverID();
+    const bool needs_shared_mem_clamp = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
+                                        driver_id == VK_DRIVER_ID_ARM_PROPRIETARY ||
+                                        driver_id == VK_DRIVER_ID_MOLTENVK;
+    const u32 max_shared_memory = device.GetMaxComputeSharedMemorySize();
+    if (needs_shared_mem_clamp && program.shared_memory_size > max_shared_memory) {
+        program.shared_memory_size = max_shared_memory;
+    }
+    Shader::Profile local_compute_profile = profiles.compute_profile;
+    if (device.IsMoltenVK() && local_compute_profile.support_descriptor_aliasing) {
+        const u32 buffers = Shader::NumDescriptors(program.info.constant_buffer_descriptors) +
+                            Shader::NumDescriptors(program.info.storage_buffers_descriptors);
+        const u32 samplers = Shader::NumDescriptors(program.info.texture_descriptors);
+        const u32 textures = samplers +
+                             Shader::NumDescriptors(program.info.texture_buffer_descriptors) +
+                             Shader::NumDescriptors(program.info.image_buffer_descriptors) +
+                             Shader::NumDescriptors(program.info.image_descriptors);
+        if (buffers > 24 || samplers > 16 || textures > 31) {
+            local_compute_profile.support_descriptor_aliasing = false;
+        }
+    }
+    std::vector<u32> code{EmitSPIRV(local_compute_profile, program)};
+    if (code.size() > MaxPrecacheSpirvWords) {
+        return false;
+    }
+    const Shader::Info info{std::move(program.info)};
+    program = {};
+    pools.Free();
+
+    device.SaveShader(code);
+    vk::ShaderModule spv_module{BuildShader(device, code)};
+    code = std::vector<u32>{};
+
+    DescriptorLayoutBuilder builder{device};
+    builder.Add(info, VK_SHADER_STAGE_COMPUTE_BIT);
+    const bool uses_push_descriptor = builder.CanUsePushDescriptor();
+    bool uses_descriptor_buffer = builder.CanUseDescriptorBuffer();
+    vk::DescriptorSetLayout set_layout =
+        builder.CreateDescriptorSetLayout(uses_push_descriptor, uses_descriptor_buffer);
+    if (uses_descriptor_buffer && !CanAllocateDescriptorBuffer(device, *set_layout)) {
+        uses_descriptor_buffer = false;
+        set_layout = builder.CreateDescriptorSetLayout(false, false);
+    }
+    vk::PipelineLayout pipeline_layout = builder.CreatePipelineLayout(*set_layout);
+
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .requiredSubgroupSize = GuestWarpSize,
+    };
+    const bool uses_warp_ops = info.UsesWarpOps() || info.uses_cooperative_matrix;
+    VkPipelineCreateFlags flags{};
+    if (device.IsKhrPipelineExecutablePropertiesEnabled() &&
+        Settings::values.renderer_debug.GetValue()) {
+        flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    }
+    if (uses_descriptor_buffer) {
+        flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+    }
+    if (BuildsUnoptimized(device.GetDriverID(), key.unique_hash)) {
+        flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    }
+    const VkComputePipelineCreateInfo compute_ci{
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = flags,
+        .stage{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
+                             device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
+                         ? &subgroup_size_ci
+                         : nullptr,
+            .flags = info.uses_cooperative_matrix
+                         ? VkPipelineShaderStageCreateFlags{
+                               VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT}
+                         : VkPipelineShaderStageCreateFlags{},
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = *spv_module,
+            .pName = "main",
+            .pSpecializationInfo = nullptr,
+        },
+        .layout = *pipeline_layout,
+        .basePipelineHandle = VK_NULL_HANDLE,
+        .basePipelineIndex = 0,
+    };
+    vk::Pipeline pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *vk_cache);
+    return static_cast<bool>(pipeline);
+} catch (const Shader::Exception&) {
+    return false;
+} catch (const vk::Exception&) {
+    return false;
+}
+
+bool WarmSingleGraphicsStage(const Device& device, const vk::PipelineCache& vk_cache,
+                             RenderPassCache& render_pass_cache, DonorShaderCache& donor_shaders,
+                             const DeviceShaderProfiles& profiles, u64 title_id,
+                             bool oot_visual_workaround, ShaderPools& pools,
+                             const GraphicsPipelineCacheKey& key, Shader::Environment& env) try {
+    size_t program_index = 0;
+    if (key.unique_hashes[1] != 0) {
+        program_index = 1;
+    } else if (key.unique_hashes[5] != 0) {
+        program_index = 5;
+    } else {
+        return false;
+    }
+    const size_t stage_index = program_index - 1;
+    const u64 shader_hash = key.unique_hashes[program_index];
+
+    pools.ReleaseContents();
+    std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
+    const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+    Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, false);
+    programs[program_index] = TranslateProgram(pools.inst, pools.block, env, cfg, profiles.host_info);
+
+    const Shader::Stage ir_stage = programs[program_index].stage;
+    if (ir_stage != Shader::Stage::VertexB && ir_stage != Shader::Stage::Fragment) {
+        return false;
+    }
+    if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
+            programs[program_index], title_id, shader_hash, oot_visual_workaround)) {
+        LOG_WARNING(Render_Vulkan,
+                    "TEMPORARY OoT visual workaround: shader {:016x}, {} scalar edits",
+                    shader_hash, *edits);
+    }
+    if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
+        Shader::Optimization::HasBrokenPattern(programs[program_index])) {
+        return false;
+    }
+
+    const bool has_emulated_geom =
+        program_index == 1 && programs[1].info.requires_layer_emulation;
+    if (has_emulated_geom) {
+        if (!device.IsGeometryShaderSupported()) {
+            return false;
+        }
+        programs[4] = GenerateGeometryPassthrough(pools.inst, pools.block, profiles.host_info,
+                                                  programs[1],
+                                                  MaxwellToOutputTopology(key.state.topology));
+    }
+
+    const bool use_libraries = [&] {
+        if (!device.IsExtGraphicsPipelineLibrarySupported() || key.state.xfb_enabled != 0) {
+            return false;
+        }
+        if (key.state.extended_dynamic_state_2 == 0 &&
+            key.state.dynamic_state.rasterize_enable == 0) {
+            return false;
+        }
+        size_t pre_textures{}, pre_images{}, fragment_textures{}, fragment_images{};
+        for (const size_t idx : {size_t{1}, size_t{4}, size_t{5}}) {
+            if (idx == 4 ? !has_emulated_geom : key.unique_hashes[idx] == 0) {
+                continue;
+            }
+            const auto& info = programs[idx].info;
+            const bool is_frag = idx == 5;
+            (is_frag ? fragment_textures : pre_textures) += info.texture_descriptors.size();
+            (is_frag ? fragment_images : pre_images) += info.image_descriptors.size();
+        }
+        return pre_textures <= GPL_FRAGMENT_TEXTURE_SCALING_BASE &&
+               fragment_textures <= GPL_FRAGMENT_TEXTURE_SCALING_BASE &&
+               pre_images <= GPL_FRAGMENT_IMAGE_SCALING_BASE &&
+               fragment_images <= GPL_FRAGMENT_IMAGE_SCALING_BASE;
+    }();
+
+    std::optional<Shader::Profile> argument_buffer_profile;
+    if (device.IsMoltenVK() && profiles.profile.support_descriptor_aliasing) {
+        const auto& info = programs[program_index].info;
+        const u32 buffers = Shader::NumDescriptors(info.constant_buffer_descriptors) +
+                            Shader::NumDescriptors(info.storage_buffers_descriptors);
+        const u32 samplers = Shader::NumDescriptors(info.texture_descriptors);
+        const u32 textures = samplers + Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                             Shader::NumDescriptors(info.image_buffer_descriptors) +
+                             Shader::NumDescriptors(info.image_descriptors);
+        if (buffers > 24 || samplers > 16 || textures > 31) {
+            argument_buffer_profile = profiles.profile;
+            argument_buffer_profile->support_descriptor_aliasing = false;
+        }
+    }
+    const Shader::Profile& stage_profile =
+        argument_buffer_profile ? *argument_buffer_profile : profiles.profile;
+
+    std::array<Shader::Info, Maxwell::MaxShaderStage> stage_infos{};
+    std::array<vk::ShaderModule, Maxwell::MaxShaderStage> spv_modules{};
+    bool large_program = false;
+    const Shader::IR::Program* previous_stage = nullptr;
+    Shader::Backend::Bindings binding{};
+    for (size_t idx = 1; idx < Maxwell::MaxShaderProgram; ++idx) {
+        const bool active = (idx == 4) ? has_emulated_geom : (key.unique_hashes[idx] != 0);
+        if (!active) {
+            continue;
+        }
+        Shader::IR::Program& prog = programs[idx];
+        const size_t stg = idx - 1;
+        auto runtime_info = MakeRuntimeInfo(programs, key, prog, previous_stage, device);
+        if (prog.stage == Shader::Stage::Fragment) {
+            runtime_info.flat_per_primitive_inputs = FlatPerPrimitiveInputs(device);
+        }
+        ConvertLegacyToGeneric(prog, runtime_info);
+        PrepareStageBindings(binding, stg, use_libraries);
+        const std::vector<u32> code = EmitPipelineShader(
+            stage_profile, runtime_info, prog, binding, key.unique_hashes[idx]);
+        if (code.size() > MaxPrecacheSpirvWords) {
+            return false;
+        }
+        device.SaveShader(code);
+        spv_modules[stg] = BuildShader(device, code);
+        large_program |= prog.blocks.size() > 64;
+        stage_infos[stg] = std::move(prog.info);
+        previous_stage = &prog;
+    }
+    programs = {};
+    if (large_program) {
+        pools.Free();
+    }
+
+    const VkRenderPass render_pass = render_pass_cache.Get(MakeWarmRenderPassKey(key.state, device));
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .requiredSubgroupSize = GuestWarpSize,
+    };
+
+    if (use_libraries) {
+        WarmPipelineStates states;
+        FillWarmPipelineStates(device, key, stage_infos, states);
+
+        const bool pre_rasterization = stage_index != 4;
+        std::vector<vk::DescriptorSetLayout> owned_set_layouts;
+        std::array<VkDescriptorSetLayout, Maxwell::MaxShaderStage> set_layouts{};
+        boost::container::static_vector<VkPipelineShaderStageCreateInfo, 5> shader_stages;
+        for (size_t stg = 0; stg < Maxwell::MaxShaderStage; ++stg) {
+            const bool in_part = pre_rasterization ? (stg < 4) : (stg == 4);
+            if (!in_part) {
+                continue;
+            }
+            DescriptorLayoutBuilder builder{device};
+            builder.Add(stage_infos[stg], WarmSlotStage(stg));
+            if (!builder.Empty()) {
+                owned_set_layouts.push_back(builder.CreateDescriptorSetLayout(false));
+                set_layouts[stg] = *owned_set_layouts.back();
+            }
+            if (!spv_modules[stg]) {
+                continue;
+            }
+            const VkShaderStageFlagBits stage_flag = WarmSlotStage(stg);
+            const bool force_warp_size = stage_infos[stg].UsesWarpOps() &&
+                                         device.IsExtSubgroupSizeControlSupported() &&
+                                         device.IsGuestWarpSizeSupported(stage_flag);
+            shader_stages.push_back({
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .pNext = force_warp_size ? &subgroup_size_ci : nullptr,
+                .flags = 0,
+                .stage = stage_flag,
+                .module = *spv_modules[stg],
+                .pName = "main",
+                .pSpecializationInfo = nullptr,
+            });
+        }
+        vk::PipelineLayout layout =
+            DescriptorLayoutBuilder{device}.CreateIndependentPipelineLayout(set_layouts, true);
+        VkPipelineCreateFlags flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+        if (GplOptimizeEnabled() || !device.CanFastLinkGraphicsLibraries()) {
+            flags |= VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
+        }
+        const VkGraphicsPipelineLibraryCreateInfoEXT library_ci{
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+            .pNext = nullptr,
+            .flags = static_cast<VkGraphicsPipelineLibraryFlagsEXT>(
+                pre_rasterization ? VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT
+                                  : VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT),
+        };
+        vk::Pipeline pipeline = device.GetLogical().CreateGraphicsPipeline(
+            {
+                .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                .pNext = &library_ci,
+                .flags = flags,
+                .stageCount = static_cast<u32>(shader_stages.size()),
+                .pStages = shader_stages.empty() ? nullptr : shader_stages.data(),
+                .pVertexInputState = nullptr,
+                .pInputAssemblyState = nullptr,
+                .pTessellationState = nullptr,
+                .pViewportState = pre_rasterization ? &states.viewport_ci : nullptr,
+                .pRasterizationState = pre_rasterization ? &states.rasterization_ci : nullptr,
+                .pMultisampleState = pre_rasterization ? nullptr : &states.multisample_ci,
+                .pDepthStencilState = pre_rasterization ? nullptr : &states.depth_stencil_ci,
+                .pColorBlendState = nullptr,
+                .pDynamicState = &states.dynamic_state_ci,
+                .layout = *layout,
+                .renderPass = render_pass,
+                .subpass = 0,
+                .basePipelineHandle = VK_NULL_HANDLE,
+                .basePipelineIndex = 0,
+            },
+            *vk_cache);
+        return static_cast<bool>(pipeline);
+    }
+
+    // Non-GPL path (macOS MoltenVK, AMD without GPL, or oversized descriptor stage): pair the
+    // stage with a minimal Sirit-generated partner shader and compile a complete graphics pipeline.
+    VkShaderModule vert_module = *spv_modules[0];
+    VkShaderModule frag_module = *spv_modules[4];
+    if (stage_index == 0) {
+        for (size_t rt = 0; rt < 8; ++rt) {
+            if (static_cast<Tegra::RenderTargetFormat>(key.state.color_formats[rt]) !=
+                Tegra::RenderTargetFormat::NONE) {
+                stage_infos[4].stores_frag_color[rt] = true;
+                stage_infos[4].frag_color_components[rt] = 0xf;
+            }
+        }
+        frag_module = donor_shaders.GetFragment(DonorFragmentKey(key.state));
+    } else {
+        u32 generic_mask = 0;
+        for (u32 loc = 0; loc < 32; ++loc) {
+            if (stage_infos[4].loads.Generic(loc)) {
+                generic_mask |= 1U << loc;
+            }
+        }
+        const bool write_point_size = key.state.topology == Maxwell::PrimitiveTopology::Points;
+        vert_module = donor_shaders.GetVertex(generic_mask, write_point_size);
+    }
+
+    WarmPipelineStates states;
+    FillWarmPipelineStates(device, key, stage_infos, states);
+
+    DescriptorLayoutBuilder builder{device};
+    for (size_t stg = 0; stg < Maxwell::MaxShaderStage; ++stg) {
+        builder.Add(stage_infos[stg], WarmSlotStage(stg));
+    }
+    const bool uses_push_descriptor = builder.CanUsePushDescriptor();
+    bool uses_descriptor_buffer = builder.CanUseDescriptorBuffer();
+    vk::DescriptorSetLayout set_layout =
+        builder.CreateDescriptorSetLayout(uses_push_descriptor, uses_descriptor_buffer);
+    if (uses_descriptor_buffer && !CanAllocateDescriptorBuffer(device, *set_layout)) {
+        uses_descriptor_buffer = false;
+        set_layout = builder.CreateDescriptorSetLayout(uses_push_descriptor, false);
+    }
+    vk::PipelineLayout pipeline_layout = builder.CreatePipelineLayout(*set_layout);
+
+    boost::container::static_vector<VkPipelineShaderStageCreateInfo, 3> shader_stages;
+    const auto add_stage = [&](size_t stg, VkShaderModule mod, bool is_donor) {
+        const VkShaderStageFlagBits stage_flag = WarmSlotStage(stg);
+        const bool force_warp_size = !is_donor && stage_infos[stg].UsesWarpOps() &&
+                                     device.IsExtSubgroupSizeControlSupported() &&
+                                     device.IsGuestWarpSizeSupported(stage_flag);
+        shader_stages.push_back({
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = force_warp_size ? &subgroup_size_ci : nullptr,
+            .flags = 0,
+            .stage = stage_flag,
+            .module = mod,
+            .pName = "main",
+            .pSpecializationInfo = nullptr,
+        });
+    };
+    add_stage(0, vert_module, stage_index != 0);
+    if (spv_modules[3]) {
+        add_stage(3, *spv_modules[3], false);
+    }
+    add_stage(4, frag_module, stage_index != 4);
+
+    VkPipelineCreateFlags flags{};
+    if (device.IsKhrPipelineExecutablePropertiesEnabled() &&
+        Settings::values.renderer_debug.GetValue()) {
+        flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    }
+    if (uses_descriptor_buffer) {
+        flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+    }
+    vk::Pipeline pipeline = device.GetLogical().CreateGraphicsPipeline(
+        {
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = flags,
+            .stageCount = static_cast<u32>(shader_stages.size()),
+            .pStages = shader_stages.data(),
+            .pVertexInputState = &states.vertex_input_ci,
+            .pInputAssemblyState = &states.input_assembly_ci,
+            .pTessellationState = &states.tessellation_ci,
+            .pViewportState = &states.viewport_ci,
+            .pRasterizationState = &states.rasterization_ci,
+            .pMultisampleState = &states.multisample_ci,
+            .pDepthStencilState = &states.depth_stencil_ci,
+            .pColorBlendState = &states.color_blend_ci,
+            .pDynamicState = &states.dynamic_state_ci,
+            .layout = *pipeline_layout,
+            .renderPass = render_pass,
+            .subpass = 0,
+            .basePipelineHandle = VK_NULL_HANDLE,
+            .basePipelineIndex = 0,
+        },
+        *vk_cache);
+    return static_cast<bool>(pipeline);
+} catch (const Shader::Exception&) {
+    return false;
+} catch (const vk::Exception&) {
+    return false;
+}
+
+} // Anonymous namespace
+
 void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop_loading,
                                               const VideoCore::DiskResourceLoadCallback& callback) {
     namespace ShaderWarm = VideoCommon::ShaderWarm;
-    const char* const graphics_env = std::getenv("EDEN_NX2_GRAPHICS_PRECACHE");
-    const bool graphics_disabled = graphics_env != nullptr && graphics_env[0] == '0';
-    if (graphics_disabled || !device.IsExtGraphicsPipelineLibrarySupported()) {
+    if (!ShaderWarm::GraphicsPrecacheRequested()) {
         return;
     }
     const std::filesystem::path warm_file = ShaderWarm::GraphicsWarmPath(title_id);
@@ -3751,6 +4863,12 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
                     GraphicsPipelineLibraryCache::SetNoRetainOnThisThread(false);
                 };
                 const SpeculativePrecacheScope speculative_scope;
+                const DeviceShaderProfiles local_profiles{
+                    .profile = profile,
+                    .compute_profile = compute_profile,
+                    .host_info = host_info,
+                };
+                DonorShaderCache donor_shaders{device};
                 ShaderPools pools;
                 size_t built_on_thread = 0;
                 while (!shared->cancel.load(std::memory_order_relaxed)) {
@@ -3809,8 +4927,17 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
                     const bool large_env = env.MemorySize() > (16ULL << 10);
                     bool ok = false;
                     try {
-                        Shader::Environment* const env_ptr = &env;
-                        ok = WarmGraphicsLibraries(pools, key, std::span{&env_ptr, 1});
+                        if (device.IsExtGraphicsPipelineLibrarySupported()) {
+                            Shader::Environment* const env_ptr = &env;
+                            ok = WarmGraphicsLibraries(pools, key, std::span{&env_ptr, 1});
+                        }
+                        if (!ok) {
+                            ok = WarmSingleGraphicsStage(
+                                device, vulkan_pipeline_cache, render_pass_cache, donor_shaders,
+                                local_profiles,
+                                program_id != 0 ? program_id : visual_workaround_title,
+                                oot_visual_workaround, pools, key, env);
+                        }
                     } catch (const std::exception& e) {
                         LOG_DEBUG(Render_Vulkan, "Shader precache: {}", e.what());
                     }
@@ -6168,9 +7295,11 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     return {.failure = exception.what()};
 }
 
-void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
-                                                 const vk::PipelineCache& pipeline_cache,
-                                                 u32 cache_version) try {
+namespace {
+
+void SerializeVulkanPipelineCacheImpl(const std::filesystem::path& filename,
+                                      const vk::PipelineCache& pipeline_cache, u32 cache_version,
+                                      std::atomic<size_t>& last_cache_size) try {
     size_t cache_size = 0;
     if (pipeline_cache) {
         pipeline_cache.Read(&cache_size, nullptr);
@@ -6232,15 +7361,18 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
     std::filesystem::remove(temporary, error);
 }
 
-vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::path& filename,
-                                                         u32 expected_cache_version) {
-    const auto create_pipeline_cache = [this](size_t data_size, const void* data) {
+vk::PipelineCache LoadVulkanPipelineCacheImpl(const Device& device,
+                                              const std::filesystem::path& filename,
+                                              u32 expected_cache_version,
+                                              std::atomic<size_t>& last_cache_size) {
+    const auto create_pipeline_cache = [&device](size_t data_size, const void* data) {
         VkPipelineCacheCreateInfo pipeline_cache_ci = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
             .initialDataSize = data_size,
-            .pInitialData = data};
+            .pInitialData = data,
+        };
         return device.GetLogical().CreatePipelineCache(pipeline_cache_ci);
     };
     try {
@@ -6284,7 +7416,7 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
         static constexpr size_t header_size = magic_number.size() + sizeof(cache_version);
         const size_t cache_size = static_cast<size_t>(end) - header_size;
         std::vector<char> cache_data(cache_size);
-        file.read(cache_data.data(), cache_size);
+        file.read(cache_data.data(), static_cast<std::streamsize>(cache_size));
 
         LOG_INFO(Render_Vulkan, "Loaded Vulkan driver pipeline cache: {} ({} KiB)",
                  Common::FS::PathToUTF8String(filename), cache_size >> 10);
@@ -6317,6 +7449,646 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
         }
 
         return create_pipeline_cache(0, nullptr);
+    }
+}
+
+constexpr u32 MetalMarkerDriver = 0x4D544C00U; // "MTL"
+
+struct CachedVulkanWarmCaps {
+    bool available{};
+    u32 driver_version{};
+    u32 device_id{};
+    bool ext_descriptor_buffer{};
+    bool ext_gpl{};
+    bool ext_mesh_shader{};
+    bool driver_caches_pipelines{};
+    bool mvk_mesh{};
+    DynamicFeatures dynamic_features{};
+};
+
+CachedVulkanWarmCaps QueryCachedVulkanWarmCaps() {
+    struct Key {
+        u32 device_index{};
+        u32 dyna_state{};
+        bool dynamic_vi{};
+        bool want_dlss{};
+        bool want_fsr4{};
+        bool operator==(const Key&) const noexcept = default;
+    };
+    const Key current_key{
+        .device_index = Settings::values.vulkan_device.GetValue(),
+        .dyna_state = static_cast<u32>(Settings::values.dyna_state.GetValue()),
+        .dynamic_vi = Settings::values.vertex_input_dynamic_state.GetValue(),
+        .want_dlss = Settings::NvidiaDlssChosen(),
+        .want_fsr4 = Settings::AmdFsr4Chosen(),
+    };
+    static std::mutex cache_mutex;
+    static std::optional<Key> cached_key;
+    static CachedVulkanWarmCaps cached_caps;
+    std::scoped_lock lock{cache_mutex};
+    if (cached_key && *cached_key == current_key) {
+        return cached_caps;
+    }
+    CachedVulkanWarmCaps out{};
+    try {
+        auto library = OpenLibrary();
+        if (library) {
+            vk::InstanceDispatch dld;
+            const vk::Instance instance = CreateInstance(
+                *library, dld, VK_API_VERSION_1_1, Core::Frontend::WindowSystemType::Headless,
+                false);
+            const Device device = CreateDevice(instance, dld, VK_NULL_HANDLE);
+            out.available = true;
+            out.driver_version = device.GetDriverVersion();
+            out.device_id = device.GetDeviceID();
+            out.ext_descriptor_buffer = device.IsExtDescriptorBufferSupported();
+            out.ext_gpl = device.IsExtGraphicsPipelineLibrarySupported();
+            out.ext_mesh_shader = device.IsExtMeshShaderSupported();
+            out.driver_caches_pipelines = DriverCachesPipelines(device);
+            out.mvk_mesh = device.IsMoltenVK() && device.IsExtMeshShaderSupported();
+            out.dynamic_features = MakeDynamicFeatures(device);
+        }
+    } catch (...) {
+        out = {};
+    }
+    cached_key = current_key;
+    cached_caps = out;
+    return out;
+}
+
+u64 WarmVariantFromCaps(const CachedVulkanWarmCaps& caps) {
+    const auto& resolution = Settings::values.resolution_info;
+    const std::array<u64, 11> inputs{
+        VideoCommon::ShaderWarm::EmissionStamp(),
+        resolution.active ? 1ULL : 0ULL,
+        resolution.up_scale,
+        resolution.down_shift,
+        Settings::values.disable_shader_loop_safety_checks.GetValue() ? 1ULL : 0ULL,
+        Settings::values.fix_bloom_effects.GetValue() ? 1ULL : 0ULL,
+        Settings::values.renderer_debug.GetValue() ? 1ULL : 0ULL,
+        caps.ext_descriptor_buffer ? 1ULL : 0ULL,
+        caps.ext_gpl ? 1ULL : 0ULL,
+        caps.ext_mesh_shader ? 1ULL : 0ULL,
+        PackDynamicFeatures(caps.dynamic_features),
+    };
+    return Common::CityHash64(reinterpret_cast<const char*>(inputs.data()), sizeof(inputs));
+}
+
+} // Anonymous namespace
+
+void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
+                                                 const vk::PipelineCache& pipeline_cache,
+                                                 u32 cache_version) {
+    SerializeVulkanPipelineCacheImpl(filename, pipeline_cache, cache_version, last_cache_size);
+}
+
+vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::path& filename,
+                                                         u32 expected_cache_version) {
+    return LoadVulkanPipelineCacheImpl(device, filename, expected_cache_version, last_cache_size);
+}
+
+bool VulkanWarmPending(u64 title_id) {
+    namespace ShaderWarm = VideoCommon::ShaderWarm;
+    if (title_id == 0) {
+        return false;
+    }
+
+    const auto compute_warm = ShaderWarm::ComputeWarmPath(title_id);
+    const bool check_graphics = ShaderWarm::GraphicsPrecacheRequested();
+    const auto graphics_warm =
+        check_graphics ? ShaderWarm::GraphicsWarmPath(title_id) : std::filesystem::path{};
+
+    // Fast filesystem-only check before probing Vulkan capabilities.
+    const auto quick_file_pending = [](const std::filesystem::path& warm_file) {
+        if (ShaderWarm::WarmFilesStale(warm_file).has_value()) {
+            return true;
+        }
+        const auto marker = ShaderWarm::ReadWarmMarker(warm_file);
+        if (!marker || marker->driver == MetalMarkerDriver ||
+            marker->cache_version != CACHE_VERSION) {
+            return true;
+        }
+        return false;
+    };
+    if (quick_file_pending(compute_warm) ||
+        (check_graphics && quick_file_pending(graphics_warm))) {
+        return true;
+    }
+
+    const u64 prev_program_id = Settings::GetCurrentProgramID();
+    const auto prev_resolution_info = Settings::values.resolution_info;
+    const bool switched_program = prev_program_id != title_id;
+    if (switched_program) {
+        Settings::SetCurrentProgramID(title_id);
+    }
+    Settings::UpdateRescalingInfo();
+    SCOPE_EXIT {
+        if (switched_program) {
+            Settings::SetCurrentProgramID(prev_program_id);
+        }
+        Settings::values.resolution_info = prev_resolution_info;
+    };
+
+    const CachedVulkanWarmCaps caps = QueryCachedVulkanWarmCaps();
+    if (!caps.available) {
+        return false;
+    }
+    const u64 variant = WarmVariantFromCaps(caps);
+    const bool need_vk_cache_file =
+        Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
+        !caps.driver_caches_pipelines;
+    const auto base_dir = Common::FS::GetVulkanPipelineCacheDir(
+        Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir), title_id);
+    const auto vk_cache_path = VideoCommon::VersionedPipelineCachePath(
+        base_dir, caps.mvk_mesh ? "vulkan_pipelines_mvk_mesh" : "vulkan_pipelines", CACHE_VERSION);
+
+    const auto full_file_pending = [&](const std::filesystem::path& warm_file) {
+        const auto current = ShaderWarm::CurrentWarmStamp(
+            warm_file, 0, caps.driver_version, caps.device_id, CACHE_VERSION, variant);
+        const auto marker = ShaderWarm::ReadWarmMarker(warm_file);
+        if (!current || !marker || !marker->Matches(*current)) {
+            return true;
+        }
+        const u64 entries =
+            marker->entries != 0 ? marker->entries : ShaderWarm::ReadWarmCount(warm_file);
+        if (entries > 0 && need_vk_cache_file) {
+            std::error_code ec;
+            const auto sz = std::filesystem::file_size(vk_cache_path, ec);
+            if (ec || sz == 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (full_file_pending(compute_warm)) {
+        return true;
+    }
+    if (check_graphics && full_file_pending(graphics_warm)) {
+        return true;
+    }
+    return false;
+}
+
+OfflineWarmSummary CompileWarmShadersOffline(
+    u64 title_id, std::stop_token stop,
+    const std::function<void(size_t done, size_t total, std::string_view stage)>& on_progress) {
+    namespace ShaderWarm = VideoCommon::ShaderWarm;
+    OfflineWarmSummary summary{};
+    if (title_id == 0) {
+        summary.error = "Invalid title ID";
+        return summary;
+    }
+    if (on_progress) {
+        on_progress(0, 0, "Preparing Vulkan shader cache");
+    }
+    Common::CreateDriverShaderCacheFolder();
+    static_cast<void>(Common::EnsureDriverShaderCacheCapacity());
+
+    const u64 prev_program_id = Settings::GetCurrentProgramID();
+    const auto prev_resolution_info = Settings::values.resolution_info;
+    const bool switched_program = prev_program_id != title_id;
+    if (switched_program) {
+        Settings::SetCurrentProgramID(title_id);
+    }
+    Settings::UpdateRescalingInfo();
+    SCOPE_EXIT {
+        if (switched_program) {
+            Settings::SetCurrentProgramID(prev_program_id);
+        }
+        Settings::values.resolution_info = prev_resolution_info;
+    };
+
+    try {
+        auto library = OpenLibrary();
+        if (!library) {
+            summary.error = "Failed to load Vulkan runtime library";
+            return summary;
+        }
+        vk::InstanceDispatch dld;
+        const vk::Instance instance = CreateInstance(
+            *library, dld, VK_API_VERSION_1_1, Core::Frontend::WindowSystemType::Headless, false);
+        const Device device = CreateDevice(instance, dld, VK_NULL_HANDLE);
+
+        const DeviceShaderProfiles profiles = MakeDeviceShaderProfiles(device, false);
+        const DynamicFeatures dynamic_features = MakeDynamicFeatures(device);
+        const bool oot_workaround = OotVisualWorkaroundEnabled();
+        const u64 variant = WarmVariant(device, dynamic_features);
+        const size_t num_threads =
+            device.HasBrokenParallelShaderCompiling()
+                ? size_t{1}
+                : std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 16);
+
+        const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
+        const auto base_dir = CreatePipelineCacheDir(shader_dir, title_id);
+        if (base_dir.empty()) {
+            summary.error = "Failed to create Vulkan pipeline cache directory";
+            return summary;
+        }
+
+        const bool driver_caches = DriverCachesPipelines(device);
+        const bool save_vk_cache =
+            Settings::values.use_vulkan_driver_pipeline_cache.GetValue() && !driver_caches;
+        const std::filesystem::path vk_cache_path = DriverPipelineCachePath(base_dir, device);
+        std::atomic<size_t> last_cache_size{0};
+        vk::PipelineCache vk_cache;
+        if (save_vk_cache) {
+            vk_cache = LoadVulkanPipelineCacheImpl(device, vk_cache_path, CACHE_VERSION,
+                                                   last_cache_size);
+        } else if (!driver_caches) {
+            vk_cache = device.GetLogical().CreatePipelineCache({
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .initialDataSize = 0,
+                .pInitialData = nullptr,
+            });
+        }
+
+        const std::unordered_set<u64> slow_hashes = ReadPrecacheSlowHashes(
+            PrecacheSlowPath(title_id), device.GetDriverVersion(), device.GetDeviceID(),
+            CACHE_VERSION);
+
+        std::error_code ec;
+        const auto has_saved_vk_cache = [&] {
+            if (!save_vk_cache) {
+                return true;
+            }
+            const auto sz = std::filesystem::file_size(vk_cache_path, ec);
+            return !ec && sz > 0;
+        };
+
+        // Stage 1: Compute shaders
+        const std::filesystem::path compute_warm = ShaderWarm::ComputeWarmPath(title_id);
+        if (std::filesystem::exists(compute_warm, ec) && !stop.stop_requested()) {
+            const auto current = ShaderWarm::CurrentWarmStamp(
+                compute_warm, 0, device.GetDriverVersion(), device.GetDeviceID(), CACHE_VERSION,
+                variant);
+            const auto marker = ShaderWarm::ReadWarmMarker(compute_warm);
+            if (current && marker && marker->Matches(*current) &&
+                (marker->entries == 0 || has_saved_vk_cache())) {
+                summary.skipped += static_cast<size_t>(marker->entries);
+            } else {
+                struct ComputeJob {
+                    ComputePipelineCacheKey key{};
+                    FileEnvironment env;
+                };
+                std::vector<ComputeJob> jobs;
+                std::unordered_set<ComputePipelineCacheKey> seen;
+                size_t entries_read = 0;
+                bool read_ok = false;
+                try {
+                    std::ifstream file(compute_warm, std::ios::binary | std::ios::ate);
+                    file.exceptions(std::ifstream::failbit);
+                    const auto end = file.tellg();
+                    file.seekg(0, std::ios::beg);
+                    std::array<char, 8> magic{};
+                    u32 version{};
+                    file.read(magic.data(), magic.size())
+                        .read(reinterpret_cast<char*>(&version), sizeof(version));
+                    constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u',
+                                                                 'c', 'a', 'c', 'h'};
+                    if (magic != expected_magic || version != CACHE_VERSION) {
+                        throw std::runtime_error("unexpected compute warm file version");
+                    }
+                    static const GuessMissing guess{};
+                    while (file.tellg() != end) {
+                        u32 num_envs{};
+                        file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+                        FileEnvironment env;
+                        env.Deserialize(file);
+                        if (num_envs != 1 || env.ShaderStage() != Shader::Stage::Compute) {
+                            throw std::runtime_error("unexpected compute warm entry");
+                        }
+                        ComputePipelineCacheKey key{};
+                        file.read(reinterpret_cast<char*>(&key), sizeof(key));
+                        ++entries_read;
+                        const u64 key_hash = key.Hash();
+                        if (!seen.insert(key).second || slow_hashes.contains(key_hash)) {
+                            ++summary.skipped;
+                            continue;
+                        }
+                        env.SetGuessMissing(&guess);
+                        jobs.push_back({key, std::move(env)});
+                    }
+                    read_ok = true;
+                } catch (const std::exception& e) {
+                    summary.error = e.what();
+                    return summary;
+                }
+
+                if (read_ok && !jobs.empty()) {
+                    const size_t total = jobs.size();
+                    const size_t worker_count = (std::min)(num_threads, total);
+                    std::atomic<size_t> next_index{0};
+                    std::atomic<size_t> built{0};
+                    std::atomic<size_t> failed{0};
+                    std::atomic<size_t> running{worker_count};
+                    if (on_progress) {
+                        on_progress(0, total, "Compiling Vulkan compute shaders");
+                    }
+                    std::vector<std::thread> threads;
+                    threads.reserve(worker_count);
+                    for (size_t t = 0; t < worker_count; ++t) {
+                        threads.emplace_back([&] {
+                            Common::SetCurrentThreadName("VkWarmCompute");
+                            [[maybe_unused]] BootBuildQos qos;
+                            const SpeculativePrecacheScope speculative_scope;
+                            const DriverBuildReport::PrecacheScope precache_scope;
+                            ShaderPools pools;
+                            for (;;) {
+                                if (stop.stop_requested()) {
+                                    break;
+                                }
+                                const size_t idx =
+                                    next_index.fetch_add(1, std::memory_order_relaxed);
+                                if (idx >= total) {
+                                    break;
+                                }
+                                ComputeJob& job = jobs[idx];
+                                const bool ok = WarmComputeStage(
+                                    device, vk_cache, profiles, title_id, oot_workaround, pools,
+                                    job.key, job.env);
+                                job.env = FileEnvironment{};
+                                (ok ? built : failed).fetch_add(1, std::memory_order_relaxed);
+                            }
+                            running.fetch_sub(1, std::memory_order_release);
+                        });
+                    }
+
+                    auto last_save = std::chrono::steady_clock::now();
+                    size_t last_saved_built = 0;
+                    while (running.load(std::memory_order_acquire) != 0) {
+                        if (on_progress) {
+                            const size_t done = built.load(std::memory_order_relaxed) +
+                                                failed.load(std::memory_order_relaxed);
+                            on_progress(done, total, "Compiling Vulkan compute shaders");
+                        }
+                        if (save_vk_cache && device.CanReadPipelineCacheDuringBuilds() &&
+                            std::chrono::steady_clock::now() - last_save > PrecacheSaveInterval) {
+                            last_save = std::chrono::steady_clock::now();
+                            const size_t built_now = built.load(std::memory_order_relaxed);
+                            if (built_now > last_saved_built) {
+                                last_saved_built = built_now;
+                                SerializeVulkanPipelineCacheImpl(vk_cache_path, vk_cache,
+                                                                 CACHE_VERSION, last_cache_size);
+                            }
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+                    }
+                    for (auto& thread : threads) {
+                        thread.join();
+                    }
+
+                    const size_t compute_built = built.load(std::memory_order_relaxed);
+                    const size_t compute_failed = failed.load(std::memory_order_relaxed);
+                    summary.built += compute_built;
+                    summary.failed += compute_failed;
+                    if (on_progress && !stop.stop_requested()) {
+                        on_progress(total, total, "Compiling Vulkan compute shaders");
+                    }
+                    if (save_vk_cache && compute_built != 0) {
+                        SerializeVulkanPipelineCacheImpl(vk_cache_path, vk_cache, CACHE_VERSION,
+                                                         last_cache_size);
+                    }
+                    if (!stop.stop_requested()) {
+                        if (const auto done_stamp = ShaderWarm::CurrentWarmStamp(
+                                compute_warm, entries_read, device.GetDriverVersion(),
+                                device.GetDeviceID(), CACHE_VERSION, variant)) {
+                            static_cast<void>(
+                                ShaderWarm::WriteWarmMarker(compute_warm, *done_stamp));
+                        }
+                    }
+                } else if (read_ok && !stop.stop_requested()) {
+                    if (const auto done_stamp = ShaderWarm::CurrentWarmStamp(
+                            compute_warm, entries_read, device.GetDriverVersion(),
+                            device.GetDeviceID(), CACHE_VERSION, variant)) {
+                        static_cast<void>(ShaderWarm::WriteWarmMarker(compute_warm, *done_stamp));
+                    }
+                }
+            }
+        }
+
+        // Stage 2: Graphics stages (GPL libraries where supported, donor pipelines otherwise)
+        const std::filesystem::path graphics_warm = ShaderWarm::GraphicsWarmPath(title_id);
+        if (ShaderWarm::GraphicsPrecacheRequested() &&
+            std::filesystem::exists(graphics_warm, ec) && !stop.stop_requested()) {
+            const auto current = ShaderWarm::CurrentWarmStamp(
+                graphics_warm, 0, device.GetDriverVersion(), device.GetDeviceID(), CACHE_VERSION,
+                variant);
+            const auto marker = ShaderWarm::ReadWarmMarker(graphics_warm);
+            if (current && marker && marker->Matches(*current) &&
+                (marker->entries == 0 || has_saved_vk_cache())) {
+                summary.skipped += static_cast<size_t>(marker->entries);
+            } else {
+                struct GraphicsStream {
+                    std::mutex mutex;
+                    std::ifstream file;
+                    std::streampos end{};
+                    std::streamoff position{};
+                    size_t read{};
+                    bool failed{};
+                } stream;
+
+                bool open_ok = false;
+                try {
+                    stream.file.open(graphics_warm, std::ios::binary | std::ios::ate);
+                    stream.file.exceptions(std::ifstream::failbit);
+                    stream.end = stream.file.tellg();
+                    stream.file.seekg(0, std::ios::beg);
+                    std::array<char, 8> magic{};
+                    u32 version{};
+                    stream.file.read(magic.data(), magic.size())
+                        .read(reinterpret_cast<char*>(&version), sizeof(version));
+                    constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u',
+                                                                 'c', 'a', 'c', 'h'};
+                    if (magic != expected_magic || version != CACHE_VERSION) {
+                        throw std::runtime_error("unexpected graphics warm file version");
+                    }
+                    stream.position = stream.file.tellg();
+                    open_ok = true;
+                } catch (const std::exception& e) {
+                    summary.error = e.what();
+                    return summary;
+                }
+
+                if (open_ok && stream.position != stream.end) {
+                    const size_t known_total =
+                        static_cast<size_t>(ShaderWarm::ReadWarmCount(graphics_warm));
+                    RenderPassCache render_pass_cache{device};
+                    std::atomic<size_t> built{0};
+                    std::atomic<size_t> skipped_slow{0};
+                    std::atomic<size_t> failed{0};
+                    std::atomic<size_t> running{num_threads};
+                    if (on_progress) {
+                        on_progress(0, known_total, "Compiling Vulkan graphics stages");
+                    }
+
+                    std::vector<std::thread> threads;
+                    threads.reserve(num_threads);
+                    for (size_t t = 0; t < num_threads; ++t) {
+                        threads.emplace_back([&] {
+                            Common::SetCurrentThreadName("VkWarmGraphics");
+                            [[maybe_unused]] BootBuildQos qos;
+                            const SpeculativePrecacheScope speculative_scope;
+                            const DriverBuildReport::PrecacheScope precache_scope;
+                            static const GuessMissing guess{};
+                            DonorShaderCache donor_shaders{device};
+                            ShaderPools pools;
+                            size_t built_on_thread = 0;
+                            for (;;) {
+                                if (stop.stop_requested()) {
+                                    break;
+                                }
+                                FileEnvironment env;
+                                GraphicsPipelineCacheKey key{};
+                                bool got_entry = false;
+                                {
+                                    std::scoped_lock lock{stream.mutex};
+                                    while (!stream.failed && stream.file.tellg() != stream.end) {
+                                        try {
+                                            u32 num_envs{};
+                                            stream.file.read(reinterpret_cast<char*>(&num_envs),
+                                                             sizeof(num_envs));
+                                            if (num_envs != 1) {
+                                                throw std::runtime_error(
+                                                    "unexpected graphics warm entry");
+                                            }
+                                            env.Deserialize(stream.file);
+                                            stream.file.read(reinterpret_cast<char*>(&key),
+                                                             sizeof(key));
+                                            ++stream.read;
+                                            stream.position = stream.file.tellg();
+                                        } catch (const std::exception& e) {
+                                            LOG_WARNING(Render_Vulkan,
+                                                        "Offline Vulkan warm: graphics entry {} "
+                                                        "unreadable ({})",
+                                                        stream.read + 1, e.what());
+                                            stream.failed = true;
+                                            break;
+                                        }
+                                        StampWarmGraphicsKey(key, env, dynamic_features);
+                                        if (slow_hashes.contains(key.Hash())) {
+                                            skipped_slow.fetch_add(1, std::memory_order_relaxed);
+                                            continue;
+                                        }
+                                        got_entry = true;
+                                        break;
+                                    }
+                                }
+                                if (!got_entry) {
+                                    break;
+                                }
+                                env.SetGuessMissing(&guess);
+                                const bool large_env = env.MemorySize() > (16ULL << 10);
+                                const bool ok = WarmSingleGraphicsStage(
+                                    device, vk_cache, render_pass_cache, donor_shaders, profiles,
+                                    title_id, oot_workaround, pools, key, env);
+                                if (large_env || (++built_on_thread % 64) == 0) {
+                                    pools.Free();
+                                }
+                                (ok ? built : failed).fetch_add(1, std::memory_order_relaxed);
+                            }
+                            running.fetch_sub(1, std::memory_order_release);
+                        });
+                    }
+
+                    const auto estimate_total = [&](size_t done_now) {
+                        size_t total = known_total;
+                        if (total == 0) {
+                            std::scoped_lock lock{stream.mutex};
+                            const std::streamoff header = 12;
+                            const std::streamoff end = stream.end;
+                            if (stream.position > header) {
+                                total = static_cast<size_t>(
+                                    static_cast<double>(stream.read) *
+                                    static_cast<double>(end - header) /
+                                    static_cast<double>(stream.position - header));
+                            }
+                        }
+                        return (std::max)(total, done_now);
+                    };
+
+                    auto last_save = std::chrono::steady_clock::now();
+                    size_t last_saved_built = 0;
+                    while (running.load(std::memory_order_acquire) != 0) {
+                        if (on_progress) {
+                            const size_t done = built.load(std::memory_order_relaxed) +
+                                                skipped_slow.load(std::memory_order_relaxed) +
+                                                failed.load(std::memory_order_relaxed);
+                            on_progress(done, estimate_total(done),
+                                        "Compiling Vulkan graphics stages");
+                        }
+                        if (save_vk_cache && device.CanReadPipelineCacheDuringBuilds() &&
+                            std::chrono::steady_clock::now() - last_save > PrecacheSaveInterval) {
+                            last_save = std::chrono::steady_clock::now();
+                            const size_t built_now = built.load(std::memory_order_relaxed);
+                            if (built_now > last_saved_built) {
+                                last_saved_built = built_now;
+                                SerializeVulkanPipelineCacheImpl(vk_cache_path, vk_cache,
+                                                                 CACHE_VERSION, last_cache_size);
+                            }
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+                    }
+                    for (auto& thread : threads) {
+                        thread.join();
+                    }
+
+                    const size_t gfx_built = built.load(std::memory_order_relaxed);
+                    const size_t gfx_skipped = skipped_slow.load(std::memory_order_relaxed);
+                    const size_t gfx_failed = failed.load(std::memory_order_relaxed);
+                    summary.built += gfx_built;
+                    summary.skipped += gfx_skipped;
+                    summary.failed += gfx_failed;
+
+                    if (save_vk_cache && gfx_built != 0) {
+                        SerializeVulkanPipelineCacheImpl(vk_cache_path, vk_cache, CACHE_VERSION,
+                                                         last_cache_size);
+                    }
+                    if (!stop.stop_requested() && !stream.failed &&
+                        stream.end == std::streampos{stream.position}) {
+                        const size_t total_done = gfx_built + gfx_skipped + gfx_failed;
+                        if (on_progress) {
+                            on_progress(total_done, total_done,
+                                        "Compiling Vulkan graphics stages");
+                        }
+                        if (const auto done_stamp = ShaderWarm::CurrentWarmStamp(
+                                graphics_warm, stream.read, device.GetDriverVersion(),
+                                device.GetDeviceID(), CACHE_VERSION, variant)) {
+                            static_cast<void>(
+                                ShaderWarm::WriteWarmMarker(graphics_warm, *done_stamp));
+                        }
+                    }
+                } else if (open_ok && !stop.stop_requested()) {
+                    if (const auto done_stamp = ShaderWarm::CurrentWarmStamp(
+                            graphics_warm, 0, device.GetDriverVersion(), device.GetDeviceID(),
+                            CACHE_VERSION, variant)) {
+                        static_cast<void>(ShaderWarm::WriteWarmMarker(graphics_warm, *done_stamp));
+                    }
+                }
+            }
+        }
+
+        if (save_vk_cache && summary.built != 0) {
+            SerializeVulkanPipelineCacheImpl(vk_cache_path, vk_cache, CACHE_VERSION,
+                                             last_cache_size);
+        }
+        summary.ok = !stop.stop_requested();
+        if (!summary.ok && summary.error.empty()) {
+            summary.error = "Stopped";
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Offline Vulkan shader warm for {:016x}: {} built, {} skipped, {} failed ({})",
+                 title_id, summary.built, summary.skipped, summary.failed,
+                 summary.ok ? "ok" : summary.error);
+        return summary;
+    } catch (const std::exception& e) {
+        summary.ok = false;
+        summary.error = e.what();
+        LOG_ERROR(Render_Vulkan, "Offline Vulkan shader warm for {:016x} failed: {}", title_id,
+                  summary.error);
+        return summary;
     }
 }
 

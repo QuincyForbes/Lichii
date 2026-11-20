@@ -8,7 +8,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <vector>
+#include <QAbstractButton>
+#include <QComboBox>
 #include <QLabel>
+#include <QPushButton>
+#include <QTimer>
 #include <qnamespace.h>
 #include "common/game_presets.h"
 #include "common/settings.h"
@@ -90,11 +94,56 @@ void ConfigureGraphicsAdvanced::Setup(const ConfigurationShared::Builder& builde
         const auto it = normal_hold.find(setting.Id());
         return it != normal_hold.end() ? it->second : nullptr;
     };
-    if (Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Vulkan) {
-        const QString reason = tr("Vulkan only: the renderer is set to another API (Graphics tab).");
-        ConfigurationShared::SetUnavailable(held(Settings::values.renderer_force_max_clock), reason);
-        ConfigurationShared::SetUnavailable(held(Settings::values.frame_pacing_mode), reason);
-    }
+    QWidget* const force_max_clock = held(Settings::values.renderer_force_max_clock);
+    QWidget* const frame_pacing = held(Settings::values.frame_pacing_mode);
+    const auto update_backend_availability = [this, force_max_clock, frame_pacing] {
+        auto backend = Settings::values.renderer_backend.GetValue();
+        if (QWidget* const top = window(); top != nullptr && top != this) {
+            for (auto* const w : top->findChildren<ConfigurationShared::Widget*>()) {
+                if (w->GetSetting().Id() == Settings::values.renderer_backend.Id() &&
+                    w->combobox != nullptr) {
+                    if (!Settings::IsConfiguringGlobal() && w->restore_button != nullptr &&
+                        !w->restore_button->isEnabled()) {
+                        backend = Settings::values.renderer_backend.GetValue(true);
+                    } else if (w->combobox->currentIndex() >= 0) {
+                        backend = static_cast<Settings::RendererBackend>(
+                            w->combobox->currentData().toUInt());
+                    }
+                    break;
+                }
+            }
+        }
+        const QString vulkan_reason =
+            backend == Settings::RendererBackend::Vulkan
+                ? QString()
+                : tr("Vulkan only: the renderer is set to another API (Graphics tab).");
+        const QString pacing_reason =
+            (backend == Settings::RendererBackend::Vulkan ||
+             backend == Settings::RendererBackend::Metal)
+                ? QString()
+                : tr("Vulkan or Metal only: the renderer is set to another API (Graphics tab).");
+        ConfigurationShared::SetUnavailable(force_max_clock, vulkan_reason);
+        ConfigurationShared::SetUnavailable(frame_pacing, pacing_reason);
+    };
+    update_backend_availability();
+    QTimer::singleShot(0, this, [this, update_backend_availability] {
+        if (QWidget* const top = window(); top != nullptr && top != this) {
+            for (auto* const w : top->findChildren<ConfigurationShared::Widget*>()) {
+                if (w->GetSetting().Id() == Settings::values.renderer_backend.Id()) {
+                    if (w->combobox != nullptr) {
+                        connect(w->combobox, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                                this, update_backend_availability);
+                    }
+                    if (w->restore_button != nullptr) {
+                        connect(w->restore_button, &QAbstractButton::clicked, this,
+                                update_backend_availability);
+                    }
+                    break;
+                }
+            }
+        }
+        update_backend_availability();
+    });
 }
 
 void ConfigureGraphicsAdvanced::ApplyConfiguration() {

@@ -989,8 +989,8 @@ void CopyBufferToImage(vk::CommandBuffer cmdbuf, VkBuffer src_buffer, VkImage im
     const VkImageMemoryBarrier read_barrier{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
-            .srcAccessMask = static_cast<VkAccessFlags>(is_initialized ? WRITE_ACCESS_FLAGS
-                                                                       : VK_ACCESS_NONE),
+            .srcAccessMask = is_initialized ? static_cast<VkAccessFlags>(WRITE_ACCESS_FLAGS)
+                                            : VkAccessFlags{VK_ACCESS_NONE},
             .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
             .oldLayout = is_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
             .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,

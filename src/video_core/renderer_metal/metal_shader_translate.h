@@ -165,6 +165,8 @@ struct Result {
     u32 array_spill_slot{~0U};
     /// Its size in entries.
     u32 array_spill_entries{};
+    /// Bitmask of [[buffer(0..30)]] slots that are strictly read-only (MTLMutabilityImmutable).
+    u32 immutable_buffer_mask{};
     std::string error;
 };
 

@@ -251,6 +251,7 @@ struct Declared {
     u32 binding;
     bool combined; ///< Takes a texture and a sampler
     bool spillable_single; ///< Read-only sampled/separate texture (not storage or buffer)
+    bool immutable_buffer; ///< Read-only constant/storage buffer safe for MTLMutabilityImmutable
     ResourceKind kind;
     u32 count; ///< Array elements, each a slot
 };
@@ -1322,25 +1323,30 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
         const spv::ExecutionModel model = Model(stage);
         const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
         std::vector<Declared> declared;
-        const auto add = [&](const auto& list, bool combined, bool sampled, ResourceKind kind) {
+        const auto add = [&](const auto& list, bool combined, bool sampled, bool is_uniform,
+                             bool is_ssbo, ResourceKind kind) {
             for (const spirv_cross::Resource& resource : list) {
                 const spirv_cross::SPIRType& type = compiler.get_type(resource.base_type_id);
+                const bool non_writable_ssbo =
+                    is_ssbo &&
+                    compiler.get_buffer_block_flags(resource.id).get(spv::DecorationNonWritable);
                 declared.push_back(Declared{
                     .set = compiler.get_decoration(resource.id, spv::DecorationDescriptorSet),
                     .binding = compiler.get_decoration(resource.id, spv::DecorationBinding),
                     .combined = combined,
                     .spillable_single = sampled && type.image.dim != spv::DimBuffer,
+                    .immutable_buffer = is_uniform || non_writable_ssbo,
                     .kind = kind,
                     .count = ArrayCount(compiler, resource),
                 });
             }
         };
-        add(resources.uniform_buffers, false, false, ResourceKind::Buffer);
-        add(resources.storage_buffers, false, false, ResourceKind::Buffer);
-        add(resources.sampled_images, true, true, ResourceKind::Texture);
-        add(resources.separate_images, false, true, ResourceKind::Texture);
-        add(resources.storage_images, false, false, ResourceKind::Texture);
-        add(resources.separate_samplers, false, false, ResourceKind::Sampler);
+        add(resources.uniform_buffers, false, false, true, false, ResourceKind::Buffer);
+        add(resources.storage_buffers, false, false, false, true, ResourceKind::Buffer);
+        add(resources.sampled_images, true, true, false, false, ResourceKind::Texture);
+        add(resources.separate_images, false, true, false, false, ResourceKind::Texture);
+        add(resources.storage_images, false, false, false, false, ResourceKind::Texture);
+        add(resources.separate_samplers, false, false, false, false, ResourceKind::Sampler);
         std::ranges::sort(declared, [](const Declared& lhs, const Declared& rhs) {
             return lhs.set != rhs.set ? lhs.set < rhs.set : lhs.binding < rhs.binding;
         });
@@ -1434,12 +1440,27 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
             options.spill_buffers && (vertex ? total_buffers > SpillThreshold
                                              : total_buffers + ReservedSlots > MetalBufferSlots);
         const u32 spill_cutoff = vertex ? SpillCutoff : MetalBufferSlots - ReservedSlots;
+        struct PendingMslBinding {
+            spirv_cross::MSLResourceBinding binding{};
+            bool needs_aux_buffer{};
+        };
+        std::vector<PendingMslBinding> pending_bindings;
+        pending_bindings.reserve(declared.size());
+        const auto mark_immutable = [&](u32 first_slot, u32 count) {
+            for (u32 i = 0; i < count; ++i) {
+                const u32 s = first_slot + i;
+                if (s < MetalBufferSlots) {
+                    result.immutable_buffer_mask |= (1U << s);
+                }
+            }
+        };
         for (const Declared& resource : declared) {
             spirv_cross::MSLResourceBinding binding{};
             binding.stage = model;
             binding.desc_set = resource.set;
             binding.binding = resource.binding;
             binding.count = resource.count;
+            bool needs_aux_buffer = false;
             switch (resource.kind) {
             case ResourceKind::Buffer:
                 if (spill && resource.count == 1 && buffers >= spill_cutoff) {
@@ -1469,6 +1490,10 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                     result.slots.push_back(
                         {resource.set, resource.binding, resource.kind, textures, resource.count});
                     textures += resource.count;
+                    // Storage images / texel buffers may cause SPIRV-Cross to synthesize an
+                    // auxiliary atomic buffer using binding.msl_buffer on MSL < 3.1; assign a
+                    // non-colliding buffer index after all primary buffer slots are placed.
+                    needs_aux_buffer = !resource.spillable_single;
                 }
                 if (resource.combined) {
                     assign_sampler(binding, resource);
@@ -1478,7 +1503,7 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                 assign_sampler(binding, resource);
                 break;
             }
-            compiler.add_msl_resource_binding(binding);
+            pending_bindings.push_back({binding, needs_aux_buffer});
         }
         // The recompiler's push constants (rescaling, render area): one buffer after the rest.
         if (!resources.push_constant_buffers.empty()) {
@@ -1487,16 +1512,20 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
             binding.desc_set = spirv_cross::kPushConstDescSet;
             binding.binding = spirv_cross::kPushConstBinding;
             binding.msl_buffer = buffers;
+            mark_immutable(buffers, 1);
             compiler.add_msl_resource_binding(binding);
             result.slots.push_back({PushConstantSet, 0, ResourceKind::Buffer, buffers++, 1});
         }
         if (spilled != 0) {
+            mark_immutable(buffers, 1);
             result.spill_slot = buffers++;
         }
         if (spilled_samplers != 0) {
+            mark_immutable(buffers, 1);
             result.sampler_spill_slot = buffers++;
         }
         if (array_entries != 0) {
+            mark_immutable(buffers, 1);
             result.array_spill_slot = buffers++;
             result.array_spill_entries = array_entries;
         }
@@ -1524,6 +1553,17 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
             tess_slots.patch_input = buffers++;
             msl.shader_input_buffer_index = tess_slots.input;
             msl.shader_patch_input_buffer_index = tess_slots.patch_input;
+        }
+        // Place any SPIRV-Cross auxiliary atomic/texel buffer indices past all real buffer slots
+        // (and past a potential sampler-reduction mask slot at `buffers`) so they never collide
+        // with [[buffer(0)]].
+        u32 aux_buffers = buffers + (options.sampler_reduction ? 1U : 0U);
+        for (PendingMslBinding& item : pending_bindings) {
+            if (item.needs_aux_buffer) {
+                item.binding.msl_buffer = aux_buffers;
+                aux_buffers += item.binding.count;
+            }
+            compiler.add_msl_resource_binding(item.binding);
         }
         compiler.set_msl_options(msl);
         if (buffers > options.first_vertex_buffer_slot &&
@@ -1575,6 +1615,9 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                 return result;
             }
             if (status == SpillStatus::Unused) {
+                if (result.spill_slot < 31) {
+                    result.immutable_buffer_mask &= ~(1U << result.spill_slot);
+                }
                 result.spill_slot = ~0U;
             }
         }
@@ -1590,6 +1633,9 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                 return result;
             }
             if (status == SpillStatus::Unused) {
+                if (result.array_spill_slot < 31) {
+                    result.immutable_buffer_mask &= ~(1U << result.array_spill_slot);
+                }
                 result.array_spill_slot = ~0U;
                 result.array_spill_entries = 0;
             }
@@ -1606,6 +1652,9 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                 return result;
             }
             if (status == SpillStatus::Unused) {
+                if (result.sampler_spill_slot < 31) {
+                    result.immutable_buffer_mask &= ~(1U << result.sampler_spill_slot);
+                }
                 result.sampler_spill_slot = ~0U;
             }
         }

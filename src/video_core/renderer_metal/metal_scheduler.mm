@@ -640,22 +640,32 @@ id<MTLTexture> StencilView(id<MTLTexture> texture) {
     return [texture newTextureViewWithPixelFormat:format];
 }
 
-void ApplyAttachment(MTLRenderPassAttachmentDescriptor* descriptor, const Attachment& attachment) {
-    descriptor.texture = AsTexture(attachment.texture);
+#define UnretainedBuffer(handle) ((__bridge __unsafe_unretained id<MTLBuffer>)(handle))
+#define UnretainedTexture(handle) ((__bridge __unsafe_unretained id<MTLTexture>)(handle))
+#define UnretainedSampler(handle) ((__bridge __unsafe_unretained id<MTLSamplerState>)(handle))
+
+void ApplyAttachment(MTLRenderPassAttachmentDescriptor* __unsafe_unretained descriptor,
+                     const Attachment& attachment) {
+    descriptor.texture = UnretainedTexture(attachment.texture);
     descriptor.level = attachment.level;
     descriptor.slice = attachment.slice;
     descriptor.depthPlane = attachment.depth_plane;
 }
 
-id<MTLTexture> RootOf(id<MTLTexture> texture) {
-    while (texture.parentTexture != nil) {
-        texture = texture.parentTexture;
+const void* RootTextureHandle(const void* handle) noexcept {
+    id<MTLTexture> __unsafe_unretained texture = UnretainedTexture(handle);
+    while (texture != nil) {
+        const id<MTLTexture> __unsafe_unretained parent = texture.parentTexture;
+        if (parent == nil) {
+            break;
+        }
+        texture = parent;
     }
-    return texture;
+    return (__bridge const void*)texture;
 }
 
 bool SameRootTexture(TextureHandle a, TextureHandle b) {
-    return a != nullptr && b != nullptr && RootOf(AsTexture(a)) == RootOf(AsTexture(b));
+    return a != nullptr && b != nullptr && RootTextureHandle(a) == RootTextureHandle(b);
 }
 
 std::pair<u32, u32> MipExtent(id<MTLTexture> texture, u32 level) {
@@ -1086,6 +1096,7 @@ constexpr std::array<const char*, static_cast<size_t>(PassEnd::Count)> PassEndNa
 struct ComputeBind {
     enum class Kind : u8 { Buffer, Bytes, Texture, Sampler, UseBuffer, UseTexture };
     Kind kind;
+    bool on_buffer;
     bool write;
     u32 slot;
     void* object;
@@ -1097,8 +1108,214 @@ struct ComputeBind {
 struct StageBindings {
     std::array<const void*, BufferSlots> buffers{};
     std::array<u32, BufferSlots> offsets{};
+    std::array<u64, BufferSlots> lengths{};
     std::array<const void*, TextureSlots> textures{};
     std::array<const void*, SamplerSlots> samplers{};
+};
+
+/// Tracks buffers and root textures written since the last scoped barrier inside one open
+/// MTLComputeCommandEncoder so consecutive compute dispatches share one encoder safely.
+struct ComputeHazardState {
+    std::vector<const void*> written_buffers;
+    std::vector<const void*> written_textures;
+    std::vector<const void*> pending_buffers;
+    std::vector<const void*> pending_textures;
+    MTLBarrierScope pending_scope{};
+
+    void Reset() noexcept {
+        written_buffers.clear();
+        written_textures.clear();
+        pending_buffers.clear();
+        pending_textures.clear();
+        pending_scope = 0;
+    }
+
+    void ResetPending() noexcept {
+        pending_buffers.clear();
+        pending_textures.clear();
+        pending_scope = 0;
+    }
+
+    static bool Contains(const std::vector<const void*>& list, const void* item) noexcept {
+        return std::find(list.begin(), list.end(), item) != list.end();
+    }
+
+    static void AddUnique(std::vector<const void*>& list, const void* item) {
+        if (item != nullptr && !Contains(list, item)) {
+            list.push_back(item);
+        }
+    }
+
+    void NoteBuffer(const void* buffer, bool write) {
+        if (buffer == nullptr) {
+            return;
+        }
+        if (Contains(written_buffers, buffer)) {
+            pending_scope |= MTLBarrierScopeBuffers;
+        }
+        if (write) {
+            AddUnique(pending_buffers, buffer);
+        }
+    }
+
+    void NoteTexture(TextureHandle texture, bool on_buffer, bool write) {
+        if (texture == nullptr) {
+            return;
+        }
+        if (!write && written_textures.empty() && (!on_buffer || written_buffers.empty())) {
+            return;
+        }
+        const void* const raw_root = RootTextureHandle(texture);
+        if (raw_root == nullptr) {
+            return;
+        }
+        if (Contains(written_textures, raw_root)) {
+            pending_scope |= MTLBarrierScopeTextures;
+        }
+        if (on_buffer) {
+            const id<MTLBuffer> __unsafe_unretained backing = UnretainedTexture(raw_root).buffer;
+            if (backing != nil) {
+                const void* const raw_buf = (__bridge const void*)backing;
+                if (Contains(written_buffers, raw_buf)) {
+                    pending_scope |= MTLBarrierScopeBuffers | MTLBarrierScopeTextures;
+                }
+                if (write) {
+                    AddUnique(pending_buffers, raw_buf);
+                }
+            }
+        }
+        if (write) {
+            AddUnique(pending_textures, raw_root);
+        }
+    }
+
+    void BeforeDispatch(__unsafe_unretained id<MTLComputeCommandEncoder> encoder,
+                        bool has_recorder) {
+        for (const void* buf : pending_buffers) {
+            if (Contains(written_buffers, buf)) {
+                pending_scope |= MTLBarrierScopeBuffers;
+                break;
+            }
+        }
+        for (const void* tex : pending_textures) {
+            if (Contains(written_textures, tex)) {
+                pending_scope |= MTLBarrierScopeTextures;
+                break;
+            }
+        }
+        if (pending_scope != 0 && encoder != nil && !has_recorder) {
+            [encoder memoryBarrierWithScope:pending_scope];
+            if ((pending_scope & MTLBarrierScopeBuffers) != 0) {
+                written_buffers.clear();
+            }
+            if ((pending_scope & MTLBarrierScopeTextures) != 0) {
+                written_textures.clear();
+            }
+        }
+        pending_scope = 0;
+    }
+
+    void AfterDispatch() {
+        for (const void* buf : pending_buffers) {
+            AddUnique(written_buffers, buf);
+        }
+        for (const void* tex : pending_textures) {
+            AddUnique(written_textures, tex);
+        }
+    }
+};
+
+struct ReusablePassDescriptor {
+    MTLRenderPassDescriptor* pass = nil;
+    std::array<MTLRenderPassColorAttachmentDescriptor*, 8> colors{};
+    MTLRenderPassDepthAttachmentDescriptor* depth = nil;
+    MTLRenderPassStencilAttachmentDescriptor* stencil = nil;
+    u8 dirty_colors{};
+    bool dirty_depth{};
+    bool dirty_stencil{};
+
+    ReusablePassDescriptor() {
+        pass = [MTLRenderPassDescriptor new];
+        for (u32 i = 0; i < 8; ++i) {
+            colors[i] = pass.colorAttachments[i];
+        }
+        depth = pass.depthAttachment;
+        stencil = pass.stencilAttachment;
+    }
+
+    MTLRenderPassDescriptor* Acquire() noexcept {
+        Reset();
+        return pass;
+    }
+
+    MTLRenderPassColorAttachmentDescriptor* Color(size_t index) noexcept {
+        dirty_colors |= static_cast<u8>(1U << index);
+        return colors[index];
+    }
+
+    MTLRenderPassDepthAttachmentDescriptor* Depth() noexcept {
+        dirty_depth = true;
+        return depth;
+    }
+
+    MTLRenderPassStencilAttachmentDescriptor* Stencil() noexcept {
+        dirty_stencil = true;
+        return stencil;
+    }
+
+    void Reset() noexcept {
+        while (dirty_colors != 0) {
+            const u32 i = static_cast<u32>(std::countr_zero(dirty_colors));
+            dirty_colors &= dirty_colors - 1U;
+            MTLRenderPassColorAttachmentDescriptor* __unsafe_unretained c = colors[i];
+            c.texture = nil;
+            c.level = 0;
+            c.slice = 0;
+            c.depthPlane = 0;
+            c.loadAction = MTLLoadActionDontCare;
+            c.storeAction = MTLStoreActionDontCare;
+            c.resolveTexture = nil;
+            c.resolveLevel = 0;
+            c.resolveSlice = 0;
+            c.resolveDepthPlane = 0;
+        }
+        if (dirty_depth) {
+            dirty_depth = false;
+            MTLRenderPassDepthAttachmentDescriptor* __unsafe_unretained d = depth;
+            d.texture = nil;
+            d.level = 0;
+            d.slice = 0;
+            d.depthPlane = 0;
+            d.loadAction = MTLLoadActionDontCare;
+            d.storeAction = MTLStoreActionDontCare;
+            d.clearDepth = 1.0;
+            d.resolveTexture = nil;
+            d.resolveLevel = 0;
+            d.resolveSlice = 0;
+            d.resolveDepthPlane = 0;
+            d.depthResolveFilter = MTLMultisampleDepthResolveFilterSample0;
+        }
+        if (dirty_stencil) {
+            dirty_stencil = false;
+            MTLRenderPassStencilAttachmentDescriptor* __unsafe_unretained s = stencil;
+            s.texture = nil;
+            s.level = 0;
+            s.slice = 0;
+            s.depthPlane = 0;
+            s.loadAction = MTLLoadActionDontCare;
+            s.storeAction = MTLStoreActionDontCare;
+            s.clearStencil = 0;
+            s.resolveTexture = nil;
+            s.resolveLevel = 0;
+            s.resolveSlice = 0;
+            s.resolveDepthPlane = 0;
+        }
+        pass.renderTargetWidth = 0;
+        pass.renderTargetHeight = 0;
+        pass.renderTargetArrayLength = 0;
+        pass.defaultRasterSampleCount = 0;
+        pass.visibilityResultBuffer = nil;
+    }
 };
 
 /// A buffer slot holding bytes (setBytes): its address stands for a buffer no other equals.
@@ -1455,8 +1672,10 @@ struct Scheduler::Impl {
         if (active_compute == kernel_compute) {
             active_compute = nil;
             active_bound = nullptr;
+            active_hazards = nullptr;
             compute_clobbered_by_copy = false;
         }
+        kernel_hazards.Reset();
         [kernel_compute endEncoding];
         kernel_compute = nil;
     }
@@ -1508,6 +1727,7 @@ struct Scheduler::Impl {
             kernel_compute = [target computeCommandEncoder];
             kernel_compute.label = @"Kernels";
             kernel_bound = {};
+            kernel_hazards.Reset();
             kernel_pipeline = nullptr;
             ++encoders;
         }
@@ -1568,7 +1788,6 @@ struct Scheduler::Impl {
         segment_bound.clear();
         segment_written_textures.clear();
         segment_touched_textures.clear();
-        segment_shared_writes = false;
         segment_opaque = false;
         checked_failed = false;
         ahead_query_relaxed = false;
@@ -1629,11 +1848,7 @@ struct Scheduler::Impl {
         if (!writes || buffer == nullptr || !AheadAnyEnabled() || NotedInSegment(buffer, true)) {
             return;
         }
-        if (AsBuffer(const_cast<void*>(buffer)).storageMode == MTLStorageModeShared) {
-            segment_shared_writes = true;
-        } else {
-            segment_bound.insert(buffer);
-        }
+        segment_bound.insert(buffer);
     }
 
     void NoteTextureTouched(const void* texture) {
@@ -1647,9 +1862,8 @@ struct Scheduler::Impl {
             return;
         }
         cached = {texture, segment_serial};
-        const id<MTLTexture> root = RootOf(AsTexture(const_cast<void*>(texture)));
-        if (root != nil) {
-            segment_touched_textures.insert((__bridge const void*)root);
+        if (const void* const raw_root = RootTextureHandle(texture); raw_root != nullptr) {
+            segment_touched_textures.insert(raw_root);
         }
     }
 
@@ -1657,9 +1871,7 @@ struct Scheduler::Impl {
         if (texture == nullptr) {
             return;
         }
-        const id<MTLTexture> root = RootOf(AsTexture(const_cast<void*>(texture)));
-        if (root != nil) {
-            const void* const raw_root = (__bridge const void*)root;
+        if (const void* const raw_root = RootTextureHandle(texture); raw_root != nullptr) {
             segment_written_textures.insert(raw_root);
             segment_touched_textures.insert(raw_root);
         }
@@ -1670,7 +1882,9 @@ struct Scheduler::Impl {
         if (!writes || texture == nullptr || !AheadAnyEnabled() || NotedInSegment(texture, true)) {
             return;
         }
-        const id<MTLBuffer> buffer = RootOf(AsTexture(const_cast<void*>(texture))).buffer;
+        const void* const raw_root = RootTextureHandle(texture);
+        const id<MTLBuffer> __unsafe_unretained buffer =
+            raw_root != nullptr ? UnretainedTexture(raw_root).buffer : nil;
         if (buffer != nil) {
             NoteSegmentBuffer((__bridge const void*)buffer, true);
         }
@@ -1695,44 +1909,45 @@ struct Scheduler::Impl {
     /// Whether the checked kernel binding `buffer` may see something in-order work of the
     /// segment writes (it would run before that work).
     bool CheckedConflict(const void* buffer) const {
-        if (buffer == nullptr) {
-            return false;
-        }
-        if (AsBuffer(const_cast<void*>(buffer)).storageMode == MTLStorageModeShared) {
-            // Ring allocations the kernel writes or CPU uploads it reads.
-            return segment_shared_writes;
-        }
-        return segment_bound.contains(buffer);
+        return buffer != nullptr && segment_bound.contains(buffer);
     }
 
-    void LogComputeBind(ComputeBind::Kind kind, u32 slot, void* object, u32 offset, bool write) {
-        compute_binds.push_back({kind, write, slot, object, offset, 0});
+    void LogComputeBind(ComputeBind::Kind kind, u32 slot, void* object, u32 offset, bool write,
+                        bool on_buffer = true) {
+        compute_binds.push_back({kind, on_buffer, write, slot, object, offset, 0});
     }
 
     void LogComputeBytes(u32 slot, const void* data, u32 size) {
         const u32 at = static_cast<u32>(compute_bind_bytes.size());
         const u8* const bytes = static_cast<const u8*>(data);
         compute_bind_bytes.insert(compute_bind_bytes.end(), bytes, bytes + size);
-        compute_binds.push_back({ComputeBind::Kind::Bytes, false, slot, nullptr, at, size});
+        compute_binds.push_back({ComputeBind::Kind::Bytes, false, false, slot, nullptr, at, size});
     }
 
     /// Sets the kernel's pipeline and binds again on the active compute encoder (a new one).
     void ReplayComputeBinds(const void** bound_pipeline, bool in_order) {
-        if (active_compute == nil) {
+        const id<MTLComputeCommandEncoder> __unsafe_unretained enc = active_compute;
+        if (enc == nil) {
             return;
+        }
+        if (active_hazards != nullptr) {
+            active_hazards->ResetPending();
         }
         if (!StateCacheEnabled() || *bound_pipeline != compute_bind_pipeline) {
             *bound_pipeline = compute_bind_pipeline;
             ++state_sets;
-            [active_compute
-                setComputePipelineState:(__bridge id<MTLComputePipelineState>)compute_bind_pipeline];
+            [enc setComputePipelineState:(__bridge __unsafe_unretained id<MTLComputePipelineState>)
+                                             compute_bind_pipeline];
         }
         for (const ComputeBind& bind : compute_binds) {
             switch (bind.kind) {
             case ComputeBind::Kind::Buffer:
+                if (active_hazards != nullptr) {
+                    active_hazards->NoteBuffer(bind.object, bind.write);
+                }
                 SetBuffer(ShaderStage::Compute, bind.slot, bind.object, bind.offset);
-                if (in_order) {
-                    NoteSegmentBuffer(bind.object, true);
+                if (in_order && bind.write) {
+                    NoteInOrderWrite(bind.object);
                 }
                 break;
             case ComputeBind::Kind::Bytes:
@@ -1740,36 +1955,47 @@ struct Scheduler::Impl {
                     active_bound->buffers[bind.slot] = &InlineBytes;
                 }
                 ++state_sets;
-                [active_compute setBytes:compute_bind_bytes.data() + bind.offset
-                                  length:bind.size
-                                 atIndex:bind.slot];
+                [enc setBytes:compute_bind_bytes.data() + bind.offset
+                       length:bind.size
+                      atIndex:bind.slot];
                 break;
             case ComputeBind::Kind::Texture:
-                if (NoteObject(active_bound->textures, bind.slot, bind.object)) {
-                    [active_compute setTexture:AsTexture(bind.object) atIndex:bind.slot];
+                if (active_hazards != nullptr) {
+                    active_hazards->NoteTexture(bind.object, bind.on_buffer, bind.write);
                 }
-                if (in_order) {
+                if (NoteObject(active_bound->textures, bind.slot, bind.object)) {
+                    [enc setTexture:UnretainedTexture(bind.object) atIndex:bind.slot];
+                }
+                if (in_order && bind.write) {
+                    NoteTextureWrite(bind.object);
                     NoteSegmentTexture(bind.object, true);
                 }
                 break;
             case ComputeBind::Kind::Sampler:
                 if (NoteObject(active_bound->samplers, bind.slot, bind.object)) {
-                    [active_compute setSamplerState:AsSampler(bind.object) atIndex:bind.slot];
+                    [enc setSamplerState:UnretainedSampler(bind.object) atIndex:bind.slot];
                 }
                 break;
             case ComputeBind::Kind::UseBuffer:
-                [active_compute useResource:AsBuffer(bind.object)
-                                      usage:MTLResourceUsageRead | MTLResourceUsageWrite];
-                if (in_order) {
-                    NoteSegmentBuffer(bind.object, true);
+                if (active_hazards != nullptr) {
+                    active_hazards->NoteBuffer(bind.object, bind.write);
+                }
+                [enc useResource:UnretainedBuffer(bind.object)
+                           usage:bind.write ? (MTLResourceUsageRead | MTLResourceUsageWrite)
+                                            : MTLResourceUsageRead];
+                if (in_order && bind.write) {
+                    NoteInOrderWrite(bind.object);
                 }
                 break;
             case ComputeBind::Kind::UseTexture:
-                [active_compute useResource:AsTexture(bind.object)
-                                      usage:bind.write
-                                                ? (MTLResourceUsageRead | MTLResourceUsageWrite)
-                                                : MTLResourceUsageRead];
-                if (in_order) {
+                if (active_hazards != nullptr) {
+                    active_hazards->NoteTexture(bind.object, bind.on_buffer, bind.write);
+                }
+                [enc useResource:UnretainedTexture(bind.object)
+                           usage:bind.write ? (MTLResourceUsageRead | MTLResourceUsageWrite)
+                                            : MTLResourceUsageRead];
+                if (in_order && bind.write) {
+                    NoteTextureWrite(bind.object);
                     NoteSegmentTexture(bind.object, true);
                 }
                 break;
@@ -1779,10 +2005,9 @@ struct Scheduler::Impl {
 
     /// EDEN_NX2_METAL_COMPUTE_COPY: a buffer copy as a dispatch on the open compute encoder
     /// `encoder` (bound as `bound`, its pipeline in `bound_pipeline`), in place of ending it for
-    /// a blit encoder and opening another after the copy. Metal orders the dispatch with the
-    /// encoder's others on the buffers' tracked hazards, as it orders the encoders. False when
-    /// the copy kernel is not there (the caller blits).
-    bool CopyByCompute(id<MTLComputeCommandEncoder> encoder, StageBindings& bound,
+    /// a blit encoder and opening another after the copy. False when the copy kernel is not there.
+    bool CopyByCompute(__unsafe_unretained id<MTLComputeCommandEncoder> encoder,
+                       StageBindings& bound, ComputeHazardState& hazards,
                        const void** bound_pipeline, BufferHandle src, u64 src_offset,
                        BufferHandle dst, u64 dst_offset, u64 size) {
         if (copy_kernel == nil) {
@@ -1802,6 +2027,12 @@ struct Scheduler::Impl {
                 return false;
             }
         }
+        if (recorder == nullptr &&
+            (ComputeHazardState::Contains(hazards.written_buffers, src) ||
+             ComputeHazardState::Contains(hazards.written_buffers, dst))) {
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            hazards.written_buffers.clear();
+        }
         const void* const copy_pipe = (__bridge const void*)copy_kernel;
         if (!StateCacheEnabled() || *bound_pipeline != copy_pipe) {
             *bound_pipeline = copy_pipe;
@@ -1816,9 +2047,14 @@ struct Scheduler::Impl {
         case Bound::Offset:
             [encoder setBufferOffset:0 atIndex:0];
             break;
-        case Bound::Other:
-            [encoder setBuffer:AsBuffer(src) offset:0 atIndex:0];
+        case Bound::Other: {
+            const id<MTLBuffer> __unsafe_unretained mtl_src = UnretainedBuffer(src);
+            if (0 < BufferSlots) {
+                bound.lengths[0] = mtl_src != nil ? static_cast<u64>(mtl_src.length) : 0;
+            }
+            [encoder setBuffer:mtl_src offset:0 atIndex:0];
             break;
+        }
         }
         switch (NoteBuffer(bound, 1, dst, 0)) {
         case Bound::Same:
@@ -1826,9 +2062,14 @@ struct Scheduler::Impl {
         case Bound::Offset:
             [encoder setBufferOffset:0 atIndex:1];
             break;
-        case Bound::Other:
-            [encoder setBuffer:AsBuffer(dst) offset:0 atIndex:1];
+        case Bound::Other: {
+            const id<MTLBuffer> __unsafe_unretained mtl_dst = UnretainedBuffer(dst);
+            if (1 < BufferSlots) {
+                bound.lengths[1] = mtl_dst != nil ? static_cast<u64>(mtl_dst.length) : 0;
+            }
+            [encoder setBuffer:mtl_dst offset:0 atIndex:1];
             break;
+        }
         }
         bound.buffers[2] = &InlineBytes;
         ++state_sets;
@@ -1837,6 +2078,7 @@ struct Scheduler::Impl {
         const u64 threads = (size + 15) / 16;
         [encoder dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((threads + 63) / 64), 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        ComputeHazardState::AddUnique(hazards.written_buffers, dst);
         if (active_compute == encoder) {
             compute_clobbered_by_copy = true;
         }
@@ -1850,12 +2092,14 @@ struct Scheduler::Impl {
             compute = [Commands() computeCommandEncoder];
             compute.label = @"Compute";
             compute_bound = {};
+            compute_hazards.Reset();
             compute_pipeline = nullptr;
             ++encoders;
             ++segment_encoders;
         }
         active_compute = compute;
         active_bound = &compute_bound;
+        active_hazards = &compute_hazards;
         compute_clobbered_by_copy = false;
     }
 
@@ -1867,6 +2111,7 @@ struct Scheduler::Impl {
             compute_clobbered_by_copy = false;
             active_compute = KernelEncoder();
             active_bound = &kernel_bound;
+            active_hazards = &kernel_hazards;
             ReplayComputeBinds(&kernel_pipeline, false);
             return;
         }
@@ -1874,17 +2119,18 @@ struct Scheduler::Impl {
             return;
         }
         compute_clobbered_by_copy = false;
-        if (active_compute == nil) {
+        const id<MTLComputeCommandEncoder> __unsafe_unretained enc = active_compute;
+        if (enc == nil) {
             return;
         }
         const void** const bound_pipeline =
-            active_compute == kernel_compute ? &kernel_pipeline : &compute_pipeline;
+            enc == kernel_compute ? &kernel_pipeline : &compute_pipeline;
         if (compute_bind_pipeline != nullptr &&
             (!StateCacheEnabled() || *bound_pipeline != compute_bind_pipeline)) {
             *bound_pipeline = compute_bind_pipeline;
             ++state_sets;
-            [active_compute
-                setComputePipelineState:(__bridge id<MTLComputePipelineState>)compute_bind_pipeline];
+            [enc setComputePipelineState:(__bridge __unsafe_unretained id<MTLComputePipelineState>)
+                                             compute_bind_pipeline];
         }
         for (const ComputeBind& bind : compute_binds) {
             if (bind.slot >= 3) {
@@ -1895,9 +2141,9 @@ struct Scheduler::Impl {
             } else if (bind.kind == ComputeBind::Kind::Bytes) {
                 active_bound->buffers[bind.slot] = &InlineBytes;
                 ++state_sets;
-                [active_compute setBytes:compute_bind_bytes.data() + bind.offset
-                                  length:bind.size
-                                 atIndex:bind.slot];
+                [enc setBytes:compute_bind_bytes.data() + bind.offset
+                       length:bind.size
+                      atIndex:bind.slot];
             }
         }
     }
@@ -1908,6 +2154,9 @@ struct Scheduler::Impl {
         kernel_checked = false;
         checked_failed = true;
         ++ahead_fallbacks;
+        if (active_hazards != nullptr) {
+            active_hazards->ResetPending();
+        }
         // As the rasterizer does for a kernel that ends the pass it draws into.
         if (render != nil && render_targets == ahead_query_targets && AheadSplitEnabled() &&
             !Wanted(ahead_query_targets)) {
@@ -1928,6 +2177,9 @@ struct Scheduler::Impl {
         if (kernel_checked && CheckedConflict(buffer)) {
             LeaveChecked(nullptr);
         }
+        if (active_hazards != nullptr) {
+            active_hazards->NoteBuffer(buffer, writes);
+        }
         if (active_compute != nil && active_compute == compute) {
             if (writes) {
                 NoteInOrderWrite(const_cast<void*>(buffer));
@@ -1940,17 +2192,20 @@ struct Scheduler::Impl {
     /// Before a compute bind of `texture`: a checked kernel only falls back in order when the
     /// root texture (or its backing buffer) was modified in the segment or has a pending clear;
     /// an in-order one records a waiting clear of it first.
-    void ComputeTexture(TextureHandle texture, bool write = true) {
+    void ComputeTexture(TextureHandle texture, bool on_buffer = true, bool write = true) {
         ResumeKernel();
         if (texture == nullptr) {
             return;
         }
+        if (write) {
+            Written(texture);
+        }
         NoteTextureTouched(texture);
         if (active_compute != nil && active_compute != compute) {
             if (kernel_checked) {
-                const id<MTLTexture> root_tex = RootOf(AsTexture(texture));
-                const void* const raw_root = (__bridge const void*)root_tex;
-                const id<MTLBuffer> backing = root_tex != nil ? root_tex.buffer : nil;
+                const void* const raw_root = RootTextureHandle(texture);
+                const id<MTLBuffer> __unsafe_unretained backing =
+                    raw_root != nullptr ? UnretainedTexture(raw_root).buffer : nil;
                 if (segment_written_textures.contains(raw_root) || PendingClearOn(texture) ||
                     (backing != nil && CheckedConflict((__bridge const void*)backing))) {
                     LeaveChecked(texture);
@@ -1959,13 +2214,18 @@ struct Scheduler::Impl {
                 LeaveChecked(texture);
             }
         }
+        if (active_hazards != nullptr) {
+            active_hazards->NoteTexture(texture, on_buffer, write);
+        }
         if (active_compute == nil || active_compute != compute) {
             return;
         }
         if (write) {
             NoteTextureWrite(texture);
         }
-        NoteSegmentTexture(texture, write);
+        if (on_buffer || !ImageNoteSkipEnabled()) {
+            NoteSegmentTexture(texture, write);
+        }
         if (pending_clear && PendingClearOn(texture)) {
             EndEncoder();
             FlushClear();
@@ -2034,90 +2294,109 @@ struct Scheduler::Impl {
     }
 
     void SetBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset) {
-        // Metal checks an offset past the buffer's end only in its validation layer; without it
-        // the GPU reads past the allocation. Zeros instead.
-        if (buffer != nullptr && PipelineCheckEnabled() && offset >= AsBuffer(buffer).length) {
-            Coverage::NoteGuardWith("buffer offset past its end", [&] {
-                return fmt::format("offset {} of a {}-byte buffer", offset,
-                                   static_cast<u64>(AsBuffer(buffer).length));
-            });
-            buffer = (__bridge BufferHandle)ZeroBuffer();
-            offset = 0;
-        }
+        StageBindings* bound = nullptr;
         switch (stage) {
         case ShaderStage::Vertex:
             if (render == nil) {
                 return;
             }
-            switch (NoteBuffer(vertex_bound, slot, buffer, offset)) {
-            case Bound::Same:
-                break;
-            case Bound::Offset:
-                [render setVertexBufferOffset:offset atIndex:slot];
-                break;
-            case Bound::Other:
-                [render setVertexBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
-                break;
-            }
+            bound = &vertex_bound;
             break;
         case ShaderStage::Fragment:
             if (render == nil) {
                 return;
             }
-            switch (NoteBuffer(fragment_bound, slot, buffer, offset)) {
-            case Bound::Same:
-                break;
-            case Bound::Offset:
-                [render setFragmentBufferOffset:offset atIndex:slot];
-                break;
-            case Bound::Other:
-                [render setFragmentBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
-                break;
-            }
+            bound = &fragment_bound;
             break;
         case ShaderStage::Object:
             if (render == nil) {
                 return;
             }
-            switch (NoteBuffer(object_bound, slot, buffer, offset)) {
-            case Bound::Same:
-                break;
-            case Bound::Offset:
-                [render setObjectBufferOffset:offset atIndex:slot];
-                break;
-            case Bound::Other:
-                [render setObjectBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
-                break;
-            }
+            bound = &object_bound;
             break;
         case ShaderStage::Mesh:
             if (render == nil) {
                 return;
             }
-            switch (NoteBuffer(mesh_bound, slot, buffer, offset)) {
-            case Bound::Same:
-                break;
-            case Bound::Offset:
-                [render setMeshBufferOffset:offset atIndex:slot];
-                break;
-            case Bound::Other:
-                [render setMeshBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
-                break;
-            }
+            bound = &mesh_bound;
             break;
         case ShaderStage::Compute:
             if (active_compute == nil) {
                 return;
             }
-            switch (NoteBuffer(*active_bound, slot, buffer, offset)) {
-            case Bound::Same:
-                break;
-            case Bound::Offset:
-                [active_compute setBufferOffset:offset atIndex:slot];
-                break;
-            case Bound::Other:
-                [active_compute setBuffer:AsBuffer(buffer) offset:offset atIndex:slot];
-                break;
+            bound = active_bound;
+            break;
+        }
+        const bool cached = StateCacheEnabled() && slot < bound->buffers.size();
+        if (cached && bound->buffers[slot] == buffer &&
+            (buffer == nullptr || bound->offsets[slot] == offset)) {
+            ++state_skips;
+            return;
+        }
+        // Metal checks an offset past the buffer's end only in its validation layer; without it
+        // the GPU reads past the allocation. Checked after the redundant-bind memo, using the
+        // cached length when the same buffer stays bound at a new offset.
+        id<MTLBuffer> __unsafe_unretained mtl_buffer = UnretainedBuffer(buffer);
+        u64 buf_len = 0;
+        if (mtl_buffer != nil) {
+            if (cached && bound->buffers[slot] == buffer) {
+                buf_len = bound->lengths[slot];
+            } else {
+                buf_len = static_cast<u64>(mtl_buffer.length);
+            }
+            if (PipelineCheckEnabled() && offset >= buf_len) {
+                Coverage::NoteGuardWith("buffer offset past its end", [&] {
+                    return fmt::format("offset {} of a {}-byte buffer", offset, buf_len);
+                });
+                mtl_buffer = ZeroBuffer();
+                buffer = (__bridge BufferHandle)mtl_buffer;
+                buf_len = static_cast<u64>(mtl_buffer.length);
+                offset = 0;
+            }
+        }
+        const Bound kind = NoteBuffer(*bound, slot, buffer, offset);
+        if (kind == Bound::Same) {
+            return;
+        }
+        if (kind == Bound::Other && slot < bound->lengths.size()) {
+            bound->lengths[slot] = buf_len;
+        }
+        const id<MTLRenderCommandEncoder> __unsafe_unretained r_enc = render;
+        const id<MTLComputeCommandEncoder> __unsafe_unretained c_enc = active_compute;
+        switch (stage) {
+        case ShaderStage::Vertex:
+            if (kind == Bound::Offset) {
+                [r_enc setVertexBufferOffset:offset atIndex:slot];
+            } else {
+                [r_enc setVertexBuffer:mtl_buffer offset:offset atIndex:slot];
+            }
+            break;
+        case ShaderStage::Fragment:
+            if (kind == Bound::Offset) {
+                [r_enc setFragmentBufferOffset:offset atIndex:slot];
+            } else {
+                [r_enc setFragmentBuffer:mtl_buffer offset:offset atIndex:slot];
+            }
+            break;
+        case ShaderStage::Object:
+            if (kind == Bound::Offset) {
+                [r_enc setObjectBufferOffset:offset atIndex:slot];
+            } else {
+                [r_enc setObjectBuffer:mtl_buffer offset:offset atIndex:slot];
+            }
+            break;
+        case ShaderStage::Mesh:
+            if (kind == Bound::Offset) {
+                [r_enc setMeshBufferOffset:offset atIndex:slot];
+            } else {
+                [r_enc setMeshBuffer:mtl_buffer offset:offset atIndex:slot];
+            }
+            break;
+        case ShaderStage::Compute:
+            if (kind == Bound::Offset) {
+                [c_enc setBufferOffset:offset atIndex:slot];
+            } else {
+                [c_enc setBuffer:mtl_buffer offset:offset atIndex:slot];
             }
             break;
         }
@@ -2229,11 +2508,11 @@ struct Scheduler::Impl {
         const u32 width = static_cast<u32>(dst.width);
         const u32 height = static_cast<u32>(dst.height);
         for (u32 layer = 0; layer < dst.arrayLength; ++layer) {
-            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-            ApplyAttachment(pass.colorAttachments[0],
-                            Attachment{.texture = texture, .level = 0, .slice = layer});
-            pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            MTLRenderPassDescriptor* const pass = helper_pass_desc.Acquire();
+            MTLRenderPassColorAttachmentDescriptor* const color0 = helper_pass_desc.Color(0);
+            ApplyAttachment(color0, Attachment{.texture = texture, .level = 0, .slice = layer});
+            color0.loadAction = MTLLoadActionDontCare;
+            color0.storeAction = MTLStoreActionStore;
             pass.renderTargetWidth = width;
             pass.renderTargetHeight = height;
             const id<MTLRenderCommandEncoder> encoder = RenderEncoder(pass);
@@ -2296,8 +2575,10 @@ struct Scheduler::Impl {
             if (active_compute == compute) {
                 active_compute = nil;
                 active_bound = nullptr;
+                active_hazards = nullptr;
                 compute_clobbered_by_copy = false;
             }
+            compute_hazards.Reset();
             [compute endEncoding];
             compute = nil;
         }
@@ -2324,25 +2605,63 @@ struct Scheduler::Impl {
         ++segment_encoders;
         ++segment_render_passes;
         ++render_passes;
-        for (u32 i = 0; i < 8; ++i) {
-            if (const id<MTLTexture> tex = pass.colorAttachments[i].texture; tex != nil) {
+        ReusablePassDescriptor* const rpd =
+            pass == draw_pass_desc.pass     ? &draw_pass_desc
+            : pass == helper_pass_desc.pass ? &helper_pass_desc
+                                            : nullptr;
+        if (rpd != nullptr) {
+            u8 colors = rpd->dirty_colors;
+            while (colors != 0) {
+                const u32 i = static_cast<u32>(std::countr_zero(colors));
+                colors &= colors - 1U;
+                MTLRenderPassColorAttachmentDescriptor* const __unsafe_unretained c = rpd->colors[i];
+                if (const id<MTLTexture> __unsafe_unretained tex = c.texture; tex != nil) {
+                    NoteTextureWrite((__bridge const void*)tex);
+                }
+                if (const id<MTLTexture> __unsafe_unretained res = c.resolveTexture; res != nil) {
+                    NoteTextureWrite((__bridge const void*)res);
+                }
+            }
+            if (rpd->dirty_depth) {
+                if (const id<MTLTexture> __unsafe_unretained tex = rpd->depth.texture; tex != nil) {
+                    NoteTextureWrite((__bridge const void*)tex);
+                }
+                if (const id<MTLTexture> __unsafe_unretained res = rpd->depth.resolveTexture;
+                    res != nil) {
+                    NoteTextureWrite((__bridge const void*)res);
+                }
+            }
+            if (rpd->dirty_stencil) {
+                if (const id<MTLTexture> __unsafe_unretained tex = rpd->stencil.texture;
+                    tex != nil) {
+                    NoteTextureWrite((__bridge const void*)tex);
+                }
+                if (const id<MTLTexture> __unsafe_unretained res = rpd->stencil.resolveTexture;
+                    res != nil) {
+                    NoteTextureWrite((__bridge const void*)res);
+                }
+            }
+        } else {
+            for (u32 i = 0; i < 8; ++i) {
+                if (const id<MTLTexture> tex = pass.colorAttachments[i].texture; tex != nil) {
+                    NoteTextureWrite((__bridge const void*)tex);
+                }
+                if (const id<MTLTexture> res = pass.colorAttachments[i].resolveTexture; res != nil) {
+                    NoteTextureWrite((__bridge const void*)res);
+                }
+            }
+            if (const id<MTLTexture> tex = pass.depthAttachment.texture; tex != nil) {
                 NoteTextureWrite((__bridge const void*)tex);
             }
-            if (const id<MTLTexture> res = pass.colorAttachments[i].resolveTexture; res != nil) {
+            if (const id<MTLTexture> res = pass.depthAttachment.resolveTexture; res != nil) {
                 NoteTextureWrite((__bridge const void*)res);
             }
-        }
-        if (const id<MTLTexture> tex = pass.depthAttachment.texture; tex != nil) {
-            NoteTextureWrite((__bridge const void*)tex);
-        }
-        if (const id<MTLTexture> res = pass.depthAttachment.resolveTexture; res != nil) {
-            NoteTextureWrite((__bridge const void*)res);
-        }
-        if (const id<MTLTexture> tex = pass.stencilAttachment.texture; tex != nil) {
-            NoteTextureWrite((__bridge const void*)tex);
-        }
-        if (const id<MTLTexture> res = pass.stencilAttachment.resolveTexture; res != nil) {
-            NoteTextureWrite((__bridge const void*)res);
+            if (const id<MTLTexture> tex = pass.stencilAttachment.texture; tex != nil) {
+                NoteTextureWrite((__bridge const void*)tex);
+            }
+            if (const id<MTLTexture> res = pass.stencilAttachment.resolveTexture; res != nil) {
+                NoteTextureWrite((__bridge const void*)res);
+            }
         }
         // A timed frame (EDEN_NX2_PASS_TIMES): the pass's start and end on the GPU's clock.
         const size_t sample = pass_records.size() * 2;
@@ -2362,17 +2681,21 @@ struct Scheduler::Impl {
         if (timed) {
             pass.sampleBufferAttachments[0].sampleBuffer = nil;
             if (encoder != nil) {
-                const id<MTLTexture> color = pass.colorAttachments[0].texture;
-                const id<MTLTexture> depth = pass.depthAttachment.texture;
+                const id<MTLTexture> __unsafe_unretained color =
+                    rpd != nullptr ? rpd->colors[0].texture : pass.colorAttachments[0].texture;
+                const id<MTLTexture> __unsafe_unretained depth =
+                    rpd != nullptr ? rpd->depth.texture : pass.depthAttachment.texture;
                 u32 pass_width = static_cast<u32>(pass.renderTargetWidth);
                 u32 pass_height = static_cast<u32>(pass.renderTargetHeight);
                 if (pass_width == 0 || pass_height == 0) {
                     if (color != nil) {
-                        std::tie(pass_width, pass_height) =
-                            MipExtent(color, static_cast<u32>(pass.colorAttachments[0].level));
+                        const u32 lvl = static_cast<u32>(
+                            rpd != nullptr ? rpd->colors[0].level : pass.colorAttachments[0].level);
+                        std::tie(pass_width, pass_height) = MipExtent(color, lvl);
                     } else if (depth != nil) {
-                        std::tie(pass_width, pass_height) =
-                            MipExtent(depth, static_cast<u32>(pass.depthAttachment.level));
+                        const u32 lvl = static_cast<u32>(
+                            rpd != nullptr ? rpd->depth.level : pass.depthAttachment.level);
+                        std::tie(pass_width, pass_height) = MipExtent(depth, lvl);
                     }
                 }
                 pass_records.push_back({
@@ -2389,16 +2712,22 @@ struct Scheduler::Impl {
         if (encoder == nil) {
             // Metal refused the pass (draws into it are dropped): name it once.
             if (refused_passes++ < 4) {
+                const id<MTLTexture> __unsafe_unretained c0 =
+                    rpd != nullptr ? rpd->colors[0].texture : pass.colorAttachments[0].texture;
+                const id<MTLTexture> __unsafe_unretained d0 =
+                    rpd != nullptr ? rpd->depth.texture : pass.depthAttachment.texture;
                 LOG_ERROR(Render_Metal, "Metal: render pass refused ({}x{}, colour 0 {}, depth {})",
                           pass.renderTargetWidth, pass.renderTargetHeight,
-                          pass.colorAttachments[0].texture != nil
-                              ? static_cast<u32>(pass.colorAttachments[0].texture.pixelFormat)
-                              : 0U,
-                          pass.depthAttachment.texture != nil
-                              ? static_cast<u32>(pass.depthAttachment.texture.pixelFormat)
-                              : 0U);
+                          c0 != nil ? static_cast<u32>(c0.pixelFormat) : 0U,
+                          d0 != nil ? static_cast<u32>(d0.pixelFormat) : 0U);
+            }
+            if (rpd != nullptr) {
+                rpd->Reset();
             }
             return nil;
+        }
+        if (rpd != nullptr) {
+            rpd->Reset();
         }
         encoder.label = StaticLabelsEnabled()
                             ? @"Pass"
@@ -2407,15 +2736,16 @@ struct Scheduler::Impl {
     }
 
     MTLRenderPassDescriptor* BuildClearDescriptor(const ClearPass& clear) {
-        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        MTLRenderPassDescriptor* const pass = helper_pass_desc.Acquire();
         bool any = false;
         for (size_t index = 0; index < clear.color.size(); ++index) {
             if (clear.color[index].texture == nullptr || !clear.clear_color[index]) {
                 continue;
             }
-            MTLRenderPassColorAttachmentDescriptor* color = pass.colorAttachments[index];
+            MTLRenderPassColorAttachmentDescriptor* const color = helper_pass_desc.Color(index);
             ApplyAttachment(color, clear.color[index]);
-            if (const auto shadow = shadows.find(clear.color[index].texture); shadow != shadows.end()) {
+            if (const auto shadow = shadows.find(clear.color[index].texture);
+                shadow != shadows.end()) {
                 shadow->second.valid = false;
                 shadow->second.dropped = false;
             }
@@ -2426,20 +2756,23 @@ struct Scheduler::Impl {
             any = true;
         }
         if (clear.depth.texture != nullptr && clear.clear_depth) {
-            ApplyAttachment(pass.depthAttachment, clear.depth);
-            pass.depthAttachment.loadAction = MTLLoadActionClear;
-            pass.depthAttachment.storeAction = MTLStoreActionStore;
-            pass.depthAttachment.clearDepth = clear.depth_value;
+            MTLRenderPassDepthAttachmentDescriptor* const depth = helper_pass_desc.Depth();
+            ApplyAttachment(depth, clear.depth);
+            depth.loadAction = MTLLoadActionClear;
+            depth.storeAction = MTLStoreActionStore;
+            depth.clearDepth = clear.depth_value;
             any = true;
         }
         if (clear.stencil.texture != nullptr && clear.clear_stencil) {
-            ApplyAttachment(pass.stencilAttachment, clear.stencil);
-            pass.stencilAttachment.loadAction = MTLLoadActionClear;
-            pass.stencilAttachment.storeAction = MTLStoreActionStore;
-            pass.stencilAttachment.clearStencil = clear.stencil_value;
+            MTLRenderPassStencilAttachmentDescriptor* const stencil = helper_pass_desc.Stencil();
+            ApplyAttachment(stencil, clear.stencil);
+            stencil.loadAction = MTLLoadActionClear;
+            stencil.storeAction = MTLStoreActionStore;
+            stencil.clearStencil = clear.stencil_value;
             any = true;
         }
         if (!any) {
+            helper_pass_desc.Reset();
             return nil;
         }
         pass.renderTargetWidth = std::clamp(clear.width, 1U, MaxRenderTargetSize);
@@ -2479,19 +2812,30 @@ struct Scheduler::Impl {
                 kernel_resume = true;
             }
             EndKernelEncoder();
-            for (u32 i = 0; i < 8; ++i) {
-                if (const id<MTLTexture> tex = pass.colorAttachments[i].texture; tex != nil) {
+            u8 colors = helper_pass_desc.dirty_colors;
+            while (colors != 0) {
+                const u32 i = static_cast<u32>(std::countr_zero(colors));
+                colors &= colors - 1U;
+                if (const id<MTLTexture> __unsafe_unretained tex = helper_pass_desc.colors[i].texture;
+                    tex != nil) {
                     NoteTextureWrite((__bridge const void*)tex);
                 }
             }
-            if (const id<MTLTexture> tex = pass.depthAttachment.texture; tex != nil) {
-                NoteTextureWrite((__bridge const void*)tex);
+            if (helper_pass_desc.dirty_depth) {
+                if (const id<MTLTexture> __unsafe_unretained tex = helper_pass_desc.depth.texture;
+                    tex != nil) {
+                    NoteTextureWrite((__bridge const void*)tex);
+                }
             }
-            if (const id<MTLTexture> tex = pass.stencilAttachment.texture; tex != nil) {
-                NoteTextureWrite((__bridge const void*)tex);
+            if (helper_pass_desc.dirty_stencil) {
+                if (const id<MTLTexture> __unsafe_unretained tex = helper_pass_desc.stencil.texture;
+                    tex != nil) {
+                    NoteTextureWrite((__bridge const void*)tex);
+                }
             }
             const id<MTLRenderCommandEncoder> encoder =
                 [AheadBuffer() renderCommandEncoderWithDescriptor:pass];
+            helper_pass_desc.Reset();
             if (encoder != nil) {
                 encoder.label = @"Ahead Clear";
                 ++passes_begun[1];
@@ -2513,8 +2857,8 @@ struct Scheduler::Impl {
             if (att.texture == nullptr) {
                 return true;
             }
-            const id<MTLTexture> root = RootOf(AsTexture(att.texture));
-            return root != nil && !segment_touched_textures.contains((__bridge const void*)root);
+            const void* const raw_root = RootTextureHandle(att.texture);
+            return raw_root != nullptr && !segment_touched_textures.contains(raw_root);
         };
         bool has_unconsumed = false;
         for (size_t i = 0; i < pending_clear->color.size(); ++i) {
@@ -3188,13 +3532,18 @@ struct Scheduler::Impl {
     bool depth_stencil_cleared{};
     u64 stores_dropped{};
     StageBindings compute_bound;
+    ComputeHazardState compute_hazards;
     const void* compute_pipeline{};
     StageBindings kernel_bound;
+    ComputeHazardState kernel_hazards;
     const void* kernel_pipeline{};
     /// The compute encoder binds and dispatches go to (the segment's or the kernels'), and what
     /// it has bound.
     id<MTLComputeCommandEncoder> active_compute = nil;
     StageBindings* active_bound{};
+    ComputeHazardState* active_hazards{};
+    ReusablePassDescriptor draw_pass_desc;
+    ReusablePassDescriptor helper_pass_desc;
     u64 state_sets{};
     u64 state_skips{};
     /// EDEN_NX2_METAL_AHEAD: the command buffers committed before the segment's, with the one
@@ -3214,9 +3563,8 @@ struct Scheduler::Impl {
     std::vector<ComputeBind> compute_binds;
     std::vector<u8> compute_bind_bytes;
     void* compute_bind_pipeline{};
-    /// EDEN_NX2_METAL_AHEAD_ANY: private buffers modified in order in the segment, root textures
-    /// written or touched in the segment, whether in-order work wrote a shared buffer, and whether
-    /// it did something not tracked at all.
+    /// EDEN_NX2_METAL_AHEAD_ANY: buffers modified in order in the segment, root textures
+    /// written or touched in the segment, and whether in-order work did something not tracked.
     std::unordered_set<const void*> segment_bound;
     std::unordered_set<const void*> segment_written_textures;
     std::unordered_set<const void*> segment_touched_textures;
@@ -3225,7 +3573,6 @@ struct Scheduler::Impl {
         u64 serial;
     };
     std::array<TouchedNote, 512> segment_touched_cache{};
-    bool segment_shared_writes{};
     /// Buffers and textures noted in the segment, by address
     /// (EDEN_NX2_METAL_SEGMENT_NOTE_CACHE).
     std::array<SegmentNote, 512> segment_notes{};
@@ -3723,7 +4070,7 @@ void Scheduler::CopyBuffer(BufferHandle src, u64 src_offset, BufferHandle dst, u
                 state.KernelEncoder();
             }
             if (MergeAheadEnabled() && state.kernel_compute != nil && state.upload_blit == nil &&
-                state.CopyByCompute(state.kernel_compute, state.kernel_bound,
+                state.CopyByCompute(state.kernel_compute, state.kernel_bound, state.kernel_hazards,
                                     &state.kernel_pipeline, src, src_offset, dst, dst_offset,
                                     size)) {
                 ++state.ahead_copies;
@@ -3731,18 +4078,18 @@ void Scheduler::CopyBuffer(BufferHandle src, u64 src_offset, BufferHandle dst, u
                 return;
             }
         } else if (state.compute != nil && state.render == nil && state.blit == nil &&
-                   state.CopyByCompute(state.compute, state.compute_bound,
+                   state.CopyByCompute(state.compute, state.compute_bound, state.compute_hazards,
                                        &state.compute_pipeline, src, src_offset, dst, dst_offset,
                                        size)) {
             ++state.compute_copies_in_order;
             return;
         }
     }
-    const id<MTLBlitCommandEncoder> encoder =
+    const id<MTLBlitCommandEncoder> __unsafe_unretained encoder =
         goes_ahead ? impl->UploadEncoder() : impl->BlitEncoder();
-    [encoder copyFromBuffer:AsBuffer(src)
+    [encoder copyFromBuffer:UnretainedBuffer(src)
                sourceOffset:src_offset
-                   toBuffer:AsBuffer(dst)
+                   toBuffer:UnretainedBuffer(dst)
           destinationOffset:dst_offset
                        size:size];
 }
@@ -3760,11 +4107,10 @@ bool Scheduler::CanUploadTextureAhead(TextureHandle texture) const noexcept {
         impl->PendingClearOn(texture)) {
         return false;
     }
-    const id<MTLTexture> root = RootOf(AsTexture(texture));
-    if (root == nil) {
+    const void* const raw_root = RootTextureHandle(texture);
+    if (raw_root == nullptr) {
         return false;
     }
-    const void* const raw_root = (__bridge const void*)root;
     if (!impl->shadows.empty() &&
         (impl->shadows.contains(texture) ||
          impl->shadows.contains(const_cast<void*>(raw_root)))) {
@@ -3844,7 +4190,8 @@ void Scheduler::FillBuffer(BufferHandle dst, u64 offset, u64 size, u8 value) {
         return;
     }
     impl->NoteInOrderWrite(dst);
-    [impl->BlitEncoder() fillBuffer:AsBuffer(dst) range:NSMakeRange(offset, size) value:value];
+    const id<MTLBlitCommandEncoder> __unsafe_unretained encoder = impl->BlitEncoder();
+    [encoder fillBuffer:UnretainedBuffer(dst) range:NSMakeRange(offset, size) value:value];
 }
 
 void Scheduler::CopyBufferToTexture(BufferHandle src, u64 offset, u32 bytes_per_row,
@@ -3860,14 +4207,14 @@ void Scheduler::CopyBufferToTexture(BufferHandle src, u64 offset, u32 bytes_per_
         impl->NoteInOrder(src);
         impl->NoteTextureWrite(dst);
     }
-    const id<MTLBlitCommandEncoder> encoder =
+    const id<MTLBlitCommandEncoder> __unsafe_unretained encoder =
         goes_ahead ? impl->UploadEncoder() : impl->BlitEncoder();
-    [encoder copyFromBuffer:AsBuffer(src)
+    [encoder copyFromBuffer:UnretainedBuffer(src)
                sourceOffset:offset
           sourceBytesPerRow:bytes_per_row
         sourceBytesPerImage:bytes_per_image
                  sourceSize:MTLSizeMake(extent.width, extent.height, extent.depth)
-                  toTexture:AsTexture(dst)
+                  toTexture:UnretainedTexture(dst)
            destinationSlice:slice
            destinationLevel:level
           destinationOrigin:MTLOriginMake(origin.x, origin.y, origin.z)];
@@ -3882,15 +4229,16 @@ void Scheduler::CopyTextureToBuffer(TextureHandle src, u32 level, u32 slice, Off
     impl->Touch(src);
     impl->NoteTextureTouched(src);
     impl->NoteInOrderWrite(dst);
-    [impl->BlitEncoder() copyFromTexture:AsTexture(src)
-                             sourceSlice:slice
-                             sourceLevel:level
-                            sourceOrigin:MTLOriginMake(origin.x, origin.y, origin.z)
-                              sourceSize:MTLSizeMake(extent.width, extent.height, extent.depth)
-                                toBuffer:AsBuffer(dst)
-                       destinationOffset:offset
-                  destinationBytesPerRow:bytes_per_row
-                destinationBytesPerImage:bytes_per_image];
+    const id<MTLBlitCommandEncoder> __unsafe_unretained encoder = impl->BlitEncoder();
+    [encoder copyFromTexture:UnretainedTexture(src)
+                 sourceSlice:slice
+                 sourceLevel:level
+                sourceOrigin:MTLOriginMake(origin.x, origin.y, origin.z)
+                  sourceSize:MTLSizeMake(extent.width, extent.height, extent.depth)
+                    toBuffer:UnretainedBuffer(dst)
+           destinationOffset:offset
+      destinationBytesPerRow:bytes_per_row
+    destinationBytesPerImage:bytes_per_image];
 }
 
 void Scheduler::CopyTexture(TextureHandle src, u32 src_level, u32 src_slice, Offset3D src_origin,
@@ -3904,15 +4252,16 @@ void Scheduler::CopyTexture(TextureHandle src, u32 src_level, u32 src_slice, Off
     impl->Touch(src);
     impl->Touch(dst);
     impl->NoteTextureWrite(dst);
-    [impl->BlitEncoder() copyFromTexture:AsTexture(src)
-                             sourceSlice:src_slice
-                             sourceLevel:src_level
-                            sourceOrigin:MTLOriginMake(src_origin.x, src_origin.y, src_origin.z)
-                              sourceSize:MTLSizeMake(extent.width, extent.height, extent.depth)
-                               toTexture:AsTexture(dst)
-                        destinationSlice:dst_slice
-                        destinationLevel:dst_level
-                       destinationOrigin:MTLOriginMake(dst_origin.x, dst_origin.y, dst_origin.z)];
+    const id<MTLBlitCommandEncoder> __unsafe_unretained encoder = impl->BlitEncoder();
+    [encoder copyFromTexture:UnretainedTexture(src)
+                 sourceSlice:src_slice
+                 sourceLevel:src_level
+                sourceOrigin:MTLOriginMake(src_origin.x, src_origin.y, src_origin.z)
+                  sourceSize:MTLSizeMake(extent.width, extent.height, extent.depth)
+                   toTexture:UnretainedTexture(dst)
+            destinationSlice:dst_slice
+            destinationLevel:dst_level
+           destinationOrigin:MTLOriginMake(dst_origin.x, dst_origin.y, dst_origin.z)];
 }
 
 void Scheduler::BreakBlits() {
@@ -4021,21 +4370,24 @@ bool Scheduler::ClearRectangle(const ClearRect& clear) {
     }
 
     @autoreleasepool {
-        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        MTLRenderPassDescriptor* const pass = impl->helper_pass_desc.Acquire();
         if (color != nil) {
-            ApplyAttachment(pass.colorAttachments[0], clear.color);
-            pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
-            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            MTLRenderPassColorAttachmentDescriptor* const c0 = impl->helper_pass_desc.Color(0);
+            ApplyAttachment(c0, clear.color);
+            c0.loadAction = MTLLoadActionLoad;
+            c0.storeAction = MTLStoreActionStore;
         }
         if (depth != nil && depth_format != MTLPixelFormatStencil8) {
-            ApplyAttachment(pass.depthAttachment, clear.depth);
-            pass.depthAttachment.loadAction = MTLLoadActionLoad;
-            pass.depthAttachment.storeAction = MTLStoreActionStore;
+            MTLRenderPassDepthAttachmentDescriptor* const d0 = impl->helper_pass_desc.Depth();
+            ApplyAttachment(d0, clear.depth);
+            d0.loadAction = MTLLoadActionLoad;
+            d0.storeAction = MTLStoreActionStore;
         }
         if (stencil) {
-            ApplyAttachment(pass.stencilAttachment, clear.depth);
-            pass.stencilAttachment.loadAction = MTLLoadActionLoad;
-            pass.stencilAttachment.storeAction = MTLStoreActionStore;
+            MTLRenderPassStencilAttachmentDescriptor* const s0 = impl->helper_pass_desc.Stencil();
+            ApplyAttachment(s0, clear.depth);
+            s0.loadAction = MTLLoadActionLoad;
+            s0.storeAction = MTLStoreActionStore;
         }
         pass.renderTargetWidth = limit_w;
         pass.renderTargetHeight = limit_h;
@@ -4100,29 +4452,9 @@ bool Scheduler::Blit(const BlitPass& blit) {
     }
 
     @autoreleasepool {
-        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
         const FormatClass format_class = ClassOf(blit.dst_format);
         const bool depth =
             format_class == FormatClass::Depth || format_class == FormatClass::DepthStencil;
-        if (depth) {
-            // Depth only: the fragment writes it; stencil keeps what it held or is cleared to 0.
-            ApplyAttachment(pass.depthAttachment, blit.dst);
-            pass.depthAttachment.loadAction =
-                blit.keep_dst ? MTLLoadActionLoad : MTLLoadActionClear;
-            pass.depthAttachment.storeAction = MTLStoreActionStore;
-            if (format_class == FormatClass::DepthStencil) {
-                ApplyAttachment(pass.stencilAttachment, blit.dst);
-                pass.stencilAttachment.loadAction =
-                    blit.keep_dst ? MTLLoadActionLoad : MTLLoadActionClear;
-                pass.stencilAttachment.storeAction = MTLStoreActionStore;
-            }
-        } else {
-            ApplyAttachment(pass.colorAttachments[0], blit.dst);
-            pass.colorAttachments[0].loadAction =
-                blit.keep_dst ? MTLLoadActionLoad : MTLLoadActionClear;
-            pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
-            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        }
         // A depth-stencil source's stencil, read through a stencil view.
         id<MTLTexture> src_stencil = nil;
         if (format_class == FormatClass::DepthStencil &&
@@ -4131,6 +4463,27 @@ bool Scheduler::Blit(const BlitPass& blit) {
             if (src_stencil == nil) {
                 return false;
             }
+        }
+        MTLRenderPassDescriptor* const pass = impl->helper_pass_desc.Acquire();
+        if (depth) {
+            // Depth only: the fragment writes it; stencil keeps what it held or is cleared to 0.
+            MTLRenderPassDepthAttachmentDescriptor* const d0 = impl->helper_pass_desc.Depth();
+            ApplyAttachment(d0, blit.dst);
+            d0.loadAction = blit.keep_dst ? MTLLoadActionLoad : MTLLoadActionClear;
+            d0.storeAction = MTLStoreActionStore;
+            if (format_class == FormatClass::DepthStencil) {
+                MTLRenderPassStencilAttachmentDescriptor* const s0 =
+                    impl->helper_pass_desc.Stencil();
+                ApplyAttachment(s0, blit.dst);
+                s0.loadAction = blit.keep_dst ? MTLLoadActionLoad : MTLLoadActionClear;
+                s0.storeAction = MTLStoreActionStore;
+            }
+        } else {
+            MTLRenderPassColorAttachmentDescriptor* const c0 = impl->helper_pass_desc.Color(0);
+            ApplyAttachment(c0, blit.dst);
+            c0.loadAction = blit.keep_dst ? MTLLoadActionLoad : MTLLoadActionClear;
+            c0.clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+            c0.storeAction = MTLStoreActionStore;
         }
         const id<MTLRenderCommandEncoder> encoder = impl->RenderEncoder(pass);
         if (encoder == nil) {
@@ -4184,24 +4537,28 @@ bool Scheduler::CopySamples(const SampleCopy& copy, bool expand) {
     const u32 width = std::clamp(copy.dst_width, 1U, MaxRenderTargetSize);
     const u32 height = std::clamp(copy.dst_height, 1U, MaxRenderTargetSize);
     @autoreleasepool {
-        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        MTLRenderPassDescriptor* const pass = impl->helper_pass_desc.Acquire();
         const FormatClass format_class = ClassOf(copy.dst_format);
         const bool depth =
             format_class == FormatClass::Depth || format_class == FormatClass::DepthStencil;
         if (depth) {
-            ApplyAttachment(pass.depthAttachment, copy.dst);
-            pass.depthAttachment.loadAction = MTLLoadActionDontCare;
-            pass.depthAttachment.storeAction = MTLStoreActionStore;
+            MTLRenderPassDepthAttachmentDescriptor* const d0 = impl->helper_pass_desc.Depth();
+            ApplyAttachment(d0, copy.dst);
+            d0.loadAction = MTLLoadActionDontCare;
+            d0.storeAction = MTLStoreActionStore;
             if (format_class == FormatClass::DepthStencil) {
                 // The stencil stays as it was: only depth is copied.
-                ApplyAttachment(pass.stencilAttachment, copy.dst);
-                pass.stencilAttachment.loadAction = MTLLoadActionLoad;
-                pass.stencilAttachment.storeAction = MTLStoreActionStore;
+                MTLRenderPassStencilAttachmentDescriptor* const s0 =
+                    impl->helper_pass_desc.Stencil();
+                ApplyAttachment(s0, copy.dst);
+                s0.loadAction = MTLLoadActionLoad;
+                s0.storeAction = MTLStoreActionStore;
             }
         } else {
-            ApplyAttachment(pass.colorAttachments[0], copy.dst);
-            pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            MTLRenderPassColorAttachmentDescriptor* const c0 = impl->helper_pass_desc.Color(0);
+            ApplyAttachment(c0, copy.dst);
+            c0.loadAction = MTLLoadActionDontCare;
+            c0.storeAction = MTLStoreActionStore;
         }
         pass.renderTargetWidth = width;
         pass.renderTargetHeight = height;
@@ -4251,23 +4608,27 @@ bool Scheduler::Convert(const ConvertPass& convert) {
         }
         const u32 width = std::clamp(convert.width, 1U, MaxRenderTargetSize);
         const u32 height = std::clamp(convert.height, 1U, MaxRenderTargetSize);
-        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        MTLRenderPassDescriptor* const pass = impl->helper_pass_desc.Acquire();
         const FormatClass format_class = ClassOf(convert.dst_format);
         const bool depth =
             format_class == FormatClass::Depth || format_class == FormatClass::DepthStencil;
         if (depth) {
-            ApplyAttachment(pass.depthAttachment, convert.dst);
-            pass.depthAttachment.loadAction = MTLLoadActionLoad;
-            pass.depthAttachment.storeAction = MTLStoreActionStore;
+            MTLRenderPassDepthAttachmentDescriptor* const d0 = impl->helper_pass_desc.Depth();
+            ApplyAttachment(d0, convert.dst);
+            d0.loadAction = MTLLoadActionLoad;
+            d0.storeAction = MTLStoreActionStore;
             if (format_class == FormatClass::DepthStencil) {
-                ApplyAttachment(pass.stencilAttachment, convert.dst);
-                pass.stencilAttachment.loadAction = MTLLoadActionLoad;
-                pass.stencilAttachment.storeAction = MTLStoreActionStore;
+                MTLRenderPassStencilAttachmentDescriptor* const s0 =
+                    impl->helper_pass_desc.Stencil();
+                ApplyAttachment(s0, convert.dst);
+                s0.loadAction = MTLLoadActionLoad;
+                s0.storeAction = MTLStoreActionStore;
             }
         } else {
-            ApplyAttachment(pass.colorAttachments[0], convert.dst);
-            pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
-            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            MTLRenderPassColorAttachmentDescriptor* const c0 = impl->helper_pass_desc.Color(0);
+            ApplyAttachment(c0, convert.dst);
+            c0.loadAction = MTLLoadActionLoad;
+            c0.storeAction = MTLStoreActionStore;
         }
         pass.renderTargetWidth = width;
         pass.renderTargetHeight = height;
@@ -4350,16 +4711,16 @@ bool Scheduler::DepthFromBuffer(BufferHandle src, u64 offset, u32 bytes_per_row,
         return true;
     }
     @autoreleasepool {
-        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-        ApplyAttachment(pass.depthAttachment,
-                        Attachment{.texture = dst_handle, .level = level, .slice = slice});
-        pass.depthAttachment.loadAction = MTLLoadActionLoad;
-        pass.depthAttachment.storeAction = MTLStoreActionStore;
+        MTLRenderPassDescriptor* const pass = state.helper_pass_desc.Acquire();
+        MTLRenderPassDepthAttachmentDescriptor* const d0 = state.helper_pass_desc.Depth();
+        ApplyAttachment(d0, Attachment{.texture = dst_handle, .level = level, .slice = slice});
+        d0.loadAction = MTLLoadActionLoad;
+        d0.storeAction = MTLStoreActionStore;
         if (stencil) {
-            ApplyAttachment(pass.stencilAttachment,
-                            Attachment{.texture = dst_handle, .level = level, .slice = slice});
-            pass.stencilAttachment.loadAction = MTLLoadActionLoad;
-            pass.stencilAttachment.storeAction = MTLStoreActionStore;
+            MTLRenderPassStencilAttachmentDescriptor* const s0 = state.helper_pass_desc.Stencil();
+            ApplyAttachment(s0, Attachment{.texture = dst_handle, .level = level, .slice = slice});
+            s0.loadAction = MTLLoadActionLoad;
+            s0.storeAction = MTLStoreActionStore;
         }
         pass.renderTargetWidth = width;
         pass.renderTargetHeight = height;
@@ -4435,17 +4796,23 @@ bool Scheduler::DepthToBuffer(TextureHandle src_handle, u32 level, u32 slice, Of
         if (depth == nil) {
             return false;
         }
-        state.EndEncoder(PassEnd::Compute);
         state.NoteTextureTouched(src_handle);
         state.NoteInOrderWrite(dst);
-        ++state.encoders;
-        ++state.segment_encoders;
-        const id<MTLComputeCommandEncoder> encoder = [state.Commands() computeCommandEncoder];
-        encoder.label = @"Depth download";
+        state.OpenInOrderCompute();
+        const id<MTLComputeCommandEncoder> __unsafe_unretained encoder = state.compute;
+        state.compute_hazards.ResetPending();
+        state.compute_hazards.NoteTexture(src_handle, false, false);
+        state.compute_hazards.NoteBuffer(dst, true);
+        state.compute_hazards.BeforeDispatch(encoder, state.recorder != nullptr);
+        state.compute_pipeline = (__bridge const void*)state.depth_download;
+        state.compute_bound.textures[0] = &InlineBytes;
+        state.compute_bound.textures[1] = &InlineBytes;
+        state.compute_bound.buffers[0] = &InlineBytes;
+        state.compute_bound.buffers[1] = &InlineBytes;
         [encoder setComputePipelineState:state.depth_download];
         [encoder setTexture:depth atIndex:0];
         [encoder setTexture:stencil atIndex:1];
-        [encoder setBuffer:AsBuffer(dst) offset:offset atIndex:0];
+        [encoder setBuffer:UnretainedBuffer(dst) offset:offset atIndex:0];
         const std::array<u32, 8> params{origin.x, origin.y, bytes_per_row / 4,
                                         static_cast<u32>(layout), extent.width, extent.height,
                                         has_stencil ? 1U : 0U, 0};
@@ -4453,7 +4820,8 @@ bool Scheduler::DepthToBuffer(TextureHandle src_handle, u32 level, u32 slice, Of
         [encoder dispatchThreadgroups:MTLSizeMake((extent.width + 7) / 8, (extent.height + 7) / 8,
                                                   1)
                 threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-        [encoder endEncoding];
+        state.compute_hazards.AfterDispatch();
+        state.CountDispatch();
         return true;
     }
 }
@@ -4522,7 +4890,6 @@ bool Scheduler::Pack16(u32 mode, bool to_buffer, TextureHandle texture_handle, u
         if (pipeline == nil || view == nil) {
             return false;
         }
-        state.EndEncoder(PassEnd::Compute);
         if (to_buffer) {
             state.NoteTextureTouched(texture_handle);
             state.NoteInOrderWrite(buffer);
@@ -4530,20 +4897,27 @@ bool Scheduler::Pack16(u32 mode, bool to_buffer, TextureHandle texture_handle, u
             state.NoteTextureWrite(texture_handle);
             state.NoteInOrder(buffer);
         }
-        ++state.encoders;
-        ++state.segment_encoders;
-        const id<MTLComputeCommandEncoder> encoder = [state.Commands() computeCommandEncoder];
-        encoder.label = @"Packed 16-bit copy";
+        state.OpenInOrderCompute();
+        const id<MTLComputeCommandEncoder> __unsafe_unretained encoder = state.compute;
+        state.compute_hazards.ResetPending();
+        state.compute_hazards.NoteTexture(texture_handle, false, !to_buffer);
+        state.compute_hazards.NoteBuffer(buffer, to_buffer);
+        state.compute_hazards.BeforeDispatch(encoder, state.recorder != nullptr);
+        state.compute_pipeline = (__bridge const void*)pipeline;
+        state.compute_bound.textures[0] = &InlineBytes;
+        state.compute_bound.buffers[0] = &InlineBytes;
+        state.compute_bound.buffers[1] = &InlineBytes;
         [encoder setComputePipelineState:pipeline];
         [encoder setTexture:view atIndex:0];
-        [encoder setBuffer:AsBuffer(buffer) offset:offset atIndex:0];
+        [encoder setBuffer:UnretainedBuffer(buffer) offset:offset atIndex:0];
         const std::array<u32, 6> params{origin.x, origin.y, extent.width, extent.height,
                                         bytes_per_row / 2, mode};
         [encoder setBytes:params.data() length:sizeof(params) atIndex:1];
         [encoder dispatchThreadgroups:MTLSizeMake((extent.width + 7) / 8, (extent.height + 7) / 8,
                                                   1)
                 threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-        [encoder endEncoding];
+        state.compute_hazards.AfterDispatch();
+        state.CountDispatch();
         return true;
     }
 }
@@ -4571,20 +4945,24 @@ bool Scheduler::SwapPacked(BufferHandle buffer, u64 offset, u32 width, u32 rows,
         if (state.swap_packed == nil) {
             return false;
         }
-        state.EndEncoder(PassEnd::Compute);
         state.NoteInOrderWrite(buffer);
-        ++state.encoders;
-        ++state.segment_encoders;
-        const id<MTLComputeCommandEncoder> encoder = [state.Commands() computeCommandEncoder];
-        encoder.label = @"Packed texel swap";
+        state.OpenInOrderCompute();
+        const id<MTLComputeCommandEncoder> __unsafe_unretained encoder = state.compute;
+        state.compute_hazards.ResetPending();
+        state.compute_hazards.NoteBuffer(buffer, true);
+        state.compute_hazards.BeforeDispatch(encoder, state.recorder != nullptr);
+        state.compute_pipeline = (__bridge const void*)state.swap_packed;
+        state.compute_bound.buffers[0] = &InlineBytes;
+        state.compute_bound.buffers[1] = &InlineBytes;
         [encoder setComputePipelineState:state.swap_packed];
-        [encoder setBuffer:AsBuffer(buffer) offset:0 atIndex:0];
+        [encoder setBuffer:UnretainedBuffer(buffer) offset:0 atIndex:0];
         const std::array<u32, 6> params{static_cast<u32>(offset), width, rows, bytes_per_row,
                                         bytes_per_image, shift};
         [encoder setBytes:params.data() length:sizeof(params) atIndex:1];
         [encoder dispatchThreadgroups:MTLSizeMake((width + 31) / 32, (rows + 7) / 8, images)
                 threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
-        [encoder endEncoding];
+        state.compute_hazards.AfterDispatch();
+        state.CountDispatch();
         return true;
     }
 }
@@ -4606,15 +4984,15 @@ bool Scheduler::ScaleNearest(const ScalePass& scale) {
     const u32 width = std::clamp(scale.dst_width, 1U, MaxRenderTargetSize);
     const u32 height = std::clamp(scale.dst_height, 1U, MaxRenderTargetSize);
     @autoreleasepool {
-        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        MTLRenderPassDescriptor* const pass = impl->helper_pass_desc.Acquire();
         const FormatClass format_class = ClassOf(scale.dst_format);
         MTLRenderPassAttachmentDescriptor* attachment = nil;
         if (format_class == FormatClass::Depth) {
-            attachment = pass.depthAttachment;
+            attachment = impl->helper_pass_desc.Depth();
         } else if (format_class == FormatClass::Stencil) {
-            attachment = pass.stencilAttachment;
+            attachment = impl->helper_pass_desc.Stencil();
         } else {
-            attachment = pass.colorAttachments[0];
+            attachment = impl->helper_pass_desc.Color(0);
         }
         ApplyAttachment(attachment, scale.dst);
         attachment.loadAction = MTLLoadActionDontCare;
@@ -4660,14 +5038,14 @@ bool Scheduler::Resolve(TextureHandle src_handle, u32 src_slice, const Attachmen
         return false;
     }
     @autoreleasepool {
-        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        MTLRenderPassDescriptor* const pass = impl->helper_pass_desc.Acquire();
         MTLRenderPassAttachmentDescriptor* attachment = nil;
         if (format_class == FormatClass::Depth || format_class == FormatClass::DepthStencil) {
-            MTLRenderPassDepthAttachmentDescriptor* depth = pass.depthAttachment;
+            MTLRenderPassDepthAttachmentDescriptor* const depth = impl->helper_pass_desc.Depth();
             depth.depthResolveFilter = MTLMultisampleDepthResolveFilterSample0;
             attachment = depth;
         } else {
-            attachment = pass.colorAttachments[0];
+            attachment = impl->helper_pass_desc.Color(0);
         }
         attachment.texture = src;
         attachment.slice = src_slice;
@@ -4711,18 +5089,33 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
                 impl->FlushClear();
             }
         }
+        if (!impl->shadows.empty()) {
+            for (size_t index = 0; index < targets.color.size(); ++index) {
+                if (targets.color[index].texture == nullptr) {
+                    continue;
+                }
+                const bool cleared = clear && clear->clear_color[index];
+                if (!cleared) {
+                    if (const auto shadow = impl->shadows.find(targets.color[index].texture);
+                        shadow != impl->shadows.end() && shadow->second.dropped) {
+                        impl->RestoreSamples(shadow->first, shadow->second);
+                    }
+                }
+            }
+        }
         const bool defer_stores = UnwrittenStoresEnabled(impl->device);
         u8 defer_color = 0;
         bool defer_depth = false;
         bool defer_stencil = false;
         bool kill_open_depth = false;
         bool kill_open_stencil = false;
-        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        MTLRenderPassDescriptor* const pass = impl->draw_pass_desc.Acquire();
         for (size_t index = 0; index < targets.color.size(); ++index) {
             if (targets.color[index].texture == nullptr) {
                 continue;
             }
-            MTLRenderPassColorAttachmentDescriptor* const color = pass.colorAttachments[index];
+            MTLRenderPassColorAttachmentDescriptor* const __unsafe_unretained color =
+                impl->draw_pass_desc.Color(index);
             ApplyAttachment(color, targets.color[index]);
             color.loadAction = MTLLoadActionLoad;
             color.storeAction = MTLStoreActionStore;
@@ -4733,12 +5126,9 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
                 if (const auto shadow = impl->shadows.find(targets.color[index].texture);
                     shadow != impl->shadows.end()) {
                     Impl::ShadowEntry& entry = shadow->second;
-                    if (!cleared && entry.dropped) {
-                        impl->RestoreSamples(shadow->first, entry);
-                    }
                     if (targets.layers == 1) {
                         resolving = true;
-                        color.resolveTexture = AsTexture(entry.shadow);
+                        color.resolveTexture = UnretainedTexture(entry.shadow);
                         color.resolveLevel = 0;
                         color.resolveSlice = targets.color[index].slice;
                         const bool drop = MsaaDiscardEnabled() && cleared;
@@ -4764,34 +5154,38 @@ void Scheduler::BeginRendering(const RenderTargetSet& targets) {
             }
         }
         if (targets.has_depth) {
-            ApplyAttachment(pass.depthAttachment, targets.depth);
-            pass.depthAttachment.loadAction = MTLLoadActionLoad;
-            pass.depthAttachment.storeAction = MTLStoreActionStore;
+            MTLRenderPassDepthAttachmentDescriptor* const __unsafe_unretained depth =
+                impl->draw_pass_desc.Depth();
+            ApplyAttachment(depth, targets.depth);
+            depth.loadAction = MTLLoadActionLoad;
+            depth.storeAction = MTLStoreActionStore;
             if (clear && clear->clear_depth) {
-                pass.depthAttachment.loadAction = MTLLoadActionClear;
-                pass.depthAttachment.clearDepth = clear->depth_value;
+                depth.loadAction = MTLLoadActionClear;
+                depth.clearDepth = clear->depth_value;
                 if (defer_stores && DepthKillEnabled()) {
-                    pass.depthAttachment.storeAction = MTLStoreActionUnknown;
+                    depth.storeAction = MTLStoreActionUnknown;
                     kill_open_depth = true;
                 }
             } else if (defer_stores) {
-                pass.depthAttachment.storeAction = MTLStoreActionUnknown;
+                depth.storeAction = MTLStoreActionUnknown;
                 defer_depth = true;
             }
         }
         if (targets.has_stencil) {
-            ApplyAttachment(pass.stencilAttachment, targets.depth);
-            pass.stencilAttachment.loadAction = MTLLoadActionLoad;
-            pass.stencilAttachment.storeAction = MTLStoreActionStore;
+            MTLRenderPassStencilAttachmentDescriptor* const __unsafe_unretained stencil =
+                impl->draw_pass_desc.Stencil();
+            ApplyAttachment(stencil, targets.depth);
+            stencil.loadAction = MTLLoadActionLoad;
+            stencil.storeAction = MTLStoreActionStore;
             if (clear && clear->clear_stencil) {
-                pass.stencilAttachment.loadAction = MTLLoadActionClear;
-                pass.stencilAttachment.clearStencil = clear->stencil_value;
+                stencil.loadAction = MTLLoadActionClear;
+                stencil.clearStencil = clear->stencil_value;
                 if (defer_stores && DepthKillEnabled()) {
-                    pass.stencilAttachment.storeAction = MTLStoreActionUnknown;
+                    stencil.storeAction = MTLStoreActionUnknown;
                     kill_open_stencil = true;
                 }
             } else if (defer_stores) {
-                pass.stencilAttachment.storeAction = MTLStoreActionUnknown;
+                stencil.storeAction = MTLStoreActionUnknown;
                 defer_stencil = true;
             }
         }
@@ -4949,7 +5343,7 @@ u64 Scheduler::VisibilitySerial() const noexcept {
 }
 
 void Scheduler::SetDrawState(const DrawState& state) {
-    const id<MTLRenderCommandEncoder> encoder = impl->render;
+    const id<MTLRenderCommandEncoder> __unsafe_unretained encoder = impl->render;
     if (encoder == nil) {
         return;
     }
@@ -4969,10 +5363,12 @@ void Scheduler::SetDrawState(const DrawState& state) {
         return true;
     };
     if (changed(last.pipeline != state.pipeline)) {
-        [encoder setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)state.pipeline];
+        [encoder setRenderPipelineState:(__bridge __unsafe_unretained id<MTLRenderPipelineState>)
+                                            state.pipeline];
     }
     if (state.depth_stencil != nullptr && changed(last.depth_stencil != state.depth_stencil)) {
-        [encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)state.depth_stencil];
+        [encoder setDepthStencilState:(__bridge __unsafe_unretained id<MTLDepthStencilState>)
+                                          state.depth_stencil];
     }
     const auto to_viewport = [](const Viewport& viewport) {
         return MTLViewport{viewport.x,      viewport.y,     viewport.width,
@@ -5079,8 +5475,8 @@ void Scheduler::BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32
                            bool write) {
     if (SlotFits(slot, BufferSlots, "buffer")) {
         if (stage == ShaderStage::Compute) {
-            impl->ComputeBuffer(buffer);
-            impl->LogComputeBind(ComputeBind::Kind::Buffer, slot, buffer, offset, true);
+            impl->ComputeBuffer(buffer, write);
+            impl->LogComputeBind(ComputeBind::Kind::Buffer, slot, buffer, offset, write);
         } else if (write && impl->render != nil) {
             impl->NoteInOrderWrite(buffer);
         }
@@ -5093,47 +5489,42 @@ u64 Scheduler::UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset, boo
         return 0;
     }
     if (stage == ShaderStage::Compute) {
-        impl->ComputeBuffer(buffer);
-        impl->LogComputeBind(ComputeBind::Kind::UseBuffer, 0, buffer, offset, true);
+        impl->ComputeBuffer(buffer, write);
+        impl->LogComputeBind(ComputeBind::Kind::UseBuffer, 0, buffer, offset, write);
     } else if (write && impl->render != nil) {
         impl->NoteInOrderWrite(buffer);
     }
-    const id<MTLBuffer> metal_buffer = AsBuffer(buffer);
+    const id<MTLBuffer> __unsafe_unretained metal_buffer = UnretainedBuffer(buffer);
+    const MTLResourceUsage usage =
+        write ? (MTLResourceUsageRead | MTLResourceUsageWrite) : MTLResourceUsageRead;
+    const id<MTLRenderCommandEncoder> __unsafe_unretained r_enc = impl->render;
     switch (stage) {
     case ShaderStage::Vertex:
-        if (impl->render != nil) {
-            [impl->render useResource:metal_buffer
-                                usage:MTLResourceUsageRead | MTLResourceUsageWrite
-                               stages:MTLRenderStageVertex];
+        if (r_enc != nil) {
+            [r_enc useResource:metal_buffer usage:usage stages:MTLRenderStageVertex];
         }
         break;
     case ShaderStage::Fragment:
-        if (impl->render != nil) {
-            [impl->render useResource:metal_buffer
-                                usage:MTLResourceUsageRead | MTLResourceUsageWrite
-                               stages:MTLRenderStageFragment];
+        if (r_enc != nil) {
+            [r_enc useResource:metal_buffer usage:usage stages:MTLRenderStageFragment];
         }
         break;
     case ShaderStage::Compute:
-        if (impl->active_compute != nil) {
-            [impl->active_compute useResource:metal_buffer
-                                        usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        if (const id<MTLComputeCommandEncoder> __unsafe_unretained c_enc = impl->active_compute;
+            c_enc != nil) {
+            [c_enc useResource:metal_buffer usage:usage];
         }
         break;
     case ShaderStage::Object:
         // A mesh pipeline's spilled buffers are read through their addresses too: without this
         // they were neither resident nor hazard-tracked for the object and mesh functions.
-        if (impl->render != nil) {
-            [impl->render useResource:metal_buffer
-                                usage:MTLResourceUsageRead | MTLResourceUsageWrite
-                               stages:MTLRenderStageObject];
+        if (r_enc != nil) {
+            [r_enc useResource:metal_buffer usage:usage stages:MTLRenderStageObject];
         }
         break;
     case ShaderStage::Mesh:
-        if (impl->render != nil) {
-            [impl->render useResource:metal_buffer
-                                usage:MTLResourceUsageRead | MTLResourceUsageWrite
-                               stages:MTLRenderStageMesh];
+        if (r_enc != nil) {
+            [r_enc useResource:metal_buffer usage:usage stages:MTLRenderStageMesh];
         }
         break;
     }
@@ -5145,42 +5536,45 @@ void Scheduler::BindBytes(ShaderStage stage, u32 slot, const void* data, u32 siz
         return;
     }
     ++impl->state_sets;
+    const id<MTLRenderCommandEncoder> __unsafe_unretained r_enc = impl->render;
     switch (stage) {
     case ShaderStage::Vertex:
         if (slot < BufferSlots) {
             impl->vertex_bound.buffers[slot] = &InlineBytes;
         }
-        [impl->render setVertexBytes:data length:size atIndex:slot];
+        [r_enc setVertexBytes:data length:size atIndex:slot];
         break;
     case ShaderStage::Fragment:
         if (slot < BufferSlots) {
             impl->fragment_bound.buffers[slot] = &InlineBytes;
         }
-        [impl->render setFragmentBytes:data length:size atIndex:slot];
+        [r_enc setFragmentBytes:data length:size atIndex:slot];
         break;
     case ShaderStage::Object:
         if (slot < BufferSlots) {
             impl->object_bound.buffers[slot] = &InlineBytes;
         }
-        [impl->render setObjectBytes:data length:size atIndex:slot];
+        [r_enc setObjectBytes:data length:size atIndex:slot];
         break;
     case ShaderStage::Mesh:
         if (slot < BufferSlots) {
             impl->mesh_bound.buffers[slot] = &InlineBytes;
         }
-        [impl->render setMeshBytes:data length:size atIndex:slot];
+        [r_enc setMeshBytes:data length:size atIndex:slot];
         break;
-    case ShaderStage::Compute:
+    case ShaderStage::Compute: {
         impl->ResumeKernel();
         impl->LogComputeBytes(slot, data, size);
-        if (impl->active_compute == nil) {
+        const id<MTLComputeCommandEncoder> __unsafe_unretained c_enc = impl->active_compute;
+        if (c_enc == nil) {
             return;
         }
         if (slot < BufferSlots) {
             impl->active_bound->buffers[slot] = &InlineBytes;
         }
-        [impl->active_compute setBytes:data length:size atIndex:slot];
+        [c_enc setBytes:data length:size atIndex:slot];
         break;
+    }
     }
 }
 
@@ -5190,38 +5584,58 @@ void Scheduler::BindTexture(ShaderStage stage, u32 slot, TextureHandle texture, 
         return;
     }
     if (stage == ShaderStage::Compute) {
-        impl->ComputeTexture(texture, true);
-        impl->LogComputeBind(ComputeBind::Kind::Texture, slot, texture, 0, true);
-    } else {
-        impl->NoteRenderTextureUse(texture, on_buffer, write);
+        impl->ComputeTexture(texture, on_buffer, write);
+        impl->LogComputeBind(ComputeBind::Kind::Texture, slot, texture, 0, write, on_buffer);
+        const id<MTLComputeCommandEncoder> __unsafe_unretained c_enc = impl->active_compute;
+        if (c_enc != nil && impl->NoteObject(impl->active_bound->textures, slot, texture)) {
+            [c_enc setTexture:UnretainedTexture(texture) atIndex:slot];
+        }
+        return;
     }
+    const id<MTLRenderCommandEncoder> __unsafe_unretained r_enc = impl->render;
+    if (r_enc == nil) {
+        return;
+    }
+    StageBindings* bound = nullptr;
     switch (stage) {
     case ShaderStage::Vertex:
-        if (impl->render != nil && impl->NoteObject(impl->vertex_bound.textures, slot, texture)) {
-            [impl->render setVertexTexture:AsTexture(texture) atIndex:slot];
-        }
+        bound = &impl->vertex_bound;
         break;
     case ShaderStage::Fragment:
-        if (impl->render != nil &&
-            impl->NoteObject(impl->fragment_bound.textures, slot, texture)) {
-            [impl->render setFragmentTexture:AsTexture(texture) atIndex:slot];
-        }
+        bound = &impl->fragment_bound;
         break;
     case ShaderStage::Object:
-        if (impl->render != nil && impl->NoteObject(impl->object_bound.textures, slot, texture)) {
-            [impl->render setObjectTexture:AsTexture(texture) atIndex:slot];
-        }
+        bound = &impl->object_bound;
         break;
     case ShaderStage::Mesh:
-        if (impl->render != nil && impl->NoteObject(impl->mesh_bound.textures, slot, texture)) {
-            [impl->render setMeshTexture:AsTexture(texture) atIndex:slot];
-        }
+        bound = &impl->mesh_bound;
         break;
     case ShaderStage::Compute:
-        if (impl->active_compute != nil &&
-            impl->NoteObject(impl->active_bound->textures, slot, texture)) {
-            [impl->active_compute setTexture:AsTexture(texture) atIndex:slot];
-        }
+        return;
+    }
+    if (!write && StateCacheEnabled() && slot < TextureSlots && bound->textures[slot] == texture) {
+        ++impl->state_skips;
+        return;
+    }
+    impl->NoteRenderTextureUse(texture, on_buffer, write);
+    if (!impl->NoteObject(bound->textures, slot, texture)) {
+        return;
+    }
+    const id<MTLTexture> __unsafe_unretained mtl_tex = UnretainedTexture(texture);
+    switch (stage) {
+    case ShaderStage::Vertex:
+        [r_enc setVertexTexture:mtl_tex atIndex:slot];
+        break;
+    case ShaderStage::Fragment:
+        [r_enc setFragmentTexture:mtl_tex atIndex:slot];
+        break;
+    case ShaderStage::Object:
+        [r_enc setObjectTexture:mtl_tex atIndex:slot];
+        break;
+    case ShaderStage::Mesh:
+        [r_enc setMeshTexture:mtl_tex atIndex:slot];
+        break;
+    case ShaderStage::Compute:
         break;
     }
 }
@@ -5231,12 +5645,12 @@ u64 Scheduler::UseTexture(ShaderStage stage, TextureHandle texture, bool write, 
         return 0;
     }
     if (stage == ShaderStage::Compute) {
-        impl->ComputeTexture(texture, write);
-        impl->LogComputeBind(ComputeBind::Kind::UseTexture, 0, texture, 0, write);
+        impl->ComputeTexture(texture, on_buffer, write);
+        impl->LogComputeBind(ComputeBind::Kind::UseTexture, 0, texture, 0, write, on_buffer);
     } else {
         impl->NoteRenderTextureUse(texture, on_buffer, write);
     }
-    const id<MTLTexture> metal_texture = AsTexture(texture);
+    const id<MTLTexture> __unsafe_unretained metal_texture = UnretainedTexture(texture);
     const MTLResourceUsage usage =
         write ? (MTLResourceUsageRead | MTLResourceUsageWrite) : MTLResourceUsageRead;
     switch (stage) {
@@ -5244,18 +5658,20 @@ u64 Scheduler::UseTexture(ShaderStage stage, TextureHandle texture, bool write, 
     case ShaderStage::Fragment:
     case ShaderStage::Object:
     case ShaderStage::Mesh:
-        if (impl->render != nil) {
+        if (const id<MTLRenderCommandEncoder> __unsafe_unretained r_enc = impl->render;
+            r_enc != nil) {
             const MTLRenderStages stages =
                 stage == ShaderStage::Vertex     ? MTLRenderStageVertex
                 : stage == ShaderStage::Fragment ? MTLRenderStageFragment
                 : stage == ShaderStage::Object   ? MTLRenderStageObject
                                                  : MTLRenderStageMesh;
-            [impl->render useResource:metal_texture usage:usage stages:stages];
+            [r_enc useResource:metal_texture usage:usage stages:stages];
         }
         break;
     case ShaderStage::Compute:
-        if (impl->active_compute != nil) {
-            [impl->active_compute useResource:metal_texture usage:usage];
+        if (const id<MTLComputeCommandEncoder> __unsafe_unretained c_enc = impl->active_compute;
+            c_enc != nil) {
+            [c_enc useResource:metal_texture usage:usage];
         }
         break;
     }
@@ -5267,7 +5683,7 @@ u64 Scheduler::SamplerResourceId(void* sampler) noexcept {
         return 0;
     }
     // Guest samplers are made with supportArgumentBuffers (CreateSampler).
-    return AsSampler(sampler).gpuResourceID._impl;
+    return UnretainedSampler(sampler).gpuResourceID._impl;
 }
 
 void Scheduler::BindSampler(ShaderStage stage, u32 slot, void* sampler) {
@@ -5277,59 +5693,65 @@ void Scheduler::BindSampler(ShaderStage stage, u32 slot, void* sampler) {
     if (stage == ShaderStage::Compute) {
         impl->ResumeKernel();
         impl->LogComputeBind(ComputeBind::Kind::Sampler, slot, sampler, 0, false);
+        const id<MTLComputeCommandEncoder> __unsafe_unretained c_enc = impl->active_compute;
+        if (c_enc != nil && impl->NoteObject(impl->active_bound->samplers, slot, sampler)) {
+            [c_enc setSamplerState:UnretainedSampler(sampler) atIndex:slot];
+        }
+        return;
+    }
+    const id<MTLRenderCommandEncoder> __unsafe_unretained r_enc = impl->render;
+    if (r_enc == nil) {
+        return;
     }
     switch (stage) {
     case ShaderStage::Vertex:
-        if (impl->render != nil && impl->NoteObject(impl->vertex_bound.samplers, slot, sampler)) {
-            [impl->render setVertexSamplerState:AsSampler(sampler) atIndex:slot];
+        if (impl->NoteObject(impl->vertex_bound.samplers, slot, sampler)) {
+            [r_enc setVertexSamplerState:UnretainedSampler(sampler) atIndex:slot];
         }
         break;
     case ShaderStage::Fragment:
-        if (impl->render != nil &&
-            impl->NoteObject(impl->fragment_bound.samplers, slot, sampler)) {
-            [impl->render setFragmentSamplerState:AsSampler(sampler) atIndex:slot];
+        if (impl->NoteObject(impl->fragment_bound.samplers, slot, sampler)) {
+            [r_enc setFragmentSamplerState:UnretainedSampler(sampler) atIndex:slot];
         }
         break;
     case ShaderStage::Object:
-        if (impl->render != nil && impl->NoteObject(impl->object_bound.samplers, slot, sampler)) {
-            [impl->render setObjectSamplerState:AsSampler(sampler) atIndex:slot];
+        if (impl->NoteObject(impl->object_bound.samplers, slot, sampler)) {
+            [r_enc setObjectSamplerState:UnretainedSampler(sampler) atIndex:slot];
         }
         break;
     case ShaderStage::Mesh:
-        if (impl->render != nil && impl->NoteObject(impl->mesh_bound.samplers, slot, sampler)) {
-            [impl->render setMeshSamplerState:AsSampler(sampler) atIndex:slot];
+        if (impl->NoteObject(impl->mesh_bound.samplers, slot, sampler)) {
+            [r_enc setMeshSamplerState:UnretainedSampler(sampler) atIndex:slot];
         }
         break;
     case ShaderStage::Compute:
-        if (impl->active_compute != nil &&
-            impl->NoteObject(impl->active_bound->samplers, slot, sampler)) {
-            [impl->active_compute setSamplerState:AsSampler(sampler) atIndex:slot];
-        }
         break;
     }
 }
 
 void Scheduler::DrawIndirect(u32 primitive, BufferHandle buffer, u64 offset) {
-    if (impl->render == nil || buffer == nullptr) {
+    const id<MTLRenderCommandEncoder> __unsafe_unretained r_enc = impl->render;
+    if (r_enc == nil || buffer == nullptr) {
         return;
     }
-    [impl->render drawPrimitives:static_cast<MTLPrimitiveType>(primitive)
-                  indirectBuffer:AsBuffer(buffer)
-            indirectBufferOffset:offset];
+    [r_enc drawPrimitives:static_cast<MTLPrimitiveType>(primitive)
+           indirectBuffer:UnretainedBuffer(buffer)
+     indirectBufferOffset:offset];
     impl->CountDraw();
 }
 
 void Scheduler::DrawIndexedIndirect(u32 primitive, u32 index_size, BufferHandle index_buffer,
                                     u64 index_offset, BufferHandle buffer, u64 offset) {
-    if (impl->render == nil || buffer == nullptr || index_buffer == nullptr) {
+    const id<MTLRenderCommandEncoder> __unsafe_unretained r_enc = impl->render;
+    if (r_enc == nil || buffer == nullptr || index_buffer == nullptr) {
         return;
     }
-    [impl->render drawIndexedPrimitives:static_cast<MTLPrimitiveType>(primitive)
-                              indexType:index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
-                            indexBuffer:AsBuffer(index_buffer)
-                      indexBufferOffset:index_offset
-                         indirectBuffer:AsBuffer(buffer)
-                   indirectBufferOffset:offset];
+    [r_enc drawIndexedPrimitives:static_cast<MTLPrimitiveType>(primitive)
+                       indexType:index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+                     indexBuffer:UnretainedBuffer(index_buffer)
+               indexBufferOffset:index_offset
+                  indirectBuffer:UnretainedBuffer(buffer)
+            indirectBufferOffset:offset];
     impl->CountDraw();
 }
 
@@ -5358,6 +5780,7 @@ void Scheduler::BeginCompute(void* pipeline, bool ahead) {
     if (goes_ahead) {
         state.active_compute = state.KernelEncoder();
         state.active_bound = &state.kernel_bound;
+        state.active_hazards = &state.kernel_hazards;
         bound_pipeline = &state.kernel_pipeline;
         state.kernel_checked = checked;
         ++state.ahead_kernels;
@@ -5372,123 +5795,150 @@ void Scheduler::BeginCompute(void* pipeline, bool ahead) {
         }
         state.OpenInOrderCompute();
     }
+    if (state.active_hazards != nullptr) {
+        state.active_hazards->ResetPending();
+    }
     if (StateCacheEnabled() && *bound_pipeline == pipeline) {
         ++state.state_skips;
         return;
     }
     *bound_pipeline = pipeline;
     ++state.state_sets;
-    [state.active_compute setComputePipelineState:(__bridge id<MTLComputePipelineState>)pipeline];
+    const id<MTLComputeCommandEncoder> __unsafe_unretained c_enc = state.active_compute;
+    [c_enc
+        setComputePipelineState:(__bridge __unsafe_unretained id<MTLComputePipelineState>)pipeline];
 }
 
 void Scheduler::Dispatch(std::array<u32, 3> groups, std::array<u32, 3> group_size) {
     impl->ResumeKernel();
-    const id<MTLComputeCommandEncoder> encoder = impl->active_compute;
+    const id<MTLComputeCommandEncoder> __unsafe_unretained encoder = impl->active_compute;
     if (encoder == nil || groups[0] == 0 || groups[1] == 0 || groups[2] == 0) {
         return;
     }
+    if (impl->active_hazards != nullptr) {
+        impl->active_hazards->BeforeDispatch(encoder, impl->recorder != nullptr);
+    }
     [encoder dispatchThreadgroups:MTLSizeMake(groups[0], groups[1], groups[2])
             threadsPerThreadgroup:MTLSizeMake(group_size[0], group_size[1], group_size[2])];
+    if (impl->active_hazards != nullptr) {
+        impl->active_hazards->AfterDispatch();
+    }
     impl->CountDispatch();
 }
 
 void Scheduler::DispatchIndirect(BufferHandle buffer, u64 offset, std::array<u32, 3> group_size) {
     impl->ComputeBuffer(buffer, false);
-    const id<MTLComputeCommandEncoder> encoder = impl->active_compute;
+    const id<MTLComputeCommandEncoder> __unsafe_unretained encoder = impl->active_compute;
     if (encoder == nil || buffer == nullptr) {
         return;
     }
-    [encoder dispatchThreadgroupsWithIndirectBuffer:AsBuffer(buffer)
+    if (impl->active_hazards != nullptr) {
+        impl->active_hazards->BeforeDispatch(encoder, impl->recorder != nullptr);
+    }
+    [encoder dispatchThreadgroupsWithIndirectBuffer:UnretainedBuffer(buffer)
                                indirectBufferOffset:offset
                               threadsPerThreadgroup:MTLSizeMake(group_size[0], group_size[1],
                                                                 group_size[2])];
+    if (impl->active_hazards != nullptr) {
+        impl->active_hazards->AfterDispatch();
+    }
     impl->CountDispatch();
 }
 
 void Scheduler::DispatchStageIn(u32 first, u32 count, u32 first_instance, u32 instances) {
     impl->ResumeKernel();
-    const id<MTLComputeCommandEncoder> encoder = impl->active_compute;
+    const id<MTLComputeCommandEncoder> __unsafe_unretained encoder = impl->active_compute;
     if (encoder == nil || count == 0 || instances == 0) {
         return;
+    }
+    if (impl->active_hazards != nullptr) {
+        impl->active_hazards->BeforeDispatch(encoder, impl->recorder != nullptr);
     }
     [encoder setStageInRegion:MTLRegionMake2D(first, first_instance, count, instances)];
     [encoder dispatchThreads:MTLSizeMake(count, instances, 1)
        threadsPerThreadgroup:MTLSizeMake((std::min)(count, 64U), 1, 1)];
+    if (impl->active_hazards != nullptr) {
+        impl->active_hazards->AfterDispatch();
+    }
     impl->CountDispatch();
 }
 
 void Scheduler::SetTessellationFactorBuffer(BufferHandle buffer, u64 offset) {
-    if (impl->render == nil || buffer == nullptr) {
+    const id<MTLRenderCommandEncoder> __unsafe_unretained r_enc = impl->render;
+    if (r_enc == nil || buffer == nullptr) {
         return;
     }
-    [impl->render setTessellationFactorBuffer:AsBuffer(buffer) offset:offset instanceStride:0];
+    [r_enc setTessellationFactorBuffer:UnretainedBuffer(buffer) offset:offset instanceStride:0];
 }
 
 void Scheduler::DrawPatches(u32 control_points, u32 patch_count) {
-    if (impl->render == nil || patch_count == 0) {
+    const id<MTLRenderCommandEncoder> __unsafe_unretained r_enc = impl->render;
+    if (r_enc == nil || patch_count == 0) {
         return;
     }
-    [impl->render drawPatches:control_points
-                   patchStart:0
-                   patchCount:patch_count
-             patchIndexBuffer:nil
-       patchIndexBufferOffset:0
-                instanceCount:1
-                 baseInstance:0];
+    [r_enc drawPatches:control_points
+            patchStart:0
+            patchCount:patch_count
+      patchIndexBuffer:nil
+patchIndexBufferOffset:0
+         instanceCount:1
+          baseInstance:0];
     impl->CountDraw();
 }
 
 void Scheduler::Draw(u32 primitive, u32 first_vertex, u32 vertex_count, u32 instance_count,
                      u32 base_instance) {
-    if (impl->render == nil || vertex_count == 0 || instance_count == 0) {
+    const id<MTLRenderCommandEncoder> __unsafe_unretained r_enc = impl->render;
+    if (r_enc == nil || vertex_count == 0 || instance_count == 0) {
         return;
     }
-    [impl->render drawPrimitives:static_cast<MTLPrimitiveType>(primitive)
-                     vertexStart:first_vertex
-                     vertexCount:vertex_count
-                   instanceCount:instance_count
-                    baseInstance:base_instance];
+    [r_enc drawPrimitives:static_cast<MTLPrimitiveType>(primitive)
+              vertexStart:first_vertex
+              vertexCount:vertex_count
+            instanceCount:instance_count
+             baseInstance:base_instance];
     impl->CountDraw();
 }
 
 void Scheduler::DrawMeshThreadgroups(u32 groups, u32 object_threads, u32 mesh_threads) {
-    if (impl->render == nil || groups == 0) {
+    const id<MTLRenderCommandEncoder> __unsafe_unretained r_enc = impl->render;
+    if (r_enc == nil || groups == 0) {
         return;
     }
-    [impl->render drawMeshThreadgroups:MTLSizeMake(groups, 1, 1)
-           threadsPerObjectThreadgroup:MTLSizeMake((std::max)(object_threads, 1U), 1, 1)
-             threadsPerMeshThreadgroup:MTLSizeMake((std::max)(mesh_threads, 1U), 1, 1)];
+    [r_enc drawMeshThreadgroups:MTLSizeMake(groups, 1, 1)
+   threadsPerObjectThreadgroup:MTLSizeMake((std::max)(object_threads, 1U), 1, 1)
+     threadsPerMeshThreadgroup:MTLSizeMake((std::max)(mesh_threads, 1U), 1, 1)];
     impl->CountDraw();
 }
 
 void Scheduler::DrawMeshThreadgroupsIndirect(BufferHandle buffer, u64 offset, u32 object_threads,
                                              u32 mesh_threads) {
-    if (impl->render == nil || buffer == nullptr) {
+    const id<MTLRenderCommandEncoder> __unsafe_unretained r_enc = impl->render;
+    if (r_enc == nil || buffer == nullptr) {
         return;
     }
-    [impl->render drawMeshThreadgroupsWithIndirectBuffer:AsBuffer(buffer)
-                                    indirectBufferOffset:offset
-                             threadsPerObjectThreadgroup:MTLSizeMake((std::max)(object_threads, 1U),
-                                                                     1, 1)
-                               threadsPerMeshThreadgroup:MTLSizeMake((std::max)(mesh_threads, 1U),
-                                                                     1, 1)];
+    [r_enc drawMeshThreadgroupsWithIndirectBuffer:UnretainedBuffer(buffer)
+                             indirectBufferOffset:offset
+                      threadsPerObjectThreadgroup:MTLSizeMake((std::max)(object_threads, 1U), 1, 1)
+                        threadsPerMeshThreadgroup:MTLSizeMake((std::max)(mesh_threads, 1U), 1, 1)];
     impl->CountDraw();
 }
 
 void Scheduler::DrawIndexed(u32 primitive, u32 index_count, u32 index_size,
                             BufferHandle index_buffer, u64 index_offset, u32 instance_count,
                             s32 base_vertex, u32 base_instance) {
-    if (impl->render == nil || index_count == 0 || instance_count == 0 || index_buffer == nullptr) {
+    const id<MTLRenderCommandEncoder> __unsafe_unretained r_enc = impl->render;
+    if (r_enc == nil || index_count == 0 || instance_count == 0 || index_buffer == nullptr) {
         return;
     }
-    [impl->render drawIndexedPrimitives:static_cast<MTLPrimitiveType>(primitive)
-                             indexCount:index_count
-                              indexType:index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
-                            indexBuffer:AsBuffer(index_buffer)
-                      indexBufferOffset:index_offset
-                          instanceCount:instance_count
-                             baseVertex:base_vertex
-                           baseInstance:base_instance];
+    [r_enc drawIndexedPrimitives:static_cast<MTLPrimitiveType>(primitive)
+                      indexCount:index_count
+                       indexType:index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+                     indexBuffer:UnretainedBuffer(index_buffer)
+               indexBufferOffset:index_offset
+                   instanceCount:instance_count
+                      baseVertex:base_vertex
+                    baseInstance:base_instance];
     impl->CountDraw();
 }
 
@@ -5720,5 +6170,9 @@ std::array<u64, 11> Scheduler::TakeCounts() noexcept {
             std::exchange(impl->ahead_copies, 0),  std::exchange(impl->ahead_kernels, 0),
             std::exchange(impl->idle_fences, 0)};
 }
+
+#undef UnretainedSampler
+#undef UnretainedTexture
+#undef UnretainedBuffer
 
 } // namespace Metal

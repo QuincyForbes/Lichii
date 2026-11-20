@@ -553,9 +553,9 @@ bool RasterizerMetal::PrepareGridDraw(bool ahead) {
         .base_instance = draw_state.base_instance,
     };
     scheduler.BeginCompute(grid_arguments_kernel.Get(), ahead);
-    scheduler.BindBuffer(ShaderStage::Compute, 0, buffer->Handle(), offset);
+    scheduler.BindBuffer(ShaderStage::Compute, 0, buffer->Handle(), offset, false);
     scheduler.BindBuffer(ShaderStage::Compute, 1, grid_draw.arguments.buffer,
-                         static_cast<u32>(grid_draw.arguments.offset));
+                         static_cast<u32>(grid_draw.arguments.offset), true);
     scheduler.BindBytes(ShaderStage::Compute, 2, &params, static_cast<u32>(sizeof(params)));
     scheduler.Dispatch({1, 1, 1}, {1, 1, 1});
     return true;
@@ -1073,7 +1073,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
                 }
             } else {
                 const StagingBufferRef indices =
-                    staging_pool.Stream(size_t{converted} * sizeof(u32), 4);
+                    staging_pool.RequestUpload(size_t{converted} * sizeof(u32), 4);
                 const std::span<u32> out(reinterpret_cast<u32*>(indices.mapped_span.data()),
                                          converted);
                 converted = IndexConvert::Convert(DrawTopology(*maxwell3d), source, index_size,
@@ -1316,9 +1316,9 @@ void RasterizerMetal::RewriteIndices(bool ahead) {
     index_rewrite.output = staging_pool.Stream(size_t{params.converted} * sizeof(u32), 4);
     const bool strip = params.mode == IndexConvert::StripRestartMode;
     scheduler.BeginCompute(strip ? index_strip_kernel.Get() : index_kernel.Get(), ahead);
-    scheduler.BindBuffer(ShaderStage::Compute, 0, index.buffer, 0);
+    scheduler.BindBuffer(ShaderStage::Compute, 0, index.buffer, 0, false);
     scheduler.BindBuffer(ShaderStage::Compute, 1, index_rewrite.output.buffer,
-                         static_cast<u32>(index_rewrite.output.offset));
+                         static_cast<u32>(index_rewrite.output.offset), true);
     scheduler.BindBytes(ShaderStage::Compute, 2, &params, static_cast<u32>(sizeof(params)));
     if (strip) {
         // One threadgroup finds where each part of the strip starts.
@@ -1543,7 +1543,8 @@ void RasterizerMetal::UnpackVertices(u32 slot, const VertexSource& source, bool 
                                     ? CreateFunction(vertex_unpack_library.Get(), "unpack_1010102")
                                     : Object{};
         vertex_unpack_kernel =
-            function ? CreateComputePipelineState(device, function.Get(), error) : Object{};
+            function ? CreateComputePipelineState(device, function.Get(), error, nullptr, 64)
+                     : Object{};
         if (!vertex_unpack_kernel) {
             vertex_unpack_failed = true;
             LOG_ERROR(Render_Metal, "Metal: 10:10:10:2 vertex unpack kernel failed to build: {}",
@@ -1569,9 +1570,9 @@ void RasterizerMetal::UnpackVertices(u32 slot, const VertexSource& source, bool 
     };
     unpacked_vertices[slot] = staging_pool.Stream(size_t{count} * 8, 16);
     scheduler.BeginCompute(vertex_unpack_kernel.Get(), ahead);
-    scheduler.BindBuffer(ShaderStage::Compute, 0, stream.buffer, stream.offset & ~3U);
+    scheduler.BindBuffer(ShaderStage::Compute, 0, stream.buffer, stream.offset & ~3U, false);
     scheduler.BindBuffer(ShaderStage::Compute, 1, unpacked_vertices[slot].buffer,
-                         static_cast<u32>(unpacked_vertices[slot].offset));
+                         static_cast<u32>(unpacked_vertices[slot].offset), true);
     scheduler.BindBytes(ShaderStage::Compute, 2, &params, static_cast<u32>(sizeof(params)));
     constexpr u32 GroupSize = 64;
     scheduler.Dispatch({(count + GroupSize - 1) / GroupSize, 1, 1}, {GroupSize, 1, 1});
@@ -1585,7 +1586,8 @@ void RasterizerMetal::GatherVertices(const VertexSources& sources, bool ahead) {
                                     ? CreateFunction(vertex_gather_library.Get(), "gather_vertices")
                                     : Object{};
         vertex_gather_kernel =
-            function ? CreateComputePipelineState(device, function.Get(), error) : Object{};
+            function ? CreateComputePipelineState(device, function.Get(), error, nullptr, 64)
+                     : Object{};
         if (!vertex_gather_kernel) {
             vertex_gather_failed = true;
             LOG_ERROR(Render_Metal, "Metal: vertex gather kernel failed to build: {}", error);
@@ -1628,9 +1630,9 @@ void RasterizerMetal::GatherVertices(const VertexSources& sources, bool ahead) {
             .gathered_stride = sources.gather_stride,
             .gathered_offset = attribute.gathered_offset,
         };
-        scheduler.BindBuffer(ShaderStage::Compute, 0, stream.buffer, stream.offset & ~3U);
+        scheduler.BindBuffer(ShaderStage::Compute, 0, stream.buffer, stream.offset & ~3U, false);
         scheduler.BindBuffer(ShaderStage::Compute, 1, gathered_vertices.buffer,
-                             static_cast<u32>(gathered_vertices.offset));
+                             static_cast<u32>(gathered_vertices.offset), true);
         scheduler.BindBytes(ShaderStage::Compute, 2, &params, static_cast<u32>(sizeof(params)));
         constexpr u32 GroupSize = 64;
         scheduler.Dispatch({(stream_elements + GroupSize - 1) / GroupSize, 1, 1},
@@ -1647,7 +1649,9 @@ void RasterizerMetal::ConvertMeshIndirect(bool ahead) {
                 ? CreateFunction(mesh_indirect_library.Get(), MeshIndirectKernelName)
                 : Object{};
         mesh_indirect_kernel =
-            function ? CreateComputePipelineState(device, function.Get(), error) : Object{};
+            function ? CreateComputePipelineState(device, function.Get(), error, nullptr,
+                                                  MeshIndirectGroupSize)
+                     : Object{};
         if (!mesh_indirect_kernel) {
             mesh_indirect_failed = true;
             LOG_ERROR(Render_Metal, "Metal: indirect mesh argument kernel failed to build: {}",
@@ -1669,13 +1673,14 @@ void RasterizerMetal::ConvertMeshIndirect(bool ahead) {
     mesh_indirect.output = staging_pool.Stream(size_t{mesh_indirect.draws} * 3 * sizeof(u32), 16);
     scheduler.BeginCompute(mesh_indirect_kernel.Get(), ahead);
     scheduler.BindBuffer(ShaderStage::Compute, 0, mesh_indirect.records,
-                         static_cast<u32>(mesh_indirect.records_offset));
+                         static_cast<u32>(mesh_indirect.records_offset), false);
     scheduler.BindBuffer(ShaderStage::Compute, 1,
                          mesh_indirect.has_count ? mesh_indirect.count : mesh_indirect.records,
                          static_cast<u32>(mesh_indirect.has_count ? mesh_indirect.count_offset
-                                                                  : mesh_indirect.records_offset));
+                                                                  : mesh_indirect.records_offset),
+                         false);
     scheduler.BindBuffer(ShaderStage::Compute, 2, mesh_indirect.output.buffer,
-                         static_cast<u32>(mesh_indirect.output.offset));
+                         static_cast<u32>(mesh_indirect.output.offset), true);
     scheduler.BindBytes(ShaderStage::Compute, 3, &params, static_cast<u32>(sizeof(params)));
     scheduler.Dispatch({(params.draws + MeshIndirectGroupSize - 1) / MeshIndirectGroupSize, 1, 1},
                        {MeshIndirectGroupSize, 1, 1});
@@ -1739,15 +1744,16 @@ void RasterizerMetal::EnsureIndexKernels() {
         std::string error;
         index_kernel_library =
             CreateLibrary(device, IndexConvert::RewriteKernelSource(), error);
-        const auto make = [&](const char* name) {
+        const auto make = [&](const char* name, u32 threads) {
             const Object function = index_kernel_library
                                         ? CreateFunction(index_kernel_library.Get(), name)
                                         : Object{};
-            return function ? CreateComputePipelineState(device, function.Get(), error)
-                            : Object{};
+            return function
+                       ? CreateComputePipelineState(device, function.Get(), error, nullptr, threads)
+                       : Object{};
         };
-        index_kernel = make("rewrite_indices");
-        index_strip_kernel = make("rewrite_restart_strip");
+        index_kernel = make("rewrite_indices", 64);
+        index_strip_kernel = make("rewrite_restart_strip", IndexConvert::StripRestartThreads);
         if (!index_kernel || !index_strip_kernel) {
             index_kernel = {};
             index_kernel_failed = true;
@@ -1757,15 +1763,16 @@ void RasterizerMetal::EnsureIndexKernels() {
     if (!indirect_kernels_failed && !indirect_arguments_kernel) {
         std::string error;
         indirect_library = CreateLibrary(device, Indirect::KernelSource(), error);
-        const auto make = [&](const char* name) {
+        const auto make = [&](const char* name, u32 threads) {
             const Object function =
                 indirect_library ? CreateFunction(indirect_library.Get(), name) : Object{};
-            return function ? CreateComputePipelineState(device, function.Get(), error)
-                            : Object{};
+            return function
+                       ? CreateComputePipelineState(device, function.Get(), error, nullptr, threads)
+                       : Object{};
         };
-        indirect_arguments_kernel = make("indirect_arguments");
-        indirect_setup_kernel = make("indirect_rewrite_setup");
-        grid_arguments_kernel = make("grid_arguments");
+        indirect_arguments_kernel = make("indirect_arguments", 64);
+        indirect_setup_kernel = make("indirect_rewrite_setup", 1);
+        grid_arguments_kernel = make("grid_arguments", 1);
         if (!indirect_arguments_kernel || !indirect_setup_kernel || !grid_arguments_kernel) {
             indirect_arguments_kernel = {};
             indirect_kernels_failed = true;
@@ -1801,10 +1808,10 @@ bool RasterizerMetal::PrepareIndirect(bool ahead) {
             .words = words,
         };
         scheduler.BeginCompute(indirect_arguments_kernel.Get(), ahead);
-        scheduler.BindBuffer(ShaderStage::Compute, 0, indirect->Handle(), indirect_offset);
-        scheduler.BindBuffer(ShaderStage::Compute, 1, count_buffer, count_offset);
+        scheduler.BindBuffer(ShaderStage::Compute, 0, indirect->Handle(), indirect_offset, false);
+        scheduler.BindBuffer(ShaderStage::Compute, 1, count_buffer, count_offset, false);
         scheduler.BindBuffer(ShaderStage::Compute, 2, plan.arguments.buffer,
-                             static_cast<u32>(plan.arguments.offset));
+                             static_cast<u32>(plan.arguments.offset), true);
         scheduler.BindBytes(ShaderStage::Compute, 3, &params, static_cast<u32>(sizeof(params)));
         constexpr u32 GroupSize = 64;
         scheduler.Dispatch({(plan.max_draws + GroupSize - 1) / GroupSize, 1, 1},
@@ -1835,20 +1842,21 @@ bool RasterizerMetal::PrepareIndirect(bool ahead) {
             .strip_threads = strip ? IndexConvert::StripRestartThreads : 0U,
         };
         scheduler.BeginCompute(indirect_setup_kernel.Get(), ahead);
-        scheduler.BindBuffer(ShaderStage::Compute, 0, indirect->Handle(), indirect_offset);
-        scheduler.BindBuffer(ShaderStage::Compute, 1, count_buffer, count_offset);
+        scheduler.BindBuffer(ShaderStage::Compute, 0, indirect->Handle(), indirect_offset, false);
+        scheduler.BindBuffer(ShaderStage::Compute, 1, count_buffer, count_offset, false);
         scheduler.BindBytes(ShaderStage::Compute, 2, &params, static_cast<u32>(sizeof(params)));
         scheduler.BindBuffer(ShaderStage::Compute, 4, plan.control.buffer,
-                             static_cast<u32>(control));
+                             static_cast<u32>(control), true);
         scheduler.Dispatch({1, 1, 1}, {1, 1, 1});
         scheduler.BeginCompute(strip ? index_strip_kernel.Get() : index_kernel.Get(), ahead);
         scheduler.BindBuffer(ShaderStage::Compute, 0,
-                             plan.indexed ? index.buffer : plan.control.buffer, 0);
+                             plan.indexed ? index.buffer : plan.control.buffer, 0, false);
         scheduler.BindBuffer(ShaderStage::Compute, 1, plan.indices.buffer,
                              static_cast<u32>(plan.indices.offset +
-                                              u64{draw} * plan.capacity * sizeof(u32)));
+                                              u64{draw} * plan.capacity * sizeof(u32)),
+                             true);
         scheduler.BindBuffer(ShaderStage::Compute, 2, plan.control.buffer,
-                             static_cast<u32>(control));
+                             static_cast<u32>(control), false);
         scheduler.DispatchIndirect(plan.control.buffer,
                                    control + Indirect::ControlGroupsWord * sizeof(u32),
                                    {strip ? IndexConvert::StripRestartThreads : 64U, 1, 1});
@@ -2150,7 +2158,7 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
             }
             return;
         }
-        scheduler.BindTexture(metal_stage, slot_value, texture, on_buffer);
+        scheduler.BindTexture(metal_stage, slot_value, texture, on_buffer, write);
     };
     size_t next_buffer = 0;
     for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
@@ -2169,7 +2177,8 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                     }
                     if (next_buffer < pending.size()) {
                         spill_table[slot.spill] = scheduler.UseBuffer(
-                            metal_stage, pending[next_buffer].buffer, pending[next_buffer].offset);
+                            metal_stage, pending[next_buffer].buffer, pending[next_buffer].offset,
+                            pending[next_buffer].is_written);
                         ++next_buffer;
                     }
                     break;
@@ -2199,7 +2208,8 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                 }
                 if (next_buffer < pending.size()) {
                     scheduler.BindBuffer(metal_stage, slot_index, pending[next_buffer].buffer,
-                                         pending[next_buffer].offset);
+                                         pending[next_buffer].offset,
+                                         pending[next_buffer].is_written);
                     ++next_buffer;
                 }
                 break;
@@ -2222,12 +2232,26 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                             static_cast<u32>(spill_table.size() * sizeof(u64)));
     }
     // Texture slots in binding order: texel buffers, image buffers, textures, images.
-    const size_t texel_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors) +
-                                 Shader::NumDescriptors(info.image_buffer_descriptors);
-    for (size_t element = 0; element < texel_buffers && element < texture_slots.size(); ++element) {
-        bind_texture(texture_slots[element],
-                     element < texel_buffer_views.size() ? texel_buffer_views[element] : nullptr,
+    const size_t read_texel_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
+    const size_t texel_buffers =
+        read_texel_buffers + Shader::NumDescriptors(info.image_buffer_descriptors);
+    size_t texel_element = 0;
+    for (; texel_element < read_texel_buffers && texel_element < texture_slots.size();
+         ++texel_element) {
+        bind_texture(texture_slots[texel_element],
+                     texel_element < texel_buffer_views.size() ? texel_buffer_views[texel_element]
+                                                               : nullptr,
                      false, true);
+    }
+    for (const auto& desc : info.image_buffer_descriptors) {
+        for (u32 element = 0; element < desc.count && texel_element < texture_slots.size();
+             ++element, ++texel_element) {
+            bind_texture(texture_slots[texel_element],
+                         texel_element < texel_buffer_views.size()
+                             ? texel_buffer_views[texel_element]
+                             : nullptr,
+                         desc.is_written, true);
+        }
     }
     size_t texture_slot = texel_buffers;
     size_t view = texel_buffers;
@@ -2282,7 +2306,7 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                     }
                 } else {
                     scheduler.BindTexture(metal_stage, texture_slots[texture_slot], tex_handle,
-                                          false);
+                                          false, false);
                 }
             }
             ++texture_slot;
@@ -2348,11 +2372,11 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                                 static_cast<u32>(bytes));
         } else {
             const StagingBufferRef table =
-                staging_pool.Stream(bytes, buffer_cache_runtime.GetUniformBufferAlignment());
+                staging_pool.RequestUpload(bytes, buffer_cache_runtime.GetUniformBufferAlignment());
             if (table.mapped_span.size() >= bytes) {
                 std::memcpy(table.mapped_span.data(), array_table.data(), bytes);
                 scheduler.BindBuffer(metal_stage, program.array_spill_slot, table.buffer,
-                                     static_cast<u32>(table.offset));
+                                     static_cast<u32>(table.offset), false);
             }
         }
     }
@@ -3281,8 +3305,8 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                         const bool strip = gpu_params.mode == IndexConvert::StripRestartMode;
                         scheduler.BeginCompute(
                             strip ? index_strip_kernel.Get() : index_kernel.Get(), true);
-                        scheduler.BindBuffer(ShaderStage::Compute, 0, idx.buffer, 0);
-                        scheduler.BindBuffer(ShaderStage::Compute, 1, promoted.Get(), 0);
+                        scheduler.BindBuffer(ShaderStage::Compute, 0, idx.buffer, 0, false);
+                        scheduler.BindBuffer(ShaderStage::Compute, 1, promoted.Get(), 0, true);
                         scheduler.BindBytes(ShaderStage::Compute, 2, &gpu_params,
                                             static_cast<u32>(sizeof(gpu_params)));
                         if (strip) {
@@ -3676,14 +3700,14 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                            std::span(samplers).subspan(first_sampler[0]), targets.width,
                            targets.height);
         bind_vertex_streams([&](u32 slot, BufferHandle buffer, u32 offset) {
-            scheduler.BindBuffer(ShaderStage::Compute, slot, buffer, offset);
+            scheduler.BindBuffer(ShaderStage::Compute, slot, buffer, offset, false);
         });
         const ShaderTranslate::TessellationSlots& vertex_slots = programs[0]->tessellation_slots;
         bind(ShaderStage::Compute, vertex_slots.output, tess_buffers.vertices);
         if (tess_draw->index_size != 0 && vertex_slots.index != ~0U) {
             // Read from the draw's first index (the stage-in fetch and VertexIndex both).
             scheduler.BindBuffer(ShaderStage::Compute, vertex_slots.index, tess_draw->index_buffer,
-                                 static_cast<u32>(tess_draw->index_offset));
+                                 static_cast<u32>(tess_draw->index_offset), false);
         }
         scheduler.DispatchStageIn(tess_draw->index_size != 0 ? 0U : tess_draw->first,
                                   tess_draw->count, tess_draw->first_instance,
@@ -3965,7 +3989,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                            std::span(samplers).subspan(first_sampler[0]), targets.width,
                            targets.height);
         bind_vertex_streams([&](u32 slot, BufferHandle buffer, u32 offset) {
-            scheduler.BindBuffer(ShaderStage::Compute, slot, buffer, offset);
+            scheduler.BindBuffer(ShaderStage::Compute, slot, buffer, offset, false);
         });
         const ShaderTranslate::TessellationSlots& slots =
             geo->capture[geo_variant].tessellation_slots;
@@ -3974,7 +3998,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         }
         if (xfb_draw.index_size != 0 && slots.index != ~0U) {
             scheduler.BindBuffer(ShaderStage::Compute, slots.index, index_buffer,
-                                 static_cast<u32>(index_offset));
+                                 static_cast<u32>(index_offset), false);
         }
         scheduler.DispatchStageIn(xfb_draw.index_size != 0 ? 0U : xfb_draw.first, xfb_draw.count,
                                   xfb_draw.first_instance, instances);
@@ -4102,17 +4126,17 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                                std::span(samplers).subspan(first_sampler[0]), targets.width,
                                targets.height);
             bind_vertex_streams([&](u32 slot, BufferHandle buffer, u32 offset) {
-                scheduler.BindBuffer(ShaderStage::Compute, slot, buffer, offset);
+                scheduler.BindBuffer(ShaderStage::Compute, slot, buffer, offset, false);
             });
             const ShaderTranslate::TessellationSlots& slots =
                 capture.capture[variant].tessellation_slots;
             if (slots.output != ~0U) {
                 scheduler.BindBuffer(ShaderStage::Compute, slots.output, outputs.buffer,
-                                     static_cast<u32>(outputs.offset));
+                                     static_cast<u32>(outputs.offset), true);
             }
             if (xfb_draw.index_size != 0 && slots.index != ~0U) {
                 scheduler.BindBuffer(ShaderStage::Compute, slots.index, index_buffer,
-                                     static_cast<u32>(index_offset));
+                                     static_cast<u32>(index_offset), false);
             }
             scheduler.DispatchStageIn(xfb_draw.index_size != 0 ? 0U : xfb_draw.first,
                                       xfb_draw.count, xfb_draw.first_instance,
@@ -4785,15 +4809,17 @@ void RasterizerMetal::EnsureGeometryKernels() {
     }
     std::string error;
     geometry_library = CreateLibrary(device, std::string{Geometry::PackSource}, error);
-    const auto make = [&](const char* name) {
+    const auto make = [&](const char* name, u32 threads) {
         const Object function =
             geometry_library ? CreateFunction(geometry_library.Get(), name) : Object{};
-        return function ? CreateComputePipelineState(device, function.Get(), error) : Object{};
+        return function
+                   ? CreateComputePipelineState(device, function.Get(), error, nullptr, threads)
+                   : Object{};
     };
-    geometry_feed_kernel = make("geo_feed");
-    geometry_count_kernel = make("geo_count");
-    geometry_scan_kernel = make("geo_scan");
-    geometry_write_kernel = make("geo_write");
+    geometry_feed_kernel = make("geo_feed", 1);
+    geometry_count_kernel = make("geo_count", Geometry::GroupSize);
+    geometry_scan_kernel = make("geo_scan", Geometry::GroupSize);
+    geometry_write_kernel = make("geo_write", Geometry::GroupSize);
     if (!geometry_count_kernel || !geometry_scan_kernel || !geometry_write_kernel ||
         !geometry_feed_kernel) {
         geometry_count_kernel = {};
@@ -7579,7 +7605,8 @@ bool RasterizerMetal::PrepareConditionRegion() {
         const Object function =
             library ? CreateFunction(library.Get(), "condition_arguments") : Object{};
         condition_kernel =
-            function ? CreateComputePipelineState(device, function.Get(), error) : Object{};
+            function ? CreateComputePipelineState(device, function.Get(), error, nullptr, 64)
+                     : Object{};
         if (!condition_kernel) {
             condition_kernel_failed = true;
             LOG_ERROR(Render_Metal, "Metal: condition kernel failed to build: {}", error);
@@ -7598,11 +7625,11 @@ bool RasterizerMetal::PrepareConditionRegion() {
     // After the render passes that counted the samples (not ahead of the segment), before the
     // draws: the draw count and their arguments are written before the commit.
     scheduler.BeginCompute(condition_kernel.Get(), false);
-    scheduler.BindBuffer(ShaderStage::Compute, 0, scheduler.VisibilityBuffer(), 0);
+    scheduler.BindBuffer(ShaderStage::Compute, 0, scheduler.VisibilityBuffer(), 0, false);
     scheduler.BindBytes(ShaderStage::Compute, 1, &gpu_condition.params,
                         static_cast<u32>(sizeof(gpu_condition.params)));
     scheduler.BindBuffer(ShaderStage::Compute, 2, gpu_condition.region.buffer,
-                         static_cast<u32>(gpu_condition.region.offset));
+                         static_cast<u32>(gpu_condition.region.offset), true);
     constexpr u32 GroupSize = 64;
     scheduler.Dispatch({Condition::RegionDraws / GroupSize, 1, 1}, {GroupSize, 1, 1});
     gpu_condition.region_tick = scheduler.CurrentTick();

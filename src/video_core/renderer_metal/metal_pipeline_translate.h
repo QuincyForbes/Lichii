@@ -142,6 +142,7 @@ struct StageProgram {
     /// Buffer slot of the table of spilled texture and sampler arrays, ~0 without; its entries.
     u32 array_spill_slot{~0U};
     u32 array_spill_entries{};
+    u32 immutable_buffer_mask{};
     /// Precomputed Metal::BindMemo kinds for this stage's descriptors.
     std::vector<u32> binding_kinds;
     /// The MTLLibrary and MTLFunction, made on first use (BuildFunctions).

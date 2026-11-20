@@ -39,6 +39,10 @@
 #include "vulkan/vulkan_core.h"
 #endif
 
+#ifdef LoadString
+#undef LoadString
+#endif
+
 namespace FS = Common::FS;
 
 #if !defined(__ANDROID__) && !defined(__APPLE__) && !defined(LICHII_CONFIG_NO_VULKAN_PROBE)

@@ -47,6 +47,7 @@ TEST_CASE("iPhone 17 Pro Max gets the phone profile", "[device_profile]") {
     const auto profile = Profile::Recommend(IPhone17ProMax());
     CHECK(profile.tier == Profile::Tier::High);
     CHECK(profile.device_name == "iPhone 17 Pro Max (A19 Pro, 12 GB)");
+    CHECK(Value(profile, "backend") == "Metal");
     CHECK(Value(profile, "resolution_setup") == "Res1X");
     CHECK(Value(profile, "use_docked_mode") == "Handheld");
     CHECK(Value(profile, "oot_resolution") == "Percent50");
@@ -83,6 +84,7 @@ TEST_CASE("Apple tiers follow memory and GPU family", "[device_profile]") {
     device.memory_mib = 5600;
     auto profile = Profile::Recommend(device);
     CHECK(profile.tier == Profile::Tier::Low);
+    CHECK(Value(profile, "backend") == "Metal");
     CHECK(Value(profile, "resolution_setup") == "Res3_4X");
     CHECK(Value(profile, "oot_resolution") == "Percent50");
     CHECK(Value(profile, "texture_quality") == "Quarter");
@@ -95,6 +97,7 @@ TEST_CASE("Apple tiers follow memory and GPU family", "[device_profile]") {
     profile = Profile::Recommend(device);
     CHECK(profile.tier == Profile::Tier::Ultra);
     CHECK(profile.device_name == "iPad Pro 13-inch (M4) (M4, 16 GB)");
+    CHECK(Value(profile, "backend") == "Metal");
     CHECK(Value(profile, "frame_gen") == "On");
     CHECK(Value(profile, "oot_frame_rate") == "Fps60");
     CHECK(Value(profile, "texture_quality") == "Full");
@@ -105,6 +108,7 @@ TEST_CASE("Apple tiers follow memory and GPU family", "[device_profile]") {
     device.memory_mib = 7900;
     profile = Profile::Recommend(device);
     CHECK(profile.tier == Profile::Tier::Mid);
+    CHECK(Value(profile, "backend") == "Metal");
     CHECK(Value(profile, "oot_frame_rate") == "Fps60");
 }
 
@@ -114,6 +118,7 @@ TEST_CASE("Desktop profile follows the GPU when it is known", "[device_profile]"
     device.memory_mib = 32768;
     auto profile = Profile::Recommend(device);
     CHECK(profile.tier == Profile::Tier::Desktop);
+    CHECK(Value(profile, "backend") == "Vulkan");
     CHECK(Value(profile, "upscaler") == "Auto");
     CHECK(Value(profile, "oot_resolution") == "Full");
     CHECK(Value(profile, "texture_quality") == "Full");
@@ -128,6 +133,7 @@ TEST_CASE("Desktop profile follows the GPU when it is known", "[device_profile]"
     profile = Profile::Recommend(device);
     CHECK(Value(profile, "upscaler") == "Dlss");
     device.os = Profile::Os::Linux;
+    CHECK(Value(Profile::Recommend(device), "backend") == "Vulkan");
     CHECK(Value(Profile::Recommend(device), "upscaler") == "Auto");
 
     device.os = Profile::Os::Windows;
@@ -139,6 +145,61 @@ TEST_CASE("Desktop profile follows the GPU when it is known", "[device_profile]"
     CHECK(Value(profile, "texture_quality") == "Half");
     CHECK(Value(profile, "oot_resolution") == "Percent75");
     CHECK(Value(profile, "vulkan_device") == "1");
+}
+
+TEST_CASE("macOS Apple Silicon recommends Direct Metal while Windows and Linux recommend Vulkan",
+          "[device_profile]") {
+    DefaultsScope scope;
+#if defined(__APPLE__)
+    CHECK(Settings::values.renderer_backend.GetDefault() == Settings::RendererBackend::Metal);
+#elif !defined(__sun__) && !defined(__managarm__)
+    CHECK(Settings::values.renderer_backend.GetDefault() == Settings::RendererBackend::Vulkan);
+#endif
+
+    Profile::Device mac;
+    mac.os = Profile::Os::MacOS;
+    mac.model = "Mac16,1";
+    mac.chip = "M4";
+    mac.apple_gpu_family = 9;
+    mac.memory_mib = 16384;
+    const auto mac_profile = Profile::Recommend(mac);
+    CHECK(mac_profile.tier == Profile::Tier::Desktop);
+    CHECK(mac_profile.device_name == "M4, 16 GB RAM");
+    CHECK(Value(mac_profile, "backend") == "Metal");
+    CHECK(Value(mac_profile, "moltenvk_driver") == "Legacy");
+    CHECK(Value(mac_profile, "use_reactive_flushing") == "Off");
+    CHECK(Value(mac_profile, "texture_quality") == "Full");
+    for (const auto& value : mac_profile.settings) {
+        CHECK_FALSE(value.reason.empty());
+    }
+
+    mac.chip = "M1";
+    mac.apple_gpu_family = 7;
+    mac.memory_mib = 8192;
+    const auto m1_profile = Profile::Recommend(mac);
+    CHECK(Value(m1_profile, "backend") == "Metal");
+    CHECK(Value(m1_profile, "texture_quality") == "Half");
+
+    Profile::Apply(mac_profile);
+    CHECK(Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Metal);
+
+#if !defined(__sun__) && !defined(__managarm__)
+    Profile::Device win;
+    win.os = Profile::Os::Windows;
+    win.memory_mib = 16384;
+    const auto win_profile = Profile::Recommend(win);
+    CHECK(Value(win_profile, "backend") == "Vulkan");
+    Profile::Apply(win_profile);
+    CHECK(Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan);
+
+    Profile::Device lin;
+    lin.os = Profile::Os::Linux;
+    lin.memory_mib = 16384;
+    const auto lin_profile = Profile::Recommend(lin);
+    CHECK(Value(lin_profile, "backend") == "Vulkan");
+    Profile::Apply(lin_profile);
+    CHECK(Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan);
+#endif
 }
 
 TEST_CASE("Applying the profile sets the global values and reports changes", "[device_profile]") {

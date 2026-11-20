@@ -565,7 +565,11 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     if (has_broken_vulkan) {
         UISettings::values.has_broken_vulkan = true;
-
+#ifdef LICHII_METAL_RENDERER
+        Settings::values.renderer_backend = Settings::RendererBackend::Metal;
+        UpdateAPIText();
+        renderer_status_button->setDisabled(true);
+#else
         QMessageBox::warning(this, tr("Broken Vulkan Installation Detected"),
                              tr("Vulkan initialization failed during boot."));
 #ifdef HAS_OPENGL
@@ -577,6 +581,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         UpdateAPIText();
         renderer_status_button->setDisabled(true);
         renderer_status_button->setChecked(false);
+#endif
     } else {
         // Read when a configuration dialog first needs them: one more Vulkan instance and a test
         // surface on the UI thread at every start otherwise.
@@ -1853,9 +1858,6 @@ void MainWindow::InitializeWidgets() {
     renderer_status_button->setFocusPolicy(Qt::NoFocus);
     connect(renderer_status_button, &QPushButton::clicked, this, &MainWindow::OnToggleGraphicsAPI);
     UpdateAPIText();
-    renderer_status_button->setCheckable(true);
-    renderer_status_button->setChecked(Settings::values.renderer_backend.GetValue() ==
-                                       Settings::RendererBackend::Vulkan);
     renderer_status_button->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(renderer_status_button, &QPushButton::customContextMenuRequested,
             [this](const QPoint& menu_location) {
@@ -1866,6 +1868,13 @@ void MainWindow::InitializeWidgets() {
                     if (renderer_backend_pair.first == Settings::RendererBackend::Null) {
                         continue;
                     }
+#ifndef HAS_OPENGL
+                    if (renderer_backend_pair.first == Settings::RendererBackend::OpenGL_GLSL ||
+                        renderer_backend_pair.first == Settings::RendererBackend::OpenGL_GLASM ||
+                        renderer_backend_pair.first == Settings::RendererBackend::OpenGL_SPIRV) {
+                        continue;
+                    }
+#endif
 #ifndef LICHII_METAL_RENDERER
                     if (renderer_backend_pair.first == Settings::RendererBackend::Metal) {
                         continue;
@@ -4734,6 +4743,10 @@ void MainWindow::OnToggleAdaptingFilter() {
 
 void MainWindow::OnToggleGraphicsAPI() {
     auto api = Settings::values.renderer_backend.GetValue();
+#ifdef LICHII_METAL_RENDERER
+    api = api == Settings::RendererBackend::Metal ? Settings::RendererBackend::Vulkan
+                                                  : Settings::RendererBackend::Metal;
+#else
     switch (api) {
 #ifdef HAS_OPENGL
     case Settings::RendererBackend::Vulkan:
@@ -4757,10 +4770,11 @@ void MainWindow::OnToggleGraphicsAPI() {
         api = Settings::RendererBackend::Vulkan;
         break;
     default:
+        api = Settings::RendererBackend::Vulkan;
         break;
     }
+#endif
     Settings::values.renderer_backend.SetValue(api);
-    renderer_status_button->setChecked(api == Settings::RendererBackend::Vulkan);
     UpdateAPIText();
 }
 
@@ -5218,6 +5232,9 @@ void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& 
     connect(shader_warm_dialog, &ShaderWarmDialog::BuildFinished, this,
             [this, game_path, loaded_per_game, dialog = shader_warm_dialog](bool ok) {
                 const bool use_disk_cache = Settings::values.use_disk_shader_cache.GetValue();
+                const bool vulkan_backend =
+                    Settings::values.renderer_backend.GetValue() ==
+                    Settings::RendererBackend::Vulkan;
                 if (loaded_per_game && !QtCommon::system->IsPoweredOn()) {
                     Settings::RestoreGlobalState(false);
                     Settings::values.players.SetGlobal(true);
@@ -5225,7 +5242,8 @@ void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& 
                     QtCommon::system->ApplySettings();
                     UpdateStatusButtons();
                 }
-                if (!ok || !use_disk_cache || !dialog || !dialog->NeedsBootGpuCompile()) {
+                if (!ok || !use_disk_cache || !vulkan_backend || !dialog ||
+                    !dialog->NeedsBootGpuCompile()) {
                     return;
                 }
                 if (QtCommon::emu_thread != nullptr || emulation_running || boot_in_progress ||
@@ -5254,9 +5272,12 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
     }
     ShaderWarm::RequestWarmBeforeStart(false);
     const auto mode = Settings::values.precache_shaders.GetValue();
-    // The precache runs where the disk shader cache loads.
+    const auto backend = Settings::values.renderer_backend.GetValue();
+    // The precache runs where the disk shader cache loads (Metal and Vulkan).
     if (title_id == 0 || mode == Settings::PrecacheShaders::Off ||
-        !Settings::values.use_disk_shader_cache.GetValue()) {
+        !Settings::values.use_disk_shader_cache.GetValue() ||
+        (backend != Settings::RendererBackend::Vulkan &&
+         backend != Settings::RendererBackend::Metal)) {
         return;
     }
     const auto compute_warm = ShaderWarm::ComputeWarmPath(title_id);
@@ -5998,7 +6019,10 @@ void MainWindow::UpdateStatusBar() {
         fpsText = tr("Real: %1 FPS | FG (%2): Paused")
                       .arg(results.average_game_fps, 0, 'f', 1)
                       .arg(FormatFrameGenMethodLabel(nvidia_frame_gen_active, true));
-    } else if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan &&
+    } else if ((Settings::values.renderer_backend.GetValue() ==
+                    Settings::RendererBackend::Vulkan ||
+                Settings::values.renderer_backend.GetValue() ==
+                    Settings::RendererBackend::Metal) &&
                Settings::values.frame_gen.GetValue()) {
         fpsText = tr("Real: %1 FPS | FG (%2): Warmup")
                       .arg(results.average_game_fps, 0, 'f', 1)
@@ -6076,9 +6100,14 @@ void MainWindow::UpdateDockedButton() {
 
 void MainWindow::UpdateAPIText() {
     const auto api = Settings::values.renderer_backend.GetValue();
-    const auto renderer_status_text =
-        UiText::ChoiceNames<Settings::RendererBackend>().find(api)->second;
+    const auto renderer_status_text = UiText::ChoiceLabel(
+        Settings::EnumMetadata<Settings::RendererBackend>::Index(), static_cast<u32>(api));
     renderer_status_button->setText(renderer_status_text.toUpper());
+#ifdef LICHII_METAL_RENDERER
+    renderer_status_button->setChecked(api == Settings::RendererBackend::Metal);
+#else
+    renderer_status_button->setChecked(api == Settings::RendererBackend::Vulkan);
+#endif
 }
 
 void MainWindow::UpdateFilterText() {
@@ -6129,8 +6158,6 @@ void MainWindow::UpdateVolumeUI() {
 }
 
 void MainWindow::UpdateStatusButtons() {
-    renderer_status_button->setChecked(Settings::values.renderer_backend.GetValue() ==
-                                       Settings::RendererBackend::Vulkan);
     UpdateAPIText();
     UpdateGPUAccuracyButton();
     UpdateDockedButton();

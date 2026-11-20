@@ -515,19 +515,29 @@ public:
     void SetDrawState(const DrawState& state);
 
     void BindVertexBuffer(u32 slot, BufferHandle buffer, u32 offset);
-    void BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset,
-                    bool write = false);
+    void BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset) {
+        BindBuffer(stage, slot, buffer, offset, stage == ShaderStage::Compute);
+    }
+    void BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset, bool write);
     void BindBytes(ShaderStage stage, u32 slot, const void* data, u32 size);
     /// Makes `buffer` resident for `stage`'s next draws or dispatches without binding it (a
     /// program reads it through an address: ShaderTranslate::Options::spill_buffers); returns the
     /// address `offset` bytes into it.
-    [[nodiscard]] u64 UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset,
-                                bool write = false);
+    [[nodiscard]] u64 UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset) {
+        return UseBuffer(stage, buffer, offset, stage == ShaderStage::Compute);
+    }
+    [[nodiscard]] u64 UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset, bool write);
     /// on_buffer=false: `texture` is known not to be a view of a buffer (a texture cache image
     /// view or a placeholder): render stages skip noting a buffer under it for the segment
     /// (EDEN_NX2_METAL_IMAGE_NOTE_SKIP).
-    void BindTexture(ShaderStage stage, u32 slot, TextureHandle texture, bool on_buffer = true,
-                     bool write = false);
+    void BindTexture(ShaderStage stage, u32 slot, TextureHandle texture) {
+        BindTexture(stage, slot, texture, true, stage == ShaderStage::Compute);
+    }
+    void BindTexture(ShaderStage stage, u32 slot, TextureHandle texture, bool on_buffer) {
+        BindTexture(stage, slot, texture, on_buffer, stage == ShaderStage::Compute);
+    }
+    void BindTexture(ShaderStage stage, u32 slot, TextureHandle texture, bool on_buffer,
+                     bool write);
     void BindSampler(ShaderStage stage, u32 slot, void* sampler);
     /// The sampler's MTLResourceID, what a program reads from a table of spilled samplers
     /// (ShaderTranslate::Result::sampler_spill_slot). 0 for none.

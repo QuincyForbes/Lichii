@@ -22,6 +22,35 @@
 
 #include <vulkan/vulkan.h>
 
+// Sanitize X11 and Win32 macros pulled in by platform Vulkan headers
+#undef Always
+#undef BadAccess
+#undef BadAlloc
+#undef BadAtom
+#undef BadColor
+#undef BadCursor
+#undef BadDrawable
+#undef BadFont
+#undef BadGC
+#undef BadIDChoice
+#undef BadImplementation
+#undef BadLength
+#undef BadMatch
+#undef BadName
+#undef BadPixmap
+#undef BadRequest
+#undef BadValue
+#undef BadWindow
+#undef Bool
+#undef CreateEvent
+#undef CreateSemaphore
+#undef False
+#undef LoadString
+#undef None
+#undef Status
+#undef Success
+#undef True
+
 // Define maintenance 7-8 extension names (not yet in official Vulkan headers)
 #ifndef VK_KHR_MAINTENANCE_7_EXTENSION_NAME
 #define VK_KHR_MAINTENANCE_7_EXTENSION_NAME "VK_KHR_maintenance7"
@@ -29,14 +58,6 @@
 #ifndef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
 #define VK_KHR_MAINTENANCE_8_EXTENSION_NAME "VK_KHR_maintenance8"
 #endif
-
-// Sanitize macros
-#undef CreateEvent
-#undef CreateSemaphore
-#undef Always
-#undef False
-#undef None
-#undef True
 
 // "Catch-all" handle for both Android and.. the rest of platforms
 struct VkSurfaceKHR_T;

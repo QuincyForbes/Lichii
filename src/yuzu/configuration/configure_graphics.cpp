@@ -263,8 +263,12 @@ void ConfigureGraphics::PopulateVSyncModeSelection(bool use_setting) {
     int index{};
     const int device{vulkan_device_combobox->currentIndex()}; //< current selected Vulkan device
 
+    static const std::vector<VkPresentModeKHR> metal_present_modes{
+        VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR,
+        VK_PRESENT_MODE_FIFO_RELAXED_KHR};
     const auto& present_modes = //< relevant vector of present modes for the selected device or API
         backend == Settings::RendererBackend::Vulkan && device > -1 ? device_present_modes[device]
+        : backend == Settings::RendererBackend::Metal               ? metal_present_modes
                                                                     : default_present_modes;
 
     vsync_mode_combobox->clear();
@@ -700,6 +704,26 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         connect(flow_scale_auto_checkbox, &QCheckBox::toggled, flow_scale, update);
     }
 
+    // MoltenVK choice only applies when Graphics API is set to Vulkan.
+    if (const auto it = hold_graphics.find(Settings::values.moltenvk_driver.Id());
+        api_combobox != nullptr && it != hold_graphics.end()) {
+        QWidget* const moltenvk_widget = it->second;
+        const auto update_moltenvk = [this, moltenvk_widget] {
+            const bool is_vulkan =
+                GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan;
+            ConfigurationShared::SetUnavailable(
+                moltenvk_widget,
+                is_vulkan ? QString() : UiText::Text("experiments.conflict.requires_vulkan"));
+        };
+        update_moltenvk();
+        connect(api_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), moltenvk_widget,
+                update_moltenvk);
+        if (api_restore_global_button != nullptr) {
+            connect(api_restore_global_button, &QAbstractButton::clicked, moltenvk_widget,
+                    update_moltenvk);
+        }
+    }
+
     const auto held = [&hold_graphics](const Settings::BasicSetting& setting) -> QWidget* {
         const auto it = hold_graphics.find(setting.Id());
         return it != hold_graphics.end() ? it->second : nullptr;
@@ -1027,10 +1051,10 @@ void ConfigureGraphics::UpdateAPILayout() {
     bool runtime_lock = !system.IsPoweredOn();
     bool need_global = !(Settings::IsConfiguringGlobal() || api_restore_global_button->isEnabled());
     vulkan_device = Settings::values.vulkan_device.GetValue(need_global);
-    vulkan_device_widget->setEnabled(!need_global && runtime_lock);
 
     const auto current_backend = GetCurrentGraphicsBackend();
     const bool is_vulkan = current_backend == Settings::RendererBackend::Vulkan;
+    vulkan_device_widget->setEnabled(is_vulkan && !need_global && runtime_lock);
     vulkan_device_widget->setVisible(is_vulkan);
     if (is_vulkan && int(vulkan_device) < vulkan_device_combobox->count()) {
         vulkan_device_combobox->setCurrentIndex(vulkan_device);
@@ -1053,6 +1077,30 @@ void ConfigureGraphics::RetrieveVulkanDevices() {
 }
 
 void ConfigureGraphics::UpdateFeatureAvailability() {
+    if (api_combobox != nullptr) {
+#ifdef LICHII_METAL_RENDERER
+        constexpr u32 recommended_api = static_cast<u32>(Settings::RendererBackend::Metal);
+#else
+        constexpr u32 recommended_api = static_cast<u32>(Settings::RendererBackend::Vulkan);
+#endif
+        const auto api_enum = Settings::EnumMetadata<Settings::RendererBackend>::Index();
+        if (combobox_translations.contains(api_enum)) {
+            const auto& api_names = combobox_translations.at(api_enum);
+            for (int i = 0; i < api_combobox->count(); ++i) {
+                const u32 value = api_combobox->itemData(i).toUInt();
+                const auto name =
+                    std::ranges::find(api_names, value, &std::pair<u32, QString>::first);
+                if (name == api_names.end()) {
+                    continue;
+                }
+                api_combobox->setItemText(
+                    i, value == recommended_api
+                           ? QStringLiteral("%1 (%2)").arg(name->second, tr("Recommended"))
+                           : name->second);
+            }
+        }
+    }
+
     [[maybe_unused]] const bool vulkan =
         GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan;
     const int device = vulkan_device_combobox != nullptr ? vulkan_device_combobox->currentIndex()
@@ -1682,6 +1730,10 @@ Settings::RendererBackend ConfigureGraphics::GetCurrentGraphicsBackend() const {
 
     if (selected_backend == Settings::RendererBackend::Vulkan &&
         UISettings::values.has_broken_vulkan)
+#ifdef LICHII_METAL_RENDERER
+        return Settings::RendererBackend::Metal;
+#else
         return Settings::RendererBackend::OpenGL_GLSL;
+#endif
     return selected_backend;
 }
