@@ -843,13 +843,16 @@ PipelineCache::~PipelineCache() {
 }
 
 namespace {
-[[nodiscard]] bool GameplayArchiveReadOnly() {
-    static const bool read_only = [] {
+[[nodiscard]] bool BinaryArchiveEnabled() {
+    static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_METAL_ARCHIVE");
-        // Populate during live gameplay only when explicitly requested with EDEN_NX2_METAL_ARCHIVE=1.
-        return value == nullptr || value[0] != '1';
+        // Opt-in only: macOS 26/27 -[_MTLBinaryArchive initWithOptions:device:url:error:] runs a
+        // single-threaded FlatBuffers deduplication pass that stalls for minutes on multi-thousand
+        // shader archives, whereas macOS's built-in Metal compiler cache + StageMslCache v2 open
+        // in milliseconds.
+        return value != nullptr && value[0] == '1';
     }();
-    return read_only;
+    return enabled;
 }
 } // Anonymous namespace
 
@@ -861,7 +864,13 @@ void PipelineCache::OpenArchive(u64 title_id) {
     const auto title_dir = shader_dir / fmt::format("{:016x}", title_id);
     std::scoped_lock lock{lifecycle_mutex};
     msl_cache.Open(title_dir / "metal_stages.v2.bin", VideoCommon::ShaderWarm::EmissionStamp());
-    archive.Open(device, title_dir / "metal_pipelines.bin", GameplayArchiveReadOnly());
+    const auto archive_path = title_dir / "metal_pipelines.bin";
+    if (BinaryArchiveEnabled()) {
+        archive.Open(device, archive_path, false);
+    } else {
+        std::error_code ec;
+        std::filesystem::remove(archive_path, ec);
+    }
 }
 
 void PipelineCache::TickFrame() {
@@ -1462,7 +1471,8 @@ void SubmitWarmComputeAsync(const Device& device, StageProgram&& program,
                 const void* const lib_handle = lib.Get();
                 auto lib_keep = std::make_shared<Object>(std::move(lib));
                 CreateComputeStateAsync(
-                    device, lib_handle, ep, workgroup_threads, &archive,
+                    device, lib_handle, ep, workgroup_threads,
+                    archive.IsOpen() ? &archive : nullptr,
                     [&ledger, &gate, &built, &failed, ledger_key,
                      lib_keep = std::move(lib_keep)](Object state, std::string) mutable {
                         const bool ok = static_cast<bool>(state);
@@ -2641,10 +2651,7 @@ bool MetalWarmPending(u64 title_id) {
     const auto title_dir = shader_dir / fmt::format("{:016x}", title_id);
     const auto stages_path = title_dir / "metal_stages.v2.bin";
     const auto pipelines_path = title_dir / "metal_pipelines.bin";
-    static const bool archive_enabled = [] {
-        const char* const value = std::getenv("EDEN_NX2_METAL_ARCHIVE");
-        return value == nullptr || value[0] != '0';
-    }();
+    const bool archive_enabled = BinaryArchiveEnabled();
 
     std::optional<bool> stages_valid;
     const auto has_stages = [&] {
@@ -2700,6 +2707,9 @@ OfflineWarmSummary CompileWarmShadersOffline(
         summary.error = "Invalid title ID";
         return summary;
     }
+    if (on_progress) {
+        on_progress(0, 0, "Preparing Metal shader cache");
+    }
     auto device_holder = CreateOfflineDevice();
     if (!device_holder) {
         summary.error = "No Metal device available";
@@ -2725,7 +2735,13 @@ OfflineWarmSummary CompileWarmShadersOffline(
     StageMslCache msl_cache;
     msl_cache.Open(title_dir / "metal_stages.v2.bin", ShaderWarm::EmissionStamp());
     PipelineArchive archive;
-    static_cast<void>(archive.Open(device, title_dir / "metal_pipelines.bin", false));
+    const auto pipelines_path = title_dir / "metal_pipelines.bin";
+    if (BinaryArchiveEnabled()) {
+        static_cast<void>(archive.Open(device, pipelines_path, false));
+    } else {
+        std::error_code remove_ec;
+        std::filesystem::remove(pipelines_path, remove_ec);
+    }
     WarmLedger ledger;
     ledger.Open(title_dir / "metal_warm_ledger.v1.bin",
                 archive.IsOpen() && !archive.HasEntries());

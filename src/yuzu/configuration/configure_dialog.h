@@ -43,6 +43,7 @@ class ConfigureShaders;
 class ConfigureRam;
 class ConfigureUi;
 class ConfigureWeb;
+class ConfigureMcp;
 
 class QLabel;
 class QLineEdit;
@@ -156,5 +157,8 @@ private:
     std::unique_ptr<ConfigureProfileManager> profile_tab;
     std::unique_ptr<ConfigureSystem> system_tab;
     std::unique_ptr<ConfigureWeb> web_tab;
+#ifdef YUZU_ENABLE_MCP
+    std::unique_ptr<ConfigureMcp> mcp_tab;
+#endif
     InputCommon::InputSubsystem* input_subsystem;
 };

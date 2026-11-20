@@ -1382,9 +1382,20 @@ Service::~Service() {
 }
 
 std::unique_ptr<Service> MaybeStartService(System& system, std::string title, u64 program_id) {
-    const char* const text = std::getenv("EDEN_NX2_DEBUG_SERVER");
-    if (text == nullptr || *text == '\0') {
+    const char* const env_text = std::getenv("EDEN_NX2_DEBUG_SERVER");
+    std::string fallback_endpoint;
+    const char* text = env_text;
+    if (text != nullptr && (std::strcmp(text, "0") == 0 || std::strcmp(text, "off") == 0)) {
         return nullptr;
+    }
+    if (text == nullptr || *text == '\0') {
+        if (!Settings::values.enable_mcp_server.GetValue()) {
+            return nullptr;
+        }
+        const u16 mcp_port = Settings::values.mcp_port.GetValue();
+        const u16 debug_port = mcp_port < 65535 ? static_cast<u16>(mcp_port + 1) : u16{6545};
+        fallback_endpoint = fmt::format("127.0.0.1:{}", debug_port);
+        text = fallback_endpoint.c_str();
     }
     std::string error;
     const auto endpoint = ParseEndpoint(text, error);

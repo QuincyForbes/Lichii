@@ -900,6 +900,7 @@ void MainWindow::SetupMcpMenu() {
             StopMcpServer();
         }
         UpdateMcpMenu();
+        OnSaveConfig();
     });
 
     mcp_writes_action = mcp_menu->addAction(tr("Allow Writes (input, memory, settings)"));
@@ -912,6 +913,7 @@ void MainWindow::SetupMcpMenu() {
             mcp_server->SetWritesAllowed(allowed);
         }
         UpdateMcpMenu();
+        OnSaveConfig();
     });
 
     mcp_menu->addSeparator();
@@ -1088,15 +1090,22 @@ void MainWindow::UpdateMcpStatusLabel() {
     if (!mcp_status_label) {
         return;
     }
-    // Shown only while the server runs, or when it was turned on but could not start.
+    mcp_status_label->setVisible(true);
     if (!mcp_server) {
-        mcp_status_label->setVisible(!mcp_last_error.empty());
-        mcp_status_label->setText(tr("MCP failed"));
-        mcp_status_label->setStyleSheet(QStringLiteral("color: #e05555;"));
-        mcp_status_label->setToolTip(QString::fromStdString(mcp_last_error));
+        mcp_status_label->setChecked(false);
+        if (!mcp_last_error.empty()) {
+            mcp_status_label->setText(tr("MCP: ERR"));
+            mcp_status_label->setStyleSheet(QStringLiteral("color: #e05555;"));
+            mcp_status_label->setToolTip(QString::fromStdString(mcp_last_error));
+        } else {
+            mcp_status_label->setText(tr("MCP: OFF"));
+            mcp_status_label->setStyleSheet(QString{});
+            mcp_status_label->setToolTip(
+                tr("MCP Server is off. Click to enable AI agent / log / GPU debug access."));
+        }
         return;
     }
-    mcp_status_label->setVisible(true);
+    mcp_status_label->setChecked(true);
     const auto s = mcp_server->GetSummary();
     const auto& a = s.activity;
     const auto idle_s =
@@ -1614,10 +1623,19 @@ void MainWindow::InitializeWidgets() {
 #ifdef YUZU_ENABLE_MCP
     // The widgets below are each inserted at 0, so this first one ends up rightmost of the group
     // (after TAS, volume and the other toggles).
-    mcp_status_label = new QLabel();
-    mcp_status_label->setObjectName(QStringLiteral("McpStatusLabel"));
+    mcp_status_label = new QPushButton();
+    mcp_status_label->setObjectName(QStringLiteral("TogglableStatusBarButton"));
     mcp_status_label->setFocusPolicy(Qt::NoFocus);
+    mcp_status_label->setCheckable(true);
     mcp_status_label->setContentsMargins(4, 0, 4, 0);
+    connect(mcp_status_label, &QPushButton::clicked, this, [this] {
+        UpdateMcpMenu();
+        if (mcp_menu) {
+            const QPoint pos = mcp_status_label->mapToGlobal(QPoint{0, 0});
+            const QSize hint = mcp_menu->sizeHint();
+            mcp_menu->popup(QPoint{pos.x(), pos.y() - hint.height()});
+        }
+    });
     statusBar()->insertPermanentWidget(0, mcp_status_label);
 #endif
 

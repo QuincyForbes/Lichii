@@ -46,6 +46,9 @@
 #include "yuzu/configuration/configure_system.h"
 #include "yuzu/configuration/configure_ui.h"
 #include "yuzu/configuration/configure_web.h"
+#ifdef YUZU_ENABLE_MCP
+#include "yuzu/configuration/configure_mcp.h"
+#endif
 #include "yuzu/configuration/recommended_settings.h"
 #include "yuzu/hotkeys.h"
 #include "qt_common/config/catalog_text.h"
@@ -86,7 +89,11 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
       performance_ram_tab{std::make_unique<ConfigureRam>(system_, *builder, this)},
       profile_tab{std::make_unique<ConfigureProfileManager>(system_, this)},
       system_tab{std::make_unique<ConfigureSystem>(system_, nullptr, *builder, this)},
-      web_tab{std::make_unique<ConfigureWeb>(this)}, input_subsystem{input_subsystem_} {
+      web_tab{std::make_unique<ConfigureWeb>(this)},
+#ifdef YUZU_ENABLE_MCP
+      mcp_tab{std::make_unique<ConfigureMcp>(this)},
+#endif
+      input_subsystem{input_subsystem_} {
     Settings::SetConfiguringGlobal(true);
 
     ui->setupUi(this);
@@ -219,6 +226,11 @@ void ConfigureDialog::ApplyConfiguration() {
     audio_tab->ApplyConfiguration();
     debug_tab_tab->ApplyConfiguration();
     web_tab->ApplyConfiguration();
+#ifdef YUZU_ENABLE_MCP
+    if (mcp_tab) {
+        mcp_tab->ApplyConfiguration();
+    }
+#endif
     network_tab->ApplyConfiguration();
     applets_tab->ApplyConfiguration();
     system.ApplySettings();
@@ -361,6 +373,13 @@ void ConfigureDialog::PopulateSelectionList() {
          {{Text("page.general"), general_tab.get()},
           {Text("section.interface"), ui_tab.get()},
           {Text("section.web_service"), web_tab.get()}}},
+#ifdef YUZU_ENABLE_MCP
+        {tr("MCP Server"),
+         QStringLiteral("wand-sparkles"),
+         {},
+         {},
+         {{tr("MCP Server"), mcp_tab.get()}}},
+#endif
         {Text("page.advanced"),
          QStringLiteral("wrench"),
          {},

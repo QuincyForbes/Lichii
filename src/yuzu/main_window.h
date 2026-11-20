@@ -669,7 +669,7 @@ private:
 
     QMenu* mcp_routes_menu = nullptr;
 
-    QLabel* mcp_status_label = nullptr;
+    QPushButton* mcp_status_label = nullptr;
     /// Refreshes mcp_status_label every second.
     QTimer mcp_status_timer;
     /// Kept across server restarts; must outlive mcp_server.
