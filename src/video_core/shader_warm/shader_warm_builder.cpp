@@ -54,6 +54,7 @@ struct OfflineWarmSummary {
 OfflineWarmSummary CompileWarmShadersOffline(
     u64 title_id, std::stop_token stop,
     const std::function<void(size_t done, size_t total, std::string_view stage)>& on_progress = {});
+bool MetalWarmPending(u64 title_id);
 } // namespace Metal
 #endif
 
@@ -91,25 +92,31 @@ constexpr u64 Switch1CounterpartBase(u64 base_id) noexcept {
 struct ArchiveFile {
     std::string path; ///< Inside the RomFS, '/' separated (the archive identity)
     FileSys::VirtualFile file;
+    bool needs_vfs_lock{};
 };
 
 /// Appends every file under `dir` to `out`, recursively, with its '/' separated path.
-void ListFiles(const FileSys::VirtualDir& dir, const std::string& prefix,
+void ListFiles(const FileSys::VirtualDir& dir, const std::string& prefix, bool needs_vfs_lock,
                std::vector<ArchiveFile>& out) {
     for (const auto& file : dir->GetFiles()) {
-        out.push_back({prefix + file->GetName(), file});
+        out.push_back({prefix + file->GetName(), file, needs_vfs_lock});
     }
     for (const auto& sub : dir->GetSubdirectories()) {
-        ListFiles(sub, prefix + sub->GetName() + "/", out);
+        ListFiles(sub, prefix + sub->GetName() + "/", needs_vfs_lock, out);
     }
 }
+
+struct RomFsRoot {
+    FileSys::VirtualDir dir;
+    bool needs_vfs_lock{};
+};
 
 /// The game's RomFS trees: a .nup gives its base, newest update and newest add-on (DLC) packages;
 /// other formats give the loader's RomFS plus any installed AOC RomFS for the title.
 struct GameFiles {
     std::unique_ptr<FileSys::NupContainer> nup;
     std::unique_ptr<Loader::AppLoader> loader;
-    std::vector<FileSys::VirtualDir> romfs;
+    std::vector<RomFsRoot> romfs;
 };
 
 /// Opens the game file and collects its RomFS trees into `game`. Returns the error text when the
@@ -169,7 +176,7 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
                 return "Stopped";
             }
             if (auto dir = game.nup->GetRomFSDir(package)) {
-                game.romfs.push_back(std::move(dir));
+                game.romfs.push_back({std::move(dir), false});
             }
         }
     } else {
@@ -185,7 +192,7 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
             return "Stopped";
         }
         if (auto dir = FileSys::ExtractRomFS(romfs)) {
-            game.romfs.push_back(std::move(dir));
+            game.romfs.push_back({std::move(dir), true});
         }
     }
     if (has_system_provider && title_id != 0) {
@@ -211,7 +218,7 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
             }
             if (const auto aoc_romfs = nca->GetRomFS()) {
                 if (auto dir = FileSys::ExtractRomFS(aoc_romfs)) {
-                    game.romfs.push_back(std::move(dir));
+                    game.romfs.push_back({std::move(dir), true});
                     loaded_aoc_ids.insert(entry.title_id);
                 }
             }
@@ -310,7 +317,8 @@ public:
     LowerPool(size_t thread_count, std::stop_token stop_, std::atomic<size_t>& completed_,
               std::atomic<size_t>& skipped_)
         : stop{std::move(stop_)}, completed{completed_}, skipped{skipped_},
-          worker_compute(thread_count), worker_graphics(thread_count) {
+          worker_compute(thread_count), worker_graphics(thread_count),
+          stop_callback{stop, StopWake{this}} {
         workers.reserve(thread_count);
         for (size_t i = 0; i < thread_count; ++i) {
             workers.emplace_back([this, i] { Work(i); });
@@ -321,18 +329,19 @@ public:
         CloseAndJoin();
     }
 
-    void Push(LowerJob job) {
+    bool Push(LowerJob job) {
         {
             std::unique_lock lock{mutex};
             not_full_cv.wait(lock, [this] {
                 return closing || stop.stop_requested() || jobs.size() < MaxQueuedJobs;
             });
             if (closing || stop.stop_requested()) {
-                return;
+                return false;
             }
             jobs.push_back(std::move(job));
         }
         not_empty_cv.notify_one();
+        return true;
     }
 
     void CloseAndJoin() {
@@ -437,6 +446,17 @@ private:
     std::vector<std::vector<FinishedCompute>> worker_compute;
     std::vector<std::vector<FinishedGraphics>> worker_graphics;
     std::vector<std::thread> workers;
+    struct StopWake {
+        LowerPool* pool;
+        void operator()() const noexcept {
+            {
+                std::scoped_lock lock{pool->mutex};
+            }
+            pool->not_empty_cv.notify_all();
+            pool->not_full_cv.notify_all();
+        }
+    };
+    std::stop_callback<StopWake> stop_callback;
 };
 
 template <typename T>
@@ -596,14 +616,37 @@ void DropStaleWarmMarker(const fs::path& warm_file, const fs::path& new_file) {
 }
 
 bool WarmPending(u64 title_id) {
-    const auto file = ComputeWarmPath(title_id);
-    std::error_code ec;
-    return !fs::exists(file, ec) || !fs::exists(WarmMarkerPath(file), ec);
+    const auto file_pending = [](const fs::path& file) {
+        if (WarmFilesStale(file).has_value()) {
+            return true;
+        }
+        std::error_code ec;
+        return !fs::exists(WarmMarkerPath(file), ec) || !ReadWarmMarker(file).has_value();
+    };
+    if (file_pending(ComputeWarmPath(title_id))) {
+        return true;
+    }
+    if (GraphicsPrecacheRequested() && file_pending(GraphicsWarmPath(title_id))) {
+        return true;
+    }
+    return false;
+}
+
+bool OfflineGpuWarmPending(u64 title_id) {
+#if defined(__APPLE__) && defined(LICHII_METAL_RENDERER)
+    if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Metal) {
+        return ::Metal::MetalWarmPending(title_id);
+    }
+#else
+    static_cast<void>(title_id);
+#endif
+    return false;
 }
 
 bool HasWarmFile(u64 title_id) {
     std::error_code ec;
-    return fs::exists(ComputeWarmPath(title_id), ec);
+    return fs::exists(ComputeWarmPath(title_id), ec) ||
+           fs::exists(GraphicsWarmPath(title_id), ec);
 }
 
 std::optional<std::string> WarmFilesStale(const fs::path& warm_file) {
@@ -634,7 +677,7 @@ std::optional<std::string> WarmFilesStale(const fs::path& warm_file) {
 }
 
 bool RefreshWarmFiles(Core::System& system, u64 title_id, std::stop_token stop) {
-    if (title_id == 0 || !Settings::CurrentProgramIsSwitch2() ||
+    if (title_id == 0 ||
         Settings::values.precache_shaders.GetValue() != Settings::PrecacheShaders::Always) {
         return false;
     }
@@ -757,9 +800,15 @@ bool DeleteWarmFiles(u64 title_id, std::string* error) {
     fs::path graphics_tmp = graphics;
     graphics_tmp += ".tmp";
     const auto slow = dir / "precache-slow.bin";
-    const auto metal_stages = dir / "metal_stages.v1.bin";
-    fs::path metal_stages_tmp = metal_stages;
-    metal_stages_tmp += ".tmp";
+    const auto metal_stages_v1 = dir / "metal_stages.v1.bin";
+    fs::path metal_stages_v1_tmp = metal_stages_v1;
+    metal_stages_v1_tmp += ".tmp";
+    const auto metal_stages_v2 = dir / "metal_stages.v2.bin";
+    fs::path metal_stages_v2_tmp = metal_stages_v2;
+    metal_stages_v2_tmp += ".tmp";
+    const auto metal_ledger = dir / "metal_warm_ledger.v1.bin";
+    fs::path metal_ledger_tmp = metal_ledger;
+    metal_ledger_tmp += ".tmp";
     const auto metal_pipelines = dir / "metal_pipelines.bin";
     fs::path metal_pipelines_tmp = metal_pipelines;
     metal_pipelines_tmp += ".tmp";
@@ -767,7 +816,8 @@ bool DeleteWarmFiles(u64 title_id, std::string* error) {
     for (const auto& path :
          {warm, WarmMarkerPath(warm), WarmCountPath(warm), tmp, graphics, WarmMarkerPath(graphics),
           WarmCountPath(graphics), graphics_tmp, PrecachedPipelinesPath(title_id), slow,
-          metal_stages, metal_stages_tmp, metal_pipelines, metal_pipelines_tmp}) {
+          metal_stages_v1, metal_stages_v1_tmp, metal_stages_v2, metal_stages_v2_tmp,
+          metal_ledger, metal_ledger_tmp, metal_pipelines, metal_pipelines_tmp}) {
         std::error_code ec;
         fs::remove(path, ec);
         if (ec) {
@@ -895,14 +945,23 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     if (options.runtime_caches) {
         caches = *options.runtime_caches;
     } else if (build_graphics) {
-        std::vector<fs::path> candidates{
-            VideoCommon::VersionedPipelineCachePath(TitleDir(title_id), "vulkan-frizti",
-                                                    VideoCommon::VulkanPipelineCacheVersion),
-            VideoCommon::VersionedPipelineCachePath(TitleDir(title_id), "vulkan",
-                                                    VideoCommon::VulkanPipelineCacheVersion)};
-        for (const u32 version : CompatibleRuntimeCacheVersions) {
-            candidates.push_back(
-                VideoCommon::VersionedPipelineCachePath(TitleDir(title_id), "vulkan", version));
+        const fs::path title_dir = TitleDir(title_id);
+        const fs::path vk_cache_dir = Common::FS::GetVulkanPipelineCacheDir(
+            Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir), title_id);
+        std::vector<fs::path> dirs{vk_cache_dir};
+        if (vk_cache_dir != title_dir) {
+            dirs.push_back(title_dir);
+        }
+        std::vector<fs::path> candidates;
+        for (const auto& dir : dirs) {
+            candidates.push_back(VideoCommon::VersionedPipelineCachePath(
+                dir, "vulkan-frizti", VideoCommon::VulkanPipelineCacheVersion));
+            candidates.push_back(VideoCommon::VersionedPipelineCachePath(
+                dir, "vulkan", VideoCommon::VulkanPipelineCacheVersion));
+            for (const u32 version : CompatibleRuntimeCacheVersions) {
+                candidates.push_back(
+                    VideoCommon::VersionedPipelineCachePath(dir, "vulkan", version));
+            }
         }
         for (const auto& candidate : candidates) {
             if (fs::exists(candidate, ec)) {
@@ -940,7 +999,7 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     FileSys::VirtualFile dictionary_pack;
     for (const auto& romfs : game.romfs) {
         std::vector<ArchiveFile> files;
-        ListFiles(romfs, "", files);
+        ListFiles(romfs.dir, "", romfs.needs_vfs_lock, files);
         std::sort(files.begin(), files.end(),
                   [](const ArchiveFile& a, const ArchiveFile& b) { return a.path < b.path; });
         std::vector<ArchiveFile> package_effects;
@@ -991,14 +1050,13 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     const size_t lower_threads =
         options.threads != 0 ? options.threads : std::clamp<size_t>(hw, 2, 16);
     const size_t producer_threads =
-        archives.empty() ? 0 : std::min<size_t>(archives.size(), std::clamp<size_t>(hw / 2, 2, 8));
+        archives.empty() ? 0 : std::min<size_t>(archives.size(), std::clamp<size_t>(hw / 4, 2, 4));
     LOG_INFO(Render_Vulkan,
              "Shader precache build: {} archives, {} zstd dictionaries, {} reader and {} lowering "
              "threads",
              archives.size(), dictionaries.Count(), producer_threads, lower_threads);
 
     std::mutex vfs_read_mutex;
-    const bool lock_vfs_reads = game.nup == nullptr;
     std::mutex compute_mutex;
     std::unordered_map<ComputeDedupKey, Origin, ComputeDedupHasher> compute_seen;
     std::mutex graphics_mutex;
@@ -1035,7 +1093,7 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
                     std::vector<u8> data;
                     {
                         std::unique_lock<std::mutex> read_lock{vfs_read_mutex, std::defer_lock};
-                        if (lock_vfs_reads) {
+                        if (archive.needs_vfs_lock) {
                             read_lock.lock();
                         }
                         // Skip large uncompressed audio/asset .pck files (Wwise AKPK / Godot GDPC)
@@ -1079,8 +1137,8 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
                                 const auto prefix = record.code.first(*prefix_size);
                                 const u128 gfx_id =
                                     HashGraphicsIdentity(stage, record.maxwell, prefix);
-                                const auto bank1 =
-                                    ExtractBank1(record.code, record.control, record.maxwell);
+                                const auto bank1 = ExtractBank1(
+                                    record.code, record.control, record.maxwell, *prefix_size);
                                 size_t entry_index = 0;
                                 bool need_lower = false;
                                 {
@@ -1115,8 +1173,9 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
                                     job.maxwell = record.maxwell;
                                     job.graphics_index = entry_index;
                                     job.program.assign(prefix.begin(), prefix.end());
-                                    jobs_pushed.fetch_add(1, std::memory_order_relaxed);
-                                    lower_pool->Push(std::move(job));
+                                    if (lower_pool->Push(std::move(job))) {
+                                        jobs_pushed.fetch_add(1, std::memory_order_relaxed);
+                                    }
                                 }
                                 return;
                             }
@@ -1153,8 +1212,9 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
                                 job.maxwell = record.maxwell;
                                 job.compute_id = ckey;
                                 job.program.assign(prefix.begin(), prefix.end());
-                                jobs_pushed.fetch_add(1, std::memory_order_relaxed);
-                                lower_pool->Push(std::move(job));
+                                if (lower_pool->Push(std::move(job))) {
+                                    jobs_pushed.fetch_add(1, std::memory_order_relaxed);
+                                }
                             }
                         };
                         const auto on_member_error = [&](const std::string& error) {
@@ -1163,8 +1223,8 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
                                       error);
                         };
                         try {
-                            WalkArchive(data, name, &dictionaries, on_record, on_member_error,
-                                        stop);
+                            WalkArchive(std::move(data), name, &dictionaries, on_record,
+                                        on_member_error, stop);
                         } catch (const ArchiveError& e) {
                             archive_errors.fetch_add(1, std::memory_order_relaxed);
                             LOG_WARNING(Render_Vulkan, "Shader precache: {}: {}", archive.path,

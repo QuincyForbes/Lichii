@@ -24,6 +24,7 @@
 
 class QPushButton;
 class QEvent;
+class QShowEvent;
 class QObject;
 class QCheckBox;
 class QComboBox;
@@ -66,6 +67,7 @@ public:
 
 private:
     void changeEvent(QEvent* event) override;
+    void showEvent(QShowEvent* event) override;
     void RetranslateUI();
 
     void Setup(const ConfigurationShared::Builder& builder);
@@ -82,6 +84,9 @@ private:
     /// Greys out the DLSS and frame generation settings the selected renderer, GPU or build can't
     /// use, with the reason in the tooltip.
     void UpdateFeatureAvailability();
+    void UpdateEffectiveSummary();
+    void ConnectDockedModeWidgets();
+    [[nodiscard]] bool IsSelectedDockedMode() const;
     void UpdateLosslessStatus();
 
     /* Turns a Vulkan present mode into a textual string for a UI
@@ -126,6 +131,8 @@ private:
     QComboBox* nvidia_dlss_quality_combobox{};
     QWidget* nvidia_dlss_preset_widget{};
     QComboBox* oot_resolution_combobox{};
+    QComboBox* texture_quality_combobox{};
+    QLabel* effective_summary_label{};
     QWidget* frame_gen_widget{};
     QCheckBox* frame_gen_checkbox{};
     QComboBox* frame_gen_type_combobox{};

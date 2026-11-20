@@ -656,43 +656,48 @@ namespace {
                                     length:text.size()
                                   encoding:NSUTF8StringEncoding];
 }
+
+[[nodiscard]] MTLCompileOptions* MakeLibraryCompileOptions() {
+    MTLCompileOptions* options = [MTLCompileOptions new];
+    // The recompiler marks what must stay exact (NoContraction); the rest may use fast math.
+    // EDEN_NX2_METAL_FAST_MATH=1: full fast math (A/B).
+    static const bool full_fast_math = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_FAST_MATH");
+        return value != nullptr && value[0] == '1';
+    }();
+    // EDEN_NX2_METAL_SAFE_MATH=1: no fast math at all, positions invariant across programs
+    // (A/B: a depth pre-pass and an EQUAL-tested colour pass of the same geometry must agree
+    // bit for bit).
+    static const bool safe_math = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_SAFE_MATH");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (safe_math) {
+        if (@available(iOS 18.0, macOS 15.0, *)) {
+            options.mathMode = MTLMathModeSafe;
+        } else {
+            options.fastMathEnabled = NO;
+        }
+    } else if (full_fast_math) {
+        options.fastMathEnabled = YES;
+    } else if (@available(iOS 18.0, macOS 15.0, *)) {
+        // Relaxed keeps fast math's reassociation but still honours NaN and Inf, as MoltenVK
+        // does; full fast math let one NaN (normalize(0), 0 * inf in specular terms) spread
+        // through the lighting and bloom passes into white blobs.
+        options.mathMode = MTLMathModeRelaxed;
+    } else {
+        options.fastMathEnabled = YES;
+    }
+    if (@available(iOS 14.0, macOS 11.0, *)) {
+        options.preserveInvariance = YES;
+    }
+    return options;
+}
 } // Anonymous namespace
 
 Object CreateLibrary(const Device& device, std::string_view source, std::string& error) {
     @autoreleasepool {
-        MTLCompileOptions* options = [MTLCompileOptions new];
-        // The recompiler marks what must stay exact (NoContraction); the rest may use fast math.
-        // EDEN_NX2_METAL_FAST_MATH=1: full fast math (A/B).
-        static const bool full_fast_math = [] {
-            const char* const value = std::getenv("EDEN_NX2_METAL_FAST_MATH");
-            return value != nullptr && value[0] == '1';
-        }();
-        // EDEN_NX2_METAL_SAFE_MATH=1: no fast math at all, positions invariant across programs
-        // (A/B: a depth pre-pass and an EQUAL-tested colour pass of the same geometry must agree
-        // bit for bit).
-        static const bool safe_math = [] {
-            const char* const value = std::getenv("EDEN_NX2_METAL_SAFE_MATH");
-            return value != nullptr && value[0] == '1';
-        }();
-        if (safe_math) {
-            if (@available(iOS 18.0, macOS 15.0, *)) {
-                options.mathMode = MTLMathModeSafe;
-            } else {
-                options.fastMathEnabled = NO;
-            }
-        } else if (full_fast_math) {
-            options.fastMathEnabled = YES;
-        } else if (@available(iOS 18.0, macOS 15.0, *)) {
-            // Relaxed keeps fast math's reassociation but still honours NaN and Inf, as MoltenVK
-            // does; full fast math let one NaN (normalize(0), 0 * inf in specular terms) spread
-            // through the lighting and bloom passes into white blobs.
-            options.mathMode = MTLMathModeRelaxed;
-        } else {
-            options.fastMathEnabled = YES;
-        }
-        if (@available(iOS 14.0, macOS 11.0, *)) {
-            options.preserveInvariance = YES;
-        }
+        MTLCompileOptions* options = MakeLibraryCompileOptions();
         NSError* ns_error = nil;
         const id<MTLLibrary> library = [device.GetDevice() newLibraryWithSource:ToNSString(source)
                                                                         options:options
@@ -701,6 +706,39 @@ Object CreateLibrary(const Device& device, std::string_view source, std::string&
             error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
         }
         return Retain(library);
+    }
+}
+
+void CreateLibraryAsync(const Device& device, std::string_view msl,
+                        std::function<void(Object, std::string)> on_done) {
+    @autoreleasepool {
+        MTLCompileOptions* options = MakeLibraryCompileOptions();
+        NSString* ns_source = ToNSString(msl);
+        if (ns_source == nil) {
+            if (on_done) {
+                on_done(Object{}, "invalid UTF-8 MSL source");
+            }
+            return;
+        }
+        auto callback =
+            std::make_shared<std::function<void(Object, std::string)>>(std::move(on_done));
+        [device.GetDevice()
+            newLibraryWithSource:ns_source
+                         options:options
+               completionHandler:^(id<MTLLibrary> library, NSError* ns_error) {
+                   @autoreleasepool {
+                       std::string error;
+                       if (library == nil) {
+                           error = ns_error != nil && ns_error.localizedDescription != nil
+                                       ? ns_error.localizedDescription.UTF8String
+                                       : "unknown error";
+                       }
+                       Object retained = Retain(library);
+                       if (*callback) {
+                           (*callback)(std::move(retained), std::move(error));
+                       }
+                   }
+               }];
     }
 }
 
@@ -776,6 +814,94 @@ Object CreateComputePipelineState(const Device& device, const void* function, st
         MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
         descriptor.computeFunction = (__bridge id<MTLFunction>)function;
         return CreateComputeState(device, descriptor, error, archive);
+    }
+}
+
+void CreateComputeStateAsync(const Device& device, const void* library, std::string_view entry_name,
+                             u32 workgroup_threads, PipelineArchive* archive,
+                             std::function<void(Object, std::string)> on_done) {
+    static_cast<void>(workgroup_threads);
+    @autoreleasepool {
+        const id<MTLLibrary> mtl_lib = (__bridge id<MTLLibrary>)library;
+        NSString* const ns_entry = mtl_lib != nil ? ToNSString(entry_name) : nil;
+        const id<MTLFunction> function =
+            mtl_lib != nil && ns_entry != nil ? [mtl_lib newFunctionWithName:ns_entry] : nil;
+        if (function == nil) {
+            if (on_done) {
+                on_done(Object{}, "compute entry function not found");
+            }
+            return;
+        }
+        MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
+        descriptor.computeFunction = function;
+
+        const id<MTLBinaryArchive> binary =
+            archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
+        const auto start = std::chrono::steady_clock::now();
+        if (binary != nil && archive->HasEntries()) {
+            id<MTLComputePipelineState> hit_state = nil;
+            {
+                std::shared_lock building{archive->BuildMutex()};
+                descriptor.binaryArchives = @[ binary ];
+                hit_state = [device.GetDevice()
+                    newComputePipelineStateWithDescriptor:descriptor
+                                                  options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                               reflection:nil
+                                                    error:nil];
+            }
+            descriptor.binaryArchives = nil;
+            if (hit_state != nil) {
+                archive->NoteBuild(
+                    true, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - start)
+                                               .count()));
+                Object retained = Retain(hit_state);
+                if (on_done) {
+                    on_done(std::move(retained), std::string{});
+                }
+                return;
+            }
+        }
+
+        MTLComputePipelineDescriptor* const copy = binary != nil ? [descriptor copy] : nil;
+        auto callback =
+            std::make_shared<std::function<void(Object, std::string)>>(std::move(on_done));
+        [device.GetDevice()
+            newComputePipelineStateWithDescriptor:descriptor
+                                          options:MTLPipelineOptionNone
+                                completionHandler:^(id<MTLComputePipelineState> state,
+                                                    MTLComputePipelineReflection*,
+                                                    NSError* ns_error) {
+                                    @autoreleasepool {
+                                        std::string error;
+                                        if (state == nil) {
+                                            error = ns_error != nil &&
+                                                            ns_error.localizedDescription != nil
+                                                        ? ns_error.localizedDescription.UTF8String
+                                                        : "unknown error";
+                                        } else if (binary != nil && archive != nullptr) {
+                                            archive->NoteBuild(
+                                                false,
+                                                static_cast<u64>(
+                                                    std::chrono::duration_cast<
+                                                        std::chrono::nanoseconds>(
+                                                        std::chrono::steady_clock::now() - start)
+                                                        .count()));
+                                            archive->DeferAdd([binary, copy] {
+                                                return [binary
+                                                           addComputePipelineFunctionsWithDescriptor:
+                                                               copy
+                                                                                               error:
+                                                                                                   nil] ==
+                                                       YES;
+                                            });
+                                        }
+                                        Object retained = Retain(state);
+                                        if (*callback) {
+                                            (*callback)(std::move(retained), std::move(error));
+                                        }
+                                    }
+                                }];
     }
 }
 

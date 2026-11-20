@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <unordered_set>
 
 #include "common/cityhash.h"
@@ -132,8 +133,7 @@ std::optional<size_t> CaptureProgramPrefixSize(std::span<const u8> program, bool
     }
     using Shader::Ampere::Instruction;
     const size_t header_size = graphics ? 128 : 0;
-    if (program.size() <= header_size || (program.size() - header_size) % sizeof(Instruction) ||
-        (program.size() - header_size) / sizeof(Instruction) > 65536) {
+    if (program.size() <= header_size || (program.size() - header_size) % sizeof(Instruction)) {
         return std::nullopt;
     }
     if (graphics) {
@@ -142,7 +142,9 @@ std::optional<size_t> CaptureProgramPrefixSize(std::span<const u8> program, bool
             return std::nullopt;
         }
     }
-    const size_t count = (program.size() - header_size) / sizeof(Instruction);
+    const size_t count =
+        std::min<size_t>((program.size() - header_size) / sizeof(Instruction),
+                         Shader::Ampere::ProgramCaptureState::MaximumInstructions);
     Shader::Ampere::ProgramCaptureState capture;
     size_t captured_count = 0;
     for (size_t index = 0; index < count; ++index) {
@@ -171,8 +173,7 @@ std::optional<std::string> LowerProgram(std::span<const u8> program, bool graphi
                                         LoweredCode& out) {
     using Shader::Ampere::Instruction;
     const size_t header_size = graphics ? 128 : 0;
-    if (program.size() <= header_size || (program.size() - header_size) % sizeof(Instruction) ||
-        (program.size() - header_size) / sizeof(Instruction) > 65536) {
+    if (program.size() <= header_size || (program.size() - header_size) % sizeof(Instruction)) {
         return "Native input must contain 1..65536 complete 16-byte instructions";
     }
     if (graphics) {
@@ -181,7 +182,10 @@ std::optional<std::string> LowerProgram(std::span<const u8> program, bool graphi
             return "Invalid native graphics header stage";
         }
     }
-    std::vector<Instruction> native((program.size() - header_size) / sizeof(Instruction));
+    const size_t max_count =
+        std::min<size_t>((program.size() - header_size) / sizeof(Instruction),
+                         Shader::Ampere::ProgramCaptureState::MaximumInstructions);
+    std::vector<Instruction> native(max_count);
     std::memcpy(native.data(), program.data() + header_size, native.size() * sizeof(Instruction));
     Shader::Ampere::ProgramCaptureState capture;
     bool complete = false;
@@ -318,17 +322,35 @@ std::optional<ComputeControl> ReadComputeControl(std::span<const u8> control, bo
 }
 
 std::span<const u8> ExtractBank1(std::span<const u8> program, std::span<const u8> control,
-                                 bool maxwell) {
+                                 bool maxwell, size_t prefix_size) {
     if (maxwell) {
-        if (control.size() >= 0x708 && Get<u32>(control, 0) == 0x98761234) {
-            const u32 c1_off = Get<u32>(control, 0x700);
-            if (c1_off != 0 && c1_off < program.size()) {
-                return program.subspan(c1_off, std::min<size_t>(256, program.size() - c1_off));
-            }
-        }
         return {};
     }
-    return program.last(std::min<size_t>(256, program.size()));
+    if (control.empty()) {
+        if (program.size() < prefix_size + 256) {
+            return {};
+        }
+        return program.last(256);
+    }
+    if (control.size() < 72 || Get<u32>(control, 0) != 0x98761234 ||
+        Get<u32>(control, 4) != 0xc9) {
+        if (program.size() < prefix_size + 256) {
+            return {};
+        }
+        return program.last(256);
+    }
+    const size_t inst_alloc = Get<u32>(control, 64);
+    const size_t total_alloc = Get<u32>(control, 68);
+    if (total_alloc <= inst_alloc || inst_alloc >= program.size()) {
+        return {};
+    }
+    const size_t end = std::min<size_t>(total_alloc, program.size());
+    const size_t min_start = std::max<size_t>(inst_alloc, prefix_size);
+    if (end <= min_start) {
+        return {};
+    }
+    const size_t bank1_size = std::min<size_t>(256, end - min_start);
+    return program.subspan(end - bank1_size, bank1_size);
 }
 
 std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& control,
@@ -394,7 +416,9 @@ std::vector<u8> GraphicsEnvFromParts(u32 stage, const LoweredCode& lowered,
 std::vector<u8> GraphicsEnv(u32 stage, const LoweredCode& lowered, std::span<const u8> program) {
     const auto sph = lowered.maxwell ? std::span<const u8>{lowered.code}.first(80)
                                      : program.first(80);
-    const auto bank1 = program.last(std::min<size_t>(256, program.size()));
+    const auto prefix_size = CaptureProgramPrefixSize(program, true, lowered.maxwell);
+    const auto bank1 = prefix_size ? ExtractBank1(program, {}, lowered.maxwell, *prefix_size)
+                                   : std::span<const u8>{};
     return GraphicsEnvFromParts(stage, lowered, sph, bank1);
 }
 
@@ -423,13 +447,22 @@ RuntimeStats ReadRuntimeStats(const std::vector<std::filesystem::path>& caches) 
         if (!file.is_open()) {
             continue;
         }
-        const auto size = static_cast<size_t>(file.tellg());
+        const auto end_pos = file.tellg();
+        if (end_pos < 12) {
+            continue;
+        }
+        if constexpr (sizeof(u64) > sizeof(size_t)) {
+            if (static_cast<u64>(end_pos) > static_cast<u64>(std::numeric_limits<size_t>::max())) {
+                continue;
+            }
+        }
+        const auto size = static_cast<size_t>(end_pos);
         file.seekg(0);
         std::vector<u8> data(size);
         if (!file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(size))) {
             continue;
         }
-        if (size < 12 || std::memcmp(data.data(), "yuzucach", 8) != 0 ||
+        if (std::memcmp(data.data(), "yuzucach", 8) != 0 ||
             !IsReadableRuntimeCacheVersion(Get<u32>(data, 8))) {
             continue;
         }
@@ -454,10 +487,21 @@ RuntimeStats ReadRuntimeStats(const std::vector<std::filesystem::path>& caches) 
                 std::array<u64, 6> counts;
                 std::memcpy(counts.data(), data.data() + cur, sizeof(counts));
                 const u32 stage = Get<u32>(bytes, cur + 48 + 6 * 4);
-                const u64 body = counts[0] + counts[1] * 8 + counts[2] * 8 + counts[3] * 12 +
-                                 counts[4] * 9 + counts[5] * 12 + TailSize(stage);
-                if (body > size - cur - EnvHeaderSize) {
+                const u64 remaining = size - cur - EnvHeaderSize;
+                constexpr std::array<u64, 6> Strides{1, 8, 8, 12, 9, 12};
+                u64 body = TailSize(stage);
+                if (body > remaining) {
                     truncated = true;
+                    break;
+                }
+                for (size_t k = 0; k < counts.size(); ++k) {
+                    if (counts[k] > (remaining - body) / Strides[k]) {
+                        truncated = true;
+                        break;
+                    }
+                    body += counts[k] * Strides[k];
+                }
+                if (truncated) {
                     break;
                 }
                 const size_t begin = cur;

@@ -190,6 +190,9 @@ int lichii_platform_clear_shader_cache(uint64_t title_id);
 /// dist/nx2_switches.txt.
 void lichii_platform_set_experiment(const char* name, int enabled);
 int lichii_platform_experiment(const char* name);
+/// Whether an experiment switch applies under the current settings: 0 hidden for the inactive
+/// graphics backend, 1 available, 2 overridden or inactive (fills reason_buf when non-null).
+int lichii_platform_experiment_availability(const char* name, char* reason_buf, size_t reason_size);
 /// Bench mode: for the rest of this process lichii_platform_experiment reports `names` as on and
 /// the saved switches only with keep_saved (nothing saved changes). Before lichii_platform_init.
 void lichii_platform_override_experiments(const char* const* names, int count, int keep_saved);

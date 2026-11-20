@@ -81,8 +81,6 @@ add_executable(yuzu
     configuration/recommended_settings.cpp
     configuration/recommended_settings.h
     configuration/configure_graphics.ui
-    configuration/configure_frame_generation.cpp
-    configuration/configure_frame_generation.h
     configuration/configure_graphics_advanced.cpp
     configuration/configure_graphics_advanced.h
     configuration/configure_graphics_advanced.ui

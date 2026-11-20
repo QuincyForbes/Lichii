@@ -24,6 +24,7 @@
 #include "common/logging.h"
 #include "common/platform_events.h"
 #include "common/settings.h"
+#include "common/ui_catalog.h"
 #include "ios_frontend/lichii_bridge_platform.h"
 #include "ios_frontend/lichii_platform_internal.h"
 
@@ -40,9 +41,85 @@ T Clamp(T value, T low, T high) {
 }
 
 void CopyString(char* out, std::size_t size, std::string_view text) {
+    if (out == nullptr || size == 0) {
+        return;
+    }
     const std::size_t length = std::min(size - 1, text.size());
     std::memcpy(out, text.data(), length);
     out[length] = '\0';
+}
+
+void SetExperimentFile(std::string_view name, bool enabled) {
+    const auto path = Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "experiments" / name;
+    std::error_code error;
+    if (enabled) {
+        std::filesystem::create_directories(path.parent_path(), error);
+        std::ofstream{path} << "1\n";
+    } else {
+        std::filesystem::remove(path, error);
+    }
+}
+
+bool ExperimentOn(const char* name) {
+    return lichii_platform_experiment(name) != 0;
+}
+
+bool IsVulkanOnlyExperiment(std::string_view id) {
+    return id == "mvk_uint8_indices" || id == "native_per_primitive" ||
+           id == "mvk_shader_dump" || id == "render_passes_old" ||
+           id == "ubo_zero_tails" || id == "mesh_compute_in_pass" ||
+           id == "emulate_all_mesh" || id == "dispatch_deps" ||
+           id == "pipeline_holds_old" || id == "mvk_stats_off";
+}
+
+std::string ChoiceLabelFor(std::string_view key, std::string_view canonical) {
+    const auto it = Settings::values.linkage.by_key.find(std::string{key});
+    if (it == Settings::values.linkage.by_key.end()) {
+        return {};
+    }
+    for (const auto& choice : UiCatalog::ChoicesOf(it->second->EnumIndex())) {
+        if (choice.canonical == canonical && choice.label != nullptr) {
+            return choice.label;
+        }
+    }
+    return {};
+}
+
+std::string ResolveCatalogText(std::string_view raw);
+
+std::string ResolveCatalogReference(std::string_view kind, std::string_view ref) {
+    if (kind == "setting") {
+        const auto* setting = UiCatalog::FindSetting(ref);
+        return setting != nullptr && setting->label != nullptr ? setting->label : std::string{};
+    }
+    if (kind == "exp") {
+        const auto* exp = UiCatalog::FindExperiment(ref);
+        return exp != nullptr && exp->label != nullptr ? exp->label : std::string{};
+    }
+    if (kind == "text") {
+        return ResolveCatalogText(UiCatalog::GetText(ref));
+    }
+    if (kind == "choice") {
+        const std::size_t dot = ref.find('.');
+        if (dot != std::string_view::npos) {
+            return ChoiceLabelFor(ref.substr(0, dot), ref.substr(dot + 1));
+        }
+    }
+    return {};
+}
+
+std::string ResolveCatalogText(std::string_view raw) {
+    if (raw.find('{') == std::string_view::npos) {
+        return std::string{raw};
+    }
+    return UiCatalog::Resolve(raw, &ResolveCatalogReference);
+}
+
+void WriteReason(char* reason_buf, std::size_t reason_size, std::string_view text_id) {
+    if (reason_buf == nullptr || reason_size == 0) {
+        return;
+    }
+    CopyString(reason_buf, reason_size, ResolveCatalogText(UiCatalog::GetText(text_id)));
 }
 
 std::filesystem::path ConfigPath(std::string_view name) {
@@ -216,10 +293,6 @@ void ApplyCpuExperiments() {
         LOG_WARNING(Frontend, "iOS: experiment guest_idle_spin on");
     }
     // Guest loads and stores (dynarmic glue): kept when a launch environment sets them.
-    if (lichii_platform_experiment("jit_inline_exclusives")) {
-        setenv("EDEN_NX2_JIT_INLINE_EXCLUSIVES", "1", 1);
-        LOG_WARNING(Frontend, "iOS: experiment jit_inline_exclusives on");
-    }
     if (lichii_platform_experiment("jit_load_faults")) {
         setenv("EDEN_NX2_JIT_LOAD_FAULTS", "8", 1);
         LOG_WARNING(Frontend, "iOS: experiment jit_load_faults on");
@@ -321,10 +394,6 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_JIT_RANGE_COMPACT", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment jit_old_tables on");
     }
-    if (lichii_platform_experiment("frame_deadlines")) {
-        setenv("EDEN_NX2_APPLE_WORKGROUP", "30", 0);
-        LOG_WARNING(Frontend, "iOS: experiment frame_deadlines on");
-    }
     if (lichii_platform_experiment("malloc_census")) {
         setenv("EDEN_NX2_MALLOC_CENSUS", "1", 1);
         LOG_WARNING(Frontend, "iOS: experiment malloc_census on");
@@ -354,10 +423,6 @@ void ApplyExperiments() {
         setenv("EDEN_NX2_RELEASE_SUBMIT", "1", 1);
         LOG_WARNING(Frontend, "iOS: experiment release_submit on");
     }
-    if (lichii_platform_experiment("idle_submit_grace")) {
-        setenv("EDEN_NX2_IDLE_GRACE_US", "250", 1);
-        LOG_WARNING(Frontend, "iOS: experiment idle_submit_grace on");
-    }
     if (lichii_platform_experiment("idle_hold_off")) {
         setenv("EDEN_NX2_IDLE_HOLD_US", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment idle_hold_off on");
@@ -365,10 +430,6 @@ void ApplyExperiments() {
     if (lichii_platform_experiment("mesh_compute_in_pass")) {
         setenv("EDEN_NX2_MESH_BEFORE_PASS", "0", 1);
         LOG_WARNING(Frontend, "iOS: experiment mesh_compute_in_pass on");
-    }
-    if (lichii_platform_experiment("dispatch_chain")) {
-        setenv("EDEN_NX2_DISPATCH_CHAIN", "1", 1);
-        LOG_WARNING(Frontend, "iOS: experiment dispatch_chain on");
     }
     if (lichii_platform_experiment("emulate_all_mesh")) {
         setenv("EDEN_NX2_MESH_EMULATE", "all", 1);
@@ -814,13 +875,49 @@ void lichii_platform_set_experiment(const char* name, int enabled) {
     if (!LichiiPlatform::ValidExperimentName(name)) {
         return;
     }
-    const auto path = LichiiPlatform::ConfigPath("experiments") / name;
-    std::error_code error;
-    if (enabled != 0) {
-        std::filesystem::create_directories(path.parent_path(), error);
-        std::ofstream{path} << "1\n";
-    } else {
-        std::filesystem::remove(path, error);
+    const std::string_view id{name};
+    const bool on = enabled != 0;
+    LichiiPlatform::SetExperimentFile(id, on);
+    if (!on) {
+        return;
+    }
+    if (id == "file_guest") {
+        LichiiPlatform::SetExperimentFile("file_guest_off", false);
+        LichiiPlatform::SetExperimentFile("chunked_guest", false);
+        LichiiPlatform::SetExperimentFile("untagged_guest", false);
+        setenv("LICHII_IOS_FILE_GUEST", "1", 1);
+    } else if (id == "chunked_guest") {
+        lichii_platform_set_file_guest(0);
+        LichiiPlatform::SetExperimentFile("untagged_guest", false);
+    } else if (id == "untagged_guest") {
+        lichii_platform_set_file_guest(0);
+        LichiiPlatform::SetExperimentFile("chunked_guest", false);
+    } else if (id == "oot_ideal_affinity") {
+        LichiiPlatform::SetExperimentFile("oot_narrow_affinity", false);
+    } else if (id == "oot_narrow_affinity") {
+        LichiiPlatform::SetExperimentFile("oot_ideal_affinity", false);
+    } else if (id == "frame_time_off") {
+        LichiiPlatform::SetExperimentFile("frame_time_guest", false);
+    } else if (id == "frame_time_guest") {
+        LichiiPlatform::SetExperimentFile("frame_time_off", false);
+    } else if (id == "metal_pacing_off") {
+        LichiiPlatform::SetExperimentFile("metal_pace_arrival", false);
+    } else if (id == "metal_pace_arrival") {
+        LichiiPlatform::SetExperimentFile("metal_pacing_off", false);
+    } else if (id == "no_mesh_emulation") {
+        LichiiPlatform::SetExperimentFile("emulate_all_mesh", false);
+        LichiiPlatform::SetExperimentFile("metal_mesh_emulated", false);
+    } else if (id == "emulate_all_mesh") {
+        LichiiPlatform::SetExperimentFile("native_per_primitive", false);
+        LichiiPlatform::SetExperimentFile("no_mesh_emulation", false);
+    } else if (id == "native_per_primitive") {
+        LichiiPlatform::SetExperimentFile("emulate_all_mesh", false);
+    } else if (id == "metal_mesh_emulated") {
+        LichiiPlatform::SetExperimentFile("no_mesh_emulation", false);
+    } else if (id == "metal_check_off") {
+        LichiiPlatform::SetExperimentFile("metal_trace_off", false);
+    } else if (id == "metal_trace_off") {
+        LichiiPlatform::SetExperimentFile("metal_check_off", false);
     }
 }
 
@@ -852,6 +949,101 @@ int lichii_platform_experiment(const char* name) {
                                                                                             : 0;
 }
 
+int lichii_platform_experiment_availability(const char* name, char* reason_buf,
+                                            size_t reason_size) {
+    if (reason_buf != nullptr && reason_size > 0) {
+        reason_buf[0] = '\0';
+    }
+    if (!LichiiPlatform::ValidExperimentName(name)) {
+        return 0;
+    }
+    const std::string_view id{name};
+    const auto& v = Settings::values;
+    const auto backend = v.renderer_backend.GetValue();
+
+    if (id.starts_with("metal_") && backend != Settings::RendererBackend::Metal) {
+        LichiiPlatform::WriteReason(reason_buf, reason_size,
+                                    "experiments.conflict.requires_metal");
+        return 0;
+    }
+    if (LichiiPlatform::IsVulkanOnlyExperiment(id) &&
+        backend != Settings::RendererBackend::Vulkan) {
+        LichiiPlatform::WriteReason(reason_buf, reason_size,
+                                    "experiments.conflict.requires_vulkan");
+        return 0;
+    }
+
+    if ((id == "native_per_primitive" || id == "emulate_all_mesh") &&
+        backend == Settings::RendererBackend::Vulkan &&
+        v.moltenvk_driver.GetValue() == Settings::MoltenVkDriver::Legacy) {
+        LichiiPlatform::WriteReason(reason_buf, reason_size,
+                                    "experiments.conflict.requires_mesh_mvk");
+        return 2;
+    }
+    if (id == "mesh_compute_in_pass" &&
+        (LichiiPlatform::ExperimentOn("no_mesh_emulation") ||
+         LichiiPlatform::ExperimentOn("render_passes_old"))) {
+        LichiiPlatform::WriteReason(reason_buf, reason_size, "experiments.conflict.overridden");
+        return 2;
+    }
+    if ((id == "fence_submit_each" || id == "idle_hold_off" || id == "split_std_waits" ||
+         id == "resume_publish_off" || id == "metal_fence_batch_off") &&
+        (v.gpu_accuracy.GetValue() == Settings::GpuAccuracy::High ||
+         v.dma_accuracy.GetValue() == Settings::DmaAccuracy::Safe)) {
+        LichiiPlatform::WriteReason(reason_buf, reason_size,
+                                    "experiments.conflict.split_disabled");
+        return 2;
+    }
+    if ((id == "idle_hold_off" || id == "release_submit" || id == "metal_fence_batch_off") &&
+        LichiiPlatform::ExperimentOn("fence_submit_each")) {
+        LichiiPlatform::WriteReason(reason_buf, reason_size, "experiments.conflict.fences_each");
+        return 2;
+    }
+    if (id == "no_zero_trim" &&
+        (lichii_platform_file_guest() != 0 || LichiiPlatform::ExperimentOn("chunked_guest"))) {
+        LichiiPlatform::WriteReason(reason_buf, reason_size, "experiments.conflict.no_trim_file");
+        return 2;
+    }
+    if ((id == "cpu_writes_old" || id == "gpu_reads_old") &&
+        backend == Settings::RendererBackend::Metal &&
+        LichiiPlatform::ExperimentOn("metal_cache_plain")) {
+        LichiiPlatform::WriteReason(reason_buf, reason_size, "experiments.conflict.overridden");
+        return 2;
+    }
+    if ((id == "metal_actor_off" || id == "metal_effects_off") &&
+        backend == Settings::RendererBackend::Metal &&
+        (LichiiPlatform::ExperimentOn("metal_temporal_off") ||
+         v.upscaler.GetValue() == Settings::Upscaler::Game)) {
+        LichiiPlatform::WriteReason(reason_buf, reason_size, "experiments.conflict.overridden");
+        return 2;
+    }
+    if (id == "no_early_submits" && backend == Settings::RendererBackend::Metal &&
+        LichiiPlatform::ExperimentOn("metal_staging_plain")) {
+        LichiiPlatform::WriteReason(reason_buf, reason_size, "experiments.conflict.overridden");
+        return 2;
+    }
+    if (id == "pipeline_list_old" && backend == Settings::RendererBackend::Metal &&
+        LichiiPlatform::ExperimentOn("metal_prebuild_off")) {
+        LichiiPlatform::WriteReason(reason_buf, reason_size, "experiments.conflict.overridden");
+        return 2;
+    }
+
+    const auto upscaler = v.upscaler.GetValue();
+    const bool metalfx_blocked = backend == Settings::RendererBackend::Metal &&
+                                 LichiiPlatform::ExperimentOn("metal_temporal_off");
+    const bool temporal_upscaler =
+        upscaler == Settings::Upscaler::Fsr3 || upscaler == Settings::Upscaler::Fsr4 ||
+        upscaler == Settings::Upscaler::Dlss ||
+        (!metalfx_blocked &&
+         (upscaler == Settings::Upscaler::Auto || upscaler == Settings::Upscaler::MetalFx));
+    if ((id == "oot_game_upscale" || id == "metal_network_runs") && temporal_upscaler) {
+        LichiiPlatform::WriteReason(reason_buf, reason_size, "experiments.conflict.overridden");
+        return 2;
+    }
+
+    return 1;
+}
+
 int lichii_platform_file_guest(void) {
     if (lichii_platform_experiment("file_guest")) {
         return 1;
@@ -863,12 +1055,17 @@ int lichii_platform_file_guest(void) {
 }
 
 void lichii_platform_set_file_guest(int enabled) {
-    lichii_platform_set_experiment("file_guest", enabled);
-    lichii_platform_set_experiment("file_guest_off", enabled == 0 ? 1 : 0);
+    const bool on = enabled != 0;
+    LichiiPlatform::SetExperimentFile("file_guest", on);
+    LichiiPlatform::SetExperimentFile("file_guest_off", !on);
+    if (on) {
+        LichiiPlatform::SetExperimentFile("chunked_guest", false);
+        LichiiPlatform::SetExperimentFile("untagged_guest", false);
+    }
     // HostMemory reads it each time a game boots; the user's choice replaces the launch value.
-    setenv("LICHII_IOS_FILE_GUEST", enabled != 0 ? "1" : "0", 1);
+    setenv("LICHII_IOS_FILE_GUEST", on ? "1" : "0", 1);
     LOG_INFO(HW_Memory, "iOS app: Keep Guest Memory in a File turned {} (from the next game start)",
-             enabled != 0 ? "on" : "off");
+             on ? "on" : "off");
 }
 
 int lichii_platform_file_guest_storage(LichiiFileGuestStorage* out) {

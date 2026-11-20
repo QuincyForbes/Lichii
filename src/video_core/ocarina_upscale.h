@@ -4,7 +4,6 @@
 #pragma once
 
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <optional>
@@ -14,6 +13,10 @@
 #include "common/common_types.h"
 #include "common/settings_enums.h"
 #include "video_core/textures/texture.h"
+
+namespace Settings {
+std::optional<DlssQuality> AppliedOcarinaRenderScale();
+}
 
 namespace VideoCommon::OcarinaUpscale {
 
@@ -114,23 +117,7 @@ constexpr OcarinaUpscaleBackend SelectOcarinaUpscaler(bool fsr_enabled, bool dls
     return SelectOcarinaUpscaler(fsr_enabled, dlss_enabled, dlss_available, false, override);
 }
 
-inline std::atomic<u32>& AppliedOcarinaRenderScaleStorage() noexcept {
-    static std::atomic<u32> value{};
-    return value;
-}
-
-inline void SetAppliedOcarinaRenderScale(std::optional<Settings::DlssQuality> quality) noexcept {
-    AppliedOcarinaRenderScaleStorage().store(quality ? static_cast<u32>(*quality) + 1 : 0,
-                                             std::memory_order_relaxed);
-}
-
-[[nodiscard]] inline std::optional<Settings::DlssQuality> AppliedOcarinaRenderScale() noexcept {
-    const u32 value = AppliedOcarinaRenderScaleStorage().load(std::memory_order_relaxed);
-    if (value == 0) {
-        return std::nullopt;
-    }
-    return static_cast<Settings::DlssQuality>(value - 1);
-}
+using Settings::AppliedOcarinaRenderScale;
 
 /// EDEN_NX2_DLSS_JITTER (boot, 0 = off): DLSS or MetalFX gets the camera jitter the FSR path uses.
 /// 1 = the jitter as FSR gets it (default), 2 = with its vertical sign flipped.

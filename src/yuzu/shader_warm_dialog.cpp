@@ -60,9 +60,9 @@ QString StageText(const std::string& stage) {
 /// Builds the stage label, progress bar, result text and the Cancel/Close button.
 ShaderWarmDialog::ShaderWarmDialog(Core::System& system_, std::filesystem::path game_path_,
                                    u64 title_id_, const QString& game_name, QWidget* parent,
-                                   bool compile_gpu_)
+                                   bool compile_gpu_, bool extract_files_)
     : QDialog(parent), system{system_}, game_path{std::move(game_path_)}, title_id{title_id_},
-      compile_gpu{compile_gpu_} {
+      compile_gpu{compile_gpu_}, extract_files{extract_files_} {
     setWindowTitle(compile_gpu ? tr("Build Shader Cache: %1").arg(game_name)
                                : tr("Precache shaders: %1").arg(game_name));
     setWindowFlag(Qt::WindowContextHelpButtonHint, false);
@@ -137,7 +137,11 @@ void ShaderWarmDialog::Start() {
         auto result = std::make_shared<ShaderWarm::Result>();
         auto gpu_summary = std::make_shared<ShaderWarm::GpuWarmSummary>();
         try {
-            *result = ShaderWarm::BuildWarmFiles(system, game_path, title_id, on_progress, stop);
+            if (extract_files) {
+                *result = ShaderWarm::BuildWarmFiles(system, game_path, title_id, on_progress, stop);
+            } else {
+                result->ok = true;
+            }
             if (compile_gpu && result->ok && !stop.stop_requested()) {
                 *gpu_summary = ShaderWarm::CompileWarmShadersOffline(title_id, stop, on_progress);
             }
@@ -201,17 +205,23 @@ void ShaderWarmDialog::OnFinished(const ShaderWarm::Result& result,
             result.compute_programs + result.vertex_programs + result.fragment_programs;
         if (compile_gpu && gpu_summary.supported) {
             stage_label->setText(tr("Shader cache is ready."));
-            text = tr("Ready: %1 programs extracted and %2 GPU shaders precompiled (%3 already "
-                      "cached).")
-                       .arg(static_cast<qulonglong>(extracted))
-                       .arg(static_cast<qulonglong>(gpu_summary.built))
-                       .arg(static_cast<qulonglong>(gpu_summary.skipped));
+            if (extract_files) {
+                text = tr("Ready: %1 programs extracted and %2 GPU shaders precompiled (%3 already "
+                          "cached).")
+                           .arg(static_cast<qulonglong>(extracted))
+                           .arg(static_cast<qulonglong>(gpu_summary.built))
+                           .arg(static_cast<qulonglong>(gpu_summary.skipped));
+            } else {
+                text = tr("Ready: %1 GPU shaders precompiled (%2 already cached).")
+                           .arg(static_cast<qulonglong>(gpu_summary.built))
+                           .arg(static_cast<qulonglong>(gpu_summary.skipped));
+            }
             if (result.skipped > 0 || gpu_summary.failed > 0) {
                 text += QLatin1Char('\n') +
                         tr("Skipped or unsupported: %L1")
                             .arg(static_cast<qulonglong>(result.skipped + gpu_summary.failed));
             }
-        } else {
+        } else if (extract_files) {
             stage_label->setText(tr("Shader precache is ready."));
             if (extracted == 0) {
                 text = result.archives == 0
@@ -235,6 +245,8 @@ void ShaderWarmDialog::OnFinished(const ShaderWarm::Result& result,
             text += QStringLiteral("\n\n") +
                     tr("It is built on the loading screen when Precache shaders before game start "
                        "is on.");
+        } else {
+            stage_label->setText(tr("Shader precache is ready."));
         }
     } else if (stopped) {
         stage_label->setText(tr("Shader precache stopped."));

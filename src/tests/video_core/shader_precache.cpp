@@ -19,6 +19,14 @@
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "video_core/shader_warm/warm_records.h"
 
+#ifdef LICHII_METAL_RENDERER
+#include "video_core/renderer_metal/metal_pipeline_translate.h"
+#include "video_core/renderer_metal/metal_shader_translate.h"
+#ifdef __APPLE__
+#include "video_core/renderer_metal/metal_resources.h"
+#endif
+#endif
+
 namespace {
 
 namespace ShaderWarm = VideoCommon::ShaderWarm;
@@ -379,3 +387,139 @@ TEST_CASE("ShaderPrecache: programs that cannot be lowered are refused", "[video
     REQUIRE(ShaderWarm::LowerProgram(no_exit, false, lowered).has_value());
     REQUIRE(lowered.code.empty());
 }
+
+#ifdef LICHII_METAL_RENDERER
+TEST_CASE("ShaderPrecache: deeply nested MSL then-if and SSA phi-copy cascades flatten and compile",
+          "[video_core]") {
+    constexpr size_t Depth = 260;
+    std::string msl =
+        "#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "kernel void main0(device uint* out_buf [[buffer(0)]],\n"
+        "                  constant uint* conds [[buffer(1)]],\n"
+        "                  uint tid [[thread_position_in_grid]])\n"
+        "{\n"
+        "    uint acc = tid;\n"
+        "    uint _phi_0;\n";
+
+    for (size_t i = 0; i < Depth; ++i) {
+        msl += fmt::format("    if (conds[{}] != 0u)\n    {{\n", i);
+        if (i + 1 < Depth) {
+            msl += fmt::format("        uint _phi_{};\n", i + 1);
+            msl += fmt::format("        acc = acc + {}u;\n", i + 1);
+        } else {
+            msl += fmt::format("        _phi_{} = acc + 999u;\n", i);
+        }
+    }
+    for (size_t i = Depth; i-- > 0;) {
+        msl += fmt::format("    }}\n    else\n    {{\n        _phi_{} = {}u;\n    }}\n", i, i);
+        if (i > 0) {
+            msl += fmt::format("    _phi_{} = _phi_{};\n", i - 1, i);
+        }
+    }
+    // Also exercise a 260-level `else { if (...) }` chain in the same kernel.
+    for (size_t i = 0; i < Depth; ++i) {
+        if (i == 0) {
+            msl += fmt::format("    if (conds[{}] == 7u)\n    {{\n        acc += 1u;\n    }}\n", i);
+        } else {
+            msl += fmt::format(
+                "    else\n    {{\n        if (conds[{}] == 7u)\n        {{\n            acc += "
+                "2u;\n        }}\n",
+                i);
+        }
+    }
+    for (size_t i = 1; i < Depth; ++i) {
+        msl += "    }\n";
+    }
+    msl += "    out_buf[tid] = _phi_0 + acc;\n}\n";
+
+    REQUIRE(Metal::ShaderTranslate::MaxBracketNesting(msl) > 256);
+    Metal::ShaderTranslate::FlattenBracketNesting(msl);
+    REQUIRE(Metal::ShaderTranslate::MaxBracketNesting(msl) < 16);
+
+#ifdef __APPLE__
+    auto device = Metal::CreateOfflineDevice();
+    REQUIRE(device != nullptr);
+    std::string error;
+    Metal::Object library = Metal::CreateLibrary(*device, msl, error);
+    INFO(error);
+    REQUIRE(static_cast<bool>(library));
+    REQUIRE(error.empty());
+#endif
+}
+
+TEST_CASE("ShaderPrecache: StageMslCache v2 roundtrips InterfaceVariable names and appends",
+          "[video_core]") {
+    TempDir dir;
+    const auto cache_path = dir.path / "metal_stages.v2.bin";
+    const u64 stamp = 0x123456789ABCDEF0ULL;
+
+    Metal::ShaderTranslate::Result first{};
+    first.source = "#include <metal_stdlib>\nusing namespace metal;\nvertex float4 v0() { return 0; }\n";
+    first.source_without_reduction = first.source;
+    first.entry_point = "v0";
+    first.slots.push_back({.set = 0, .binding = 2, .kind = Metal::ShaderTranslate::ResourceKind::Buffer, .index = 0, .count = 1});
+    first.outputs.push_back(Metal::ShaderTranslate::InterfaceVariable{
+        .location = 3,
+        .builtin = Metal::ShaderTranslate::InterfaceVariable::NoBuiltin,
+        .vecsize = 4,
+        .per_patch = false,
+        .name = "very_long_heap_allocated_interface_variable_member_name_exceeding_sso_001",
+    });
+    first.reduction_slot = 5;
+
+    Metal::ShaderTranslate::Result second = first;
+    second.entry_point = "v1";
+    second.outputs[0].per_patch = true;
+    second.outputs[0].name =
+        "another_very_long_heap_allocated_interface_variable_member_name_exceeding_sso_002";
+
+    const u128 k1{0x1111ULL, 0x2222ULL};
+    const u128 k2{0x3333ULL, 0x4444ULL};
+
+    {
+        Metal::StageMslCache writer;
+        writer.Open(cache_path, stamp);
+        writer.Insert(k1, first);
+        REQUIRE(writer.PendingSize() == 1);
+        writer.Flush();
+        REQUIRE(writer.PendingSize() == 0);
+        REQUIRE(writer.Size() == 1);
+
+        // Incremental append of a second stage without rewriting the file.
+        writer.Insert(k2, second);
+        writer.Flush();
+        REQUIRE(writer.PendingSize() == 0);
+        REQUIRE(writer.Size() == 2);
+    }
+
+    std::ifstream raw(cache_path, std::ios::binary);
+    std::array<char, 8> magic{};
+    raw.read(magic.data(), magic.size());
+    REQUIRE(std::string_view(magic.data(), magic.size()) == "MTLSTG02");
+
+    REQUIRE(Metal::StageMslCache::HasValidEntries(cache_path, stamp));
+    REQUIRE_FALSE(Metal::StageMslCache::HasValidEntries(cache_path, stamp + 1));
+
+    Metal::StageMslCache reader;
+    reader.Open(cache_path, stamp);
+    REQUIRE(reader.Size() == 2);
+    REQUIRE(reader.PendingSize() == 0);
+
+    const auto loaded1 = reader.Find(k1);
+    const auto loaded2 = reader.Find(k2);
+    REQUIRE(loaded1.has_value());
+    REQUIRE(loaded2.has_value());
+    REQUIRE(loaded1->entry_point == "v0");
+    REQUIRE(loaded1->reduction_slot == 5);
+    REQUIRE(loaded1->slots.size() == 1);
+    REQUIRE(loaded1->slots[0].binding == 2);
+    REQUIRE(loaded1->outputs.size() == 1);
+    REQUIRE_FALSE(loaded1->outputs[0].per_patch);
+    REQUIRE(loaded1->outputs[0].name == first.outputs[0].name);
+    REQUIRE(loaded2->entry_point == "v1");
+    REQUIRE(loaded2->outputs.size() == 1);
+    REQUIRE(loaded2->outputs[0].per_patch);
+    REQUIRE(loaded2->outputs[0].name == second.outputs[0].name);
+}
+#endif

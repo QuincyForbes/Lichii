@@ -26,6 +26,7 @@ struct SettingItem: Identifiable, Hashable {
     let percentage: Bool
     let minimum: Double
     let maximum: Double
+    let pairedKey: String?
     let choices: [SettingChoice]
     /// The game this setting belongs to (Ocarina of Time's own...), 0 for every game.
     let game: UInt64
@@ -36,8 +37,10 @@ struct SettingItem: Identifiable, Hashable {
     init(_ info: LichiiSettingInfo) {
         let key = Bridge.constant(info.key)
         self.key = key
+        let enumName = Bridge.constant(info.category_enum_name)
         let names = SettingsCatalog.categoryNames
-        category = Int(info.category_id) < names.count ? names[Int(info.category_id)] : Bridge.constant(info.category)
+        category = !enumName.isEmpty ? enumName :
+            (Int(info.category_id) < names.count ? names[Int(info.category_id)] : Bridge.constant(info.category))
         kind = SettingKind(rawValue: info.kind) ?? .string
         switchable = info.switchable
         runtimeModifiable = info.runtime_modifiable
@@ -45,6 +48,8 @@ struct SettingItem: Identifiable, Hashable {
         percentage = info.percentage
         minimum = info.minimum
         maximum = info.maximum
+        let paired = Bridge.constant(info.paired_key)
+        pairedKey = paired.isEmpty ? nil : paired
         game = key.withCString { lichii_settings_game($0) }
         let catalogChoices = UiText.choices(for: key)
         if !catalogChoices.isEmpty {
@@ -164,7 +169,7 @@ enum SettingsGroup: String, CaseIterable, Identifiable {
         switch self {
         case .graphics:
             return [SettingsCatalog.resolutionCategory, SettingsCatalog.upscalingCategory, "Renderer"] + // catalog-check: ok
-                SettingsCatalog.gameCategories + ["RendererAdvanced", SettingsCatalog.enhancementsCategory]
+                SettingsCatalog.gameCategories + ["RendererAdvanced", "RendererMemory", SettingsCatalog.enhancementsCategory] // catalog-check: ok
         case .audio: return ["Audio", "SystemAudio"] // catalog-check: ok
         case .system: return ["Core", "Cpu", "System", "Controls", "LibraryApplet", "DataStorage", "Overlay"] // catalog-check: ok
         case .advanced:
@@ -186,6 +191,9 @@ enum SettingsCatalog {
         return lichii_settings_info(index, &info) ? SettingItem(info) : nil
     }
 
+    @MainActor static let byKey: [String: SettingItem] =
+        Dictionary(all.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
+
     /// Settings::Category in declaration order (common/settings_common.h).
     static let categoryNames = [
         "Android", "Audio", "Core", "Cpu", "CpuDebug", "CpuUnsafe", "Overlay", "Renderer", // catalog-check: ok
@@ -193,6 +201,7 @@ enum SettingsCatalog {
         "SystemAudio", "DataStorage", "Debugging", "DebuggingGraphics", "GpuDriver", "Miscellaneous", // catalog-check: ok
         "Network", "WebService", "AddOns", "Controls", "Ui", "UiAudio", "UiGeneral", "UiLayout", // catalog-check: ok
         "UiGameList", "Screenshots", "Shortcuts", "Multiplayer", "Services", "Paths", "LibraryApplet", // catalog-check: ok
+        "RendererMemory", // catalog-check: ok
     ]
 
     /// Shown first, in this order.
@@ -237,6 +246,28 @@ enum SettingsCatalog {
     /// Switches to compare two ways of doing something on the device (Settings > Advanced).
     static let experimentsCategory = "Experiments" // catalog-check: ok
 
+    static let vulkanOnlyKeys: Set<String> = [
+        "moltenvk_driver", "mesh_direct_outputs", "use_vulkan_driver_pipeline_cache",
+        "async_presentation", "frame_pacing_mode",
+    ]
+
+    @MainActor
+    static func currentValue(of key: String) -> String {
+        key.withCString { Bridge.string(lichii_settings_get($0)) }
+    }
+
+    @MainActor
+    static func currentCanonical(of key: String) -> String {
+        let raw = currentValue(of: key)
+        return byKey[key]?.choices.first { $0.value == raw }?.canonical ?? ""
+    }
+
+    @MainActor
+    static func currentChoiceLabel(of key: String) -> String? {
+        let raw = currentValue(of: key)
+        return byKey[key]?.choices.first { $0.value == raw }?.name
+    }
+
     @MainActor
     static func availability(of item: SettingItem) -> SettingAvailability {
         if !UiText.settingShown(item.key) {
@@ -263,7 +294,68 @@ enum SettingsCatalog {
         if item.key == "moltenvk_driver" || item.key == "mesh_direct_outputs", !platform.meshMoltenVkBundled {
             return .unavailable(UiText.text("reason.legacy_moltenvk"))
         }
+        if vulkanOnlyKeys.contains(item.key) || item.category == "RendererExtensions",
+           currentCanonical(of: "backend") != "Vulkan" {
+            return .unavailable(UiText.text("experiments.conflict.requires_vulkan"))
+        }
         return .available
+    }
+
+    /// Whether a setting whose parent toggle or mode controls its visibility should be listed now.
+    @MainActor
+    static func isVisibleWithDependencies(_ item: SettingItem) -> Bool {
+        if let pairedKey = item.pairedKey, UiText.settingShown(pairedKey),
+           currentValue(of: pairedKey) != "true" {
+            return false
+        }
+        if item.key == "frame_gen_flow_scale_auto" || item.key == "frame_gen_flow_scale" {
+            if currentCanonical(of: "frame_gen_type") != "Lsfg" {
+                return false
+            }
+            if item.key == "frame_gen_flow_scale", currentValue(of: "frame_gen_flow_scale_auto") == "true" {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Non-nil when the setting's control should be disabled (empty string when the help text
+    /// already explains why, otherwise the reason to display under the control).
+    @MainActor
+    static func disabledReason(for item: SettingItem) -> String? {
+        switch item.key {
+        case "frame_gen_multiplier":
+            return (Int(currentValue(of: "frame_gen_target_rate")) ?? 0) > 60 ? "" : nil
+        case "mesh_direct_outputs":
+            return currentCanonical(of: "moltenvk_driver") == "Legacy"
+                ? UiText.text("experiments.conflict.requires_mesh_mvk") : nil
+        default:
+            return nil
+        }
+    }
+
+    /// Dynamic interaction note when another active setting clamps or overrides this one.
+    @MainActor
+    static func interactionNote(for item: SettingItem, value: String) -> (text: String, highlight: Bool)? {
+        switch item.key {
+        case "resolution_setup":
+            let upscaler = currentCanonical(of: "upscaler")
+            guard ["MetalFx", "Fsr3", "Fsr4", "Dlss"].contains(upscaler) else { return nil }
+            let canonical = item.choices.first { $0.value == value }?.canonical ?? ""
+            return (UiText.text("note.upscaler_locks_scale"), canonical != "Res1X")
+        case "oot_resolution":
+            let upscaler = currentCanonical(of: "upscaler")
+            let metalfxBlocked = currentCanonical(of: "backend") == "Metal" &&
+                PlatformCenter.shared.isExperimentEnabled("metal_temporal_off")
+            let temporalActive = ["Fsr3", "Fsr4", "Dlss"].contains(upscaler) ||
+                (!metalfxBlocked && ["Auto", "MetalFx"].contains(upscaler))
+            guard temporalActive else { return nil }
+            let canonical = item.choices.first { $0.value == value }?.canonical ?? ""
+            let clamped = ["Game", "Percent150", "Percent200", "Percent300"].contains(canonical)
+            return (UiText.text("note.oot_upscaler_dynamic"), clamped)
+        default:
+            return nil
+        }
     }
 
     /// A hint under a usable setting: about its value where that matters, else what it does.
@@ -290,9 +382,17 @@ enum SettingsCatalog {
         guard !query.isEmpty else { return nil }
         let lines = all.compactMap { item -> String? in
             guard !perGame || item.switchable,
-                  item.label.localizedCaseInsensitiveContains(query) || item.key.localizedCaseInsensitiveContains(query),
-                  case .unavailable(let reason) = availability(of: item) else { return nil }
-            return "\(item.label): \(reason)"
+                  item.label.localizedCaseInsensitiveContains(query) || item.key.localizedCaseInsensitiveContains(query) else {
+                return nil
+            }
+            switch availability(of: item) {
+            case .unavailable(let reason):
+                return "\(item.label): \(reason)"
+            case .available where !isVisibleWithDependencies(item):
+                return "\(item.label): \(UiText.text("search.hidden_now"))"
+            default:
+                return nil
+            }
         }
         guard !lines.isEmpty else { return nil }
         let platformName = Theme.isPad ? "iPadOS" : "iOS"
@@ -341,6 +441,11 @@ enum SettingsCatalog {
         if category.hasPrefix("Game:"), let id = UInt64(category.dropFirst(5), radix: 16) {
             return Bridge.constant(lichii_settings_game_name(id))
         }
+        if category == "RendererMemory" { // catalog-check: ok
+            let key = "category.RendererMemory"
+            let resolved = UiText.text(key)
+            return resolved == key ? UiText.text("experiments.memory.title") : resolved
+        }
         let key = "category.\(category)"
         let resolved = UiText.text(key)
         return resolved == key ? category : resolved
@@ -366,6 +471,7 @@ enum SettingsCatalog {
         let rank = Dictionary(essentials.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
         let visible = all.filter { item in
             availability(of: item) == .available &&
+                isVisibleWithDependencies(item) &&
                 (query.isEmpty ? group.categories.contains(displayCategory(of: item))
                     : item.label.localizedCaseInsensitiveContains(query) ||
                         item.key.localizedCaseInsensitiveContains(query))
@@ -419,7 +525,9 @@ enum SettingsCatalog {
     static func sections(perGame: Bool, query: String, advanced: Bool = false,
                          programId: UInt64 = 0) -> [SettingSection] {
         let visible = all.filter { item in
-            availability(of: item) == .available && (!perGame || item.switchable) &&
+            availability(of: item) == .available &&
+                isVisibleWithDependencies(item) &&
+                (!perGame || item.switchable) &&
                 (!perGame || item.key.withCString { lichii_settings_applies($0, programId) }) &&
                 (query.isEmpty ? advancedCategories.contains(displayCategory(of: item)) == advanced
                     : item.label.localizedCaseInsensitiveContains(query) ||

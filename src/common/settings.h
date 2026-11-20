@@ -441,13 +441,23 @@ struct Values {
                                                   Specialization::Scalar,
                                                   true,
                                                   true};
-    SwitchableSetting<DlssQuality> nvidia_dlss_quality{linkage, DlssQuality::Auto,
-                                                       "nvidia_dlss_quality", Category::Renderer};
+    SwitchableSetting<DlssQuality> nvidia_dlss_quality{linkage,
+                                                       DlssQuality::Auto,
+                                                       "nvidia_dlss_quality",
+                                                       Category::Renderer,
+                                                       Specialization::Default,
+                                                       true,
+                                                       true};
     // The DLSS model (preset) for every mode: K by default (NVIDIA's defaults for Performance and
     // Ultra Performance drew thin lines); Default leaves the choice to NVIDIA. EDEN_NX2_DLSS_PRESET
     // still overrides it.
-    SwitchableSetting<DlssPreset> nvidia_dlss_preset{linkage, DlssPreset::K, "nvidia_dlss_preset",
-                                                     Category::Renderer};
+    SwitchableSetting<DlssPreset> nvidia_dlss_preset{linkage,
+                                                     DlssPreset::K,
+                                                     "nvidia_dlss_preset",
+                                                     Category::Renderer,
+                                                     Specialization::Default,
+                                                     true,
+                                                     true};
     // Apple only: which bundled MoltenVK to load. Read once per process, at the first Vulkan start.
     Setting<MoltenVkDriver> moltenvk_driver{linkage, MoltenVkDriver::Legacy, "moltenvk_driver",
                                             Category::Renderer};
@@ -472,14 +482,24 @@ struct Values {
                                                   true};
     // The Legend of Zelda: Ocarina of Time's own anti-aliasing network and its sharpening output
     // pass, or the tonemapped image as the game renders it (video_core/oot_network.h).
-    SwitchableSetting<OotAntiAliasing> oot_anti_aliasing{linkage, OotAntiAliasing::Game,
-                                                         "oot_anti_aliasing", Category::Renderer};
+    SwitchableSetting<OotAntiAliasing> oot_anti_aliasing{linkage,
+                                                         OotAntiAliasing::Game,
+                                                         "oot_anti_aliasing",
+                                                         Category::Renderer,
+                                                         Specialization::Default,
+                                                         true,
+                                                         true};
     // The title screen's and cutscenes' videos (AV1 1080p60): a bilinear copy, or the game's own
     // upscaler (removes banding, 1080p -> 1440p; tensor operations). Automatic: the game's where
     // the GPU runs tensor operations natively (RTX), the copy elsewhere (its emulated matrices
     // cost ~33 ms a frame). EDEN_NX2_OOT_MOVIE_NETWORK=0/1 overrides it for tests.
-    SwitchableSetting<OotMovieUpscale> oot_movie_upscale{linkage, OotMovieUpscale::Bilinear,
-                                                         "oot_movie_upscale", Category::Renderer};
+    SwitchableSetting<OotMovieUpscale> oot_movie_upscale{linkage,
+                                                         OotMovieUpscale::Bilinear,
+                                                         "oot_movie_upscale",
+                                                         Category::Renderer,
+                                                         Specialization::Default,
+                                                         true,
+                                                         true};
     // Ocarina of Time's 3D resolution, the one source for it (built-in patches in
     // core/file_sys/patch_manager.cpp): Game is the game's dynamic resolution (down to 480p), the
     // others a fixed share of its full size; above 100 % the full size with the emulator's
@@ -1263,9 +1283,10 @@ struct OotPresetCompanions {
     std::optional<TextureQuality> textures;
 };
 OotPresetCompanions OotGraphicsPresetCompanions(OotGraphicsPreset preset);
+void ApplyOotGraphicsPreset(OotGraphicsPreset preset);
 // The emulator's resolution scale for the running program. Ocarina of Time takes it from
 // oot_resolution (1x up to 100 %, and always with a temporal upscaler, which needs 1x); every
-// other program from resolution_setup.
+// other program from resolution_setup (1x with an explicit temporal upscaler).
 ResolutionSetup EffectiveResolutionSetup();
 
 // Settings upscaler, by what reads it.
@@ -1280,7 +1301,7 @@ bool OcarinaFsrChosen();
 using NvidiaDlssQuality = DlssQuality;
 
 /// The DLSS quality whose render scale Ocarina of Time's built-in patch applies when the game
-/// starts: Balanced, Performance or Ultra Performance with NVIDIA DLSS (or AMD FSR 4) on, docked.
+/// starts: Balanced, Performance or Ultra Performance with NVIDIA DLSS on, docked.
 std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale();
 /// The quality whose render-scale patch the running game's main module got (none: unpatched).
 void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality);

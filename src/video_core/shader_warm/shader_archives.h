@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -87,6 +88,14 @@ enum class GameFileKind : u8 {
 /// already reported stay valid, like the Python generator). Once `stop` is requested, the
 /// containers not yet unpacked are skipped.
 void WalkArchive(std::span<const u8> data, const std::string& name,
+                 const ZstdDictionaries* dictionaries,
+                 const std::function<void(const ShaderRecord&)>& on_record,
+                 const std::function<void(const std::string&)>& on_member_error,
+                 std::stop_token stop = {});
+
+/// Rvalue overload that releases the outer compressed `data` buffer as soon as top-level
+/// decompression finishes so compressed and unpacked containers do not stay in RAM together.
+void WalkArchive(std::vector<u8>&& data, const std::string& name,
                  const ZstdDictionaries* dictionaries,
                  const std::function<void(const ShaderRecord&)>& on_record,
                  const std::function<void(const std::string&)>& on_member_error,

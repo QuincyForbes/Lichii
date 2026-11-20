@@ -22,6 +22,11 @@ final class PlatformCenter: ObservableObject {
     @Published private(set) var shaderStage = Int32(LICHII_SHADER_IDLE.rawValue)
     @Published private(set) var shaderDone: UInt64 = 0
     @Published private(set) var shaderTotal: UInt64 = 0
+    /// Bumped whenever an experiment, guest memory backing file, or setting changes so toggles
+    /// and availability captions refresh live on screen.
+    @Published private(set) var experimentsRevision = 0
+    /// Bumped whenever a setting changes so companion updates and dependent rows refresh live.
+    @Published private(set) var settingsRevision = 0
     /// The previous game session ended without a clean stop (crash, or iOS closed Lichii).
     @Published var uncleanExit: GameSession?
 
@@ -256,6 +261,47 @@ final class PlatformCenter: ObservableObject {
         guard canClearShaderCache(programId) else { return -1 }
         return lichii_platform_clear_shader_cache(programId)
     }
+
+    // MARK: - Experiments & Settings Reactivity
+
+    enum ExperimentAvailability: Equatable {
+        case hidden(String)
+        case available
+        case overridden(String)
+    }
+
+    func bumpExperiments() {
+        experimentsRevision += 1
+    }
+
+    func bumpSettings() {
+        settingsRevision += 1
+        experimentsRevision += 1
+    }
+
+    func isExperimentEnabled(_ id: String) -> Bool {
+        id.withCString { lichii_platform_experiment($0) != 0 }
+    }
+
+    func setExperiment(_ id: String, enabled: Bool) {
+        id.withCString { lichii_platform_set_experiment($0, enabled ? 1 : 0) }
+        experimentsRevision += 1
+    }
+
+    func experimentAvailability(_ id: String) -> ExperimentAvailability {
+        var buffer = [CChar](repeating: 0, count: 256)
+        let state = id.withCString { name in
+            buffer.withUnsafeMutableBufferPointer { buf in
+                lichii_platform_experiment_availability(name, buf.baseAddress, buf.count)
+            }
+        }
+        let reason = String(cString: buffer)
+        switch state {
+        case 0: return .hidden(reason)
+        case 2: return .overridden(reason)
+        default: return .available
+        }
+    }
 }
 
 /// Experiments > Keep Guest Memory in a File, and whether storage has room for it.
@@ -273,7 +319,10 @@ enum GuestMemoryFile {
 
     static var enabled: Bool {
         get { lichii_platform_file_guest() != 0 }
-        set { lichii_platform_set_file_guest(newValue ? 1 : 0) }
+        set {
+            lichii_platform_set_file_guest(newValue ? 1 : 0)
+            PlatformCenter.shared.bumpExperiments()
+        }
     }
 
     static var storage: LichiiFileGuestStorage? {

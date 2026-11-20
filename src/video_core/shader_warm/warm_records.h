@@ -26,8 +26,9 @@ constexpr u32 WarmCacheVersion = VideoCommon::VulkanPipelineCacheVersion;
 /// What the builder finds in the game files, recorded in the precache's count file. A file built by
 /// an older builder is stale (WarmFilesStale). 2: Mario Kart World's .esetb effects.
 /// 3: .ptcl particle effects (Fire Emblem). 4: nested Effect/**, .blarc, .pck, DLC/AOC, compact
-/// deduplicated graphics and Switch 1 Maxwell BNSH/BAHS.
-constexpr u32 WarmBuilderVersion = 4;
+/// deduplicated graphics and Switch 1 Maxwell BNSH/BAHS. 5: BAHS/NVN2 Bank 1 constant buffer
+/// bounds and unconditional Ampere capture checks.
+constexpr u32 WarmBuilderVersion = 5;
 /// Other runtime cache versions with the same record layout, newest first (zortos293/Lichii
 /// builds write 53 and 54; 52 to 54 are identical). Their records still give the draw state
 /// guesses when this version has no cache yet.
@@ -106,9 +107,10 @@ struct ComputeControl {
 std::optional<ComputeControl> ReadComputeControl(std::span<const u8> control,
                                                  bool maxwell = false);
 
-/// Extracts constant buffer bank 1 (up to 256 bytes) from `program` / `control`.
+/// Extracts constant buffer bank 1 (up to 256 bytes) from `program` / `control`, never overlapping
+/// `[0..prefix_size)`.
 std::span<const u8> ExtractBank1(std::span<const u8> program, std::span<const u8> control,
-                                 bool maxwell);
+                                 bool maxwell, size_t prefix_size = 0);
 
 /// One compute entry (env count, env, code, compute trailer, key); `key` gets the 24-byte key.
 std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& control,

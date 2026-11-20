@@ -22,11 +22,16 @@
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 
 #include "common/cityhash.h"
+#include "common/fs/file.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/platform_events.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread_worker.h"
 #include "video_core/async_translate.h"
@@ -75,11 +80,19 @@ void ReleaseSource(StageProgram& program) {
 /// samples with Metal's own reduction instead of being skipped. `error` keeps the first error.
 /// EDEN_NX2_METAL_DUMP_FAILED=<folder>: the MSL of each program Metal refuses goes there
 /// (failed-N.metal, the error at its end), for looking at what the translation produced.
+[[nodiscard]] bool DumpRefusedProgramEnabled() {
+    static const bool enabled = [] {
+        const char* const folder = std::getenv("EDEN_NX2_METAL_DUMP_FAILED");
+        return folder != nullptr && folder[0] != '\0';
+    }();
+    return enabled;
+}
+
 void DumpRefusedProgram(const std::string& msl, const std::string& error) {
-    static const char* const folder = std::getenv("EDEN_NX2_METAL_DUMP_FAILED");
-    if (folder == nullptr || folder[0] == '\0') {
+    if (!DumpRefusedProgramEnabled()) {
         return;
     }
+    static const char* const folder = std::getenv("EDEN_NX2_METAL_DUMP_FAILED");
     static std::atomic<u32> count{};
     const u32 index = count.fetch_add(1, std::memory_order_relaxed);
     if (index >= 64) {
@@ -89,43 +102,83 @@ void DumpRefusedProgram(const std::string& msl, const std::string& error) {
     file << msl << "\n// Metal refused it: " << error << '\n';
 }
 
+struct SharedLibraryEntry {
+    std::mutex mutex;
+    std::condition_variable done_cv;
+    bool done = false;
+    Object library;
+    std::string error;
+};
+
+struct SharedLibraryState {
+    std::mutex mutex;
+    std::unordered_map<u64, std::shared_ptr<SharedLibraryEntry>> cache;
+};
+
+SharedLibraryState& GetSharedLibraryState() {
+    static SharedLibraryState state;
+    return state;
+}
+
+void ClearSharedLibraryCache() {
+    SharedLibraryState& state = GetSharedLibraryState();
+    std::vector<std::shared_ptr<SharedLibraryEntry>> evicted;
+    {
+        std::scoped_lock lock{state.mutex};
+        evicted.reserve(state.cache.size());
+        std::erase_if(state.cache, [&](auto& item) {
+            if (!item.second) {
+                return true;
+            }
+            std::scoped_lock entry_lock{item.second->mutex};
+            if (!item.second->done) {
+                return false;
+            }
+            evicted.push_back(std::move(item.second));
+            return true;
+        });
+    }
+}
+
 /// Libraries by MSL text, shared by every pipeline using the same program (a fragment program
 /// is often part of dozens of pipelines) so the slow source compile runs once; concurrent
 /// builders of the same text wait for the first one.
 Object SharedLibrary(const Device& device, const std::string& source, std::string& error) {
-    struct Entry {
-        std::mutex mutex;
-        std::condition_variable done_cv;
-        bool done = false;
-        Object library;
-        std::string error;
-    };
-    static std::mutex cache_mutex;
-    static std::unordered_map<u64, std::shared_ptr<Entry>> cache;
-    const u64 device_bits = static_cast<u64>(reinterpret_cast<std::uintptr_t>(DeviceHandle(device)));
+    SharedLibraryState& state = GetSharedLibraryState();
+    const u64 device_bits =
+        static_cast<u64>(reinterpret_cast<std::uintptr_t>(DeviceHandle(device)));
     const u64 key = Common::CityHash64(source.data(), source.size()) ^ (u64{source.size()} << 40) ^
                     (device_bits * 0x9E3779B97F4A7C15ULL);
-    std::shared_ptr<Entry> entry;
+    std::shared_ptr<SharedLibraryEntry> entry;
+    std::vector<std::shared_ptr<SharedLibraryEntry>> evicted;
     bool owner = false;
     {
-        std::scoped_lock lock{cache_mutex};
-        auto& slot = cache[key];
-        if (!slot) {
-            if (cache.size() > 8192) {
+        std::scoped_lock lock{state.mutex};
+        const auto found = state.cache.find(key);
+        if (found != state.cache.end() && found->second) {
+            entry = found->second;
+        } else {
+            if (state.cache.size() >= 512) {
+                evicted.reserve(state.cache.size());
                 // Bound the cache; pipelines keep their own references.
-                std::erase_if(cache, [](const auto& item) {
+                std::erase_if(state.cache, [&](auto& item) {
+                    if (!item.second) {
+                        return true;
+                    }
                     std::scoped_lock entry_lock{item.second->mutex};
-                    return item.second->done;
+                    if (!item.second->done) {
+                        return false;
+                    }
+                    evicted.push_back(std::move(item.second));
+                    return true;
                 });
             }
-            auto& fresh = cache[key];
-            fresh = std::make_shared<Entry>();
+            entry = std::make_shared<SharedLibraryEntry>();
+            state.cache[key] = entry;
             owner = true;
-            entry = fresh;
-        } else {
-            entry = slot;
         }
     }
+    evicted.clear();
     if (owner) {
         std::string build_error;
         Object library = CreateLibrary(device, source, build_error);
@@ -692,6 +745,8 @@ void* ComputePipeline::State(const Device& device) {
         state = CreateComputePipelineState(device, program.function.Get(), error, archive);
         ReleaseSource(program);
     }
+    program.function.Reset();
+    program.library.Reset();
     if (!state) {
         program.reduction_variants = false;
         failed = true;
@@ -718,6 +773,8 @@ void* ComputePipeline::ReducingState(const Device& device) {
         reducing_state =
             CreateComputePipelineState(device, program.reducing_function.Get(), error, archive);
     }
+    program.reducing_function.Reset();
+    program.reducing_library.Reset();
     if (!reducing_state) {
         program.reducing_failed = true;
         static std::atomic<u32> logged{};
@@ -743,12 +800,20 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory,
     // the foreground, and the used list at the GPU thread's next frame.
     background_listener = Common::PlatformEvents::AddBackgroundListener([this] {
         save_requested.store(true, std::memory_order_relaxed);
-        for (int wait = 0; wait < 25 && save_requested.load(std::memory_order_relaxed); ++wait) {
-            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        if (frame_count.load(std::memory_order_relaxed) != 0) {
+            for (int wait = 0; wait < 25 && save_requested.load(std::memory_order_relaxed);
+                 ++wait) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{10});
+            }
         }
-        files.Wait();
+        std::scoped_lock lock{lifecycle_mutex};
+        if (files.IsOpen()) {
+            files.Wait();
+        }
         msl_cache.Save();
-        archive.Save();
+        if (archive.IsOpen()) {
+            archive.Save();
+        }
     });
     if (const u32 threads = AsyncPipelineThreads(); threads != 0) {
         // Background QoS: a draw that waits for a build runs it itself or lends it its own.
@@ -772,6 +837,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory,
 PipelineCache::~PipelineCache() {
     Common::PlatformEvents::RemoveBackgroundListener(background_listener);
     builders.reset();
+    ClearSharedLibraryCache();
     files.SaveUsed();
     msl_cache.Save();
 }
@@ -793,7 +859,8 @@ void PipelineCache::OpenArchive(u64 title_id) {
     }
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
     const auto title_dir = shader_dir / fmt::format("{:016x}", title_id);
-    msl_cache.Open(title_dir / "metal_stages.v1.bin", VideoCommon::ShaderWarm::EmissionStamp());
+    std::scoped_lock lock{lifecycle_mutex};
+    msl_cache.Open(title_dir / "metal_stages.v2.bin", VideoCommon::ShaderWarm::EmissionStamp());
     archive.Open(device, title_dir / "metal_pipelines.bin", GameplayArchiveReadOnly());
 }
 
@@ -816,7 +883,7 @@ void PipelineCache::TickFrame() {
         msl_cache.Save();
         archive.Save();
     }
-    ++frame_count;
+    frame_count.fetch_add(1, std::memory_order_relaxed);
     EvictUnusedPipelines();
 }
 
@@ -877,8 +944,8 @@ void PipelineCache::EvictUnusedPipelines() {
                                    building_states.contains(pipeline.get())});
         keys.push_back(key);
     }
-    const std::vector<size_t> evicted =
-        WorkPolicy::PressureEvictions(uses, frame_count, critical, evict_max);
+    const std::vector<size_t> evicted = WorkPolicy::PressureEvictions(
+        uses, frame_count.load(std::memory_order_relaxed), critical, evict_max);
     if (evicted.empty()) {
         return;
     }
@@ -1003,10 +1070,442 @@ struct WarmGraphicsResult {
     bool read_error{};
 };
 
+/// POSIX pthread wrapper with a 16 MiB stack so `Common::RunOnLargeStack` inside `SpirvToMsl`
+/// executes inline on warm worker threads with zero per-shader `pthread_create` calls.
+class LargeStackThread {
+public:
+    LargeStackThread() = default;
+
+    template <typename Fn>
+    explicit LargeStackThread(Fn&& fn) {
+#ifndef _WIN32
+        auto heap_fn = std::make_unique<std::function<void()>>(std::forward<Fn>(fn));
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 16 * 1024 * 1024);
+        const int rc = pthread_create(
+            &handle, &attr,
+            +[](void* arg) -> void* {
+                std::unique_ptr<std::function<void()>> task{
+                    static_cast<std::function<void()>*>(arg)};
+                (*task)();
+                return nullptr;
+            },
+            heap_fn.get());
+        pthread_attr_destroy(&attr);
+        if (rc == 0) {
+            heap_fn.release();
+            joinable = true;
+        } else {
+            fallback = std::thread(std::move(*heap_fn));
+        }
+#else
+        fallback = std::thread(std::forward<Fn>(fn));
+#endif
+    }
+
+    LargeStackThread(const LargeStackThread&) = delete;
+    LargeStackThread& operator=(const LargeStackThread&) = delete;
+
+    LargeStackThread(LargeStackThread&& other) noexcept
+        : fallback{std::move(other.fallback)}
+#ifndef _WIN32
+          ,
+          handle{other.handle}, joinable{std::exchange(other.joinable, false)}
+#endif
+    {
+    }
+
+    ~LargeStackThread() {
+        Join();
+    }
+
+    void Join() {
+#ifndef _WIN32
+        if (joinable) {
+            pthread_join(handle, nullptr);
+            joinable = false;
+        }
+#endif
+        if (fallback.joinable()) {
+            fallback.join();
+        }
+    }
+
+private:
+    std::thread fallback;
+#ifndef _WIN32
+    pthread_t handle{};
+    bool joinable{};
+#endif
+};
+
+/// Bounds concurrent asynchronous Metal XPC compilations so CPU translation threads never block
+/// inside `_dispatch_sync_f_slow` while keeping `MTLCompilerService` saturated.
+class AsyncCompileGate {
+public:
+    static constexpr size_t MaxInFlight = 48;
+
+    void Acquire() {
+        std::unique_lock lock{mutex};
+        cv.wait(lock, [this] { return in_flight < MaxInFlight; });
+        ++in_flight;
+    }
+
+    void Release() {
+        {
+            std::scoped_lock lock{mutex};
+            --in_flight;
+        }
+        cv.notify_all();
+    }
+
+    void WaitAll() {
+        std::unique_lock lock{mutex};
+        cv.wait(lock, [this] { return in_flight == 0; });
+    }
+
+    [[nodiscard]] size_t InFlight() {
+        std::scoped_lock lock{mutex};
+        return in_flight;
+    }
+
+private:
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t in_flight{};
+};
+
+[[nodiscard]] u64 WarmLedgerVariant(u32 apple_family) {
+    static const bool full_fast_math = [] {
+        const char* const v = std::getenv("EDEN_NX2_METAL_FAST_MATH");
+        return v != nullptr && v[0] == '1';
+    }();
+    static const bool safe_math = [] {
+        const char* const v = std::getenv("EDEN_NX2_METAL_SAFE_MATH");
+        return v != nullptr && v[0] == '1';
+    }();
+    const std::array<u64, 4> inputs{
+        u64{apple_family},
+        TranslateForIos ? 1ULL : 0ULL,
+        full_fast_math ? 1ULL : 0ULL,
+        safe_math ? 1ULL : 0ULL,
+    };
+    return Common::CityHash64(reinterpret_cast<const char*>(inputs.data()), sizeof(inputs));
+}
+
+[[nodiscard]] u64 HashMslText(std::string_view msl) noexcept {
+    return Common::CityHash64(msl.data(), msl.size()) ^ (u64{msl.size()} << 40);
+}
+
+/// LSB 0: MTLLibrary-only warm entry; LSB 1: compute MTLLibrary + MTLBinaryArchive entry.
+[[nodiscard]] u64 MakeGraphicsLedgerKey(std::string_view msl, u64 variant) noexcept {
+    return (HashMslText(msl) ^ variant) & ~1ULL;
+}
+
+[[nodiscard]] u64 MakeComputeLedgerKey(std::string_view msl, std::string_view entry_point,
+                                       u64 variant) noexcept {
+    const u64 entry_hash = Common::CityHash64(entry_point.data(), entry_point.size());
+    return ((HashMslText(msl) ^ (entry_hash * 0x9E3779B97F4A7C15ULL)) ^ variant) | 1ULL;
+}
+
+/// Incremental append-safe ledger (<ShaderDir>/<title_id>/metal_warm_ledger.v1.bin) of MSL hashes
+/// already compiled into macOS's Metal shader cache (and `metal_pipelines.bin` for compute).
+class WarmLedger {
+public:
+    void Open(const std::filesystem::path& file_path, bool drop_compute_entries) {
+        std::scoped_lock save_lock{save_mutex};
+        std::scoped_lock lock{mutex};
+        path = file_path;
+        completed.clear();
+        in_flight.clear();
+        pending.clear();
+        file_initialized = false;
+        needs_rewrite = false;
+
+        Common::FS::IOFile in{path, Common::FS::FileAccessMode::Read,
+                              Common::FS::FileType::BinaryFile,
+                              Common::FS::FileShareFlag::ShareReadWrite};
+        if (!in.IsOpen()) {
+            return;
+        }
+        LedgerHeader hdr{};
+        if (!in.ReadObject(hdr) || hdr.magic != LedgerMagic || hdr.version != LedgerVersion) {
+            return;
+        }
+        const u64 file_size = in.GetSize();
+        if (file_size < sizeof(LedgerHeader)) {
+            return;
+        }
+        const u64 payload_bytes = file_size - sizeof(LedgerHeader);
+        const size_t count = static_cast<size_t>(payload_bytes / sizeof(u64));
+        std::vector<u64> stored(count);
+        if (count != 0 && in.ReadSpan<u64>(stored) != count) {
+            return;
+        }
+        in.Close();
+        if (payload_bytes % sizeof(u64) != 0) {
+            std::error_code resize_ec;
+            std::filesystem::resize_file(path, sizeof(LedgerHeader) + count * sizeof(u64),
+                                         resize_ec);
+        }
+        completed.reserve(count);
+        for (const u64 key : stored) {
+            if (drop_compute_entries && (key & 1ULL) != 0) {
+                needs_rewrite = true;
+                continue;
+            }
+            completed.insert(key);
+        }
+        file_initialized = !needs_rewrite;
+    }
+
+    /// Returns true if the caller should compile `key`, or false if it was already compiled or is
+    /// currently in flight.
+    [[nodiscard]] bool TryBegin(u64 key) {
+        std::scoped_lock lock{mutex};
+        if (completed.contains(key) || in_flight.contains(key)) {
+            return false;
+        }
+        in_flight.insert(key);
+        return true;
+    }
+
+    void Complete(u64 key, bool succeeded) {
+        std::scoped_lock lock{mutex};
+        in_flight.erase(key);
+        if (succeeded && completed.insert(key).second) {
+            pending.push_back(key);
+        }
+    }
+
+    [[nodiscard]] size_t PendingSize() const {
+        std::scoped_lock lock{mutex};
+        return pending.size();
+    }
+
+    void Flush() {
+        std::scoped_lock save_lock{save_mutex};
+        std::filesystem::path target_path;
+        bool rewrite = false;
+        std::vector<u64> batch;
+        std::vector<u64> all_keys;
+        {
+            std::scoped_lock lock{mutex};
+            if (path.empty() || (pending.empty() && !needs_rewrite)) {
+                return;
+            }
+            target_path = path;
+            rewrite = !file_initialized || needs_rewrite;
+            if (rewrite) {
+                all_keys.assign(completed.begin(), completed.end());
+            } else {
+                batch = pending;
+            }
+        }
+
+        std::error_code ec;
+        std::filesystem::create_directories(target_path.parent_path(), ec);
+        if (rewrite) {
+            std::filesystem::path tmp = target_path;
+            tmp += ".tmp";
+            {
+                Common::FS::IOFile out{tmp, Common::FS::FileAccessMode::Write,
+                                       Common::FS::FileType::BinaryFile,
+                                       Common::FS::FileShareFlag::ShareReadWrite};
+                const LedgerHeader hdr{.magic = LedgerMagic, .version = LedgerVersion, .reserved = 0};
+                if (!out.IsOpen() || !out.WriteObject(hdr) ||
+                    (!all_keys.empty() && out.WriteSpan<u64>(all_keys) != all_keys.size()) ||
+                    !out.Flush()) {
+                    out.Close();
+                    std::filesystem::remove(tmp, ec);
+                    return;
+                }
+            }
+            std::filesystem::rename(tmp, target_path, ec);
+            if (ec) {
+                std::filesystem::remove(tmp, ec);
+                return;
+            }
+            std::scoped_lock lock{mutex};
+            file_initialized = true;
+            needs_rewrite = false;
+            pending.clear();
+        } else if (!batch.empty()) {
+            Common::FS::IOFile out{target_path, Common::FS::FileAccessMode::ReadWrite,
+                                   Common::FS::FileType::BinaryFile,
+                                   Common::FS::FileShareFlag::ShareReadWrite};
+            const u64 prev_size = out.GetSize();
+            if (!out.IsOpen() || !out.Seek(static_cast<s64>(prev_size))) {
+                return;
+            }
+            if (out.WriteSpan<u64>(batch) != batch.size() || !out.Flush()) {
+                static_cast<void>(out.SetSize(prev_size));
+                return;
+            }
+            std::scoped_lock lock{mutex};
+            if (pending.size() >= batch.size()) {
+                pending.erase(pending.begin(),
+                              pending.begin() + static_cast<std::ptrdiff_t>(batch.size()));
+            } else {
+                pending.clear();
+            }
+        }
+    }
+
+private:
+    static constexpr std::array<char, 8> LedgerMagic{'M', 'T', 'L', 'W', 'L', 'D', '0', '1'};
+    static constexpr u32 LedgerVersion = 1;
+
+    struct LedgerHeader {
+        std::array<char, 8> magic;
+        u32 version;
+        u32 reserved;
+    };
+    static_assert(sizeof(LedgerHeader) == 16);
+
+    mutable std::mutex save_mutex;
+    mutable std::mutex mutex;
+    std::filesystem::path path;
+    bool file_initialized{};
+    bool needs_rewrite{};
+    std::unordered_set<u64> completed;
+    std::unordered_set<u64> in_flight;
+    std::vector<u64> pending;
+};
+
+void SplitWarmStageMsl(StageProgram& program, std::string& primary_msl, std::string& fallback_msl) {
+    if (ReductionVariantsEnabled() && program.reduction_slot != ~0U && !program.msl.empty() &&
+        !program.msl_without_reduction.empty()) {
+        primary_msl = std::move(program.msl_without_reduction);
+        fallback_msl = std::move(program.msl);
+    } else {
+        primary_msl = std::move(program.msl);
+        fallback_msl = std::move(program.msl_without_reduction);
+    }
+}
+
+void SubmitWarmGraphicsAsync(const Device& device, StageProgram&& program, u64 ledger_variant,
+                             WarmLedger& ledger, AsyncCompileGate& gate,
+                             std::atomic<size_t>& built, std::atomic<size_t>& skipped,
+                             std::atomic<size_t>& failed) {
+    std::string primary_msl;
+    std::string fallback_msl;
+    SplitWarmStageMsl(program, primary_msl, fallback_msl);
+    program = StageProgram{};
+    const u64 ledger_key = MakeGraphicsLedgerKey(primary_msl, ledger_variant);
+    if (!ledger.TryBegin(ledger_key)) {
+        skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    std::string dump_copy = DumpRefusedProgramEnabled() ? primary_msl : std::string{};
+    gate.Acquire();
+    CreateLibraryAsync(
+        device, primary_msl,
+        [&device, &ledger, &gate, &built, &failed, ledger_key,
+         fallback = std::move(fallback_msl),
+         dump = std::move(dump_copy)](Object library, std::string error) mutable {
+            if (library) {
+                library.Reset();
+                ledger.Complete(ledger_key, true);
+                built.fetch_add(1, std::memory_order_relaxed);
+                gate.Release();
+                return;
+            }
+            if (!dump.empty()) {
+                DumpRefusedProgram(dump, error);
+                std::string{}.swap(dump);
+            }
+            if (!fallback.empty()) {
+                CreateLibraryAsync(device, fallback,
+                                   [&ledger, &gate, &built, &failed,
+                                    ledger_key](Object retry_lib, std::string) {
+                                       const bool ok = static_cast<bool>(retry_lib);
+                                       retry_lib.Reset();
+                                       ledger.Complete(ledger_key, ok);
+                                       (ok ? built : failed).fetch_add(1, std::memory_order_relaxed);
+                                       gate.Release();
+                                   });
+                return;
+            }
+            ledger.Complete(ledger_key, false);
+            failed.fetch_add(1, std::memory_order_relaxed);
+            gate.Release();
+        });
+}
+
+void SubmitWarmComputeAsync(const Device& device, StageProgram&& program,
+                            const ComputePipelineKey& key, PipelineArchive& archive,
+                            u64 ledger_variant, WarmLedger& ledger, AsyncCompileGate& gate,
+                            std::atomic<size_t>& built, std::atomic<size_t>& skipped,
+                            std::atomic<size_t>& failed) {
+    std::string primary_msl;
+    std::string fallback_msl;
+    SplitWarmStageMsl(program, primary_msl, fallback_msl);
+    std::string entry_point = std::move(program.entry_point);
+    const u32 workgroup_threads =
+        (std::max)(1U, key.workgroup_size[0] * key.workgroup_size[1] * key.workgroup_size[2]);
+    const u64 ledger_key = MakeComputeLedgerKey(primary_msl, entry_point, ledger_variant);
+    if (!ledger.TryBegin(ledger_key)) {
+        skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    std::string dump_copy = DumpRefusedProgramEnabled() ? primary_msl : std::string{};
+    gate.Acquire();
+    CreateLibraryAsync(
+        device, primary_msl,
+        [&device, &archive, &ledger, &gate, &built, &failed, ledger_key, workgroup_threads,
+         entry = std::move(entry_point), fallback = std::move(fallback_msl),
+         dump = std::move(dump_copy)](Object library, std::string error) mutable {
+            auto finish_pso = [&device, &archive, &ledger, &gate, &built, &failed, ledger_key,
+                               workgroup_threads](Object lib, const std::string& ep) {
+                const void* const lib_handle = lib.Get();
+                auto lib_keep = std::make_shared<Object>(std::move(lib));
+                CreateComputeStateAsync(
+                    device, lib_handle, ep, workgroup_threads, &archive,
+                    [&ledger, &gate, &built, &failed, ledger_key,
+                     lib_keep = std::move(lib_keep)](Object state, std::string) mutable {
+                        const bool ok = static_cast<bool>(state);
+                        state.Reset();
+                        lib_keep.reset();
+                        ledger.Complete(ledger_key, ok);
+                        (ok ? built : failed).fetch_add(1, std::memory_order_relaxed);
+                        gate.Release();
+                    });
+            };
+            if (library) {
+                finish_pso(std::move(library), entry);
+                return;
+            }
+            if (!dump.empty()) {
+                DumpRefusedProgram(dump, error);
+                std::string{}.swap(dump);
+            }
+            if (!fallback.empty()) {
+                CreateLibraryAsync(
+                    device, fallback,
+                    [finish_pso, entry = std::move(entry), &ledger, &gate, &failed,
+                     ledger_key](Object retry_lib, std::string) mutable {
+                        if (retry_lib) {
+                            finish_pso(std::move(retry_lib), entry);
+                            return;
+                        }
+                        ledger.Complete(ledger_key, false);
+                        failed.fetch_add(1, std::memory_order_relaxed);
+                        gate.Release();
+                    });
+                return;
+            }
+            ledger.Complete(ledger_key, false);
+            failed.fetch_add(1, std::memory_order_relaxed);
+            gate.Release();
+        });
+}
+
 WarmGraphicsResult WarmGraphicsStages(
     const std::filesystem::path& warm_file, const Device& device, u32 apple_family,
     bool mesh_shaders, size_t num_workers, VideoCommon::StageCache* shared_stage_cache,
-    StageMslCache& msl_cache, std::stop_token stop, bool check_skip_button,
+    StageMslCache& msl_cache, WarmLedger& ledger, std::stop_token stop, bool check_skip_button,
     const std::function<void(size_t done, size_t total, size_t built_count, size_t failed_count,
                              size_t skipped_count, u64 elapsed_ms)>& on_tick) {
     namespace ShaderWarm = VideoCommon::ShaderWarm;
@@ -1047,16 +1546,18 @@ WarmGraphicsResult WarmGraphicsStages(
     const size_t known_total = static_cast<size_t>(ShaderWarm::ReadWarmCount(warm_file));
     const auto begin = std::chrono::steady_clock::now();
     const size_t workers_count = (std::max)(num_workers, size_t{1});
+    const u64 ledger_variant = WarmLedgerVariant(apple_family);
     std::atomic<size_t> built{};
     std::atomic<size_t> skipped{};
     std::atomic<size_t> failed{};
     std::atomic<bool> cancel{false};
     std::atomic<size_t> running{workers_count};
+    AsyncCompileGate gate;
     LOG_INFO(Render_Metal,
              "Metal shader precache: {} graphics programs ({} MB) to warm on {} threads",
              known_total, static_cast<long long>(reader.end) / (1024 * 1024), workers_count);
     {
-        std::vector<std::thread> threads;
+        std::vector<LargeStackThread> threads;
         threads.reserve(workers_count);
         for (size_t i = 0; i < workers_count; ++i) {
             threads.emplace_back([&] {
@@ -1105,27 +1606,31 @@ WarmGraphicsResult WarmGraphicsStages(
                         continue;
                     }
                     env.SetGuessMissing(&guess);
-                    bool ok = false;
-                    InAutoreleasePool([&] {
-                        std::optional<StageProgram> program =
-                            translator.WarmSingleStage(metal_key, slot, env);
-                        if (!program) {
-                            return;
-                        }
-                        std::string error;
-                        BuildProgramLibrary(device, *program, error, true);
-                        ok = static_cast<bool>(program->library);
-                    });
-                    (ok ? built : failed).fetch_add(1, std::memory_order_relaxed);
+                    std::optional<StageProgram> program =
+                        translator.WarmSingleStage(metal_key, slot, env);
+                    if (!program) {
+                        failed.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                    SubmitWarmGraphicsAsync(device, std::move(*program), ledger_variant, ledger,
+                                            gate, built, skipped, failed);
                 }
                 running.fetch_sub(1, std::memory_order_relaxed);
             });
         }
-        while (running.load(std::memory_order_relaxed) != 0) {
-            if (stop.stop_requested() || (check_skip_button && ShaderWarm::TakeSkipWarm())) {
+        while (running.load(std::memory_order_relaxed) != 0 || gate.InFlight() != 0) {
+            if (!out.cancelled &&
+                (stop.stop_requested() || (check_skip_button && ShaderWarm::TakeSkipWarm()))) {
                 cancel.store(true, std::memory_order_relaxed);
                 out.cancelled = true;
                 break;
+            }
+            if (msl_cache.PendingSize() >= 128) {
+                msl_cache.Flush();
+            }
+            if (ledger.PendingSize() >= 256) {
+                msl_cache.Flush();
+                ledger.Flush();
             }
             if (on_tick) {
                 const size_t b = built.load(std::memory_order_relaxed);
@@ -1151,15 +1656,18 @@ WarmGraphicsResult WarmGraphicsStages(
             }
             std::this_thread::sleep_for(std::chrono::milliseconds{50});
         }
-        for (std::thread& thread : threads) {
-            thread.join();
+        for (LargeStackThread& thread : threads) {
+            thread.Join();
         }
+        gate.WaitAll();
     }
+    msl_cache.Flush();
+    ledger.Flush();
     out.entries = reader.read;
     out.built = built.load(std::memory_order_relaxed);
     out.skipped = skipped.load(std::memory_order_relaxed);
     out.failed = failed.load(std::memory_order_relaxed);
-    out.read_error = reader.failed || reader.end != std::streampos{reader.position};
+    out.read_error = !out.cancelled && (reader.failed || reader.end != std::streampos{reader.position});
     return out;
 }
 } // Anonymous namespace
@@ -1183,7 +1691,9 @@ std::optional<VideoCommon::ShaderWarm::WarmStamp> PipelineCache::QueuePrecacheFi
     const bool mesh_shaders = DeviceSupportsMeshShaders(device);
     const auto current = MetalWarmStamp(warm_file, 0, apple_family, mesh_shaders);
     const auto marker = ShaderWarm::ReadWarmMarker(warm_file);
-    const bool caches_present = (!archive.IsOpen() || archive.HasEntries()) && msl_cache.Size() != 0;
+    const bool caches_present =
+        (marker && marker->entries == 0) ||
+        ((!archive.IsOpen() || archive.HasEntries()) && msl_cache.Size() != 0);
     const bool marked = current && marker && marker->Matches(*current) && caches_present;
     if (only_if_unmarked && marked) {
         LOG_INFO(Render_Metal, "Metal shader precache: compute programs already built");
@@ -1195,6 +1705,7 @@ std::optional<VideoCommon::ShaderWarm::WarmStamp> PipelineCache::QueuePrecacheFi
     // Its own reader, as Vulkan's: the disk cache loader deletes a file it rejects.
     size_t entries = 0;
     size_t queued = 0;
+    std::unordered_set<ComputePipelineKey> seen_warm;
     try {
         std::ifstream file(warm_file, std::ios::binary | std::ios::ate);
         file.exceptions(std::ifstream::failbit);
@@ -1225,7 +1736,7 @@ std::optional<VideoCommon::ShaderWarm::WarmStamp> PipelineCache::QueuePrecacheFi
             file.read(reinterpret_cast<char*>(&key), sizeof(key));
             ++entries;
             // Programs in the pipeline records were queued already.
-            if (!disk_compute.insert(key).second) {
+            if (disk_compute.contains(key) || !seen_warm.insert(key).second) {
                 continue;
             }
             // The precache file records no reads: guesses stand in for them.
@@ -1246,11 +1757,19 @@ void PipelineCache::RunWarmPrecache(u64 title_id, u32 apple_family, bool mesh_sh
                                     size_t num_workers, std::stop_token stop_loading,
                                     const VideoCore::DiskResourceLoadCallback& callback) {
     namespace ShaderWarm = VideoCommon::ShaderWarm;
+    const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
+    const auto title_dir = shader_dir / fmt::format("{:016x}", title_id);
     const bool restore_read_only = archive.IsReadOnly();
     archive.SetReadOnly(false);
-    const auto restore_archive = [this, restore_read_only] {
-        msl_cache.Save();
+
+    WarmLedger ledger;
+    ledger.Open(title_dir / "metal_warm_ledger.v1.bin",
+                archive.IsOpen() && !archive.HasEntries());
+
+    const auto restore_archive = [this, &ledger, restore_read_only] {
+        msl_cache.Flush();
         archive.Save();
+        ledger.Flush();
         archive.SetReadOnly(restore_read_only);
     };
 
@@ -1270,20 +1789,23 @@ void PipelineCache::RunWarmPrecache(u64 title_id, u32 apple_family, bool mesh_sh
     if (!compute_jobs.empty()) {
         const auto start = std::chrono::steady_clock::now();
         const size_t total = compute_jobs.size();
+        const size_t workers_count = (std::max)(num_workers, size_t{1});
+        const u64 ledger_variant = WarmLedgerVariant(apple_family);
         std::atomic<size_t> next_index{0};
         std::atomic<size_t> built{0};
+        std::atomic<size_t> skipped{0};
         std::atomic<size_t> failed{0};
         std::atomic<bool> cancel{false};
-        std::atomic<size_t> running{num_workers};
-        std::mutex cache_mutex;
-        ShaderWarm::SetBuildStatus({.total = total, .threads = num_workers, .running = true});
+        std::atomic<size_t> running{workers_count};
+        AsyncCompileGate gate;
+        ShaderWarm::SetBuildStatus({.total = total, .threads = workers_count, .running = true});
         if (callback) {
             callback(VideoCore::LoadCallbackStage::Warm, 0, total);
         }
         {
-            std::vector<std::thread> threads;
-            threads.reserve(num_workers);
-            for (size_t w = 0; w < num_workers; ++w) {
+            std::vector<LargeStackThread> threads;
+            threads.reserve(workers_count);
+            for (size_t w = 0; w < workers_count; ++w) {
                 threads.emplace_back([&] {
                     PipelineTranslator worker{TranslateForIos, apple_family, mesh_shaders,
                                               &stage_cache, &msl_cache};
@@ -1296,39 +1818,37 @@ void PipelineCache::RunWarmPrecache(u64 title_id, u32 apple_family, bool mesh_sh
                             break;
                         }
                         ComputeJob& job = compute_jobs[idx];
-                        std::unique_ptr<ComputePipeline> pipeline;
-                        bool state_ok = false;
-                        InAutoreleasePool([&] {
-                            std::optional<StageProgram> program =
-                                worker.Compute(job.key.unique_hash, job.env);
-                            if (!program) {
-                                return;
-                            }
-                            pipeline =
-                                std::make_unique<ComputePipeline>(job.key, std::move(*program));
-                            pipeline->SetArchive(&archive);
-                            state_ok = pipeline->State(device) != nullptr;
-                        });
-                        if (pipeline && state_ok) {
-                            std::scoped_lock lock{cache_mutex};
-                            compute_cache.insert_or_assign(job.key, std::move(pipeline));
-                            built.fetch_add(1, std::memory_order_relaxed);
-                        } else {
+                        std::optional<StageProgram> program =
+                            worker.Compute(job.key.unique_hash, job.env);
+                        if (!program) {
                             failed.fetch_add(1, std::memory_order_relaxed);
+                            continue;
                         }
+                        SubmitWarmComputeAsync(device, std::move(*program), job.key, archive,
+                                               ledger_variant, ledger, gate, built, skipped,
+                                               failed);
                     }
                     running.fetch_sub(1, std::memory_order_relaxed);
                 });
             }
-            while (running.load(std::memory_order_relaxed) != 0) {
-                if (stop_loading.stop_requested() || ShaderWarm::TakeSkipWarm()) {
+            while (running.load(std::memory_order_relaxed) != 0 || gate.InFlight() != 0) {
+                if (!skipped_warm && (stop_loading.stop_requested() || ShaderWarm::TakeSkipWarm())) {
                     cancel.store(true, std::memory_order_relaxed);
                     skipped_warm = true;
                     break;
                 }
+                if (msl_cache.PendingSize() >= 128) {
+                    msl_cache.Flush();
+                }
+                if (ledger.PendingSize() >= 256) {
+                    msl_cache.Flush();
+                    archive.Save();
+                    ledger.Flush();
+                }
                 const size_t b = built.load(std::memory_order_relaxed);
+                const size_t s = skipped.load(std::memory_order_relaxed);
                 const size_t f = failed.load(std::memory_order_relaxed);
-                const size_t done = b + f;
+                const size_t done = b + s + f;
                 const u64 elapsed_ms = static_cast<u64>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - start)
@@ -1338,7 +1858,8 @@ void PipelineCache::RunWarmPrecache(u64 title_id, u32 apple_family, bool mesh_sh
                     .done = done,
                     .built = b,
                     .failed = f,
-                    .threads = num_workers,
+                    .skipped = s,
+                    .threads = workers_count,
                     .elapsed_ms = elapsed_ms,
                     .running = true,
                 });
@@ -1347,11 +1868,13 @@ void PipelineCache::RunWarmPrecache(u64 title_id, u32 apple_family, bool mesh_sh
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds{50});
             }
-            for (std::thread& thread : threads) {
-                thread.join();
+            for (LargeStackThread& thread : threads) {
+                thread.Join();
             }
+            gate.WaitAll();
         }
         const size_t b = built.load(std::memory_order_relaxed);
+        const size_t s = skipped.load(std::memory_order_relaxed);
         const size_t f = failed.load(std::memory_order_relaxed);
         const u64 elapsed_ms = static_cast<u64>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1359,25 +1882,26 @@ void PipelineCache::RunWarmPrecache(u64 title_id, u32 apple_family, bool mesh_sh
                 .count());
         ShaderWarm::SetBuildStatus({
             .total = total,
-            .done = b + f,
+            .done = b + s + f,
             .built = b,
             .failed = f,
-            .threads = num_workers,
+            .skipped = s,
+            .threads = workers_count,
             .elapsed_ms = elapsed_ms,
             .running = false,
         });
+        restore_archive();
+        archive.SetReadOnly(false);
         if (!skipped_warm && !stop_loading.stop_requested() && compute_stamp) {
-            restore_archive();
-            archive.SetReadOnly(false);
             static_cast<void>(ShaderWarm::WriteWarmMarker(ShaderWarm::ComputeWarmPath(title_id),
                                                           *compute_stamp));
         }
         LOG_INFO(Render_Metal,
-                 "Metal shader precache: compute {} ({} built, {} failed in {:.1f} s)",
+                 "Metal shader precache: compute {} ({} built, {} skipped, {} failed in {:.1f} s)",
                  stop_loading.stop_requested() ? "stopped" : (skipped_warm ? "skipped" : "done"),
-                 b, f, elapsed_ms / 1000.0);
+                 b, s, f, elapsed_ms / 1000.0);
     } else if (compute_stamp && !stop_loading.stop_requested()) {
-        // Every entry in warm-compute.bin was already built in the session records above.
+        // Every entry in warm-compute.bin was already built in the session records (or 0 entries).
         restore_archive();
         archive.SetReadOnly(false);
         static_cast<void>(
@@ -1390,12 +1914,13 @@ void PipelineCache::RunWarmPrecache(u64 title_id, u32 apple_family, bool mesh_sh
         std::filesystem::exists(graphics_warm, ec)) {
         const auto current = MetalWarmStamp(graphics_warm, 0, apple_family, mesh_shaders);
         const auto marker = ShaderWarm::ReadWarmMarker(graphics_warm);
-        if (current && marker && marker->Matches(*current) && msl_cache.Size() != 0) {
+        if (current && marker && marker->Matches(*current) &&
+            (marker->entries == 0 || msl_cache.Size() != 0)) {
             LOG_INFO(Render_Metal, "Metal shader precache: graphics stages already built");
         } else {
             const WarmGraphicsResult graphics_res = WarmGraphicsStages(
                 graphics_warm, device, apple_family, mesh_shaders, num_workers, &stage_cache,
-                msl_cache, stop_loading, true,
+                msl_cache, ledger, stop_loading, true,
                 [&](size_t done, size_t total, size_t b, size_t f, size_t s, u64 elapsed_ms) {
                     ShaderWarm::SetBuildStatus({
                         .total = total,
@@ -1448,9 +1973,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         return;
     }
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
-    files.Open(shader_dir / fmt::format("{:016x}", title_id));
-    if (!files.IsOpen()) {
-        return;
+    {
+        std::scoped_lock lock{lifecycle_mutex};
+        files.Open(shader_dir / fmt::format("{:016x}", title_id));
+        if (!files.IsOpen()) {
+            return;
+        }
     }
     // A boot build that never finished (Metal killed the process in it) is not tried again at
     // once: this run reads the records only, the next one builds again.
@@ -1544,6 +2072,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             if (!disk_compute.insert(key).second || !build) {
                 return;
             }
+            if (!precache && !files.BuildAtBoot(key.Hash())) {
+                ++unlisted;
+                return;
+            }
             queue_compute(key, std::move(env));
         };
         const auto load_graphics = [&](std::ifstream& file,
@@ -1623,12 +2155,6 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         };
         VideoCommon::LoadPipelines(stop_loading, files.Records(), PipelineFiles::RecordsVersion,
                                    load_compute, load_graphics);
-        if (build) {
-            // Boot 2+ (or after offline compilation): when warm-compute.bin already has a valid
-            // `.done` marker, populate `compute_cache` in memory from `metal_stages.v1.bin` and
-            // `metal_pipelines.bin` so compute programs never evaporate on subsequent boots.
-            static_cast<void>(QueuePrecacheFile(title_id, apple_family, queue_compute, false));
-        }
         {
             std::scoped_lock lock{state.mutex};
             if (callback) {
@@ -1638,6 +2164,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
         workers.WaitForRequests(stop_loading);
     }
+    ClearSharedLibraryCache();
     if (!build) {
         return;
     }
@@ -1646,6 +2173,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     } else {
         msl_cache.Save();
     }
+    ClearSharedLibraryCache();
     archive.SetReadOnly(restore_read_only);
     files.EndBoot();
     const PipelineArchive::Counts counts = archive.Totals();
@@ -1678,8 +2206,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         return nullptr;
     }
     PipelineTranslator::RefreshKey(graphics_key, maxwell3d->regs, DrawTopology(*maxwell3d));
+    const u64 current_frame = frame_count.load(std::memory_order_relaxed);
     if (current_pipeline != nullptr && current_pipeline->Key() == graphics_key) {
-        current_pipeline->SetLastUse(frame_count);
+        current_pipeline->SetLastUse(current_frame);
         return current_pipeline;
     }
     auto it = graphics_cache.find(graphics_key);
@@ -1708,7 +2237,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     if (current_pipeline == nullptr) {
         refusal = NoteRefusal(graphics_key.Hash());
     } else {
-        current_pipeline->SetLastUse(frame_count);
+        current_pipeline->SetLastUse(current_frame);
         if (!current_pipeline->MarkUsed()) {
             files.NoteUsed(graphics_key.Hash());
         }
@@ -2069,6 +2598,99 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     return std::make_unique<ComputePipeline>(key, std::move(*program));
 }
 
+bool MetalWarmPending(u64 title_id) {
+    namespace ShaderWarm = VideoCommon::ShaderWarm;
+    if (title_id == 0) {
+        return false;
+    }
+    struct CachedDeviceCaps {
+        bool available{};
+        u32 apple_family{};
+        bool mesh_shaders{};
+    };
+    static const CachedDeviceCaps caps = [] {
+        auto dev = CreateOfflineDevice();
+        if (!dev) {
+            return CachedDeviceCaps{};
+        }
+        return CachedDeviceCaps{
+            .available = true,
+            .apple_family = DeviceAppleFamily(*dev),
+            .mesh_shaders = DeviceSupportsMeshShaders(*dev),
+        };
+    }();
+    if (!caps.available) {
+        return false;
+    }
+
+    const u64 prev_program_id = Settings::GetCurrentProgramID();
+    const auto prev_resolution_info = Settings::values.resolution_info;
+    const bool switched_program = prev_program_id != title_id;
+    if (switched_program) {
+        Settings::SetCurrentProgramID(title_id);
+        Settings::UpdateRescalingInfo();
+    }
+    SCOPE_EXIT {
+        if (switched_program) {
+            Settings::SetCurrentProgramID(prev_program_id);
+            Settings::values.resolution_info = prev_resolution_info;
+        }
+    };
+
+    const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
+    const auto title_dir = shader_dir / fmt::format("{:016x}", title_id);
+    const auto stages_path = title_dir / "metal_stages.v2.bin";
+    const auto pipelines_path = title_dir / "metal_pipelines.bin";
+    static const bool archive_enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_ARCHIVE");
+        return value == nullptr || value[0] != '0';
+    }();
+
+    std::optional<bool> stages_valid;
+    const auto has_stages = [&] {
+        if (!stages_valid) {
+            stages_valid = StageMslCache::HasValidEntries(stages_path, ShaderWarm::EmissionStamp());
+        }
+        return *stages_valid;
+    };
+
+    const auto file_pending = [&](const std::filesystem::path& warm_file, bool need_archive) {
+        if (ShaderWarm::WarmFilesStale(warm_file).has_value()) {
+            return true;
+        }
+        const auto current =
+            MetalWarmStamp(warm_file, 0, caps.apple_family, caps.mesh_shaders);
+        const auto marker = ShaderWarm::ReadWarmMarker(warm_file);
+        if (!current || !marker || !marker->Matches(*current)) {
+            return true;
+        }
+        const u64 entries =
+            marker->entries != 0 ? marker->entries : ShaderWarm::ReadWarmCount(warm_file);
+        if (entries > 0) {
+            if (!has_stages()) {
+                return true;
+            }
+            if (need_archive && archive_enabled) {
+                std::error_code ec;
+                const auto sz = std::filesystem::file_size(pipelines_path, ec);
+                if (ec || sz == 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    if (file_pending(ShaderWarm::ComputeWarmPath(title_id), true)) {
+        return true;
+    }
+    if (ShaderWarm::GraphicsPrecacheRequested() &&
+        file_pending(ShaderWarm::GraphicsWarmPath(title_id), false)) {
+        return true;
+    }
+    return false;
+}
+
 OfflineWarmSummary CompileWarmShadersOffline(
     u64 title_id, std::stop_token stop,
     const std::function<void(size_t done, size_t total, std::string_view stage)>& on_progress) {
@@ -2083,6 +2705,16 @@ OfflineWarmSummary CompileWarmShadersOffline(
         summary.error = "No Metal device available";
         return summary;
     }
+
+    const u64 prev_program_id = Settings::GetCurrentProgramID();
+    const auto prev_resolution_info = Settings::values.resolution_info;
+    Settings::SetCurrentProgramID(title_id);
+    Settings::UpdateRescalingInfo();
+    SCOPE_EXIT {
+        Settings::SetCurrentProgramID(prev_program_id);
+        Settings::values.resolution_info = prev_resolution_info;
+    };
+
     const Device& device = *device_holder;
     const u32 apple_family = DeviceAppleFamily(device);
     const bool mesh_shaders = DeviceSupportsMeshShaders(device);
@@ -2090,11 +2722,13 @@ OfflineWarmSummary CompileWarmShadersOffline(
 
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
     const auto title_dir = shader_dir / fmt::format("{:016x}", title_id);
-    VideoCommon::StageCache stage_cache;
     StageMslCache msl_cache;
-    msl_cache.Open(title_dir / "metal_stages.v1.bin", ShaderWarm::EmissionStamp());
+    msl_cache.Open(title_dir / "metal_stages.v2.bin", ShaderWarm::EmissionStamp());
     PipelineArchive archive;
     static_cast<void>(archive.Open(device, title_dir / "metal_pipelines.bin", false));
+    WarmLedger ledger;
+    ledger.Open(title_dir / "metal_warm_ledger.v1.bin",
+                archive.IsOpen() && !archive.HasEntries());
 
     std::error_code ec;
     const std::filesystem::path compute_warm = ShaderWarm::ComputeWarmPath(title_id);
@@ -2102,7 +2736,8 @@ OfflineWarmSummary CompileWarmShadersOffline(
         const auto current = MetalWarmStamp(compute_warm, 0, apple_family, mesh_shaders);
         const auto marker = ShaderWarm::ReadWarmMarker(compute_warm);
         const bool caches_present =
-            (!archive.IsOpen() || archive.HasEntries()) && msl_cache.Size() != 0;
+            (marker && marker->entries == 0) ||
+            ((!archive.IsOpen() || archive.HasEntries()) && msl_cache.Size() != 0);
         if (current && marker && marker->Matches(*current) && caches_present) {
             summary.skipped += marker->entries;
         } else {
@@ -2153,20 +2788,24 @@ OfflineWarmSummary CompileWarmShadersOffline(
             }
             if (read_ok && !jobs.empty()) {
                 const size_t total = jobs.size();
+                const size_t workers_count = (std::max)(num_workers, size_t{1});
+                const u64 ledger_variant = WarmLedgerVariant(apple_family);
                 std::atomic<size_t> next_index{0};
                 std::atomic<size_t> built{0};
+                std::atomic<size_t> skipped{0};
                 std::atomic<size_t> failed{0};
-                std::atomic<size_t> running{num_workers};
+                std::atomic<size_t> running{workers_count};
+                AsyncCompileGate gate;
                 if (on_progress) {
                     on_progress(0, total, "Compiling Metal compute shaders");
                 }
                 {
-                    std::vector<std::thread> threads;
-                    threads.reserve(num_workers);
-                    for (size_t w = 0; w < num_workers; ++w) {
+                    std::vector<LargeStackThread> threads;
+                    threads.reserve(workers_count);
+                    for (size_t w = 0; w < workers_count; ++w) {
                         threads.emplace_back([&] {
                             PipelineTranslator worker{TranslateForIos, apple_family, mesh_shaders,
-                                                      &stage_cache, &msl_cache};
+                                                      nullptr, &msl_cache};
                             for (;;) {
                                 if (stop.stop_requested()) {
                                     break;
@@ -2177,46 +2816,60 @@ OfflineWarmSummary CompileWarmShadersOffline(
                                     break;
                                 }
                                 ComputeJob& job = jobs[idx];
-                                bool ok = false;
-                                InAutoreleasePool([&] {
-                                    std::optional<StageProgram> program =
-                                        worker.Compute(job.key.unique_hash, job.env);
-                                    if (!program) {
-                                        return;
-                                    }
-                                    ComputePipeline pipeline{job.key, std::move(*program)};
-                                    pipeline.SetArchive(&archive);
-                                    ok = pipeline.State(device) != nullptr;
-                                });
-                                (ok ? built : failed).fetch_add(1, std::memory_order_relaxed);
+                                std::optional<StageProgram> program =
+                                    worker.Compute(job.key.unique_hash, job.env);
+                                if (!program) {
+                                    failed.fetch_add(1, std::memory_order_relaxed);
+                                    continue;
+                                }
+                                SubmitWarmComputeAsync(device, std::move(*program), job.key,
+                                                       archive, ledger_variant, ledger, gate,
+                                                       built, skipped, failed);
                             }
                             running.fetch_sub(1, std::memory_order_relaxed);
                         });
                     }
-                    while (running.load(std::memory_order_relaxed) != 0) {
+                    while (running.load(std::memory_order_relaxed) != 0 || gate.InFlight() != 0) {
                         if (stop.stop_requested()) {
                             break;
                         }
+                        if (msl_cache.PendingSize() >= 128) {
+                            msl_cache.Flush();
+                        }
+                        if (ledger.PendingSize() >= 256) {
+                            msl_cache.Flush();
+                            archive.Save();
+                            ledger.Flush();
+                        }
                         if (on_progress) {
                             const size_t done = built.load(std::memory_order_relaxed) +
+                                                skipped.load(std::memory_order_relaxed) +
                                                 failed.load(std::memory_order_relaxed);
                             on_progress(done, total, "Compiling Metal compute shaders");
                         }
                         std::this_thread::sleep_for(std::chrono::milliseconds{50});
                     }
-                    for (std::thread& thread : threads) {
-                        thread.join();
+                    for (LargeStackThread& thread : threads) {
+                        thread.Join();
                     }
+                    gate.WaitAll();
                 }
                 summary.built += built.load(std::memory_order_relaxed);
+                summary.skipped += skipped.load(std::memory_order_relaxed);
                 summary.failed += failed.load(std::memory_order_relaxed);
-                msl_cache.Save();
+                msl_cache.Flush();
                 archive.Save();
+                ledger.Flush();
                 if (!stop.stop_requested()) {
                     if (const auto done_stamp =
                             MetalWarmStamp(compute_warm, entries, apple_family, mesh_shaders)) {
                         static_cast<void>(ShaderWarm::WriteWarmMarker(compute_warm, *done_stamp));
                     }
+                }
+            } else if (read_ok && !stop.stop_requested()) {
+                if (const auto done_stamp =
+                        MetalWarmStamp(compute_warm, entries, apple_family, mesh_shaders)) {
+                    static_cast<void>(ShaderWarm::WriteWarmMarker(compute_warm, *done_stamp));
                 }
             }
         }
@@ -2226,12 +2879,13 @@ OfflineWarmSummary CompileWarmShadersOffline(
     if (std::filesystem::exists(graphics_warm, ec) && !stop.stop_requested()) {
         const auto current = MetalWarmStamp(graphics_warm, 0, apple_family, mesh_shaders);
         const auto marker = ShaderWarm::ReadWarmMarker(graphics_warm);
-        if (current && marker && marker->Matches(*current) && msl_cache.Size() != 0) {
+        if (current && marker && marker->Matches(*current) &&
+            (marker->entries == 0 || msl_cache.Size() != 0)) {
             summary.skipped += marker->entries;
         } else {
             const WarmGraphicsResult graphics_res = WarmGraphicsStages(
-                graphics_warm, device, apple_family, mesh_shaders, num_workers, &stage_cache,
-                msl_cache, stop, false,
+                graphics_warm, device, apple_family, mesh_shaders, num_workers, nullptr,
+                msl_cache, ledger, stop, false,
                 [&](size_t done, size_t total, size_t, size_t, size_t, u64) {
                     if (on_progress) {
                         on_progress(done, total, "Compiling Metal graphics stages");
@@ -2240,7 +2894,8 @@ OfflineWarmSummary CompileWarmShadersOffline(
             summary.built += graphics_res.built;
             summary.skipped += graphics_res.skipped;
             summary.failed += graphics_res.failed;
-            msl_cache.Save();
+            msl_cache.Flush();
+            ledger.Flush();
             if (!graphics_res.cancelled && !graphics_res.read_error && !stop.stop_requested()) {
                 if (const auto done_stamp = MetalWarmStamp(graphics_warm, graphics_res.entries,
                                                            apple_family, mesh_shaders)) {
@@ -2250,8 +2905,9 @@ OfflineWarmSummary CompileWarmShadersOffline(
         }
     }
 
-    msl_cache.Save();
+    msl_cache.Flush();
     archive.Save();
+    ledger.Flush();
     summary.ok = !stop.stop_requested();
     if (!summary.ok && summary.error.empty()) {
         summary.error = "Stopped";

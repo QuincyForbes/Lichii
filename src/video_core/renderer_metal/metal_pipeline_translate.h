@@ -39,6 +39,10 @@
 #include "video_core/renderer_metal/metal_xfb.h"
 #include "video_core/stage_cache.h"
 
+namespace Common::FS {
+class IOFile;
+}
+
 namespace Metal {
 
 struct ShaderPools {
@@ -327,33 +331,51 @@ struct TranslatedPipeline {
     std::optional<GeometryCompute> geometry;
 };
 
-/// Persistent disk + in-memory cache of SPIR-V -> MSL translations (<ShaderDir>/<title_id>/
-/// metal_stages.v1.bin). Thread-safe across translation, boot and offline warm workers.
+/// Persistent zstd-compressed, header-indexed disk cache of SPIR-V -> MSL translations
+/// (<ShaderDir>/<title_id>/metal_stages.v2.bin). Thread-safe across translation, boot and offline
+/// warm workers.
 class StageMslCache {
 public:
     StageMslCache() = default;
 
     void Open(const std::filesystem::path& file_path, u64 build_stamp);
-    void Save();
+    void Flush();
+    void Save() {
+        Flush();
+    }
 
     [[nodiscard]] std::optional<ShaderTranslate::Result> Find(const u128& key) const;
     void Insert(const u128& key, const ShaderTranslate::Result& result);
 
     [[nodiscard]] size_t Size() const;
+    [[nodiscard]] size_t PendingSize() const;
+
+    [[nodiscard]] static bool HasValidEntries(const std::filesystem::path& file_path,
+                                              u64 build_stamp);
 
 private:
+    struct DiskSlice {
+        u64 offset{};
+        u32 comp_size{};
+        u32 uncomp_size{};
+    };
+
     struct KeyHasher {
         size_t operator()(const u128& k) const noexcept {
             return static_cast<size_t>(k[0] ^ (k[1] * 0x9E3779B97F4A7C15ULL));
         }
     };
 
+    mutable std::mutex save_mutex;
     mutable std::shared_mutex mutex;
     std::filesystem::path path;
     u64 stamp{};
+    u64 valid_file_size{};
     bool open{};
-    bool dirty{};
-    std::unordered_map<u128, ShaderTranslate::Result, KeyHasher> entries;
+    std::shared_ptr<::Common::FS::IOFile> read_file;
+    std::unordered_map<u128, DiskSlice, KeyHasher> disk_index;
+    std::unordered_map<u128, std::shared_ptr<const ShaderTranslate::Result>, KeyHasher>
+        pending_entries;
 };
 
 class PipelineTranslator {
@@ -385,7 +407,7 @@ public:
     [[nodiscard]] std::optional<StageProgram> Compute(u64 unique_hash, Shader::Environment& env);
 
     /// Single-stage vertex (slot 1) or fragment (slot 5) translation for `warm-graphics.bin`,
-    /// populating StageCache and StageMslCache (`metal_stages.v1.bin`).
+    /// populating StageCache and StageMslCache (`metal_stages.v2.bin`).
     [[nodiscard]] std::optional<StageProgram> WarmSingleStage(const GraphicsPipelineKey& key,
                                                               size_t slot,
                                                               Shader::Environment& env);

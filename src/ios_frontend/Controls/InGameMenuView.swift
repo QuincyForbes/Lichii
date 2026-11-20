@@ -16,7 +16,7 @@ struct InGameMenuView: View {
     @State private var resolution = QuickSettings.string(InGameMenuView.resolutionKey)
     @State private var frameGen = QuickSettings.bool("frame_gen")
     @State private var frameGenMultiplier = max(2, QuickSettings.int("frame_gen_multiplier"))
-    @State private var frameGenMetalFx = QuickSettings.string("frame_gen_type") == "MetalFx"
+    @State private var frameGenMetalFx = QuickSettings.canonical("frame_gen_type") == "MetalFx"
     @State private var speedLimit = QuickSettings.bool("use_speed_limit")
     @State private var speedPercent = QuickSettings.int("speed_limit")
     @State private var pendingRestart = false
@@ -163,11 +163,14 @@ struct InGameMenuView: View {
                     .onChange(of: frameGen) { value in change("frame_gen", value ? "true" : "false") }
                 if frameGen {
                     Stepper("\(SettingLabels.title(for: "frame_gen_multiplier")): \(frameGenMultiplier)x", value: $frameGenMultiplier, in: 2...4)
+                        .disabled(QuickSettings.int("frame_gen_target_rate") > 60)
                         .onChange(of: frameGenMultiplier) { value in change("frame_gen_multiplier", String(value)) }
                     // Apple's interpolation (iOS 26) makes the 2x frame; 3x and 4x stay built-in.
                     if #available(iOS 26, *) {
                         Toggle("\(SettingLabels.choice("MetalFx", for: "frame_gen_type")) Interpolation", isOn: $frameGenMetalFx)
-                            .onChange(of: frameGenMetalFx) { value in change("frame_gen_type", value ? "MetalFx" : "Fsr3") }
+                            .onChange(of: frameGenMetalFx) { value in
+                                change("frame_gen_type", QuickSettings.choiceValue("frame_gen_type", canonical: value ? "MetalFx" : "Fsr3"))
+                            }
                     }
                 }
             }
@@ -184,7 +187,7 @@ struct InGameMenuView: View {
             }
 
             if pendingRestart {
-                Label("Some changes apply after the game restarts.", systemImage: "arrow.clockwise")
+                Label(UiText.text("note.applies_next_boot"), systemImage: "arrow.clockwise")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

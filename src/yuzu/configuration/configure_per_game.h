@@ -39,7 +39,6 @@ class InputSubsystem;
 class ConfigurePerGameAddons;
 class ConfigureAudio;
 class ConfigureCpu;
-class ConfigureFrameGeneration;
 class ConfigureGraphics;
 class ConfigureGraphicsAdvanced;
 class ConfigureGraphicsExtensions;
@@ -125,7 +124,6 @@ private:
     std::unique_ptr<ConfigurePerGameAddons> addons_tab;
     std::unique_ptr<ConfigureAudio> audio_tab;
     std::unique_ptr<ConfigureCpu> cpu_tab;
-    std::unique_ptr<ConfigureFrameGeneration> frame_gen_tab;
     std::unique_ptr<ConfigureGraphicsAdvanced> graphics_advanced_tab;
     std::unique_ptr<ConfigureGraphicsExtensions> graphics_extensions_tab;
     std::unique_ptr<ConfigureGraphics> graphics_tab;

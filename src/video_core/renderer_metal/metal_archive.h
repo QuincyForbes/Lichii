@@ -42,7 +42,9 @@ public:
     /// archive (avoiding exclusive writer lock stalls during live gameplay).
     bool Open(const Device& device, const std::filesystem::path& path, bool read_only = false);
 
-    [[nodiscard]] bool IsOpen() const noexcept;
+    [[nodiscard]] bool IsOpen() const noexcept {
+        return is_open.load(std::memory_order_relaxed);
+    }
 
     [[nodiscard]] bool HasEntries() const noexcept {
         return has_entries.load(std::memory_order_relaxed);
@@ -94,6 +96,7 @@ private:
     Counts recent{};
     Counts total{};
     bool dirty{};
+    std::atomic_bool is_open{false};
     std::atomic_bool read_only{false};
     std::atomic_bool has_entries{false};
 };

@@ -22,11 +22,13 @@ enum SettingsRoute: Hashable {
 /// iPads, push stack on iPhone and compact Split View / Slide Over windows.
 struct SettingsTabView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @ObservedObject private var platform = PlatformCenter.shared
     @State private var selectedRoute: SettingsRoute? = .group(.graphics)
     @State private var query = ""
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     var body: some View {
+        let _ = platform.settingsRevision
         if Theme.isPad && horizontalSizeClass == .regular {
             NavigationSplitView(columnVisibility: $columnVisibility) {
                 List(selection: $selectedRoute) {
@@ -91,6 +93,7 @@ private struct SettingsRouteDetail: View {
 /// the Advanced page.
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var platform = PlatformCenter.shared
     let scope: SettingsScope
     @State private var ready = false
     @State private var query = ""
@@ -104,6 +107,7 @@ struct SettingsView: View {
     }
 
     var body: some View {
+        let _ = platform.settingsRevision
         List {
             if ready {
                 if let game {
@@ -165,6 +169,7 @@ struct SettingsView: View {
             Button(UiText.text("reset.confirm"), role: .destructive) {
                 lichii_settings_reset_game()
                 generation += 1
+                PlatformCenter.shared.bumpSettings()
             }
         } message: {
             Text(overrideSummary)
@@ -342,9 +347,11 @@ private struct GlobalSettingsRoot: View {
 
 /// One page of the global settings (Graphics, Audio, System, Advanced).
 private struct SettingsGroupView: View {
+    @ObservedObject private var platform = PlatformCenter.shared
     let group: SettingsGroup
 
     var body: some View {
+        let _ = platform.settingsRevision
         List {
             if group == .advanced {
                 Section {
@@ -570,6 +577,7 @@ struct DiagnosticsView: View {
 }
 
 struct SettingRow: View {
+    @ObservedObject private var platform = PlatformCenter.shared
     let item: SettingItem
     let perGame: Bool
     @State private var value: String
@@ -585,11 +593,14 @@ struct SettingRow: View {
     }
 
     var body: some View {
+        let _ = platform.settingsRevision
+        let disabledReason = SettingsCatalog.disabledReason(for: item)
+        let controlDisabled = (perGame && useGlobal) || disabledReason != nil
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .center, spacing: 10) {
                 control
-                    .disabled(perGame && useGlobal)
-                    .opacity(perGame && useGlobal ? 0.55 : 1)
+                    .disabled(controlDisabled)
+                    .opacity(controlDisabled ? 0.55 : 1)
                 if perGame {
                     Button {
                         useGlobal.toggle()
@@ -599,6 +610,7 @@ struct SettingRow: View {
                         }
                         value = item.value()
                         refusal = nil
+                        PlatformCenter.shared.bumpSettings()
                     } label: {
                         Image(systemName: useGlobal ? "globe" : "pencil.circle.fill")
                             .foregroundStyle(useGlobal ? Color.secondary : Theme.accent)
@@ -611,14 +623,34 @@ struct SettingRow: View {
                     .accessibilityAddTraits(.isToggle)
                 }
             }
+            if let disabledReason, !disabledReason.isEmpty {
+                Caption(text: disabledReason, systemImage: "info.circle", color: .secondary)
+            }
+            if let interaction = SettingsCatalog.interactionNote(for: item, value: value) {
+                Caption(text: interaction.text,
+                        systemImage: interaction.highlight ? "exclamationmark.circle" : "info.circle",
+                        color: interaction.highlight ? .orange : .secondary)
+            }
             if let refusal {
                 Caption(text: refusal, systemImage: "exclamationmark.circle", color: .orange)
             } else if let note = SettingsCatalog.note(for: item, value: value) {
                 Caption(text: note, systemImage: "info.circle", color: .secondary)
             }
             if !item.runtimeModifiable, Bridge.emuState.inGame {
-                Caption(text: UiText.text("note.next_start"), systemImage: "arrow.clockwise",
+                Caption(text: UiText.text("note.applies_next_boot"), systemImage: "arrow.clockwise",
                         color: .secondary)
+            }
+        }
+        .onChange(of: platform.settingsRevision) { _, _ in
+            let latest = item.value()
+            if value != latest {
+                value = latest
+            }
+            if perGame {
+                let latestGlobal = item.usesGlobal
+                if useGlobal != latestGlobal {
+                    useGlobal = latestGlobal
+                }
             }
         }
     }
@@ -663,6 +695,7 @@ struct SettingRow: View {
         } else {
             refusal = nil
         }
+        PlatformCenter.shared.bumpSettings()
     }
 
     /// Numbers come back in the core's own format ("1.500000").

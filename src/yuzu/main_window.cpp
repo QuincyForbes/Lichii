@@ -200,12 +200,6 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
-#ifdef EGLANTINE_STREAMLINE
-#include "video_core/vulkan_common/streamline.h"
-#endif
-#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
-#include "video_core/vulkan_common/ffx_runtime.h"
-#endif
 
 #include <SDL3/SDL.h>
 
@@ -2732,6 +2726,9 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     }
 
     PrepareShaderPrecache(title_id, std::filesystem::path{filename.toStdU16String()});
+    if (close_pending) {
+        return;
+    }
     speed_limit_before_hotkeys.reset();
     Settings::LogSettings();
 
@@ -2796,12 +2793,11 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     QtCommon::system->SetShuttingDown(false);
     game_list->setDisabled(true);
 
-    // Create and start the emulation thread
+    // Create the emulation thread and finish all signal and UI setup before starting it, so a fast
+    // BuildOnly exit cannot shut down the main process while BootGame still reads system state.
     QtCommon::emu_thread = std::make_unique<EmuThread>();
     connect(QtCommon::emu_thread.get(), &QThread::finished, this, &MainWindow::OnEmulationStopped,
             Qt::QueuedConnection);
-    emit EmulationStarting();
-    QtCommon::emu_thread->start();
 
     // Register an ExecuteProgram callback such that Core can execute a sub-program
     QtCommon::system->RegisterExecuteProgramCallback(
@@ -2908,6 +2904,9 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     } else {
         UpdateMenuState();
     }
+
+    emit EmulationStarting();
+    QtCommon::emu_thread->start();
 }
 
 void MainWindow::BootGameFromList(const QString& filename, StartGameType with_config) {
@@ -2972,7 +2971,7 @@ bool MainWindow::OnShutdownBegin() {
 
     int shutdown_time = 1000;
 
-    if (QtCommon::system->DebuggerEnabled()) {
+    if (QtCommon::system->DebuggerEnabled() || VideoCommon::ShaderWarm::BuildOnlyRequested()) {
         shutdown_time = 0;
     } else if (QtCommon::system->GetExitLocked()) {
         shutdown_time = 5000;
@@ -3052,7 +3051,7 @@ void MainWindow::OnEmulationStopped() {
     play_time_manager->Stop();
     AllowOSSleep();
     VideoCore::Probe::StoreScene(0, 0, 0, 0, nullptr);
-    last_upscaler_status_key.reset();
+    ResetScalingStatusTelemetry();
     last_status_scaling_filter.reset();
     shutdown_timer.stop();
     emu_terminate_timer.stop();
@@ -3068,6 +3067,8 @@ void MainWindow::OnEmulationStopped() {
     }
 
     emulation_running = false;
+    VideoCommon::ShaderWarm::RequestBuildOnly(false);
+    update_input_timer.setInterval(idle_input_update_timeout);
 
     discord_rpc->Update();
     Common::FeralGamemode::Stop();
@@ -5187,12 +5188,26 @@ void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& 
     if (std::error_code ec; std::filesystem::is_directory(path, ec)) {
         path /= "main";
     }
+    const bool loaded_per_game = program_id != 0;
+    if (loaded_per_game) {
+        QtConfig per_game_config(fmt::format("{:016X}", program_id),
+                                 Config::ConfigType::PerGameConfig);
+        QtCommon::system->ApplySettings();
+    }
     shader_warm_dialog = new ShaderWarmDialog(*QtCommon::system, path, program_id,
                                               GameTitleName(game_path), this, true);
     connect(shader_warm_dialog, &QDialog::finished, shader_warm_dialog, &QObject::deleteLater);
     connect(shader_warm_dialog, &ShaderWarmDialog::BuildFinished, this,
-            [this, game_path, dialog = shader_warm_dialog](bool ok) {
-                if (!ok || !dialog || !dialog->NeedsBootGpuCompile()) {
+            [this, game_path, loaded_per_game, dialog = shader_warm_dialog](bool ok) {
+                const bool use_disk_cache = Settings::values.use_disk_shader_cache.GetValue();
+                if (loaded_per_game && !QtCommon::system->IsPoweredOn()) {
+                    Settings::RestoreGlobalState(false);
+                    Settings::values.players.SetGlobal(true);
+                    QtCommon::system->HIDCore().ReloadInputDevices();
+                    QtCommon::system->ApplySettings();
+                    UpdateStatusButtons();
+                }
+                if (!ok || !use_disk_cache || !dialog || !dialog->NeedsBootGpuCompile()) {
                     return;
                 }
                 if (QtCommon::emu_thread != nullptr || emulation_running || boot_in_progress ||
@@ -5226,7 +5241,13 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         !Settings::values.use_disk_shader_cache.GetValue()) {
         return;
     }
-    if (!ShaderWarm::WarmPending(title_id)) {
+    const auto compute_warm = ShaderWarm::ComputeWarmPath(title_id);
+    const bool warm_missing =
+        ShaderWarm::WarmFilesStale(compute_warm).has_value() ||
+        (ShaderWarm::GraphicsPrecacheRequested() &&
+         ShaderWarm::WarmFilesStale(ShaderWarm::GraphicsWarmPath(title_id)).has_value());
+    const bool offline_gpu_pending = ShaderWarm::OfflineGpuWarmPending(title_id);
+    if (!warm_missing && !ShaderWarm::WarmPending(title_id) && !offline_gpu_pending) {
         // Precached before: the renderer runs it again only when the driver or the file changed.
         ShaderWarm::RequestWarmBeforeStart(true);
         return;
@@ -5266,31 +5287,29 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         }
         LOG_INFO(Frontend, "Shader precache before the game starts: {} (remember={})",
                  now ? "yes" : "no", remember->isChecked());
-        if (!now) {
+        if (!now || close_pending) {
             return;
         }
     }
-    std::error_code ec;
-    const auto compute_warm = ShaderWarm::ComputeWarmPath(title_id);
-    const bool warm_missing =
-        ShaderWarm::WarmFilesStale(compute_warm).has_value() ||
-        (ShaderWarm::GraphicsPrecacheRequested() &&
-         ShaderWarm::WarmFilesStale(ShaderWarm::GraphicsWarmPath(title_id)).has_value());
-    if (warm_missing) {
+    if (warm_missing || offline_gpu_pending) {
+        std::error_code ec;
         auto extract_path = game_path;
         if (std::filesystem::is_directory(extract_path, ec)) {
             extract_path /= "main";
         }
         ShaderWarmDialog dialog(*QtCommon::system, extract_path, title_id,
-                                GameTitleName(Common::FS::PathToUTF8String(game_path)), this,
-                                false);
+                                GameTitleName(Common::FS::PathToUTF8String(game_path)), this, true,
+                                warm_missing);
         connect(&dialog, &ShaderWarmDialog::BuildFinished, &dialog, [&dialog](bool ok) {
             if (ok) {
                 dialog.accept();
             }
         });
         dialog.Start();
-        dialog.exec();
+        if (dialog.exec() != QDialog::Accepted || close_pending) {
+            ShaderWarm::RequestSkipWarm();
+            return;
+        }
         if (!std::filesystem::exists(compute_warm, ec)) {
             return;
         }
@@ -5908,121 +5927,35 @@ void MainWindow::UpdateStatusBar() {
         shader_building_label->setVisible(false);
     }
 
-    const auto res_info = Settings::values.resolution_info;
-    const auto res_scale = res_info.up_factor;
-    res_scale_label->setText(
-        tr("Scale: %1x", "%1 is the resolution scaling factor").arg(res_scale));
-
     const auto active_filter = Settings::values.scaling_filter.GetValue();
     if (last_status_scaling_filter != active_filter) {
         last_status_scaling_filter = active_filter;
         UpdateFilterText();
     }
 
-    const auto backend = Settings::values.renderer_backend.GetValue();
-    const auto upscaler_setting = Settings::values.upscaler.GetValue();
-    const char* const probed_scene =
-        VideoCore::Probe::scene_upscaler.load(std::memory_order_relaxed);
-    UpscalerStatusKey status_key{
-        .backend = backend,
-        .upscaler = upscaler_setting,
-        .filter = active_filter,
-        .probed_scene = probed_scene,
-    };
-#ifdef EGLANTINE_STREAMLINE
-    if (backend == Settings::RendererBackend::Vulkan &&
-        upscaler_setting == Settings::Upscaler::Dlss) {
-        const auto dlss = Vulkan::Streamline::GetSessionStatus();
-        status_key.dlss_active = dlss.available && dlss.frames > 0;
-        status_key.mode_name = dlss.mode_name;
-        status_key.preset_name = dlss.preset_name;
-        status_key.version = dlss.version;
+    const auto& telemetry = QueryScalingStatusTelemetry();
+    if (res_scale_label->text() != telemetry.status_bar_scale_text) {
+        res_scale_label->setText(telemetry.status_bar_scale_text);
     }
-#endif
-#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
-    if (backend == Settings::RendererBackend::Vulkan &&
-        upscaler_setting == Settings::Upscaler::Fsr4) {
-        const auto fsr4 = Vulkan::FfxRuntime::GetSessionStatus();
-        status_key.fsr4_active = fsr4.available && fsr4.frames > 0;
-        status_key.version = fsr4.version;
+    if (res_scale_label->toolTip() != telemetry.status_bar_scale_tooltip) {
+        res_scale_label->setToolTip(telemetry.status_bar_scale_tooltip);
     }
-#endif
 
-    if (last_upscaler_status_key != status_key) {
-        last_upscaler_status_key = status_key;
-        QString upscaler_text;
-        QString upscaler_tooltip;
-        const QString filter_label = UiText::ChoiceLabel(
-            Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
-            static_cast<u32>(active_filter));
-        const std::string_view scene_sv = probed_scene != nullptr ? probed_scene : "";
-
-        if (status_key.dlss_active) {
-            upscaler_text = QStringLiteral("DLSS");
-            if (!status_key.mode_name.empty()) {
-                upscaler_text +=
-                    QLatin1Char(' ') + QString::fromStdString(status_key.mode_name).toUpper();
-            }
-            if (!status_key.preset_name.empty()) {
-                upscaler_text +=
-                    QLatin1Char(' ') + QString::fromStdString(status_key.preset_name).toUpper();
-            }
-            upscaler_tooltip =
-                tr("%1 (%2) active — window filter: %3.")
-                    .arg(UiText::ChoiceLabel("upscaler", "Dlss"),
-                         status_key.version.empty() ? QStringLiteral("Streamline")
-                                                    : QString::fromStdString(status_key.version),
-                         filter_label);
-        } else if (status_key.fsr4_active) {
-            const QString ver = QString::fromStdString(status_key.version);
-            upscaler_text = ver.startsWith(QStringLiteral("4."))
-                                ? QStringLiteral("FSR %1").arg(ver)
-                                : QStringLiteral("FSR 4");
-            upscaler_tooltip = tr("%1 active — window filter: %2.")
-                                   .arg(UiText::ChoiceLabel("upscaler", "Fsr4"), filter_label);
-        } else if (backend == Settings::RendererBackend::Vulkan ||
-                   backend == Settings::RendererBackend::Metal) {
-            if (scene_sv == "DLSS") {
-                upscaler_text = QStringLiteral("DLSS");
-            } else if (scene_sv == "FSR 4") {
-                upscaler_text = QStringLiteral("FSR 4");
-            } else if (scene_sv == "FSR 3.1") {
-                upscaler_text = QStringLiteral("FSR 3.1");
-            } else if (scene_sv.starts_with("Metal")) {
-                upscaler_text = UiText::ChoiceLabel(
-                    Settings::EnumMetadata<Settings::FrameGenType>::Index(),
-                    static_cast<u32>(Settings::FrameGenType::MetalFx));
-            } else if (upscaler_setting == Settings::Upscaler::MetalFx) {
-#if defined(__APPLE__)
-                upscaler_text = UiText::ChoiceLabel(
-                    Settings::EnumMetadata<Settings::FrameGenType>::Index(),
-                    static_cast<u32>(Settings::FrameGenType::MetalFx));
-#endif
-            } else if (upscaler_setting == Settings::Upscaler::Fsr3) {
-                upscaler_text = QStringLiteral("FSR 3.1");
-            }
-            if (!upscaler_text.isEmpty()) {
-                upscaler_tooltip =
-                    tr("%1 active — window filter: %2.").arg(upscaler_text, filter_label);
-            }
+    if (telemetry.status_bar_upscaler_text.isEmpty()) {
+        if (upscaler_status_label->isVisible()) {
+            upscaler_status_label->clear();
+            upscaler_status_label->setToolTip(QString{});
+            upscaler_status_label->setVisible(false);
         }
-
-        if (upscaler_text.isEmpty()) {
-            if (upscaler_status_label->isVisible()) {
-                upscaler_status_label->clear();
-                upscaler_status_label->setToolTip(QString{});
-                upscaler_status_label->setVisible(false);
-            }
-        } else {
-            if (upscaler_status_label->text() != upscaler_text) {
-                upscaler_status_label->setText(upscaler_text);
-            }
-            if (upscaler_status_label->toolTip() != upscaler_tooltip) {
-                upscaler_status_label->setToolTip(upscaler_tooltip);
-            }
-            if (!upscaler_status_label->isVisible()) {
-                upscaler_status_label->setVisible(true);
-            }
+    } else {
+        if (upscaler_status_label->text() != telemetry.status_bar_upscaler_text) {
+            upscaler_status_label->setText(telemetry.status_bar_upscaler_text);
+        }
+        if (upscaler_status_label->toolTip() != telemetry.status_bar_upscaler_tooltip) {
+            upscaler_status_label->setToolTip(telemetry.status_bar_upscaler_tooltip);
+        }
+        if (!upscaler_status_label->isVisible()) {
+            upscaler_status_label->setVisible(true);
         }
     }
 
@@ -6034,17 +5967,6 @@ void MainWindow::UpdateStatusBar() {
         emu_speed_label->setText(tr("Speed: %1%").arg(results.emulation_speed * 100.0, 0, 'f', 0));
     }
 
-    const auto fg_method_name = [this] {
-        auto fg_type = Settings::values.frame_gen_type.GetValue();
-        if (nvidia_frame_gen_active) {
-            fg_type = Settings::FrameGenType::NvidiaDlssG;
-        } else if (fg_type == Settings::FrameGenType::NvidiaDlssG) {
-            fg_type = Settings::FrameGenType::Fsr3;
-        }
-        return UiText::ChoiceLabel(Settings::EnumMetadata<Settings::FrameGenType>::Index(),
-                                   static_cast<u32>(fg_type));
-    };
-
     QString fpsText;
     if (results.generated_fps > 0.5 && results.average_game_fps > 0.5) {
         const double mult = results.total_fps / results.average_game_fps;
@@ -6053,16 +5975,16 @@ void MainWindow::UpdateStatusBar() {
                       .arg(results.generated_fps, 0, 'f', 1)
                       .arg(results.total_fps, 0, 'f', 1)
                       .arg(mult, 0, 'f', 1)
-                      .arg(fg_method_name());
+                      .arg(FormatFrameGenMethodLabel(nvidia_frame_gen_active, true));
     } else if (nvidia_frame_gen_active) {
         fpsText = tr("Real: %1 FPS | FG (%2): Paused")
                       .arg(results.average_game_fps, 0, 'f', 1)
-                      .arg(fg_method_name());
+                      .arg(FormatFrameGenMethodLabel(nvidia_frame_gen_active, true));
     } else if (Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan &&
                Settings::values.frame_gen.GetValue()) {
         fpsText = tr("Real: %1 FPS | FG (%2): Warmup")
                       .arg(results.average_game_fps, 0, 'f', 1)
-                      .arg(fg_method_name());
+                      .arg(FormatFrameGenMethodLabel(nvidia_frame_gen_active, false));
     } else {
         fpsText = tr("Real: %1 FPS").arg(results.average_game_fps, 0, 'f', 1);
     }

@@ -91,6 +91,7 @@ enum RecommendedSettings {
             }
         }
         lichii_platform_log_memory("recommended settings applied")
+        PlatformCenter.shared.bumpSettings()
         return true
     }
 }

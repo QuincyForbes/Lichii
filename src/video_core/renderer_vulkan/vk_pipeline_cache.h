@@ -107,6 +107,12 @@ struct ShaderPools {
         inst.ReleaseContents();
     }
 
+    void Free() {
+        flow_block.Free();
+        block.Free();
+        inst.Free();
+    }
+
     Shader::ObjectPool<Shader::IR::Inst> inst{8192};
     Shader::ObjectPool<Shader::IR::Block> block{32};
     Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_block{32};

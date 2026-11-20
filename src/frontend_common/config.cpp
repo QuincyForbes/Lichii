@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/game_settings.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_common.h"
@@ -684,6 +685,26 @@ void Config::MigrateRendererValues() {
         }
     }
 
+    if (global) {
+        constexpr std::string_view MaxResolution = "Max Resolution (built-in)";
+        constexpr std::string_view EnabledMaxResolution = "enabled:Max Resolution (built-in)";
+        if (const auto it = values.disabled_addons.find(Settings::OcarinaOfTimeProgramId);
+            it != values.disabled_addons.end()) {
+            const auto erased = std::erase_if(it->second, [&](std::string_view entry) {
+                return entry == MaxResolution || entry == EnabledMaxResolution;
+            });
+            if (it->second.empty()) {
+                values.disabled_addons.erase(it);
+            }
+            if (erased > 0) {
+                std::error_code ec;
+                std::filesystem::remove(FS::GetEdenPath(FS::EdenPath::CacheDir) / "game_list" /
+                                            "0400486024DEC000.pv.txt",
+                                        ec);
+            }
+        }
+    }
+
     if (missing("upscaler")) {
         // oot_anti_aliasing was read as a 2-value enum: its old FSR 3.1 value 2 came out clamped.
         const auto oot_aa = old_int("oot_anti_aliasing");
@@ -1230,7 +1251,7 @@ void Config::WritePreparedSetting(const std::string& key, const std::string& adj
     std::string full_key = GetFullKey(key, false);
     if (adjusted_default_value.has_value() && use_global.has_value()) {
         if (!global) {
-            WriteString(std::string(full_key).append("\\global"), ToString(use_global.value()));
+            WriteString(std::string(full_key).append("\\use_global"), ToString(use_global.value()));
         }
         if (global || use_global.value() == false) {
             WriteString(std::string(full_key).append("\\default"),

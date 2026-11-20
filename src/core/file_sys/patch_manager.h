@@ -74,10 +74,12 @@ struct BuiltinPatchInfo {
     std::string effect;
     BuiltinPatchChoice choice;
     BuiltinPatchSource source;
-    /// The resolved choice, before another patch that contains this one is considered.
+    /// The resolved choice, after considering whether the patch is blocked.
     bool resolved_enabled;
     /// Name of an enabled built-in patch that contains this one (it then does nothing here).
     std::string included_in;
+    /// Why this patch is currently blocked from applying (empty when not blocked).
+    std::string blocked_reason;
 };
 
 struct Patch {
@@ -139,6 +141,7 @@ public:
 
     // Currently tracked RomFS patches:
     // - Game Updates
+    // - Texture quality & game parameter overrides (Program RomFS)
     // - LayeredFS
     [[nodiscard]] VirtualFile PatchRomFS(const NCA* base_nca, VirtualFile base_romfs,
                                          ContentRecordType type = ContentRecordType::Program,
@@ -146,9 +149,17 @@ public:
                                          bool apply_layeredfs = true) const;
 
     // Builds a RomFS from an unpacked tree with the LayeredFS mods over it, or returns nullptr
-    // when no mod has a romfs layer. Saves unpacking a built RomFS again (NUP containers).
+    // when no mod or RomFS override applies. Saves unpacking a built RomFS again (NUP containers).
     [[nodiscard]] VirtualFile CreateLayeredRomFS(VirtualDir base,
                                                  ContentRecordType type) const;
+
+    // Wraps an unpacked Program RomFS tree with texture quality, game parameter overrides and
+    // LayeredFS mods and builds a RomFS image, or returns nullptr when none of them apply.
+    [[nodiscard]] VirtualFile BuildPatchedRomFS(
+        VirtualDir base, ContentRecordType type = ContentRecordType::Program) const;
+
+    // Returns the user-configurable built-in patches for this title.
+    [[nodiscard]] std::vector<Patch> GetBuiltinPatches() const;
 
     // Returns a vector of patches
     [[nodiscard]] std::vector<Patch> GetPatches(VirtualFile update_raw = nullptr) const;
@@ -169,9 +180,13 @@ public:
     [[nodiscard]] static PatchManager::Metadata GetMetadataFromBaseOrUpdate(Core::System& system, u64 application_id) noexcept;
 
 private:
+    struct UpdateSelection;
+
     [[nodiscard]] VirtualDir GetModificationLoadRoot(bool sdmc = false) const;
     [[nodiscard]] std::vector<std::string> GetDisabledAddons() const;
-    void ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const;
+    [[nodiscard]] UpdateSelection ResolveUpdateSelection(
+        ContentRecordType type, const std::vector<std::string>& disabled) const;
+    void ApplyRomFSPatches(VirtualFile& romfs, ContentRecordType type) const;
     void CollectLayers(ContentRecordType type, std::vector<VirtualDir>& layers,
                        std::vector<VirtualDir>& layers_ext) const;
     [[nodiscard]] std::vector<VirtualFile> CollectPatches(const std::vector<VirtualDir>& patch_dirs,

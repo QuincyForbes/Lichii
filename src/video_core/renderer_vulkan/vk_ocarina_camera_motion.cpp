@@ -7,7 +7,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
-#include <type_traits>
 
 #include "common/logging.h"
 #include "common/settings.h"
@@ -1152,52 +1151,9 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
 
 namespace {
 
-constexpr bool IsOcarinaUnpaddedRenderScale(Settings::OotResolution r) noexcept {
-    return r != Settings::OotResolution::Game && r != Settings::OotResolution::Percent87 &&
-           r != Settings::OotResolution::Percent150 && r != Settings::OotResolution::Percent200 &&
-           r != Settings::OotResolution::Percent300;
-}
-
-constexpr bool IsOcarinaUnpaddedRenderScale(Settings::DlssQuality q) noexcept {
-    return q != Settings::DlssQuality::Balanced;
-}
-
-constexpr bool IsOcarinaUnpaddedRenderScale(Settings::OcarinaDlssMode m) noexcept {
-    return m != Settings::OcarinaDlssMode::Balanced;
-}
-
-namespace OcarinaScaleSettings {
-using namespace Settings;
-template <typename... Args>
-auto Try(int, Args... args) -> decltype(AppliedOcarinaRenderScale(args...)) {
-    return AppliedOcarinaRenderScale(args...);
-}
-inline std::nullopt_t Try(long) noexcept {
-    return std::nullopt;
-}
-} // namespace OcarinaScaleSettings
-
-namespace OcarinaScaleVideo {
-using namespace VideoCommon;
-template <typename... Args>
-auto Try(int, Args... args) -> decltype(AppliedOcarinaRenderScale(args...)) {
-    return AppliedOcarinaRenderScale(args...);
-}
-inline std::nullopt_t Try(long) noexcept {
-    return std::nullopt;
-}
-} // namespace OcarinaScaleVideo
-
 bool HasAppliedOcarinaFsrRenderScale() {
-    if constexpr (!std::is_same_v<decltype(OcarinaScaleSettings::Try(0)), std::nullopt_t>) {
-        if (const auto scale = OcarinaScaleSettings::Try(0)) {
-            return IsOcarinaUnpaddedRenderScale(*scale);
-        }
-    }
-    if constexpr (!std::is_same_v<decltype(OcarinaScaleVideo::Try(0)), std::nullopt_t>) {
-        if (const auto scale = OcarinaScaleVideo::Try(0)) {
-            return IsOcarinaUnpaddedRenderScale(*scale);
-        }
+    if (const auto scale = Settings::AppliedOcarinaRenderScale()) {
+        return *scale != Settings::DlssQuality::Balanced;
     }
     return false;
 }

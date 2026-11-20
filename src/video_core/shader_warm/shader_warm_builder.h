@@ -91,10 +91,13 @@ bool WriteWarmMarker(const std::filesystem::path& warm_file, const WarmStamp& st
 void DropStaleWarmMarker(const std::filesystem::path& warm_file,
                          const std::filesystem::path& new_file);
 
-/// True when the title's precache has never finished: no precache file yet, or no marker next
-/// to it. A marker that no longer matches (new driver) is not seen here: the emulator checks that
-/// at boot.
+/// True when the title's precache is missing, stale (WarmFilesStale) or has no valid .done marker
+/// on warm-compute.bin (or warm-graphics.bin when GraphicsPrecacheRequested() is enabled). A
+/// marker written for an older driver is checked by the renderer at boot.
 bool WarmPending(u64 title_id);
+
+/// True when offline host GPU shader compilation (Metal on Apple) is pending for `title_id`.
+bool OfflineGpuWarmPending(u64 title_id);
 
 /// Whether this boot precaches before the game starts: Always, or Ask when the frontend asked and
 /// the user agreed (`asked`). Off never does.
@@ -205,9 +208,9 @@ bool HasWarmFile(u64 title_id);
 /// written by an older builder (WarmBuilderVersion) or changed since. Empty when it is current.
 std::optional<std::string> WarmFilesStale(const std::filesystem::path& warm_file);
 
-/// Before the disk cache loads: builds the precache file of the running Switch 2 program from its
-/// game file when it is WarmFilesStale and precache_shaders is Always (Off and Ask leave building
-/// to the loading screen flow). Returns true when it built one.
+/// Before the disk cache loads: builds the precache file of the running program from its game
+/// file when it is WarmFilesStale and precache_shaders is Always (Off and Ask leave building to
+/// the loading screen flow). Returns true when it built one.
 bool RefreshWarmFiles(Core::System& system, u64 title_id, std::stop_token stop);
 
 /// Builds the precache file for the game at `game_path` (any format the loader opens, Switch 2

@@ -3086,11 +3086,32 @@ inline u64 UnwrapEmissionStamp(u64 (*fn)()) {
     return fn();
 }
 
+u64 PackDynamicFeatures(const DynamicFeatures& f) noexcept {
+    u64 bits = 0;
+    bits |= (f.has_extended_dynamic_state ? 1ULL : 0ULL) << 0;
+    bits |= (f.has_extended_dynamic_state_2 ? 1ULL : 0ULL) << 1;
+    bits |= (f.has_extended_dynamic_state_2_logic_op ? 1ULL : 0ULL) << 2;
+    bits |= (f.has_extended_dynamic_state_2_patch_control_points ? 1ULL : 0ULL) << 3;
+    bits |= (f.has_extended_dynamic_state_3_blend ? 1ULL : 0ULL) << 4;
+    bits |= (f.has_extended_dynamic_state_3_enables ? 1ULL : 0ULL) << 5;
+    bits |= (f.has_dynamic_state3_depth_clamp_enable ? 1ULL : 0ULL) << 6;
+    bits |= (f.has_dynamic_state3_logic_op_enable ? 1ULL : 0ULL) << 7;
+    bits |= (f.has_dynamic_state3_line_stipple_enable ? 1ULL : 0ULL) << 8;
+    bits |= (f.has_dynamic_vertex_input ? 1ULL : 0ULL) << 9;
+    bits |= (f.has_static_vertex_repack ? 1ULL : 0ULL) << 10;
+    bits |= (f.has_color_write_enable ? 1ULL : 0ULL) << 11;
+    bits |= (f.has_provoking_vertex ? 1ULL : 0ULL) << 12;
+    bits |= (f.has_provoking_vertex_first_mode ? 1ULL : 0ULL) << 13;
+    bits |= (f.has_provoking_vertex_last_mode ? 1ULL : 0ULL) << 14;
+    bits |= (f.has_provoking_vertex_tf_preserve ? 1ULL : 0ULL) << 15;
+    return bits;
+}
+
 /// The precache marker's variant: the build's SPIR-V emission stamp and the settings and device
 /// capabilities that change what the driver gets for a precache build.
-u64 WarmVariant(const Device& device) {
+u64 WarmVariant(const Device& device, const DynamicFeatures& dynamic_features) {
     const auto& resolution = Settings::values.resolution_info;
-    const std::array<u64, 10> inputs{
+    const std::array<u64, 11> inputs{
         UnwrapEmissionStamp(VideoCommon::ShaderWarm::EmissionStamp),
         resolution.active ? 1ULL : 0ULL,
         resolution.up_scale,
@@ -3101,8 +3122,110 @@ u64 WarmVariant(const Device& device) {
         device.IsExtDescriptorBufferSupported() ? 1ULL : 0ULL,
         device.IsExtGraphicsPipelineLibrarySupported() ? 1ULL : 0ULL,
         device.IsExtMeshShaderSupported() ? 1ULL : 0ULL,
+        PackDynamicFeatures(dynamic_features),
     };
     return Common::CityHash64(reinterpret_cast<const char*>(inputs.data()), sizeof(inputs));
+}
+
+/// Adapts a guessed graphics precache key from warm-graphics.bin to this device's active
+/// DynamicFeatures so the built GPL libraries match runtime ShaderLibraryKey dynamic states and
+/// never request dynamic states the driver lacks.
+void StampWarmGraphicsKey(GraphicsPipelineCacheKey& key, const FileEnvironment& env,
+                          const DynamicFeatures& features) {
+    const bool was_eds1 = key.state.extended_dynamic_state != 0;
+    const bool was_eds2 = key.state.extended_dynamic_state_2 != 0;
+    const bool was_dynamic_vi = key.state.dynamic_vertex_input != 0;
+
+    key.state.driver_id = features.driver_id;
+    key.state.driver_version = features.driver_version;
+    key.state.extended_dynamic_state.Assign(features.has_extended_dynamic_state ? 1 : 0);
+    key.state.extended_dynamic_state_2.Assign(features.has_extended_dynamic_state_2 ? 1 : 0);
+    key.state.extended_dynamic_state_2_logic_op.Assign(
+        features.has_extended_dynamic_state_2_logic_op ? 1 : 0);
+    key.state.extended_dynamic_state_3_blend.Assign(
+        features.has_extended_dynamic_state_3_blend ? 1 : 0);
+    key.state.extended_dynamic_state_3_enables.Assign(
+        features.has_extended_dynamic_state_3_enables ? 1 : 0);
+    key.state.color_write_enable_dynamic.Assign(features.has_color_write_enable ? 1 : 0);
+    key.state.dynamic_vertex_input.Assign(features.has_dynamic_vertex_input ? 1 : 0);
+
+    if (features.has_extended_dynamic_state) {
+        key.state.dynamic_state.raw2 = 0;
+        key.state.dynamic_state.cull_face.Assign(0);
+        key.state.dynamic_state.cull_enable.Assign(0);
+    } else if (was_eds1) {
+        key.state.dynamic_state.depth_test_func.Assign(
+            FixedPipelineState::PackComparisonOp(Maxwell::ComparisonOp::LessEqual_D3D));
+        key.state.dynamic_state.depth_test_enable.Assign(key.state.depth_enabled.Value());
+        key.state.dynamic_state.depth_write_enable.Assign(key.state.depth_enabled.Value());
+    }
+    if (features.has_extended_dynamic_state_2) {
+        key.state.dynamic_state.primitive_restart_enable.Assign(0);
+        key.state.dynamic_state.depth_bias_enable.Assign(0);
+        key.state.dynamic_state.rasterize_enable.Assign(0);
+    } else if (was_eds2) {
+        key.state.dynamic_state.rasterize_enable.Assign(1);
+    }
+    if (features.has_extended_dynamic_state_2_logic_op) {
+        key.state.dynamic_state.logic_op.Assign(0);
+    }
+    if (features.has_dynamic_state3_logic_op_enable) {
+        key.state.dynamic_state.logic_op_enable.Assign(0);
+    }
+    if (features.has_dynamic_state3_depth_clamp_enable) {
+        key.state.dynamic_state.depth_clamp_disabled.Assign(0);
+    }
+    if (features.has_dynamic_state3_line_stipple_enable) {
+        key.state.dynamic_state.line_stipple_enable.Assign(0);
+    }
+
+    if (features.has_dynamic_vertex_input) {
+        if (!was_dynamic_vi) {
+            u64 types = 0;
+            if (key.unique_hashes[1] != 0) {
+                bool any_enabled = false;
+                for (size_t i = 0; i < Maxwell::NumVertexAttributes; ++i) {
+                    const auto& attr = key.state.attributes[i];
+                    if (attr.enabled == 0) {
+                        continue;
+                    }
+                    any_enabled = true;
+                    u64 code = 1;
+                    if (attr.Type() == Maxwell::VertexAttribute::Type::SInt) {
+                        code = 2;
+                    } else if (attr.Type() == Maxwell::VertexAttribute::Type::UInt) {
+                        code = 3;
+                    }
+                    types |= code << (i * 2);
+                }
+                if (!any_enabled) {
+                    types = VideoCommon::ShaderWarm::DefaultAttributeTypes;
+                }
+            }
+            key.state.attribute_types = types;
+        }
+        MaskKeyedAttributeTypes(key, std::span{&env, 1});
+    } else if (was_dynamic_vi) {
+        MaskKeyedAttributeTypes(key, std::span{&env, 1});
+        const u64 types = key.state.attribute_types;
+        key.state.enabled_divisors = 0;
+        key.state.binding_divisors.fill(0);
+        key.state.vertex_strides.fill(16);
+        for (size_t i = 0; i < Maxwell::NumVertexAttributes; ++i) {
+            auto& attr = key.state.attributes[i];
+            attr.raw = 0;
+            const u32 code = static_cast<u32>((types >> (i * 2)) & 3);
+            if (code == 0) {
+                continue;
+            }
+            attr.enabled.Assign(1);
+            attr.size.Assign(static_cast<u32>(Maxwell::VertexAttribute::Size::Size_R32_G32_B32_A32));
+            attr.type.Assign(static_cast<u32>(
+                code == 2   ? Maxwell::VertexAttribute::Type::SInt
+                : code == 3 ? Maxwell::VertexAttribute::Type::UInt
+                            : Maxwell::VertexAttribute::Type::Float));
+        }
+    }
 }
 
 std::filesystem::path PrecacheSlowPath(u64 title_id) {
@@ -3169,7 +3292,7 @@ bool PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
     std::unordered_set<u64> slow_hashes = ReadPrecacheSlowHashes(
         slow_file, device.GetDriverVersion(), device.GetDeviceID(), CACHE_VERSION);
     const std::string path = Common::FS::PathToUTF8String(warm_file);
-    const u64 variant = WarmVariant(device);
+    const u64 variant = WarmVariant(device, dynamic_features);
     const auto stamp = [&](u64 entries) {
         return ShaderWarm::CurrentWarmStamp(warm_file, entries, device.GetDriverVersion(),
                                             device.GetDeviceID(), CACHE_VERSION, variant);
@@ -3241,7 +3364,10 @@ bool PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
     }
     const bool build_only = ShaderWarm::BuildOnlyRequested();
     const char* const what = build_only ? "Build shaders" : "Shader precache";
-    const size_t num_threads = std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 64);
+    const size_t num_threads =
+        device.HasBrokenParallelShaderCompiling()
+            ? 1ULL
+            : std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 16);
     if (jobs.empty() && !compute_pending) {
         LOG_INFO(Render_Vulkan,
                  "{}: 0 built, {} skipped (already built), 0 failed in 0.0 s on {} threads", what,
@@ -3361,7 +3487,7 @@ bool PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
                 {device.GetDriverVersion(), device.GetDeviceID(), CACHE_VERSION}, precached);
         }
     };
-    const auto give_up = [&](Slot& slot, size_t index, s64 seconds) {
+    const auto give_up = [&](Slot& slot, size_t index, s64 seconds, bool record_slow) {
         u8 running = Slot::Running;
         precache_threads_left->fetch_add(1);
         if (!slot.state.compare_exchange_strong(running, Slot::Left)) {
@@ -3374,10 +3500,12 @@ bool PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
             run->done.fetch_add(1);
         }
         ++given_up;
-        if (const u64 hung_hash = run->jobs[index].hash; hung_hash != 0) {
-            if (slow_hashes.insert(hung_hash).second) {
-                WritePrecacheSlowHashes(slow_file, device.GetDriverVersion(), device.GetDeviceID(),
-                                        CACHE_VERSION, slow_hashes);
+        if (record_slow) {
+            if (const u64 hung_hash = run->jobs[index].hash; hung_hash != 0) {
+                if (slow_hashes.insert(hung_hash).second) {
+                    WritePrecacheSlowHashes(slow_file, device.GetDriverVersion(),
+                                            device.GetDeviceID(), CACHE_VERSION, slow_hashes);
+                }
             }
         }
         LOG_ERROR(Render_Vulkan, "{}: gave up on {} after {} s, its thread is left to it", what,
@@ -3436,7 +3564,7 @@ bool PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
                 LOG_WARNING(Render_Vulkan, "{}: {} still building after {} s", what,
                             run->jobs[index].label, seconds);
             }
-            if (busy > PrecacheGiveUp() && give_up(slot, index, seconds)) {
+            if (busy > PrecacheGiveUp() && give_up(slot, index, seconds, true)) {
                 --active;
                 // Another thread takes its place, unless every thread was lost this way: then
                 // the driver is stuck and the rest is not reached.
@@ -3478,10 +3606,9 @@ bool PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
     for (auto& [thread, slot] : threads) {
         const size_t index = slot->job.load();
         if (slot->state.load() == Slot::Running && index != SIZE_MAX) {
-            give_up(*slot, index,
-                    std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::nanoseconds{now_ns() - slot->since.load()})
-                        .count());
+            const auto busy = std::chrono::nanoseconds{now_ns() - slot->since.load()};
+            give_up(*slot, index, std::chrono::duration_cast<std::chrono::seconds>(busy).count(),
+                    false);
         }
         if (slot->state.load() == Slot::Left) {
             thread.detach();
@@ -3537,7 +3664,7 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
         }
         return;
     }
-    const u64 variant = WarmVariant(device);
+    const u64 variant = WarmVariant(device, dynamic_features);
     const auto stamp = [&](u64 entries) {
         return ShaderWarm::CurrentWarmStamp(warm_file, entries, device.GetDriverVersion(),
                                             device.GetDeviceID(), CACHE_VERSION, variant);
@@ -3558,7 +3685,7 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
         std::streampos end{};
         bool failed{};
         size_t read{};
-        size_t skipped_slow{};
+        std::atomic<size_t> skipped_slow{};
         std::streamoff position{};
         std::unordered_set<u64> slow_Snapshot;
         std::atomic<size_t> built{};
@@ -3589,7 +3716,10 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
     }
     const size_t known_total = static_cast<size_t>(ShaderWarm::ReadWarmCount(warm_file));
     const auto begin = std::chrono::steady_clock::now();
-    const size_t num_threads = std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 64);
+    const size_t num_threads =
+        device.HasBrokenParallelShaderCompiling()
+            ? 1ULL
+            : std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 16);
     const auto now_ns = [] {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
                    std::chrono::steady_clock::now().time_since_epoch())
@@ -3617,8 +3747,12 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
                 Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
                 static const GuessMissing guess{};
                 GraphicsPipelineLibraryCache::SetNoRetainOnThisThread(true);
+                SCOPE_EXIT {
+                    GraphicsPipelineLibraryCache::SetNoRetainOnThisThread(false);
+                };
                 const SpeculativePrecacheScope speculative_scope;
                 ShaderPools pools;
+                size_t built_on_thread = 0;
                 while (!shared->cancel.load(std::memory_order_relaxed)) {
                     FileEnvironment env;
                     GraphicsPipelineCacheKey key{};
@@ -3646,9 +3780,10 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
                                 shared->failed = true;
                                 break;
                             }
+                            StampWarmGraphicsKey(key, env, dynamic_features);
                             key_hash = key.Hash();
                             if (shared->slow_Snapshot.contains(key_hash)) {
-                                ++shared->skipped_slow;
+                                shared->skipped_slow.fetch_add(1, std::memory_order_relaxed);
                                 continue;
                             }
                             got_entry = true;
@@ -3671,12 +3806,16 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
                                             std::memory_order_release);
                     slot->reported = false;
                     env.SetGuessMissing(&guess);
+                    const bool large_env = env.MemorySize() > (16ULL << 10);
                     bool ok = false;
                     try {
                         Shader::Environment* const env_ptr = &env;
                         ok = WarmGraphicsLibraries(pools, key, std::span{&env_ptr, 1});
                     } catch (const std::exception& e) {
                         LOG_DEBUG(Render_Vulkan, "Shader precache: {}", e.what());
+                    }
+                    if (large_env || (++built_on_thread % 64) == 0) {
+                        pools.Free();
                     }
                     slot->active_hash.store(0, std::memory_order_release);
                     if (slot->state.load() == Slot::Left) {
@@ -3694,7 +3833,8 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
     for (size_t thread = 0; thread < num_threads; ++thread) {
         spawn();
     }
-    const auto give_up = [&](Slot& slot, u64 key_hash, u64 shader_hash, s64 seconds) {
+    const auto give_up = [&](Slot& slot, u64 key_hash, u64 shader_hash, s64 seconds,
+                             bool record_slow) {
         u8 running_state = Slot::Running;
         precache_threads_left->fetch_add(1);
         if (!slot.state.compare_exchange_strong(running_state, Slot::Left)) {
@@ -3703,7 +3843,7 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
         }
         shared->failed_builds.fetch_add(1);
         ++given_up;
-        if (key_hash != 0 && slow_hashes.insert(key_hash).second) {
+        if (record_slow && key_hash != 0 && slow_hashes.insert(key_hash).second) {
             {
                 std::scoped_lock lock{shared->mutex};
                 shared->slow_Snapshot.insert(key_hash);
@@ -3717,9 +3857,51 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
                   shader_hash, seconds);
         return true;
     };
+    const auto status = [&](bool running) {
+        s64 slowest = 0;
+        const s64 now = now_ns();
+        for (const auto& [thread, slot] : threads) {
+            if (slot->state.load() == Slot::Running && slot->active_hash.load() != 0) {
+                slowest = (std::max)(slowest, now - slot->since.load(std::memory_order_relaxed));
+            }
+        }
+        const size_t built_count = shared->built.load(std::memory_order_relaxed);
+        const size_t failed_count = shared->failed_builds.load(std::memory_order_relaxed);
+        const size_t skipped_count = shared->skipped_slow.load(std::memory_order_relaxed);
+        const size_t done = built_count + failed_count + skipped_count;
+        size_t total = known_total;
+        if (total == 0) {
+            std::scoped_lock lock{shared->mutex};
+            const std::streamoff header = 12;
+            const std::streamoff end = shared->end;
+            if (shared->position > header) {
+                total = static_cast<size_t>(static_cast<double>(shared->read) *
+                                            static_cast<double>(end - header) /
+                                            static_cast<double>(shared->position - header));
+            }
+        }
+        total = (std::max)(total, done);
+        ShaderWarm::SetBuildStatus({
+            .total = total,
+            .done = done,
+            .built = built_count,
+            .failed = failed_count,
+            .skipped = skipped_count,
+            .threads = num_threads,
+            .elapsed_ms = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               std::chrono::steady_clock::now() - begin)
+                                               .count()),
+            .slowest_ms = static_cast<u64>(slowest / 1'000'000),
+            .running = running,
+        });
+        if (callback) {
+            callback(VideoCore::LoadCallbackStage::Warm, done, total);
+        }
+    };
     auto last_save = std::chrono::steady_clock::now();
     size_t last_saved_built = 0;
     for (;;) {
+        status(true);
         if (stop_loading.stop_requested() || ShaderWarm::TakeSkipWarm()) {
             shared->cancel = true;
             skipped = true;
@@ -3746,7 +3928,7 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
                             "Shader precache: graphics library {:016x} still building after {} s",
                             shader_hash, seconds);
             }
-            if (busy > PrecacheGiveUp() && give_up(slot, key_hash, shader_hash, seconds)) {
+            if (busy > PrecacheGiveUp() && give_up(slot, key_hash, shader_hash, seconds, true)) {
                 --active;
                 if (given_up < num_threads) {
                     spawn();
@@ -3758,21 +3940,6 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
         }
         if (active == 0) {
             break;
-        }
-        if (callback) {
-            const size_t done = shared->built.load() + shared->failed_builds.load();
-            size_t total = known_total;
-            if (total == 0) {
-                std::scoped_lock lock{shared->mutex};
-                const std::streamoff header = 12;
-                const std::streamoff end = shared->end;
-                if (shared->position > header) {
-                    total = static_cast<size_t>(static_cast<double>(shared->read) *
-                                                static_cast<double>(end - header) /
-                                                static_cast<double>(shared->position - header));
-                }
-            }
-            callback(VideoCore::LoadCallbackStage::Warm, done, std::max(total, done));
         }
         if (std::chrono::steady_clock::now() - last_save > PrecacheSaveInterval) {
             last_save = std::chrono::steady_clock::now();
@@ -3796,10 +3963,9 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
     for (auto& [thread, slot] : threads) {
         const u64 key_hash = slot->active_hash.load();
         if (slot->state.load() == Slot::Running && key_hash != 0) {
+            const auto busy = std::chrono::nanoseconds{now_ns() - slot->since.load()};
             give_up(*slot, key_hash, slot->active_shader.load(),
-                    std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::nanoseconds{now_ns() - slot->since.load()})
-                        .count());
+                    std::chrono::duration_cast<std::chrono::seconds>(busy).count(), false);
         }
         if (slot->state.load() == Slot::Left) {
             thread.detach();
@@ -3807,6 +3973,7 @@ void PipelineCache::PrecacheGraphicsLibraries(u64 title_id, std::stop_token stop
             thread.join();
         }
     }
+    status(false);
     size_t entries_read = 0;
     bool finished_all = false;
     {
@@ -4730,7 +4897,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // stage's reads are replayed against the environment first. A merged VertexA/VertexB pair and
     // titles whose shaders are edited after translation are left out.
     using StageCache = VideoCommon::StageCache;
-    const bool cache_stages{stage_cache.Enabled() && !uses_vertex_a && !oot_visual_workaround};
+    const bool cache_stages{!libraries_only && stage_cache.Enabled() && !uses_vertex_a &&
+                            !oot_visual_workaround};
     StageReuse reuse;
     std::array<std::vector<u8>, Maxwell::MaxShaderProgram> signatures;
     std::array<bool, Maxwell::MaxShaderProgram> looked_up{};
@@ -5333,7 +5501,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             const auto begin = std::chrono::steady_clock::now();
             modules[stage_index] = EmitShaderModuleCached(
                 stage_cache, reuse, index,
-                !argument_buffer_profile &&
+                cache_stages && !argument_buffer_profile &&
                     StageCacheable(program, mesh_emulation.has_value(), index),
                 device, stage_profile, runtime_info, program, binding, key.unique_hashes[index],
                 stage_index, {}, use_libraries ? &spirv_hashes[stage_index] : nullptr);
@@ -5343,7 +5511,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         previous_stage = &program;
     }
-    if (!emit_pools) {
+    if (!emit_pools && !libraries_only) {
         for (auto& [new_translation, entry] : reuse.new_translations) {
             stage_cache.Insert(std::move(new_translation), std::move(entry));
         }
@@ -5402,6 +5570,23 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel && !libraries_only ? &workers
                                                                                    : nullptr};
+    std::array<Shader::Info, Maxwell::MaxShaderStage> saved_infos;
+    if (!thread_worker && !emit_pools) {
+        // Release IR programs before synchronous driver compilation so boot/precache workers do not
+        // hold large shaders in memory while vkCreateGraphicsPipelines runs.
+        bool large_program = false;
+        for (size_t stage = 0; stage < infos.size(); ++stage) {
+            if (infos[stage]) {
+                large_program |= programs[stage + 1].blocks.size() > 64;
+                saved_infos[stage] = std::move(programs[stage + 1].info);
+                infos[stage] = &saved_infos[stage];
+            }
+        }
+        programs = {};
+        if (large_program) {
+            pools.Free();
+        }
+    }
     GraphicsPipeline::LibraryParams library_params{
         .library_cache = use_libraries ? &graphics_libraries : nullptr,
         .spirv_hashes = spirv_hashes,
@@ -5966,8 +6151,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         // IR through the compile, up to hundreds of MiB for one large shader.
         program = {};
         code = std::vector<u32>{};
-        pools.block.Free();
-        pools.inst.Free();
+        pools.Free();
     }
     return {.pipeline = std::make_unique<ComputePipeline>(
                 device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,

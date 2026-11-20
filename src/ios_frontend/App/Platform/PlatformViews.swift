@@ -375,13 +375,24 @@ struct ShaderCacheSettingsSection: View {
 /// Experiments > file_guest: what it does, and the storage it needs against what is free.
 /// Also offered after a game was closed by iOS.
 struct GuestMemoryFileSection: View {
-    @State private var enabled = GuestMemoryFile.enabled
+    @ObservedObject private var platform = PlatformCenter.shared
     @State private var storage = GuestMemoryFile.storage
 
     var body: some View {
+        let _ = platform.experimentsRevision
+        let isEnabled = GuestMemoryFile.enabled
         let fit = GuestMemoryFile.fit(storage)
+        let toggleBinding = Binding<Bool>(
+            get: {
+                _ = platform.experimentsRevision
+                return GuestMemoryFile.enabled
+            },
+            set: { value in
+                GuestMemoryFile.enabled = value
+            }
+        )
         Section {
-            Toggle(isOn: $enabled) {
+            Toggle(isOn: toggleBinding) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(UiText.experimentLabel("file_guest"))
                     Text(UiText.text("experiments.large_games.subtitle"))
@@ -389,15 +400,12 @@ struct GuestMemoryFileSection: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .onChange(of: enabled) { _, value in
-                GuestMemoryFile.enabled = value
-            }
             .disabled(Bridge.emuState.inGame || Bridge.emuState == .booting)
             if let storage {
                 LabeledContent("Free storage", value: GuestMemoryFile.size(storage.free_mib))
                 LabeledContent("Needed", value: "\(GuestMemoryFile.size(storage.needed_mib)) free")
             }
-            if enabled {
+            if isEnabled {
                 Label(fitText(fit), systemImage: fit == .short ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
                     .font(.footnote)
                     .foregroundStyle(fit == .short ? Color.orange : fit == .unknown ? Color.secondary : Color.green)
@@ -430,19 +438,45 @@ struct GuestMemoryFileSection: View {
 
 /// One toggle row for a `UiText.ExperimentEntry`.
 private struct ExperimentToggleRow: View {
+    @ObservedObject private var platform = PlatformCenter.shared
     let entry: UiText.ExperimentEntry
-    @State private var enabled: Bool
-
-    init(entry: UiText.ExperimentEntry) {
-        self.entry = entry
-        _enabled = State(initialValue: entry.id.withCString { lichii_platform_experiment($0) != 0 })
-    }
+    @State private var changedWhileRunning = false
 
     var body: some View {
-        Toggle(entry.label, isOn: $enabled)
-            .onChange(of: enabled) { _, value in
-                entry.id.withCString { lichii_platform_set_experiment($0, value ? 1 : 0) }
+        let _ = platform.experimentsRevision
+        let availability = platform.experimentAvailability(entry.id)
+        let overriddenReason: String? = {
+            if case .overridden(let reason) = availability { return reason }
+            return nil
+        }()
+        let toggleBinding = Binding<Bool>(
+            get: {
+                _ = platform.experimentsRevision
+                return platform.isExperimentEnabled(entry.id)
+            },
+            set: { value in
+                platform.setExperiment(entry.id, enabled: value)
+                if Bridge.emuState.inGame || Bridge.emuState == .booting {
+                    changedWhileRunning = true
+                }
             }
+        )
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(entry.label, isOn: toggleBinding)
+                .disabled(overriddenReason != nil)
+            if let overriddenReason, !overriddenReason.isEmpty {
+                Label(overriddenReason, systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if changedWhileRunning, Bridge.emuState.inGame || Bridge.emuState == .booting {
+                Label(UiText.text("note.applies_next_boot"), systemImage: "arrow.clockwise")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }
 
@@ -453,7 +487,12 @@ struct ExperimentsView: View {
     @State private var query = ""
 
     private func matchingExperiments(in section: String) -> [UiText.ExperimentEntry] {
-        let items = UiText.experiments(in: section)
+        let items = UiText.experiments(in: section).filter { entry in
+            if case .hidden = platform.experimentAvailability(entry.id) {
+                return false
+            }
+            return true
+        }
         guard !query.isEmpty else { return items }
         return items.filter {
             $0.label.localizedCaseInsensitiveContains(query) ||
@@ -461,9 +500,28 @@ struct ExperimentsView: View {
         }
     }
 
+    private var unavailableSearchLines: [String] {
+        guard !query.isEmpty else { return [] }
+        return UiText.allExperiments.compactMap { entry -> String? in
+            guard entry.label.localizedCaseInsensitiveContains(query) ||
+                    entry.id.localizedCaseInsensitiveContains(query),
+                  case .hidden(let reason) = platform.experimentAvailability(entry.id) else {
+                return nil
+            }
+            return "\(entry.label): \(reason)"
+        }
+    }
+
+    private var showsGuestMemoryFile: Bool {
+        guard !query.isEmpty else { return true }
+        return UiText.experimentLabel("file_guest").localizedCaseInsensitiveContains(query) ||
+            "file_guest".localizedCaseInsensitiveContains(query)
+    }
+
     var body: some View {
+        let _ = platform.experimentsRevision
         List {
-            if query.isEmpty {
+            if showsGuestMemoryFile {
                 GuestMemoryFileSection()
             }
 
@@ -481,6 +539,18 @@ struct ExperimentsView: View {
                             Text(UiText.text("experiments.\(section).footer"))
                         }
                     }
+                }
+            }
+
+            let unavailable = unavailableSearchLines
+            if !unavailable.isEmpty {
+                let backendName = SettingsCatalog.currentChoiceLabel(of: "backend") ??
+                    (Theme.isPad ? "iPadOS" : "iOS")
+                Section {
+                } header: {
+                    Text(UiText.format("search.unavailable", backendName))
+                } footer: {
+                    Text(unavailable.joined(separator: "\n"))
                 }
             }
 

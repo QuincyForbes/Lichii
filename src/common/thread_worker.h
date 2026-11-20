@@ -19,6 +19,7 @@
 #include <vector>
 #include <queue>
 
+#include "common/large_stack.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "common/unique_function.h"
@@ -41,7 +42,8 @@ class StatefulThreadWorker {
 
 public:
     explicit StatefulThreadWorker(size_t num_workers, std::string name, StateMaker func = {},
-                                  ThreadPlacement placement = ThreadPlacement::Default)
+                                  ThreadPlacement placement = ThreadPlacement::Default,
+                                  size_t stack_size = 0)
         : workers_queued{num_workers}, thread_name{std::move(name)} {
         const auto lambda = [this, func, placement](std::stop_token stop_token) {
             Common::SetCurrentThreadName(thread_name.c_str());
@@ -94,7 +96,16 @@ public:
         };
         threads.reserve(num_workers);
         for (size_t i = 0; i < num_workers; ++i) {
-            threads.emplace_back(lambda);
+            threads.push_back(StartThreadWithStack(stack_size, lambda));
+        }
+    }
+
+    ~StatefulThreadWorker() {
+        for (auto& thread : threads) {
+            thread.request_stop();
+        }
+        for (auto& thread : threads) {
+            thread.join();
         }
     }
 
@@ -148,7 +159,7 @@ private:
     std::atomic<size_t> workers_stopped{};
     std::atomic<size_t> workers_queued{};
     std::string thread_name;
-    std::vector<std::jthread> threads;
+    std::vector<LargeStackThread> threads;
 };
 
 using ThreadWorker = StatefulThreadWorker<>;

@@ -419,52 +419,8 @@ void AppendWords(u32*& out, const T& value) {
     out += sizeof(T) / sizeof(u32);
 }
 
-constexpr bool IsOcarinaPerformanceScale(Settings::OotResolution r) noexcept {
-    return r == Settings::OotResolution::Percent75;
-}
-
-constexpr bool IsOcarinaPerformanceScale(Settings::DlssQuality q) noexcept {
-    return q == Settings::DlssQuality::Performance;
-}
-
-constexpr bool IsOcarinaPerformanceScale(Settings::OcarinaDlssMode m) noexcept {
-    return m == Settings::OcarinaDlssMode::Performance;
-}
-
-namespace OcarinaPerfScaleSettings {
-using namespace Settings;
-template <typename... Args>
-auto Try(int, Args... args) -> decltype(AppliedOcarinaRenderScale(args...)) {
-    return AppliedOcarinaRenderScale(args...);
-}
-inline std::nullopt_t Try(long) noexcept {
-    return std::nullopt;
-}
-} // namespace OcarinaPerfScaleSettings
-
-namespace OcarinaPerfScaleVideo {
-using namespace VideoCommon;
-template <typename... Args>
-auto Try(int, Args... args) -> decltype(AppliedOcarinaRenderScale(args...)) {
-    return AppliedOcarinaRenderScale(args...);
-}
-inline std::nullopt_t Try(long) noexcept {
-    return std::nullopt;
-}
-} // namespace OcarinaPerfScaleVideo
-
 bool HasAppliedOcarinaPerformanceScale() {
-    if constexpr (!std::is_same_v<decltype(OcarinaPerfScaleSettings::Try(0)), std::nullopt_t>) {
-        if (const auto scale = OcarinaPerfScaleSettings::Try(0)) {
-            return IsOcarinaPerformanceScale(*scale);
-        }
-    }
-    if constexpr (!std::is_same_v<decltype(OcarinaPerfScaleVideo::Try(0)), std::nullopt_t>) {
-        if (const auto scale = OcarinaPerfScaleVideo::Try(0)) {
-            return IsOcarinaPerformanceScale(*scale);
-        }
-    }
-    return false;
+    return Settings::AppliedOcarinaRenderScale() == Settings::DlssQuality::Performance;
 }
 
 template <typename Params>

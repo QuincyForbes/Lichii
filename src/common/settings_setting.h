@@ -9,9 +9,13 @@
 #include <algorithm>
 #include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
+#include <utility>
+#include <vector>
 #include <fmt/ranges.h>
 #include "common/common_types.h"
 #include "common/settings_common.h"
@@ -204,6 +208,16 @@ public:
                 this->SetValue(input == "true");
             } else if constexpr (std::is_same_v<Type, float>) {
                 this->SetValue(std::stof(input));
+            } else if constexpr (std::is_enum_v<Type>) {
+                if (input.front() != '-' && (input.front() < '0' || input.front() > '9')) {
+                    for (const auto& [name, val] : EnumMetadata<Type>::Canonicalizations()) {
+                        if (name == input) {
+                            this->SetValue(val);
+                            return;
+                        }
+                    }
+                }
+                this->SetValue(Type(std::stoll(input)));
             } else {
                 this->SetValue(Type(std::stoll(input)));
             }
@@ -242,6 +256,22 @@ public:
             return EnumMetadata<Type>::Index();
         } else {
             return (std::numeric_limits<u32>::max)();
+        }
+    }
+
+    [[nodiscard]] std::span<const std::pair<std::string_view, u32>> Canonicalizations()
+        const noexcept override final {
+        if constexpr (std::is_enum_v<Type>) {
+            static const auto entries = [] {
+                std::vector<std::pair<std::string_view, u32>> out;
+                for (const auto& [name, val] : EnumMetadata<Type>::Canonicalizations()) {
+                    out.emplace_back(name, static_cast<u32>(val));
+                }
+                return out;
+            }();
+            return entries;
+        } else {
+            return {};
         }
     }
 

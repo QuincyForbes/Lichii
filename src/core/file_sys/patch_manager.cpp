@@ -12,10 +12,14 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <mutex>
 #include <optional>
 #include <span>
 
 #include "common/assert.h"
+#include "common/fs/path_util.h"
+#include "common/game_settings.h"
 #include "common/hex_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -28,9 +32,11 @@
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/ips_layer.h"
+#include "core/file_sys/oot_game_params.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
+#include "core/file_sys/texture_quality.h"
 #include "core/file_sys/vfs/vfs_cached.h"
 #include "core/file_sys/vfs/vfs_layered.h"
 #include "core/file_sys/vfs/vfs_vector.h"
@@ -40,7 +46,6 @@
 #include "core/loader/loader.h"
 #include "core/loader/nso.h"
 #include "core/memory/cheat_engine.h"
-#include "video_core/ocarina_upscale.h"
 
 namespace FileSys {
 namespace {
@@ -72,6 +77,9 @@ struct BuiltinPatch {
     bool (*default_on)() = nullptr;
     /// While this returns true the patch does not apply, whatever the settings say.
     bool (*blocked)() = nullptr;
+    std::string_view blocked_reason{};
+    /// Game-specific setting that turns this Add-Ons patch on while not blocked.
+    bool (*setting_enabled)() = nullptr;
     // Another built-in this one contains; it is skipped once this one is applied.
     std::string_view replaces{};
     BuiltinPatchKind kind = BuiltinPatchKind::Performance;
@@ -86,8 +94,6 @@ struct BuiltinPatch {
 };
 
 constexpr std::string_view ENABLED_PREFIX = "enabled:";
-constexpr u64 OOT_TITLE_ID = 0x0400486024DEC000;
-constexpr std::string_view MAX_RESOLUTION_NAME = "Max Resolution (built-in)";
 
 bool IsListed(const std::vector<std::string>& list, std::string_view name) {
     return std::ranges::find(list, name) != list.end();
@@ -130,6 +136,11 @@ bool OotNoNdsrEnabled() {
 bool TemporalUpscalerReplacesNdsr() {
     switch (Settings::values.upscaler.GetValue()) {
     case Settings::Upscaler::Auto:
+#if defined(__APPLE__)
+        return true;
+#else
+        return false;
+#endif
     case Settings::Upscaler::Fsr3:
     case Settings::Upscaler::Fsr4:
     case Settings::Upscaler::Dlss:
@@ -141,21 +152,17 @@ bool TemporalUpscalerReplacesNdsr() {
     return false;
 }
 
-bool IsMaxResolutionAddonDisabled() {
-    const auto it = Settings::values.disabled_addons.find(OOT_TITLE_ID);
-    return it != Settings::values.disabled_addons.end() &&
-           IsListed(it->second, MAX_RESOLUTION_NAME);
+bool OotNoNdsrSelectedBySetting() {
+    return !TemporalUpscalerReplacesNdsr() &&
+           Settings::values.oot_anti_aliasing.GetValue() == Settings::OotAntiAliasing::NoSharpening;
 }
 
 std::optional<Settings::DlssQuality> DesiredOcarinaQualityScale() {
-    if (IsMaxResolutionAddonDisabled() || !Settings::IsDockedMode()) {
+    if (!Settings::IsDockedMode()) {
         return std::nullopt;
     }
-    bool scale_from_quality = Settings::AmdFsr4Chosen();
 #ifdef EGLANTINE_STREAMLINE
-    scale_from_quality |= Settings::NvidiaDlssChosen();
-#endif
-    if (!scale_from_quality) {
+    if (!Settings::NvidiaDlssChosen()) {
         return std::nullopt;
     }
     const auto quality = Settings::values.nvidia_dlss_quality.GetValue();
@@ -164,6 +171,7 @@ std::optional<Settings::DlssQuality> DesiredOcarinaQualityScale() {
         quality == Settings::DlssQuality::UltraPerformance) {
         return quality;
     }
+#endif
     return std::nullopt;
 }
 
@@ -177,30 +185,6 @@ bool ShouldRecordAppliedRenderScale() {
     }
 #endif
     return Settings::OcarinaFsrChosen() || Settings::MetalFxTemporalChosen();
-}
-
-template <typename Q = Settings::DlssQuality, typename M = Settings::OcarinaDlssMode>
-void SyncSettingsAppliedScale(std::optional<Q> quality) {
-    if constexpr (requires { SetAppliedOcarinaRenderScale(quality); }) {
-        SetAppliedOcarinaRenderScale(quality);
-    } else if constexpr (requires(std::optional<M> m) { SetAppliedOcarinaRenderScale(m); }) {
-        std::optional<M> mode;
-        if (quality) {
-            if (*quality == Q::Balanced) {
-                mode = M::Balanced;
-            } else if (*quality == Q::Performance) {
-                mode = M::Performance;
-            } else if (*quality == Q::UltraPerformance) {
-                mode = M::UltraPerformance;
-            }
-        }
-        SetAppliedOcarinaRenderScale(mode);
-    }
-}
-
-void RecordAppliedOcarinaRenderScale(std::optional<Settings::DlssQuality> quality) {
-    VideoCommon::SetAppliedOcarinaRenderScale(quality);
-    SyncSettingsAppliedScale(quality);
 }
 
 // A third of the docked 2560x1440 is not a whole size: the game pads the scene to 854x480 and
@@ -710,6 +694,8 @@ constexpr std::array BUILTIN_PATCHES{
         .records = OOT_NO_NDSR_RECORDS,
         .default_on = OotNoNdsrEnabled,
         .blocked = TemporalUpscalerReplacesNdsr,
+        .blocked_reason = "Replaced by active temporal upscaler",
+        .setting_enabled = OotNoNdsrSelectedBySetting,
         .kind = BuiltinPatchKind::Image,
         .game = OOT_GAME,
         .description = "Removes the game's own anti-aliasing and sharpening network.",
@@ -793,6 +779,9 @@ BuiltinPatchChoice ChoiceFor(const std::vector<std::string>& disabled, std::stri
 // The game's own choice, then the global setting of the patch's kind, then the platform default.
 BuiltinDecision Decide(const BuiltinPatch& patch, const std::vector<std::string>& disabled) {
     const auto choice = ChoiceFor(disabled, patch.name);
+    if (patch.setting_enabled != nullptr && patch.setting_enabled()) {
+        return {true, BuiltinPatchSource::Game, choice};
+    }
     if (choice != BuiltinPatchChoice::FollowGlobal) {
         return {choice == BuiltinPatchChoice::On, BuiltinPatchSource::Game, choice};
     }
@@ -935,7 +924,74 @@ std::string GetUpdateVersionStringFromSlot(const ContentProvider* provider, u64 
 YUZU_NO_INLINE std::optional<u64> GetParentApplicationId(const ContentProvider* provider, u64 title_id) {
     return provider == nullptr ? std::nullopt : provider->GetParentApplicationId(title_id);
 }
+
+u32 TextureQualityMipDrop() {
+    if (const char* v = std::getenv("EDEN_NX2_TEXTURE_QUALITY");
+        v != nullptr && v[0] >= '0' && v[0] <= '2' && v[1] == '\0') {
+        return static_cast<u32>(v[0] - '0');
+    }
+    return static_cast<u32>(Settings::values.texture_quality.GetValue());
+}
+
+bool TextureQualityArraysEnabled() {
+    const char* v = std::getenv("EDEN_NX2_TQ_ARRAYS");
+    return v != nullptr && v[0] == '1';
+}
+
+std::filesystem::path TextureQualityPlanPath(u64 title_id, std::string_view source_tag,
+                                             u32 levels, bool arrays) {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "texture_quality" /
+           fmt::format("{:016X}-{}-{}{}.bin", title_id, source_tag, levels, arrays ? "a" : "");
+}
+
+std::mutex& PatchedRomFSMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::vector<std::weak_ptr<VfsFile>>& PatchedRomFSRegistry() {
+    static std::vector<std::weak_ptr<VfsFile>> registry;
+    return registry;
+}
+
+bool IsAlreadyPatchedRomFS(const VirtualFile& romfs) {
+    if (romfs == nullptr) {
+        return false;
+    }
+    std::scoped_lock lk{PatchedRomFSMutex()};
+    auto& registry = PatchedRomFSRegistry();
+    std::erase_if(registry, [](const std::weak_ptr<VfsFile>& entry) { return entry.expired(); });
+    return std::ranges::any_of(registry, [&](const std::weak_ptr<VfsFile>& entry) {
+        const auto locked = entry.lock();
+        return locked != nullptr && locked.get() == romfs.get();
+    });
+}
+
+void RememberPatchedRomFS(const VirtualFile& romfs) {
+    if (romfs == nullptr) {
+        return;
+    }
+    std::scoped_lock lk{PatchedRomFSMutex()};
+    auto& registry = PatchedRomFSRegistry();
+    std::erase_if(registry, [](const std::weak_ptr<VfsFile>& entry) { return entry.expired(); });
+    const bool present = std::ranges::any_of(registry, [&](const std::weak_ptr<VfsFile>& entry) {
+        const auto locked = entry.lock();
+        return locked != nullptr && locked.get() == romfs.get();
+    });
+    if (!present) {
+        registry.emplace_back(romfs);
+    }
+}
+
 } // Anonymous namespace
+
+struct PatchManager::UpdateSelection {
+    u64 update_tid{};
+    bool disabled = true;
+    std::optional<u32> enabled_version;
+    VirtualFile versioned_entry;
+    std::vector<Patch> external_patches;
+};
 
 PatchManager::PatchManager(u64 title_id_,
                            const Service::FileSystem::FileSystemController& fs_controller_,
@@ -962,12 +1018,95 @@ VirtualDir PatchManager::GetModificationLoadRoot(bool sdmc) const {
 }
 
 std::vector<std::string> PatchManager::GetDisabledAddons() const {
-    auto disabled = Settings::values.disabled_addons[title_id];
+    std::vector<std::string> disabled;
+    if (const auto it = Settings::values.disabled_addons.find(title_id);
+        it != Settings::values.disabled_addons.end()) {
+        disabled = it->second;
+    }
     if (parent_title_id) {
-        const auto& shared = Settings::values.disabled_addons[*parent_title_id];
-        disabled.insert(disabled.end(), shared.begin(), shared.end());
+        if (const auto it = Settings::values.disabled_addons.find(*parent_title_id);
+            it != Settings::values.disabled_addons.end()) {
+            disabled.insert(disabled.end(), it->second.begin(), it->second.end());
+        }
     }
     return disabled;
+}
+
+PatchManager::UpdateSelection PatchManager::ResolveUpdateSelection(
+    ContentRecordType type, const std::vector<std::string>& disabled) const {
+    UpdateSelection selection{.update_tid = GetUpdateTitleID(title_id)};
+    const auto* content_union = static_cast<const ContentProviderUnion*>(&content_provider);
+
+    bool has_versioned = false;
+    const auto collect_versioned = [&](const auto* provider) {
+        if (provider == nullptr || has_versioned) {
+            return;
+        }
+        const auto versions = provider->ListUpdateVersions(selection.update_tid);
+        if (versions.empty()) {
+            return;
+        }
+        has_versioned = true;
+        for (const auto& entry : versions) {
+            std::string version_str = entry.version_string;
+            if (version_str.empty()) {
+                version_str = FormatTitleVersion(entry.version);
+            }
+            const bool entry_disabled = IsVersionedExternalUpdateDisabled(disabled, entry.version);
+            const bool enable_this = !entry_disabled && !selection.enabled_version.has_value();
+            if (enable_this) {
+                selection.disabled = false;
+                selection.enabled_version = entry.version;
+                selection.versioned_entry =
+                    provider->GetEntryForVersion(selection.update_tid, type, entry.version);
+            }
+            selection.external_patches.push_back({
+                .enabled = enable_this,
+                .name = "Update",
+                .version = std::move(version_str),
+                .type = PatchType::Update,
+                .program_id = title_id,
+                .title_id = selection.update_tid,
+                .source = PatchSource::External,
+                .numeric_version = entry.version,
+            });
+        }
+    };
+
+    if (content_union != nullptr) {
+        collect_versioned(content_union->GetExternalProvider());
+        collect_versioned(static_cast<const ManualContentProvider*>(
+            content_union->GetSlotProvider(ContentProviderUnionSlot::FrontendManual)));
+    }
+
+    const bool nand_disabled = IsListed(disabled, "Update (NAND)");
+    const bool sdmc_disabled = IsListed(disabled, "Update (SDMC)");
+    const bool generic_disabled = IsListed(disabled, "Update");
+
+    if (!has_versioned) {
+        if (!nand_disabled && !sdmc_disabled && !generic_disabled) {
+            selection.disabled = false;
+        }
+    } else if (selection.disabled && content_union != nullptr &&
+               (!nand_disabled || !sdmc_disabled)) {
+        const auto nand_sdmc_entries = content_union->ListEntriesFilterOrigin(
+            std::nullopt, TitleType::Update, type, selection.update_tid);
+        for (const auto& [slot, entry] : nand_sdmc_entries) {
+            (void)entry;
+            if ((slot == ContentProviderUnionSlot::UserNAND ||
+                 slot == ContentProviderUnionSlot::SysNAND) &&
+                !nand_disabled) {
+                selection.disabled = false;
+                break;
+            }
+            if (slot == ContentProviderUnionSlot::SDMC && !sdmc_disabled) {
+                selection.disabled = false;
+                break;
+            }
+        }
+    }
+
+    return selection;
 }
 
 std::string_view BuiltinPatchKindName(BuiltinPatchKind kind) {
@@ -1038,129 +1177,21 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
         return exefs;
 
     const auto disabled = GetDisabledAddons();
-
-    bool update_disabled = true;
-    std::optional<u32> enabled_version;
-    bool checked_external = false;
-    bool checked_manual = false;
-
-    const auto* content_union = static_cast<const ContentProviderUnion*>(&content_provider);
-    const auto update_tid = GetUpdateTitleID(title_id);
-
-    if (content_union) {
-        // First, check ExternalContentProvider
-        const auto* external_provider = content_union->GetExternalProvider();
-        if (external_provider) {
-            const auto update_versions = external_provider->ListUpdateVersions(update_tid);
-
-            if (!update_versions.empty()) {
-                checked_external = true;
-                for (const auto& update_entry : update_versions) {
-                    if (!IsVersionedExternalUpdateDisabled(disabled, update_entry.version)) {
-                        update_disabled = false;
-                        enabled_version = update_entry.version;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Also check ManualContentProvider (for Android)
-        if (!checked_external) {
-            const auto* manual_provider = static_cast<const ManualContentProvider*>(
-                content_union->GetSlotProvider(ContentProviderUnionSlot::FrontendManual));
-            if (manual_provider) {
-                const auto manual_update_versions = manual_provider->ListUpdateVersions(update_tid);
-
-                if (!manual_update_versions.empty()) {
-                    checked_manual = true;
-                    for (const auto& update_entry : manual_update_versions) {
-                        if (!IsVersionedExternalUpdateDisabled(disabled, update_entry.version)) {
-                            update_disabled = false;
-                            enabled_version = update_entry.version;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // check for original NAND style
-    // Check NAND if: no external updates exist, OR all external updates are disabled
-    if (!checked_external && !checked_manual) {
-        // Only enable NAND update if it exists AND is not disabled
-        // We need to check if an update actually exists in the content provider
-        const bool has_nand_update = content_provider.HasEntry(update_tid, ContentRecordType::Program);
-
-        if (has_nand_update) {
-            const bool nand_disabled = std::find(disabled.cbegin(), disabled.cend(), "Update (NAND)") != disabled.cend();
-            const bool sdmc_disabled = std::find(disabled.cbegin(), disabled.cend(), "Update (SDMC)") != disabled.cend();
-            const bool generic_disabled = std::find(disabled.cbegin(), disabled.cend(), "Update") != disabled.cend();
-
-            if (!nand_disabled && !sdmc_disabled && !generic_disabled) {
-                update_disabled = false;
-            }
-        }
-    } else if (update_disabled && content_union) {
-        const bool nand_disabled = std::find(disabled.cbegin(), disabled.cend(), "Update (NAND)") != disabled.cend();
-        const bool sdmc_disabled = std::find(disabled.cbegin(), disabled.cend(), "Update (SDMC)") != disabled.cend();
-
-        if (!nand_disabled || !sdmc_disabled) {
-            const auto nand_sdmc_entries = content_union->ListEntriesFilterOrigin(
-                std::nullopt, TitleType::Update, ContentRecordType::Program, update_tid);
-
-            for (const auto& [slot, entry] : nand_sdmc_entries) {
-                if (slot == ContentProviderUnionSlot::UserNAND ||
-                    slot == ContentProviderUnionSlot::SysNAND) {
-                    if (!nand_disabled) {
-                        update_disabled = false;
-                        break;
-                    }
-                } else if (slot == ContentProviderUnionSlot::SDMC) {
-                    if (!sdmc_disabled) {
-                        update_disabled = false;
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    const auto selection = ResolveUpdateSelection(ContentRecordType::Program, disabled);
 
     // Game Updates
-    std::unique_ptr<NCA> update = nullptr;
-
-    // If we have a specific enabled version from external provider, use it
-    if (enabled_version.has_value() && content_union) {
-        const auto* external_provider = content_union->GetExternalProvider();
-        if (external_provider) {
-            auto file = external_provider->GetEntryForVersion(update_tid, ContentRecordType::Program, *enabled_version);
-            if (file != nullptr) {
-                update = std::make_unique<NCA>(file);
-            }
-        }
-
-        // Also try ManualContentProvider
-        if (update == nullptr) {
-            const auto* manual_provider = static_cast<const ManualContentProvider*>(
-                content_union->GetSlotProvider(ContentProviderUnionSlot::FrontendManual));
-            if (manual_provider) {
-                auto file = manual_provider->GetEntryForVersion(update_tid, ContentRecordType::Program, *enabled_version);
-                if (file != nullptr) {
-                    update = std::make_unique<NCA>(file);
-                }
-            }
-        }
+    std::unique_ptr<NCA> update;
+    if (selection.versioned_entry != nullptr) {
+        update = std::make_unique<NCA>(selection.versioned_entry);
+    }
+    if (update == nullptr && !selection.disabled) {
+        update = content_provider.GetEntry(selection.update_tid, ContentRecordType::Program);
     }
 
-    // Fallback to regular content provider if no external update was loaded
-    if (update == nullptr && !update_disabled) {
-        update = content_provider.GetEntry(update_tid, ContentRecordType::Program);
-    }
-
-    if (!update_disabled && update != nullptr && update->GetExeFS() != nullptr) {
+    if (!selection.disabled && update != nullptr && update->GetExeFS() != nullptr) {
         LOG_INFO(Loader, "    ExeFS: Update ({}) applied successfully",
-                 FormatTitleVersion(content_provider.GetEntryVersion(update_tid).value_or(0)));
+                 FormatTitleVersion(selection.enabled_version.value_or(
+                     content_provider.GetEntryVersion(selection.update_tid).value_or(0))));
         exefs = update->GetExeFS();
     }
 
@@ -1242,7 +1273,7 @@ std::vector<VirtualFile> PatchManager::CollectPatches(const std::vector<VirtualD
 
 std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::string& name) const {
     if (name == "main") {
-        RecordAppliedOcarinaRenderScale(std::nullopt);
+        Settings::SetAppliedOcarinaRenderScale(std::nullopt);
     }
     if (nso.size() < sizeof(Loader::NSOHeader)) {
         return nso;
@@ -1423,7 +1454,7 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             replaced.push_back(patch.replaces);
         }
         if (patch.applied_scale && ShouldRecordAppliedRenderScale()) {
-            RecordAppliedOcarinaRenderScale(patch.applied_scale);
+            Settings::SetAppliedOcarinaRenderScale(patch.applied_scale);
         }
     }
 
@@ -1566,13 +1597,23 @@ void PatchManager::CollectLayers(ContentRecordType type, std::vector<VirtualDir>
     }
 }
 
-void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const {
+void PatchManager::ApplyRomFSPatches(VirtualFile& romfs, ContentRecordType type) const {
+    if (romfs == nullptr || IsAlreadyPatchedRomFS(romfs)) {
+        return;
+    }
+
     std::vector<VirtualDir> layers;
     std::vector<VirtualDir> layers_ext;
     CollectLayers(type, layers, layers_ext);
 
-    // When there are no layers to apply, return early as there is no need to rebuild the RomFS
-    if (layers.empty() && layers_ext.empty()) {
+    const bool is_program = type == ContentRecordType::Program;
+    const u32 mip_drop = is_program ? TextureQualityMipDrop() : 0;
+    const OotGameParams oot_params =
+        is_program && title_id == Settings::OcarinaOfTimeProgramId
+            ? OotGameParamsFor(title_id)
+            : OotGameParams{};
+
+    if (layers.empty() && layers_ext.empty() && mip_drop == 0 && !oot_params.Any()) {
         return;
     }
 
@@ -1580,10 +1621,32 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
     if (extracted == nullptr) {
         return;
     }
+    const auto unpatched_extracted = extracted;
 
-    layers.emplace_back(std::move(extracted));
+    if (mip_drop != 0) {
+        const bool arrays = TextureQualityArraysEnabled();
+        extracted = ApplyTextureQuality(
+            extracted, mip_drop,
+            TextureQualityPlanPath(title_id, fmt::format("{}", romfs->GetSize()), mip_drop, arrays),
+            arrays);
+    }
+    if (oot_params.Any()) {
+        extracted = ApplyOotGameParams(extracted, oot_params);
+    }
 
-    auto layered = LayeredVfsDirectory::MakeLayeredDirectory(std::move(layers));
+    if (layers.empty() && layers_ext.empty() && extracted == unpatched_extracted) {
+        RememberPatchedRomFS(romfs);
+        return;
+    }
+
+    const bool had_layeredfs = !layers.empty() || !layers_ext.empty();
+    VirtualDir layered;
+    if (layers.empty()) {
+        layered = std::move(extracted);
+    } else {
+        layers.emplace_back(std::move(extracted));
+        layered = LayeredVfsDirectory::MakeLayeredDirectory(std::move(layers));
+    }
     auto layered_ext = LayeredVfsDirectory::MakeLayeredDirectory(std::move(layers_ext));
     if (layered == nullptr && layered_ext == nullptr) {
         return;
@@ -1594,16 +1657,34 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
         return;
     }
 
-    LOG_INFO(Loader, "    RomFS: LayeredFS patches applied successfully");
+    if (had_layeredfs) {
+        LOG_INFO(Loader, "    RomFS: LayeredFS patches applied successfully");
+    }
+    RememberPatchedRomFS(packed);
     romfs = std::move(packed);
 }
 
 VirtualFile PatchManager::CreateLayeredRomFS(VirtualDir base, ContentRecordType type) const {
+    if (base == nullptr) {
+        return nullptr;
+    }
     std::vector<VirtualDir> layers;
     std::vector<VirtualDir> layers_ext;
     CollectLayers(type, layers, layers_ext);
-    if (base == nullptr || (layers.empty() && layers_ext.empty())) {
-        return nullptr;
+    // NUP containers wrap their unpacked tree with ApplyTextureQuality and ApplyOotGameParams
+    // right before calling CreateLayeredRomFS; returning a built RomFS here marks IsRomFSLayered()
+    // true so RomFSFactory::OpenCurrentProcess will not unpack and re-apply them via PatchRomFS.
+    const bool already_transformed =
+        type == ContentRecordType::Program &&
+        (TextureQualityMipDrop() != 0 ||
+         (title_id == Settings::OcarinaOfTimeProgramId && OotGameParamsFor(title_id).Any()));
+    if (layers.empty() && layers_ext.empty()) {
+        if (!already_transformed) {
+            return nullptr;
+        }
+        auto packed = CreateRomFS(std::move(base));
+        RememberPatchedRomFS(packed);
+        return packed;
     }
     const auto mods = layers.size() + layers_ext.size();
     layers.emplace_back(std::move(base));
@@ -1612,6 +1693,61 @@ VirtualFile PatchManager::CreateLayeredRomFS(VirtualDir base, ContentRecordType 
     auto packed = CreateRomFS(std::move(layered), std::move(layered_ext));
     if (packed != nullptr) {
         LOG_INFO(Loader, "    RomFS: {} LayeredFS layer(s) applied to the unpacked RomFS", mods);
+        RememberPatchedRomFS(packed);
+    }
+    return packed;
+}
+
+VirtualFile PatchManager::BuildPatchedRomFS(VirtualDir base, ContentRecordType type) const {
+    if (base == nullptr) {
+        return nullptr;
+    }
+    std::vector<VirtualDir> layers;
+    std::vector<VirtualDir> layers_ext;
+    CollectLayers(type, layers, layers_ext);
+
+    const bool is_program = type == ContentRecordType::Program;
+    const u32 mip_drop = is_program ? TextureQualityMipDrop() : 0;
+    const OotGameParams oot_params =
+        is_program && title_id == Settings::OcarinaOfTimeProgramId
+            ? OotGameParamsFor(title_id)
+            : OotGameParams{};
+
+    if (layers.empty() && layers_ext.empty() && mip_drop == 0 && !oot_params.Any()) {
+        return nullptr;
+    }
+
+    const auto unpatched_base = base;
+    if (mip_drop != 0) {
+        const bool arrays = TextureQualityArraysEnabled();
+        base = ApplyTextureQuality(base, mip_drop,
+                                   TextureQualityPlanPath(title_id, "dir", mip_drop, arrays),
+                                   arrays);
+    }
+    if (oot_params.Any()) {
+        base = ApplyOotGameParams(base, oot_params);
+    }
+
+    if (layers.empty() && layers_ext.empty() && base == unpatched_base) {
+        return nullptr;
+    }
+
+    const auto mods = layers.size() + layers_ext.size();
+    VirtualDir layered;
+    if (layers.empty()) {
+        layered = std::move(base);
+    } else {
+        layers.emplace_back(std::move(base));
+        layered = LayeredVfsDirectory::MakeLayeredDirectory(std::move(layers));
+    }
+    auto layered_ext = LayeredVfsDirectory::MakeLayeredDirectory(std::move(layers_ext));
+    auto packed = CreateRomFS(std::move(layered), std::move(layered_ext));
+    if (packed != nullptr) {
+        if (mods != 0) {
+            LOG_INFO(Loader, "    RomFS: {} LayeredFS layer(s) applied to the unpacked RomFS",
+                     mods);
+        }
+        RememberPatchedRomFS(packed);
     }
     return packed;
 }
@@ -1628,106 +1764,28 @@ VirtualFile PatchManager::PatchRomFS(const NCA* base_nca, VirtualFile base_romfs
     }
 
     auto romfs = base_romfs;
+    if (IsAlreadyPatchedRomFS(romfs)) {
+        return romfs;
+    }
 
     // Game Updates
-    const auto update_tid = GetUpdateTitleID(title_id);
     const auto disabled = GetDisabledAddons();
-
-    bool update_disabled = true;
-    std::optional<u32> enabled_version;
-    VirtualFile update_raw = nullptr;
-    bool checked_external = false;
-    bool checked_manual = false;
-
-    const auto* content_union = static_cast<const ContentProviderUnion*>(&content_provider);
-    if (content_union) {
-        // First, check ExternalContentProvider
-        const auto* external_provider = content_union->GetExternalProvider();
-        if (external_provider) {
-            const auto update_versions = external_provider->ListUpdateVersions(update_tid);
-
-            if (!update_versions.empty()) {
-                checked_external = true;
-                for (const auto& update_entry : update_versions) {
-                    if (!IsVersionedExternalUpdateDisabled(disabled, update_entry.version)) {
-                        update_disabled = false;
-                        enabled_version = update_entry.version;
-                        update_raw = external_provider->GetEntryForVersion(update_tid, type, update_entry.version);
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (!checked_external) {
-            const auto* manual_provider = static_cast<const ManualContentProvider*>(
-                content_union->GetSlotProvider(ContentProviderUnionSlot::FrontendManual));
-            if (manual_provider) {
-                const auto manual_update_versions = manual_provider->ListUpdateVersions(update_tid);
-
-                if (!manual_update_versions.empty()) {
-                    checked_manual = true;
-                    for (const auto& update_entry : manual_update_versions) {
-                        if (!IsVersionedExternalUpdateDisabled(disabled, update_entry.version)) {
-                            update_disabled = false;
-                            enabled_version = update_entry.version;
-                            update_raw = manual_provider->GetEntryForVersion(update_tid, type, update_entry.version);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+    const auto selection = ResolveUpdateSelection(type, disabled);
+    VirtualFile update_raw = selection.versioned_entry;
+    if (update_raw == nullptr && !selection.disabled) {
+        update_raw = content_provider.GetEntryRaw(selection.update_tid, type);
     }
 
-    if (!checked_external && !checked_manual) {
-        const bool nand_disabled = std::find(disabled.cbegin(), disabled.cend(), "Update (NAND)") != disabled.cend();
-        const bool sdmc_disabled = std::find(disabled.cbegin(), disabled.cend(), "Update (SDMC)") != disabled.cend();
-        const bool generic_disabled = std::find(disabled.cbegin(), disabled.cend(), "Update") != disabled.cend();
-
-        if (!nand_disabled && !sdmc_disabled && !generic_disabled) {
-            update_disabled = false;
-        }
-        if (!update_disabled) {
-            update_raw = content_provider.GetEntryRaw(update_tid, type);
-        }
-    } else if (update_disabled && content_union) {
-        const bool nand_disabled = std::find(disabled.cbegin(), disabled.cend(), "Update (NAND)") != disabled.cend();
-        const bool sdmc_disabled = std::find(disabled.cbegin(), disabled.cend(), "Update (SDMC)") != disabled.cend();
-
-        if (!nand_disabled || !sdmc_disabled) {
-            const auto nand_sdmc_entries = content_union->ListEntriesFilterOrigin(
-                std::nullopt, TitleType::Update, type, update_tid);
-
-            for (const auto& [slot, entry] : nand_sdmc_entries) {
-                if (slot == ContentProviderUnionSlot::UserNAND ||
-                    slot == ContentProviderUnionSlot::SysNAND) {
-                    if (!nand_disabled) {
-                        update_disabled = false;
-                        update_raw = content_provider.GetEntryRaw(update_tid, type);
-                        break;
-                    }
-                } else if (slot == ContentProviderUnionSlot::SDMC) {
-                    if (!sdmc_disabled) {
-                        update_disabled = false;
-                        update_raw = content_provider.GetEntryRaw(update_tid, type);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if (!update_disabled && update_raw != nullptr && base_nca != nullptr) {
+    if (!selection.disabled && update_raw != nullptr && base_nca != nullptr) {
         const auto new_nca = std::make_shared<NCA>(update_raw, base_nca);
         if (new_nca->GetStatus() == Loader::ResultStatus::Success &&
             new_nca->GetRomFS() != nullptr) {
             LOG_INFO(Loader, "    RomFS: Update ({}) applied successfully",
-                     enabled_version.has_value() ? FormatTitleVersion(*enabled_version) :
-                     FormatTitleVersion(content_provider.GetEntryVersion(update_tid).value_or(0)));
+                     FormatTitleVersion(selection.enabled_version.value_or(
+                         content_provider.GetEntryVersion(selection.update_tid).value_or(0))));
             romfs = new_nca->GetRomFS();
         }
-    } else if (!update_disabled && packed_update_raw != nullptr && base_nca != nullptr) {
+    } else if (!selection.disabled && packed_update_raw != nullptr && base_nca != nullptr) {
         const auto new_nca = std::make_shared<NCA>(packed_update_raw, base_nca);
         if (new_nca->GetStatus() == Loader::ResultStatus::Success &&
             new_nca->GetRomFS() != nullptr) {
@@ -1736,12 +1794,61 @@ VirtualFile PatchManager::PatchRomFS(const NCA* base_nca, VirtualFile base_romfs
         }
     }
 
-    // LayeredFS
     if (apply_layeredfs) {
-        ApplyLayeredFS(romfs, type);
+        ApplyRomFSPatches(romfs, type);
     }
 
     return romfs;
+}
+
+std::vector<Patch> PatchManager::GetBuiltinPatches() const {
+    if (title_id == 0) {
+        return {};
+    }
+    std::vector<Patch> out;
+    const auto builtin_disabled = GetDisabledAddons();
+    for (const auto& patch : BUILTIN_PATCHES) {
+        if (patch.title_id != title_id || patch.chosen) {
+            continue;
+        }
+        const auto decision = Decide(patch, builtin_disabled);
+        const bool is_blocked = patch.blocked != nullptr && patch.blocked();
+        // Name an enabled built-in that contains this one, so unchecking only this one is not
+        // mistaken for turning the change off. Whether it applies is only known in PatchNSO (a
+        // user mod can make it skip), hence "when it applies".
+        const auto replacing = std::ranges::find_if(BUILTIN_PATCHES, [&](const BuiltinPatch& other) {
+            return other.title_id == title_id && other.replaces == patch.name &&
+                   Decide(other, builtin_disabled).enabled &&
+                   (other.blocked == nullptr || !other.blocked());
+        });
+        const bool included = replacing != BUILTIN_PATCHES.end();
+        const bool resolved_enabled = decision.enabled && !is_blocked;
+        out.push_back({.enabled = resolved_enabled,
+                       .name = std::string{patch.name},
+                       .version = included ? fmt::format("IPS, replaced by {} when it applies",
+                                                         replacing->name)
+                                           : std::string{"IPS"},
+                       .type = PatchType::Mod,
+                       .program_id = title_id,
+                       .title_id = title_id,
+                       .source = PatchSource::Unknown,
+                       .builtin = BuiltinPatchInfo{
+                           .kind = patch.kind,
+                           .game = std::string{patch.game},
+                           .description = std::string{patch.description},
+                           .effect = std::string{patch.effect},
+                           .choice = decision.choice,
+                           .source = decision.source,
+                           .resolved_enabled = resolved_enabled,
+                           .included_in = included ? std::string{replacing->name} : std::string{},
+                           .blocked_reason =
+                               is_blocked ? std::string{patch.blocked_reason.empty()
+                                                            ? "Replaced by active setting"
+                                                            : patch.blocked_reason}
+                                          : std::string{},
+                       }});
+    }
+    return out;
 }
 
 std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
@@ -1750,88 +1857,18 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     std::vector<Patch> out;
-    const auto& disabled = Settings::values.disabled_addons[title_id];
+    const auto disabled = GetDisabledAddons();
 
     // Game Updates
-    const auto update_tid = GetUpdateTitleID(title_id);
-
-    std::vector<Patch> external_update_patches;
-
+    const auto selection = ResolveUpdateSelection(ContentRecordType::Program, disabled);
+    const auto update_tid = selection.update_tid;
     const auto* content_union = static_cast<const ContentProviderUnion*>(&content_provider);
 
-    if (content_union) {
-        // First, check ExternalContentProvider for updates
-        const auto* external_provider = content_union->GetExternalProvider();
-        if (external_provider) {
-            const auto update_versions = external_provider->ListUpdateVersions(update_tid);
+    for (const auto& patch : selection.external_patches) {
+        out.push_back(patch);
+    }
 
-            for (const auto& update_entry : update_versions) {
-                std::string version_str = update_entry.version_string;
-                if (version_str.empty()) {
-                    version_str = FormatTitleVersion(update_entry.version);
-                }
-
-                const auto update_disabled =
-                    IsVersionedExternalUpdateDisabled(disabled, update_entry.version);
-
-                Patch update_patch = {.enabled = !update_disabled,
-                                      .name = "Update",
-                                      .version = version_str,
-                                      .type = PatchType::Update,
-                                      .program_id = title_id,
-                                      .title_id = update_tid,
-                                      .source = PatchSource::External,
-                                      .numeric_version = update_entry.version};
-
-                external_update_patches.push_back(update_patch);
-            }
-        }
-
-        const auto* manual_provider = static_cast<const ManualContentProvider*>(
-            content_union->GetSlotProvider(ContentProviderUnionSlot::FrontendManual));
-        if (manual_provider && external_update_patches.empty()) {
-            const auto manual_update_versions = manual_provider->ListUpdateVersions(update_tid);
-
-            for (const auto& update_entry : manual_update_versions) {
-                std::string version_str = update_entry.version_string;
-                if (version_str.empty()) {
-                    version_str = FormatTitleVersion(update_entry.version);
-                }
-
-                const auto update_disabled =
-                    IsVersionedExternalUpdateDisabled(disabled, update_entry.version);
-
-
-                Patch update_patch = {.enabled = !update_disabled,
-                                      .name = "Update",
-                                      .version = version_str,
-                                      .type = PatchType::Update,
-                                      .program_id = title_id,
-                                      .title_id = update_tid,
-                                      .source = PatchSource::External,
-                                      .numeric_version = update_entry.version};
-
-                external_update_patches.push_back(update_patch);
-            }
-        }
-
-        if (external_update_patches.size() > 1) {
-            bool found_enabled = false;
-            for (auto& patch : external_update_patches) {
-                if (patch.enabled) {
-                    if (found_enabled) {
-                        patch.enabled = false;
-                    } else {
-                        found_enabled = true;
-                    }
-                }
-            }
-        }
-
-        for (auto& patch : external_update_patches) {
-            out.push_back(std::move(patch));
-        }
-
+    if (content_union != nullptr) {
         const auto all_updates = content_union->ListEntriesFilterOrigin(
             std::nullopt, std::nullopt, ContentRecordType::Program, update_tid);
 
@@ -1846,17 +1883,17 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
             std::string source_suffix;
 
             switch (slot) {
-                case ContentProviderUnionSlot::UserNAND:
-                case ContentProviderUnionSlot::SysNAND:
-                    source_type = PatchSource::NAND;
-                    source_suffix = " (NAND)";
-                    break;
-                case ContentProviderUnionSlot::SDMC:
-                    source_type = PatchSource::SDMC;
-                    source_suffix = " (SDMC)";
-                    break;
-                default:
-                    break;
+            case ContentProviderUnionSlot::UserNAND:
+            case ContentProviderUnionSlot::SysNAND:
+                source_type = PatchSource::NAND;
+                source_suffix = " (NAND)";
+                break;
+            case ContentProviderUnionSlot::SDMC:
+                source_type = PatchSource::SDMC;
+                source_suffix = " (SDMC)";
+                break;
+            default:
+                break;
             }
 
             std::string version_str;
@@ -1875,56 +1912,29 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
             }
 
             std::string patch_name = "Update" + source_suffix;
+            const bool update_disabled =
+                IsListed(disabled, patch_name) || IsListed(disabled, "Update");
 
-            bool update_disabled =
-                std::find(disabled.cbegin(), disabled.cend(), patch_name) != disabled.cend();
-
-            Patch update_patch = {.enabled = !update_disabled,
-                                  .name = patch_name,
-                                  .version = version_str,
-                                  .type = PatchType::Update,
-                                  .program_id = title_id,
-                                  .title_id = update_tid,
-                                  .source = source_type,
-                                  .numeric_version = numeric_ver};
-
-            out.push_back(update_patch);
+            out.push_back({.enabled = !update_disabled,
+                           .name = std::move(patch_name),
+                           .version = std::move(version_str),
+                           .type = PatchType::Update,
+                           .program_id = title_id,
+                           .title_id = update_tid,
+                           .source = source_type,
+                           .numeric_version = numeric_ver});
         }
-    } else {
-        PatchManager update{update_tid, fs_controller, content_provider};
-        const auto metadata = update.GetControlMetadata();
-        const auto& nacp = metadata.first;
+    }
 
-        bool update_disabled =
-            std::find(disabled.cbegin(), disabled.cend(), "Update") != disabled.cend();
-        Patch update_patch = {.enabled = !update_disabled,
-                              .name = "Update",
-                              .version = "",
-                              .type = PatchType::Update,
-                              .program_id = title_id,
-                              .title_id = title_id,
-                              .source = PatchSource::Unknown,
-                              .numeric_version = 0};
-
-        if (nacp != nullptr) {
-            update_patch.version = nacp->GetVersionString();
-            out.push_back(update_patch);
-        } else {
-            if (content_provider.HasEntry(update_tid, ContentRecordType::Program)) {
-                const auto meta_ver = content_provider.GetEntryVersion(update_tid);
-                if (meta_ver.value_or(0) == 0) {
-                    out.push_back(update_patch);
-                } else {
-                    update_patch.version = FormatTitleVersion(*meta_ver);
-                    update_patch.numeric_version = *meta_ver;
-                    out.push_back(update_patch);
-                }
-            } else if (update_raw != nullptr) {
-                update_patch.version = "PACKED";
-                update_patch.source = PatchSource::Packed;
-                out.push_back(update_patch);
-            }
-        }
+    if (out.empty() && update_raw != nullptr) {
+        out.push_back({.enabled = !IsListed(disabled, "Update"),
+                       .name = "Update",
+                       .version = "PACKED",
+                       .type = PatchType::Update,
+                       .program_id = title_id,
+                       .title_id = title_id,
+                       .source = PatchSource::Packed,
+                       .numeric_version = 0});
     }
 
     // General Mods (LayeredFS and IPS)
@@ -2020,41 +2030,9 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
         }
     }
 
-    for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id || patch.chosen) {
-            continue;
-        }
-        const auto builtin_disabled = GetDisabledAddons();
-        const auto decision = Decide(patch, builtin_disabled);
-        // Name an enabled built-in that contains this one, so unchecking only this one is not
-        // mistaken for turning the change off. Whether it applies is only known in PatchNSO (a
-        // user mod can make it skip), hence "when it applies".
-        const auto replacing = std::ranges::find_if(BUILTIN_PATCHES, [&](const BuiltinPatch& other) {
-            return other.title_id == title_id && other.replaces == patch.name &&
-                   Decide(other, builtin_disabled).enabled &&
-                   (other.blocked == nullptr || !other.blocked());
-        });
-        const bool included = replacing != BUILTIN_PATCHES.end();
-        out.push_back({.enabled = decision.enabled && !(patch.blocked && patch.blocked()),
-                       .name = std::string{patch.name},
-                       .version = included ? fmt::format("IPS, replaced by {} when it applies",
-                                                         replacing->name)
-                                           : std::string{"IPS"},
-                       .type = PatchType::Mod,
-                       .program_id = title_id,
-                       .title_id = title_id,
-                       .source = PatchSource::Unknown,
-                       .builtin = BuiltinPatchInfo{
-                           .kind = patch.kind,
-                           .game = std::string{patch.game},
-                           .description = std::string{patch.description},
-                           .effect = std::string{patch.effect},
-                           .choice = decision.choice,
-                           .source = decision.source,
-                           .resolved_enabled = decision.enabled,
-                           .included_in = included ? std::string{replacing->name} : std::string{},
-                       }});
-    }
+    auto builtins = GetBuiltinPatches();
+    out.insert(out.end(), std::make_move_iterator(builtins.begin()),
+               std::make_move_iterator(builtins.end()));
 
     // DLC
     std::vector<ContentProviderEntry> dlc_match;

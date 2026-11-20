@@ -155,6 +155,8 @@ enum ContentBridge {
         let resolvedEnabled: Bool
         /// An enabled built-in patch that contains this one; empty when none.
         let includedIn: String
+        /// Why this patch is currently blocked from applying; empty when not blocked.
+        let blockedReason: String
 
         var followsGlobal: Bool { choice == "global" }
     }

@@ -36,10 +36,25 @@ enum QuickSettings {
         return ""
     }
 
+    /// Numeric value string ("3") for a canonical enum name ("MetalFx"), falling back to `canonical`.
+    static func choiceValue(_ key: String, canonical: String) -> String {
+        if let match = UiText.choices(for: key).first(where: { $0.canonical == canonical }) {
+            return match.value
+        }
+        if let info = info(key) {
+            for index in 0..<info.enum_count where
+                Bridge.constant(key.withCString { lichii_settings_enum_name($0, index) }) == canonical {
+                return String(key.withCString { lichii_settings_enum_value($0, index) })
+            }
+        }
+        return canonical
+    }
+
     /// Sets and saves to the per-game or the global config, wherever the value comes from; a
     /// running game picks up runtime-modifiable values at once.
     static func set(_ key: String, _ value: String) {
         _ = key.withCString { k in value.withCString { v in lichii_settings_set_effective(k, v) } }
+        PlatformCenter.shared.bumpSettings()
     }
 
     static func set(_ key: String, _ value: Bool) {

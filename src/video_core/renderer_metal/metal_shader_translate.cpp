@@ -8,6 +8,7 @@
 #include <optional>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <spirv_msl.hpp>
@@ -274,12 +275,901 @@ bool DeviceMslEnabled() {
 
 namespace {
 Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Options& options);
+[[nodiscard]] std::string_view Trim(std::string_view text);
 
-/// The deepest nesting of (), [] and {} in `source` (what Metal's parser limits to 256).
-[[nodiscard]] u32 MaxBracketNesting(std::string_view source) {
+[[nodiscard]] bool IsIdentStart(char c) noexcept {
+    return std::isalpha(static_cast<unsigned char>(c)) != 0 || c == '_';
+}
+
+[[nodiscard]] bool IsIdentCont(char c) noexcept {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+}
+
+[[nodiscard]] size_t SkipCommentOrLiteral(std::string_view src, size_t i) noexcept {
+    const size_t n = src.size();
+    if (i + 1 < n && src[i] == '/' && src[i + 1] == '/') {
+        i += 2;
+        while (i < n && src[i] != '\n') {
+            ++i;
+        }
+        return i;
+    }
+    if (i + 1 < n && src[i] == '/' && src[i + 1] == '*') {
+        i += 2;
+        while (i + 1 < n && !(src[i] == '*' && src[i + 1] == '/')) {
+            ++i;
+        }
+        return i + 1 < n ? i + 2 : n;
+    }
+    if (src[i] == '"' || src[i] == '\'') {
+        const char quote = src[i++];
+        while (i < n && src[i] != quote) {
+            i += (src[i] == '\\' && i + 1 < n) ? 2 : 1;
+        }
+        return i < n ? i + 1 : n;
+    }
+    return i;
+}
+
+[[nodiscard]] size_t SkipTrivia(std::string_view src, size_t i, size_t limit) noexcept {
+    while (i < limit) {
+        if (std::isspace(static_cast<unsigned char>(src[i])) != 0) {
+            ++i;
+            continue;
+        }
+        if (i + 1 < limit && src[i] == '/' && (src[i + 1] == '/' || src[i + 1] == '*')) {
+            i = (std::min)(SkipCommentOrLiteral(src, i), limit);
+            continue;
+        }
+        break;
+    }
+    return i;
+}
+
+[[nodiscard]] size_t SkipPureWs(std::string_view src, size_t i, size_t limit) noexcept {
+    while (i < limit && std::isspace(static_cast<unsigned char>(src[i])) != 0) {
+        ++i;
+    }
+    return i;
+}
+
+[[nodiscard]] bool MatchKeyword(std::string_view src, size_t pos, std::string_view kw) noexcept {
+    if (pos + kw.size() > src.size() || src.substr(pos, kw.size()) != kw) {
+        return false;
+    }
+    if (pos != 0 && IsIdentCont(src[pos - 1])) {
+        return false;
+    }
+    if (pos + kw.size() < src.size() && IsIdentCont(src[pos + kw.size()])) {
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool IsPrecededByMemberAccess(std::string_view src, size_t floor_pos,
+                                            size_t ident_pos) noexcept {
+    while (ident_pos > floor_pos &&
+           std::isspace(static_cast<unsigned char>(src[ident_pos - 1])) != 0) {
+        --ident_pos;
+    }
+    if (ident_pos <= floor_pos) {
+        return false;
+    }
+    if (src[ident_pos - 1] == '.') {
+        return true;
+    }
+    return ident_pos >= floor_pos + 2 && src[ident_pos - 2] == '-' && src[ident_pos - 1] == '>';
+}
+
+[[nodiscard]] bool IsPrecededByElse(std::string_view src, size_t if_pos) noexcept {
+    while (if_pos > 0 && std::isspace(static_cast<unsigned char>(src[if_pos - 1])) != 0) {
+        --if_pos;
+    }
+    return if_pos >= 4 && MatchKeyword(src, if_pos - 4, "else");
+}
+
+[[nodiscard]] bool IsControlKeyword(std::string_view tok) noexcept {
+    return tok == "return" || tok == "break" || tok == "continue" || tok == "discard_fragment" ||
+           tok == "if" || tok == "else" || tok == "for" || tok == "while" || tok == "do" ||
+           tok == "switch" || tok == "case" || tok == "default" || tok == "goto" ||
+           tok == "typedef" || tok == "using" || tok == "static_assert";
+}
+
+[[nodiscard]] std::vector<u32> BuildBracketMatch(std::string_view src) {
+    if (src.size() >= ~0U) {
+        return {};
+    }
+    std::vector<u32> match(src.size(), ~0U);
+    std::vector<std::pair<char, u32>> stack;
+    stack.reserve(256);
+    for (size_t i = 0; i < src.size();) {
+        const size_t skipped = SkipCommentOrLiteral(src, i);
+        if (skipped != i) {
+            i = skipped;
+            continue;
+        }
+        const char c = src[i];
+        if (c == '(' || c == '[' || c == '{') {
+            stack.emplace_back(c, static_cast<u32>(i));
+        } else if (c == ')' || c == ']' || c == '}') {
+            const char want = c == ')' ? '(' : c == ']' ? '[' : '{';
+            if (stack.empty() || stack.back().first != want) {
+                return {};
+            }
+            const u32 open = stack.back().second;
+            stack.pop_back();
+            match[open] = static_cast<u32>(i);
+            match[i] = open;
+        }
+        ++i;
+    }
+    if (!stack.empty()) {
+        return {};
+    }
+    return match;
+}
+
+[[nodiscard]] std::vector<u32> BuildIfStmtEnds(std::string_view src,
+                                               const std::vector<u32>& match) {
+    std::vector<u32> if_end(src.size(), ~0U);
+    std::vector<u32> if_positions;
+    if_positions.reserve(256);
+    for (size_t i = 0; i < src.size();) {
+        const size_t skipped = SkipCommentOrLiteral(src, i);
+        if (skipped != i) {
+            i = skipped;
+            continue;
+        }
+        if (IsIdentStart(src[i])) {
+            size_t end = i + 1;
+            while (end < src.size() && IsIdentCont(src[end])) {
+                ++end;
+            }
+            if (end - i == 2 && src[i] == 'i' && src[i + 1] == 'f' &&
+                !IsPrecededByMemberAccess(src, 0, i)) {
+                if_positions.push_back(static_cast<u32>(i));
+            }
+            i = end;
+            continue;
+        }
+        ++i;
+    }
+    for (size_t idx = if_positions.size(); idx-- > 0;) {
+        const u32 pos = if_positions[idx];
+        const size_t cond_open = SkipTrivia(src, pos + 2, src.size());
+        if (cond_open >= src.size() || src[cond_open] != '(') {
+            continue;
+        }
+        const u32 cond_close = match[cond_open];
+        const size_t then_open = SkipTrivia(src, size_t{cond_close} + 1, src.size());
+        if (then_open >= src.size() || src[then_open] != '{') {
+            continue;
+        }
+        const u32 then_close = match[then_open];
+        const size_t after_then = SkipTrivia(src, size_t{then_close} + 1, src.size());
+        if (MatchKeyword(src, after_then, "else")) {
+            const size_t after_else = SkipTrivia(src, after_then + 4, src.size());
+            if (after_else < src.size() && src[after_else] == '{') {
+                if_end[pos] = match[after_else] + 1;
+            } else if (MatchKeyword(src, after_else, "if") && if_end[after_else] != ~0U) {
+                if_end[pos] = if_end[after_else];
+            }
+        } else {
+            if_end[pos] = then_close + 1;
+        }
+    }
+    return if_end;
+}
+
+/// Pass (a): collapses `else { if (cond) { ... } [else ...] }` into `else if (cond) { ... }` in O(N).
+bool CollapseElseIfChains(std::string& source) {
+    const std::string_view src{source};
+    const std::vector<u32> match = BuildBracketMatch(src);
+    if (match.empty()) {
+        return false;
+    }
+    const std::vector<u32> if_end = BuildIfStmtEnds(src, match);
+    struct SpanEdit {
+        size_t begin;
+        size_t end;
+        std::string_view replacement;
+    };
+    std::vector<SpanEdit> edits;
+    for (size_t i = 0; i < src.size();) {
+        const size_t skipped = SkipCommentOrLiteral(src, i);
+        if (skipped != i) {
+            i = skipped;
+            continue;
+        }
+        if (IsIdentStart(src[i])) {
+            size_t end = i + 1;
+            while (end < src.size() && IsIdentCont(src[end])) {
+                ++end;
+            }
+            if (end - i == 4 && src.substr(i, 4) == "else" &&
+                !IsPrecededByMemberAccess(src, 0, i)) {
+                const size_t else_open = SkipPureWs(src, end, src.size());
+                if (else_open < src.size() && src[else_open] == '{') {
+                    const u32 else_close = match[else_open];
+                    const size_t inner_if = SkipPureWs(src, else_open + 1, else_close);
+                    if (MatchKeyword(src, inner_if, "if") && if_end[inner_if] != ~0U) {
+                        const size_t after_inner =
+                            SkipPureWs(src, if_end[inner_if], size_t{else_close} + 1);
+                        const size_t next_after_close =
+                            SkipTrivia(src, size_t{else_close} + 1, src.size());
+                        if (after_inner == else_close &&
+                            !MatchKeyword(src, next_after_close, "else")) {
+                            edits.push_back({end, inner_if, " "});
+                            edits.push_back({if_end[inner_if], size_t{else_close} + 1, ""});
+                        }
+                    }
+                }
+            }
+            i = end;
+            continue;
+        }
+        ++i;
+    }
+    if (edits.empty()) {
+        return false;
+    }
+    std::ranges::sort(edits, {}, &SpanEdit::begin);
+    for (size_t k = 1; k < edits.size(); ++k) {
+        if (edits[k - 1].end > edits[k].begin) {
+            return false;
+        }
+    }
+    std::string out;
+    out.reserve(src.size());
+    size_t cursor = 0;
+    for (const SpanEdit& edit : edits) {
+        out.append(src.substr(cursor, edit.begin - cursor));
+        out.append(edit.replacement);
+        cursor = edit.end;
+    }
+    out.append(src.substr(cursor));
+    source = std::move(out);
+    return true;
+}
+
+[[nodiscard]] bool HasUnenclosedBreakOrContinue(std::string_view src,
+                                                const std::vector<u32>& match, size_t begin,
+                                                size_t end, bool inside_switch = false) {
+    for (size_t i = begin; i < end;) {
+        const size_t skipped = SkipCommentOrLiteral(src, i);
+        if (skipped != i) {
+            i = skipped;
+            continue;
+        }
+        if (IsIdentStart(src[i])) {
+            size_t tok_end = i + 1;
+            while (tok_end < end && IsIdentCont(src[tok_end])) {
+                ++tok_end;
+            }
+            const std::string_view tok = src.substr(i, tok_end - i);
+            if (!IsPrecededByMemberAccess(src, begin, i)) {
+                if (tok == "continue") {
+                    return true;
+                }
+                if (tok == "break" && !inside_switch) {
+                    return true;
+                }
+                if (tok == "for" || tok == "while") {
+                    const size_t open_p = SkipTrivia(src, tok_end, end);
+                    if (open_p < end && src[open_p] == '(' && match[open_p] < end) {
+                        const size_t body = SkipTrivia(src, size_t{match[open_p]} + 1, end);
+                        if (body < end && src[body] == '{' && match[body] < end) {
+                            i = size_t{match[body]} + 1;
+                            continue;
+                        }
+                    }
+                } else if (tok == "do") {
+                    const size_t body = SkipTrivia(src, tok_end, end);
+                    if (body < end && src[body] == '{' && match[body] < end) {
+                        i = size_t{match[body]} + 1;
+                        continue;
+                    }
+                } else if (tok == "switch") {
+                    const size_t open_p = SkipTrivia(src, tok_end, end);
+                    if (open_p < end && src[open_p] == '(' && match[open_p] < end) {
+                        const size_t body = SkipTrivia(src, size_t{match[open_p]} + 1, end);
+                        if (body < end && src[body] == '{' && match[body] < end) {
+                            if (HasUnenclosedBreakOrContinue(src, match, body + 1, match[body],
+                                                             true)) {
+                                return true;
+                            }
+                            i = size_t{match[body]} + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            i = tok_end;
+            continue;
+        }
+        ++i;
+    }
+    return false;
+}
+
+void AppendWithRenames(std::string& out, std::string_view text,
+                       const std::unordered_map<std::string_view, std::string_view>& renames) {
+    if (renames.empty()) {
+        out.append(text);
+        return;
+    }
+    for (size_t i = 0; i < text.size();) {
+        const size_t skipped = SkipCommentOrLiteral(text, i);
+        if (skipped != i) {
+            out.append(text.substr(i, skipped - i));
+            i = skipped;
+            continue;
+        }
+        if (IsIdentStart(text[i])) {
+            size_t end = i + 1;
+            while (end < text.size() && IsIdentCont(text[end])) {
+                ++end;
+            }
+            const std::string_view tok = text.substr(i, end - i);
+            if (!IsPrecededByMemberAccess(text, 0, i)) {
+                if (const auto it = renames.find(tok); it != renames.end()) {
+                    out.append(it->second);
+                    i = end;
+                    continue;
+                }
+            }
+            out.append(tok);
+            i = end;
+            continue;
+        }
+        out.push_back(text[i++]);
+    }
+}
+
+void EnsureTrailingNewline(std::string& out) {
+    if (!out.empty() && out.back() != '\n') {
+        out.push_back('\n');
+    }
+}
+
+enum class TopStmtKind : u8 { If, Decl, AssignCopy, Other };
+
+struct TopStmt {
+    TopStmtKind kind{TopStmtKind::Other};
+    size_t begin{};
+    size_t end{};
+    // If
+    std::string_view cond;
+    u32 then_open{};
+    u32 then_close{};
+    bool has_else{};
+    std::string_view else_body;
+    size_t else_begin{};
+    size_t else_end{};
+    // Decl: `<type> <decl_var>;`
+    std::string_view decl_var;
+    u32 decl_var_pos{};
+    // AssignCopy: `<lhs> = <rhs>;`
+    std::string_view lhs;
+    u32 lhs_pos{};
+    std::string_view rhs;
+    // Other: any variables declared at top level of this statement
+    std::vector<std::string_view> declared_vars;
+};
+
+[[nodiscard]] bool ParseIfHeader(std::string_view src, const std::vector<u32>& match,
+                                 const std::vector<u32>& if_end, size_t if_pos, TopStmt& out) {
+    if (if_pos >= src.size() || if_end[if_pos] == ~0U) {
+        return false;
+    }
+    const size_t cond_open = SkipTrivia(src, if_pos + 2, src.size());
+    if (cond_open >= src.size() || src[cond_open] != '(') {
+        return false;
+    }
+    const u32 cond_close = match[cond_open];
+    const size_t then_open = SkipTrivia(src, size_t{cond_close} + 1, src.size());
+    if (then_open >= src.size() || src[then_open] != '{') {
+        return false;
+    }
+    const u32 then_close = match[then_open];
+    out.kind = TopStmtKind::If;
+    out.begin = if_pos;
+    out.end = if_end[if_pos];
+    out.cond = src.substr(cond_open + 1, cond_close - cond_open - 1);
+    out.then_open = static_cast<u32>(then_open);
+    out.then_close = then_close;
+    const size_t after_then = SkipTrivia(src, size_t{then_close} + 1, out.end);
+    if (MatchKeyword(src, after_then, "else")) {
+        out.has_else = true;
+        const size_t after_else = SkipTrivia(src, after_then + 4, out.end);
+        if (after_else < out.end && src[after_else] == '{') {
+            const u32 else_close = match[after_else];
+            out.else_begin = after_else + 1;
+            out.else_end = else_close;
+            out.else_body = src.substr(out.else_begin, out.else_end - out.else_begin);
+        } else {
+            out.else_begin = after_else;
+            out.else_end = out.end;
+            out.else_body = src.substr(out.else_begin, out.else_end - out.else_begin);
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool ParseTopStmts(std::string_view src, const std::vector<u32>& match,
+                                 const std::vector<u32>& if_end, size_t body_begin,
+                                 size_t body_end, std::vector<TopStmt>& stmts) {
+    stmts.clear();
+    size_t pos = body_begin;
+    while (pos < body_end) {
+        const size_t cur = SkipTrivia(src, pos, body_end);
+        if (cur >= body_end) {
+            break;
+        }
+        if (src[cur] == '#') {
+            return false;
+        }
+        if (src[cur] == ';') {
+            pos = cur + 1;
+            continue;
+        }
+        if (MatchKeyword(src, cur, "if")) {
+            TopStmt stmt{};
+            if (!ParseIfHeader(src, match, if_end, cur, stmt) || stmt.end > body_end) {
+                return false;
+            }
+            pos = stmt.end;
+            stmts.push_back(std::move(stmt));
+            continue;
+        }
+        if (MatchKeyword(src, cur, "for") || MatchKeyword(src, cur, "while") ||
+            MatchKeyword(src, cur, "switch")) {
+            const size_t kw_len = src[cur] == 'f' ? 3 : (src[cur] == 'w' ? 5 : 6);
+            const size_t open_p = SkipTrivia(src, cur + kw_len, body_end);
+            if (open_p >= body_end || src[open_p] != '(' || match[open_p] >= body_end) {
+                return false;
+            }
+            const size_t body = SkipTrivia(src, size_t{match[open_p]} + 1, body_end);
+            if (body >= body_end || src[body] != '{' || match[body] >= body_end) {
+                return false;
+            }
+            const size_t end = size_t{match[body]} + 1;
+            stmts.push_back(TopStmt{.kind = TopStmtKind::Other, .begin = cur, .end = end});
+            pos = end;
+            continue;
+        }
+        if (MatchKeyword(src, cur, "do")) {
+            const size_t body = SkipTrivia(src, cur + 2, body_end);
+            if (body >= body_end || src[body] != '{' || match[body] >= body_end) {
+                return false;
+            }
+            const size_t while_kw = SkipTrivia(src, size_t{match[body]} + 1, body_end);
+            if (!MatchKeyword(src, while_kw, "while")) {
+                return false;
+            }
+            const size_t open_p = SkipTrivia(src, while_kw + 5, body_end);
+            if (open_p >= body_end || src[open_p] != '(' || match[open_p] >= body_end) {
+                return false;
+            }
+            const size_t semi = SkipTrivia(src, size_t{match[open_p]} + 1, body_end);
+            if (semi >= body_end || src[semi] != ';') {
+                return false;
+            }
+            stmts.push_back(TopStmt{.kind = TopStmtKind::Other, .begin = cur, .end = semi + 1});
+            pos = semi + 1;
+            continue;
+        }
+        if (src[cur] == '{') {
+            if (match[cur] >= body_end) {
+                return false;
+            }
+            const size_t end = size_t{match[cur]} + 1;
+            stmts.push_back(TopStmt{.kind = TopStmtKind::Other, .begin = cur, .end = end});
+            pos = end;
+            continue;
+        }
+
+        // Scan a `;`-terminated top-level statement, jumping over nested brackets in O(1).
+        struct Tok {
+            std::string_view text;
+            u32 pos;
+            bool is_ident;
+        };
+        std::vector<Tok> toks;
+        bool has_brackets = false;
+        bool has_member_access = false;
+        bool has_comma = false;
+        size_t first_plain_eq = ~size_t{0};
+        size_t scan = cur;
+        bool found_semi = false;
+        while (scan < body_end) {
+            scan = SkipTrivia(src, scan, body_end);
+            if (scan >= body_end) {
+                break;
+            }
+            if (src[scan] == ';') {
+                found_semi = true;
+                ++scan;
+                break;
+            }
+            if (src[scan] == '(' || src[scan] == '[' || src[scan] == '{') {
+                if (match[scan] >= body_end) {
+                    return false;
+                }
+                has_brackets = true;
+                toks.push_back({src.substr(scan, 1), static_cast<u32>(scan), false});
+                scan = size_t{match[scan]} + 1;
+                continue;
+            }
+            if (src[scan] == '"' || src[scan] == '\'') {
+                const size_t lit_end = SkipCommentOrLiteral(src, scan);
+                toks.push_back({src.substr(scan, lit_end - scan), static_cast<u32>(scan), false});
+                scan = lit_end;
+                continue;
+            }
+            if (IsIdentStart(src[scan])) {
+                size_t end = scan + 1;
+                while (end < body_end && IsIdentCont(src[end])) {
+                    ++end;
+                }
+                toks.push_back({src.substr(scan, end - scan), static_cast<u32>(scan), true});
+                scan = end;
+                continue;
+            }
+            // Punctuation / operators.
+            if (src[scan] == '.' ||
+                (scan + 1 < body_end && src[scan] == '-' && src[scan + 1] == '>')) {
+                has_member_access = true;
+            }
+            if (src[scan] == ',') {
+                has_comma = true;
+            }
+            if (src[scan] == '=') {
+                const char prev_c = scan > cur ? src[scan - 1] : ' ';
+                const char next_c = scan + 1 < body_end ? src[scan + 1] : ' ';
+                const bool compound = prev_c == '=' || prev_c == '!' || prev_c == '<' ||
+                                      prev_c == '>' || prev_c == '+' || prev_c == '-' ||
+                                      prev_c == '*' || prev_c == '/' || prev_c == '%' ||
+                                      prev_c == '&' || prev_c == '|' || prev_c == '^' ||
+                                      next_c == '=';
+                if (!compound && first_plain_eq == ~size_t{0}) {
+                    first_plain_eq = toks.size();
+                }
+            }
+            toks.push_back({src.substr(scan, 1), static_cast<u32>(scan), false});
+            ++scan;
+        }
+        if (!found_semi) {
+            return false;
+        }
+
+        TopStmt stmt{.kind = TopStmtKind::Other, .begin = cur, .end = scan};
+        if (toks.size() == 3 && !has_brackets && !has_member_access && toks[0].is_ident &&
+            toks[1].text == "=" && first_plain_eq == 1 && toks[2].is_ident &&
+            !IsControlKeyword(toks[0].text) && !IsControlKeyword(toks[2].text)) {
+            stmt.kind = TopStmtKind::AssignCopy;
+            stmt.lhs = toks[0].text;
+            stmt.lhs_pos = toks[0].pos;
+            stmt.rhs = toks[2].text;
+        } else if (!toks.empty() && !IsControlKeyword(toks[0].text)) {
+            if (!has_brackets && !has_member_access && !has_comma &&
+                first_plain_eq == ~size_t{0} && toks.size() >= 2 && toks.back().is_ident &&
+                !IsControlKeyword(toks.back().text)) {
+                bool valid_type_tokens = true;
+                for (size_t t = 0; t + 1 < toks.size(); ++t) {
+                    const std::string_view tx = toks[t].text;
+                    if (!toks[t].is_ident && tx != ":" && tx != "<" && tx != ">" && tx != "*" &&
+                        tx != "&") {
+                        valid_type_tokens = false;
+                        break;
+                    }
+                }
+                if (valid_type_tokens) {
+                    stmt.kind = TopStmtKind::Decl;
+                    stmt.decl_var = toks.back().text;
+                    stmt.decl_var_pos = toks.back().pos;
+                }
+            } else if (first_plain_eq != ~size_t{0} && first_plain_eq >= 2 &&
+                       toks[first_plain_eq - 1].is_ident) {
+                const std::string_view prev_tx = toks[first_plain_eq - 2].text;
+                if (toks[first_plain_eq - 2].is_ident || prev_tx == ">" || prev_tx == "*" ||
+                    prev_tx == "&") {
+                    stmt.declared_vars.push_back(toks[first_plain_eq - 1].text);
+                }
+            }
+        }
+        stmts.push_back(std::move(stmt));
+        pos = scan;
+    }
+    return true;
+}
+
+/// Pass (b): flattens deeply nested (> 16 levels) tail `then`-branch `if` chains into
+/// `do { if (!(cond)) { <else> break; } <prefix> ... } while (false);` in O(N).
+bool FlattenTailThenIfChains(std::string& source) {
+    constexpr size_t MinFlattenDepth = 16;
+    const std::string_view src{source};
+    const std::vector<u32> match = BuildBracketMatch(src);
+    if (match.empty()) {
+        return false;
+    }
+    const std::vector<u32> if_end = BuildIfStmtEnds(src, match);
+
+    // Precompute O(1) prev/next standalone identifier occurrence links across `src`.
+    std::vector<u32> prev_ident_at(src.size(), ~0U);
+    std::vector<u32> next_ident_at(src.size(), ~0U);
+    {
+        std::unordered_map<std::string_view, u32> last_seen;
+        last_seen.reserve(4096);
+        for (size_t i = 0; i < src.size();) {
+            const size_t skipped = SkipCommentOrLiteral(src, i);
+            if (skipped != i) {
+                i = skipped;
+                continue;
+            }
+            if (IsIdentStart(src[i])) {
+                size_t end = i + 1;
+                while (end < src.size() && IsIdentCont(src[end])) {
+                    ++end;
+                }
+                if (!IsPrecededByMemberAccess(src, 0, i)) {
+                    const std::string_view tok = src.substr(i, end - i);
+                    const auto [it, inserted] = last_seen.emplace(tok, static_cast<u32>(i));
+                    if (!inserted) {
+                        const u32 prev = it->second;
+                        prev_ident_at[i] = prev;
+                        next_ident_at[prev] = static_cast<u32>(i);
+                        it->second = static_cast<u32>(i);
+                    }
+                }
+                i = end;
+                continue;
+            }
+            ++i;
+        }
+    }
+
+    struct ChainLevel {
+        std::string_view cond;
+        bool has_else{};
+        std::string_view else_body;
+        std::vector<std::string_view> prefix_slices;
+        std::unordered_map<std::string_view, std::string_view> renames_at_level;
+    };
+
+    std::string out;
+    out.reserve(src.size());
+    bool any_flattened = false;
+    size_t emit_cursor = 0;
+    std::vector<TopStmt> stmts;
+
+    for (size_t i = 0; i < src.size();) {
+        const size_t skipped = SkipCommentOrLiteral(src, i);
+        if (skipped != i) {
+            i = skipped;
+            continue;
+        }
+        if (!MatchKeyword(src, i, "if") || if_end[i] == ~0U) {
+            ++i;
+            continue;
+        }
+
+        TopStmt root_if{};
+        if (!ParseIfHeader(src, match, if_end, i, root_if)) {
+            ++i;
+            continue;
+        }
+
+        std::vector<ChainLevel> levels;
+        std::unordered_map<std::string_view, std::string_view> active_renames;
+        std::unordered_set<std::string_view> hoisted_decls;
+        std::string_view leaf_then;
+        size_t leaf_begin = 0;
+        size_t leaf_end = 0;
+
+        TopStmt curr = root_if;
+        for (;;) {
+            if (curr.has_else &&
+                HasUnenclosedBreakOrContinue(src, match, curr.else_begin, curr.else_end)) {
+                leaf_begin = curr.begin;
+                leaf_end = curr.end;
+                leaf_then = src.substr(leaf_begin, leaf_end - leaf_begin);
+                break;
+            }
+
+            const size_t body_begin = size_t{curr.then_open} + 1;
+            const size_t body_end = curr.then_close;
+            bool stepped_deeper = false;
+
+            if (ParseTopStmts(src, match, if_end, body_begin, body_end, stmts) && !stmts.empty()) {
+                size_t p = stmts.size();
+                while (p > 0 && stmts[p - 1].kind == TopStmtKind::AssignCopy) {
+                    --p;
+                }
+                if (p > 0 && stmts[p - 1].kind == TopStmtKind::If) {
+                    const size_t if_idx = p - 1;
+                    const TopStmt& next_if = stmts[if_idx];
+                    bool copies_valid = true;
+                    std::vector<bool> omitted_decl(if_idx, false);
+                    std::vector<std::pair<std::string_view, std::string_view>> new_renames;
+                    std::unordered_set<std::string_view> seen_rhs;
+
+                    for (size_t j = if_idx + 1; j < stmts.size(); ++j) {
+                        const std::string_view lhs = stmts[j].lhs;
+                        const std::string_view rhs = stmts[j].rhs;
+                        if (lhs == rhs || !seen_rhs.insert(rhs).second ||
+                            hoisted_decls.contains(rhs)) {
+                            copies_valid = false;
+                            break;
+                        }
+                        size_t decl_idx = ~size_t{0};
+                        for (size_t d = 0; d < if_idx; ++d) {
+                            if (!omitted_decl[d] && stmts[d].kind == TopStmtKind::Decl &&
+                                stmts[d].decl_var == rhs) {
+                                decl_idx = d;
+                                break;
+                            }
+                        }
+                        if (decl_idx == ~size_t{0}) {
+                            copies_valid = false;
+                            break;
+                        }
+                        const u32 decl_pos = stmts[decl_idx].decl_var_pos;
+                        // Ensure `rhs` does not appear anywhere else in `stmts[0 .. if_idx - 1]`.
+                        if ((prev_ident_at[decl_pos] != ~0U &&
+                             prev_ident_at[decl_pos] >= body_begin) ||
+                            next_ident_at[decl_pos] == ~0U ||
+                            next_ident_at[decl_pos] < next_if.begin) {
+                            copies_valid = false;
+                            break;
+                        }
+                        // Ensure `lhs` does not appear anywhere in `[stmts[decl_idx].begin, next_if.end)`.
+                        const u32 lhs_prev = prev_ident_at[stmts[j].lhs_pos];
+                        if (lhs_prev != ~0U && lhs_prev >= stmts[decl_idx].begin) {
+                            copies_valid = false;
+                            break;
+                        }
+                        omitted_decl[decl_idx] = true;
+                        const auto target_it = active_renames.find(lhs);
+                        const std::string_view resolved_target =
+                            target_it != active_renames.end() ? target_it->second : lhs;
+                        new_renames.emplace_back(rhs, resolved_target);
+                    }
+
+                    if (copies_valid) {
+                        bool prefix_safe = true;
+                        std::vector<std::string_view> prefix_decls;
+                        std::vector<std::string_view> prefix_slices;
+                        for (size_t s = 0; s < if_idx; ++s) {
+                            if (omitted_decl[s]) {
+                                continue;
+                            }
+                            if (HasUnenclosedBreakOrContinue(src, match, stmts[s].begin,
+                                                             stmts[s].end)) {
+                                prefix_safe = false;
+                                break;
+                            }
+                            if (stmts[s].kind == TopStmtKind::Decl) {
+                                if (hoisted_decls.contains(stmts[s].decl_var)) {
+                                    prefix_safe = false;
+                                    break;
+                                }
+                                prefix_decls.push_back(stmts[s].decl_var);
+                            } else {
+                                for (const std::string_view dv : stmts[s].declared_vars) {
+                                    if (hoisted_decls.contains(dv)) {
+                                        prefix_safe = false;
+                                        break;
+                                    }
+                                    prefix_decls.push_back(dv);
+                                }
+                                if (!prefix_safe) {
+                                    break;
+                                }
+                            }
+                            prefix_slices.push_back(
+                                src.substr(stmts[s].begin, stmts[s].end - stmts[s].begin));
+                        }
+
+                        if (prefix_safe) {
+                            for (const std::string_view dv : prefix_decls) {
+                                hoisted_decls.insert(dv);
+                            }
+                            levels.push_back(ChainLevel{
+                                .cond = curr.cond,
+                                .has_else = curr.has_else,
+                                .else_body = curr.else_body,
+                                .prefix_slices = std::move(prefix_slices),
+                                .renames_at_level = active_renames,
+                            });
+                            for (const auto& [from, to] : new_renames) {
+                                active_renames.insert_or_assign(from, to);
+                            }
+                            curr = next_if;
+                            stepped_deeper = true;
+                        }
+                    }
+                }
+            }
+
+            if (!stepped_deeper) {
+                // `curr` is the innermost level of this chain.
+                levels.push_back(ChainLevel{
+                    .cond = curr.cond,
+                    .has_else = curr.has_else,
+                    .else_body = curr.else_body,
+                    .prefix_slices = {},
+                    .renames_at_level = active_renames,
+                });
+                leaf_begin = body_begin;
+                leaf_end = body_end;
+                leaf_then = src.substr(leaf_begin, leaf_end - leaf_begin);
+                break;
+            }
+        }
+
+        if (levels.size() > MinFlattenDepth &&
+            !HasUnenclosedBreakOrContinue(src, match, leaf_begin, leaf_end)) {
+            out.append(src.substr(emit_cursor, root_if.begin - emit_cursor));
+            const bool after_else = IsPrecededByElse(src, root_if.begin);
+            if (after_else) {
+                out.append("{\n");
+            }
+            out.append("do\n{\n");
+            for (const ChainLevel& lvl : levels) {
+                out.append("    if (!(");
+                AppendWithRenames(out, lvl.cond, lvl.renames_at_level);
+                out.append("))\n    {\n");
+                if (lvl.has_else) {
+                    out.append("        ");
+                    AppendWithRenames(out, Trim(lvl.else_body), lvl.renames_at_level);
+                    EnsureTrailingNewline(out);
+                }
+                out.append("        break;\n    }\n");
+                for (const std::string_view pfx : lvl.prefix_slices) {
+                    out.append("    ");
+                    AppendWithRenames(out, pfx, lvl.renames_at_level);
+                    EnsureTrailingNewline(out);
+                }
+            }
+            out.append("    {\n        ");
+            AppendWithRenames(out, Trim(leaf_then), active_renames);
+            EnsureTrailingNewline(out);
+            out.append("    }\n} while (false);");
+            if (after_else) {
+                out.append("\n}");
+            }
+            emit_cursor = root_if.end;
+            i = root_if.end;
+            any_flattened = true;
+            continue;
+        }
+
+        // Not deep enough (or unsafe leaf break/continue): step past `if (cond)` so nested blocks
+        // inside `then`/`else` are still visited cleanly.
+        i = size_t{root_if.then_open} + 1;
+    }
+
+    if (!any_flattened) {
+        return false;
+    }
+    out.append(src.substr(emit_cursor));
+    source = std::move(out);
+    return true;
+}
+
+} // Anonymous namespace
+
+u32 MaxBracketNesting(std::string_view source) {
     u32 depth = 0;
     u32 deepest = 0;
-    for (const char c : source) {
+    for (size_t i = 0; i < source.size();) {
+        const size_t skipped = SkipCommentOrLiteral(source, i);
+        if (skipped != i) {
+            i = skipped;
+            continue;
+        }
+        const char c = source[i++];
         if (c == '(' || c == '[' || c == '{') {
             deepest = (std::max)(deepest, ++depth);
         } else if ((c == ')' || c == ']' || c == '}') && depth != 0) {
@@ -288,7 +1178,17 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
     }
     return deepest;
 }
-} // Anonymous namespace
+
+void FlattenBracketNesting(std::string& source) {
+    for (int pass = 0; pass < 4 && MaxBracketNesting(source) > 16; ++pass) {
+        const bool collapsed_else = CollapseElseIfChains(source);
+        const bool flattened_then =
+            MaxBracketNesting(source) > 16 ? FlattenTailThenIfChains(source) : false;
+        if (!collapsed_else && !flattened_then) {
+            break;
+        }
+    }
+}
 
 Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& options) {
     // SPIRV-Cross recurses through a program's control flow: large game shaders overflowed the
@@ -708,6 +1608,9 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
             if (status == SpillStatus::Unused) {
                 result.sampler_spill_slot = ~0U;
             }
+        }
+        if (MaxBracketNesting(result.source) > 128) {
+            FlattenBracketNesting(result.source);
         }
         const bool reducible = stage == Stage::Vertex || stage == Stage::Fragment ||
                                stage == Stage::Compute;

@@ -85,7 +85,6 @@ std::shared_ptr<const GplLibrary> GraphicsPipelineLibraryCache::GetOrCreate(
                                         .count());
     if (library) {
         built[index].fetch_add(1, std::memory_order_relaxed);
-        total_libraries.fetch_add(1, std::memory_order_relaxed);
         build_ns[index].fetch_add(ns, std::memory_order_relaxed);
         StoreMax(build_max_ns[index], ns);
         if (ns > 2'000'000 && logged_builds.fetch_add(1, std::memory_order_relaxed) < 400) {
@@ -101,13 +100,18 @@ std::shared_ptr<const GplLibrary> GraphicsPipelineLibraryCache::GetOrCreate(
         entry->done = true;
     }
     entry->condition.notify_all();
+    bool retained = true;
     if (no_retain_on_thread) {
         // Threads already waiting on the entry hold it; later lookups build again, which the
         // driver's disk cache answers in about a millisecond.
         std::scoped_lock lock{mutex};
         if (const auto it = entries.find(key); it != entries.end() && it->second == entry) {
             entries.erase(it);
+            retained = false;
         }
+    }
+    if (library && retained) {
+        total_libraries.fetch_add(1, std::memory_order_relaxed);
     }
     return library;
 }

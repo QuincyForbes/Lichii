@@ -151,6 +151,7 @@ void LoadingScreen::Prepare(Loader::AppLoader& loader) {
     }
 
     slow_shader_compile_start = false;
+    slow_shader_first_value = 0;
     OnLoadProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
 }
 
@@ -176,8 +177,13 @@ void LoadingScreen::OnLoadProgress(VideoCore::LoadCallbackStage stage, std::size
         previous_stage = stage;
         // reset back to fast shader compiling since the stage changed
         slow_shader_compile_start = false;
+        slow_shader_first_value = 0;
     }
     // update the max of the progress bar if the number of shaders change
+    if (total != previous_total || value < slow_shader_first_value) {
+        slow_shader_compile_start = false;
+        slow_shader_first_value = 0;
+    }
     if (total != previous_total) {
         ui->progress_bar->setMaximum(static_cast<int>(total));
         previous_total = total;

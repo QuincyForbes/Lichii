@@ -486,90 +486,83 @@ bool ReadGame(const std::string& path, LichiiGame& out) {
 
 /* ------------------------------------------------------------------------------- settings */
 
-struct EnumChoice {
-    std::string name;
-    u32 value;
-};
-
-template <typename T>
-void AddEnum(std::map<u32, std::vector<EnumChoice>>& table) {
-    auto& choices = table[Settings::EnumMetadata<T>::Index()];
-    for (const auto& [name, value] : Settings::EnumMetadata<T>::Canonicalizations()) {
-        choices.push_back({std::string{name}, static_cast<u32>(value)});
+const char* CategoryEnumName(Settings::Category category) {
+    using Settings::Category;
+    switch (category) {
+    case Category::Android:
+        return "Android";
+    case Category::Audio:
+        return "Audio";
+    case Category::Core:
+        return "Core";
+    case Category::Cpu:
+        return "Cpu";
+    case Category::CpuDebug:
+        return "CpuDebug";
+    case Category::CpuUnsafe:
+        return "CpuUnsafe";
+    case Category::Overlay:
+        return "Overlay";
+    case Category::Renderer:
+        return "Renderer";
+    case Category::RendererAdvanced:
+        return "RendererAdvanced";
+    case Category::RendererHacks:
+        return "RendererHacks";
+    case Category::RendererExtensions:
+        return "RendererExtensions";
+    case Category::RendererDebug:
+        return "RendererDebug";
+    case Category::System:
+        return "System";
+    case Category::SystemAudio:
+        return "SystemAudio";
+    case Category::DataStorage:
+        return "DataStorage";
+    case Category::Debugging:
+        return "Debugging";
+    case Category::DebuggingGraphics:
+        return "DebuggingGraphics";
+    case Category::GpuDriver:
+        return "GpuDriver";
+    case Category::Miscellaneous:
+        return "Miscellaneous";
+    case Category::Network:
+        return "Network";
+    case Category::WebService:
+        return "WebService";
+    case Category::AddOns:
+        return "AddOns";
+    case Category::Controls:
+        return "Controls";
+    case Category::Ui:
+        return "Ui";
+    case Category::UiAudio:
+        return "UiAudio";
+    case Category::UiGeneral:
+        return "UiGeneral";
+    case Category::UiLayout:
+        return "UiLayout";
+    case Category::UiGameList:
+        return "UiGameList";
+    case Category::Screenshots:
+        return "Screenshots";
+    case Category::Shortcuts:
+        return "Shortcuts";
+    case Category::Multiplayer:
+        return "Multiplayer";
+    case Category::Services:
+        return "Services";
+    case Category::Paths:
+        return "Paths";
+    case Category::LibraryApplet:
+        return "LibraryApplet";
+    case Category::RendererMemory:
+        return "RendererMemory";
+    case Category::MaxEnum:
+        break;
     }
-}
-
-const std::map<u32, std::vector<EnumChoice>>& EnumTable() {
-    static const auto table = [] {
-        using namespace Settings;
-        std::map<u32, std::vector<EnumChoice>> t;
-        AddEnum<AudioEngine>(t);
-        AddEnum<AudioMode>(t);
-        AddEnum<Language>(t);
-        AddEnum<Region>(t);
-        AddEnum<TimeZone>(t);
-        AddEnum<AnisotropyMode>(t);
-        AddEnum<AstcDecodeMode>(t);
-        AddEnum<AstcRecompression>(t);
-        AddEnum<FramePacingMode>(t);
-        AddEnum<VSyncMode>(t);
-        AddEnum<VramUsageMode>(t);
-        AddEnum<RendererBackend>(t);
-        AddEnum<GpuAccuracy>(t);
-        AddEnum<DmaAccuracy>(t);
-        AddEnum<GpuFenceBehavior>(t);
-        AddEnum<NativeComputeWriteMark>(t);
-        AddEnum<CpuBackend>(t);
-        AddEnum<CpuAccuracy>(t);
-        AddEnum<CpuClock>(t);
-        AddEnum<MemoryLayout>(t);
-        AddEnum<ConfirmStop>(t);
-        AddEnum<FullscreenMode>(t);
-        AddEnum<NvdecEmulation>(t);
-        AddEnum<ResolutionSetup>(t);
-        AddEnum<ScalingFilter>(t);
-        AddEnum<AntiAliasing>(t);
-        AddEnum<OotAntiAliasing>(t);
-        AddEnum<Upscaler>(t);
-        AddEnum<DlssQuality>(t);
-        AddEnum<DlssPreset>(t);
-        AddEnum<OcarinaDlssMode>(t);
-        AddEnum<OotMovieUpscale>(t);
-        AddEnum<TextureQuality>(t);
-        AddEnum<OotResolution>(t);
-        AddEnum<OotGraphicsPreset>(t);
-        AddEnum<OotFrameRate>(t);
-        AddEnum<MkwFrameRate>(t);
-        AddEnum<GamePatchMode>(t);
-        AddEnum<MoltenVkDriver>(t);
-        AddEnum<AspectRatio>(t);
-        AddEnum<ConsoleMode>(t);
-        AddEnum<AppletMode>(t);
-        AddEnum<SpirvOptimizeMode>(t);
-        AddEnum<GpuClock>(t);
-        AddEnum<GpuUnswizzleSize>(t);
-        AddEnum<GpuUnswizzle>(t);
-        AddEnum<GpuUnswizzleChunk>(t);
-        AddEnum<TemperatureUnits>(t);
-        AddEnum<ExtendedDynamicState>(t);
-        AddEnum<GpuLogLevel>(t);
-        AddEnum<GameListMode>(t);
-        AddEnum<SpeedMode>(t);
-        AddEnum<FrameGenType>(t);
-        AddEnum<FrameGenMotion>(t);
-        AddEnum<FrameGenFlowQuality>(t);
-        return t;
-    }();
-    return table;
-}
-
-const std::vector<EnumChoice>* EnumChoices(const Settings::BasicSetting& setting) {
-    if (!setting.IsEnum()) {
-        return nullptr;
-    }
-    const auto& table = EnumTable();
-    const auto it = table.find(setting.EnumIndex());
-    return it == table.end() ? nullptr : &it->second;
+    return "Miscellaneous";
 }
 
 const std::vector<Settings::BasicSetting*>& AllSettings() {
@@ -622,6 +615,7 @@ void FillInfo(const Settings::BasicSetting& setting, LichiiSettingInfo& out) {
     out = {};
     out.key = setting.GetLabel().c_str();
     out.category = Settings::TranslateCategory(setting.GetCategory());
+    out.category_enum_name = CategoryEnumName(setting.GetCategory());
     out.category_id = static_cast<uint32_t>(setting.GetCategory());
     out.kind = KindOf(setting);
     out.switchable = setting.Switchable();
@@ -637,9 +631,7 @@ void FillInfo(const Settings::BasicSetting& setting, LichiiSettingInfo& out) {
     if (const auto* paired = setting.PairedSetting()) {
         out.paired_key = paired->GetLabel().c_str();
     }
-    if (const auto* choices = EnumChoices(setting)) {
-        out.enum_count = static_cast<uint32_t>(choices->size());
-    }
+    out.enum_count = static_cast<uint32_t>(setting.Canonicalizations().size());
 }
 
 bool InGameScope() {
@@ -745,14 +737,20 @@ bool lichii_settings_find(const char* key, LichiiSettingInfo* out_info) {
 
 const char* lichii_settings_enum_name(const char* key, uint32_t index) {
     const auto* setting = FindSetting(key);
-    const auto* choices = setting ? EnumChoices(*setting) : nullptr;
-    return choices && index < choices->size() ? (*choices)[index].name.c_str() : "";
+    if (setting == nullptr) {
+        return "";
+    }
+    const auto choices = setting->Canonicalizations();
+    return index < choices.size() ? choices[index].first.data() : "";
 }
 
 uint32_t lichii_settings_enum_value(const char* key, uint32_t index) {
     const auto* setting = FindSetting(key);
-    const auto* choices = setting ? EnumChoices(*setting) : nullptr;
-    return choices && index < choices->size() ? (*choices)[index].value : 0;
+    if (setting == nullptr) {
+        return 0;
+    }
+    const auto choices = setting->Canonicalizations();
+    return index < choices.size() ? choices[index].second : 0;
 }
 
 char* lichii_settings_get(const char* key) {
@@ -798,6 +796,35 @@ static void ApplyOotPresetCompanions() {
     }
 }
 
+static void ApplySettingMutualExclusions(std::string_view key) {
+    auto& v = Settings::values;
+    const bool game = InGameScope();
+    const auto clear = [game](Settings::SwitchableSetting<bool>& other) {
+        if (game) {
+            if (other.GetValue()) {
+                other.SetGlobal(false);
+                other.SetValue(false);
+            }
+            return;
+        }
+        const bool custom = !other.UsingGlobal();
+        if (custom) {
+            other.SetGlobal(true);
+        }
+        other.SetValue(false);
+        if (custom) {
+            other.SetGlobal(false);
+        }
+    };
+    if (key == "oot_graphics_preset") {
+        ApplyOotPresetCompanions();
+    } else if (key == "hyrule_30fps" && v.hyrule_30fps.GetValue(!game)) {
+        clear(v.hyrule_dynamic_fps);
+    } else if (key == "hyrule_dynamic_fps" && v.hyrule_dynamic_fps.GetValue(!game)) {
+        clear(v.hyrule_30fps);
+    }
+}
+
 bool lichii_settings_set(const char* key, const char* value) {
     auto* setting = FindSetting(key);
     if (setting == nullptr || value == nullptr) {
@@ -809,9 +836,7 @@ bool lichii_settings_set(const char* key, const char* value) {
         }
         setting->SetGlobal(false);
         setting->LoadString(value);
-        if (std::string_view{key} == "oot_graphics_preset") {
-            ApplyOotPresetCompanions();
-        }
+        ApplySettingMutualExclusions(key);
         return true;
     }
     // A running game may use its own value; the global one is written underneath.
@@ -823,9 +848,7 @@ bool lichii_settings_set(const char* key, const char* value) {
     if (custom) {
         setting->SetGlobal(false);
     }
-    if (std::string_view{key} == "oot_graphics_preset") {
-        ApplyOotPresetCompanions();
-    }
+    ApplySettingMutualExclusions(key);
     return true;
 }
 

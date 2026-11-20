@@ -69,6 +69,8 @@ public:
         bool IsNativeProgram() const override;
         bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
         bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) override;
+        std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
+        std::vector<u64> MappedStoragePointerKeys() const override;
         u32 ReadCbufValue(u32 index, u32 offset) override;
         Shader::TextureType ReadTextureType(u32 handle) override;
         Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override;
@@ -79,6 +81,7 @@ public:
         u32 SharedMemorySize() const override;
         std::array<u32, 3> WorkgroupSize() const override;
         bool HasHLEMacroState() const override;
+        bool HasNativeInstructions() const override;
         std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override;
         void Dump(u64 pipeline_hash, u64 shader_hash) override;
 

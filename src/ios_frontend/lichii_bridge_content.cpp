@@ -994,6 +994,10 @@ char* lichii_content_list_addons_json(uint64_t program_id, const char* game_path
             const char* choice = info.choice == FileSys::BuiltinPatchChoice::On    ? "on"
                                  : info.choice == FileSys::BuiltinPatchChoice::Off ? "off"
                                                                                    : "global";
+            std::string blocked_reason;
+            if constexpr (requires { info.blocked_reason; }) {
+                blocked_reason = info.blocked_reason;
+            }
             entry["builtin"] = {
                 {"kind", FileSys::BuiltinPatchKindName(info.kind)},
                 {"game", info.game},
@@ -1003,6 +1007,7 @@ char* lichii_content_list_addons_json(uint64_t program_id, const char* game_path
                 {"source", FileSys::BuiltinPatchSourceName(info.source)},
                 {"resolved_enabled", info.resolved_enabled},
                 {"included_in", info.included_in},
+                {"blocked_reason", blocked_reason},
             };
         }
         out.push_back(std::move(entry));

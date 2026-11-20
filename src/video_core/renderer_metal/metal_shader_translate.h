@@ -216,6 +216,13 @@ inline constexpr u32 DomainThreads = 64;
 /// emits them and the buffer cache appends their bindings, so the pipeline binds in sequence.
 [[nodiscard]] Result SpirvToMsl(std::span<const u32> spirv, Stage stage, const Options& options);
 
+/// Maximum nesting depth of (), [] and {} in `source` (ignoring comments and literals).
+[[nodiscard]] u32 MaxBracketNesting(std::string_view source);
+
+/// Flattens deeply nested `else { if (...) }` chains and tail `then`-branch `if` cascades in
+/// structured MSL so Metal's 256-bracket parser limit is not exceeded.
+void FlattenBracketNesting(std::string& source);
+
 /// Buffers a vertex program may keep in slots when it spills (Options::spill_buffers).
 inline constexpr u32 SpillCutoff = 12;
 /// Buffers from which a vertex program spills.

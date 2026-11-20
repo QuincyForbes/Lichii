@@ -196,6 +196,10 @@ struct SamplerOptions {
 [[nodiscard]] Object CreateLibrary(const Device& device, std::string_view source,
                                    std::string& error);
 
+/// Asynchronous MTLLibrary compilation via Metal's XPC completion handler.
+void CreateLibraryAsync(const Device& device, std::string_view msl,
+                        std::function<void(Object, std::string)> on_done);
+
 /// An MTLFunction of a library; empty when it has none of that name.
 [[nodiscard]] Object CreateFunction(const void* library, std::string_view name);
 
@@ -204,6 +208,12 @@ struct SamplerOptions {
 [[nodiscard]] Object CreateComputePipelineState(const Device& device, const void* function,
                                                 std::string& error,
                                                 PipelineArchive* archive = nullptr);
+
+/// Asynchronous MTLComputePipelineState build: checks `archive` synchronously first when it has
+/// entries, and submits an asynchronous XPC build + `archive->DeferAdd` on a miss.
+void CreateComputeStateAsync(const Device& device, const void* library, std::string_view entry_name,
+                             u32 workgroup_threads, PipelineArchive* archive,
+                             std::function<void(Object, std::string)> on_done);
 
 /// What a texture is, for checks before Metal is given it.
 struct TextureFacts {

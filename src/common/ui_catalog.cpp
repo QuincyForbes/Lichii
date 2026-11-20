@@ -468,7 +468,7 @@ const Setting kSettings[] = {
      QT_TRANSLATE_NOOP("ConfigurationShared", "{choice:oot_frame_rate.Fps30} saves power and heat; "
                                               "{choice:oot_frame_rate.Fps60} is the game's normal "
                                               "rate; {choice:oot_frame_rate.Unlocked} goes up to "
-                                              "{setting:frame_rate_limit}. The game keeps its normal "
+                                              "{setting:nx2_frame_rate_limit}. The game keeps its normal "
                                               "speed at each (its time step follows real time).\n"
                                               "Takes effect at once."),
      Nowhere},
@@ -1138,7 +1138,7 @@ const Setting kSettings[] = {
     {"use_optimized_vertex_buffers",
      QT_TRANSLATE_NOOP("ConfigurationShared", "Optimized Vertex Buffers"),
      nullptr,
-     IOS},
+     Nowhere},
     {"emulate_bgr565",
      QT_TRANSLATE_NOOP("ConfigurationShared", "Emulate BGR565"),
      nullptr,
@@ -1653,10 +1653,6 @@ const Setting kSettings[] = {
      nullptr,
      nullptr,
      Nowhere},
-    {"show_fw_warning",
-     nullptr,
-     nullptr,
-     Nowhere},
 };
 
 const Choice kChoices[] = {
@@ -2029,7 +2025,7 @@ const Text kTexts[] = {
      QT_TRANSLATE_NOOP("UiCatalog", "The game's picture goes through the upscaler, then the screen "
                                     "filter.")},
     {"category.FrameRate.footer",
-     QT_TRANSLATE_NOOP("UiCatalog", "{setting:frame_rate_limit} paces every game without its own "
+     QT_TRANSLATE_NOOP("UiCatalog", "{setting:nx2_frame_rate_limit} paces every game without its own "
                                     "choice. Frame generation adds frames on top of the game's.")},
     {"category.Game.footer",
      QT_TRANSLATE_NOOP("UiCatalog", "Game-specific: these apply to this game only.")},
@@ -2056,6 +2052,13 @@ const Text kTexts[] = {
                                     "Before iOS 26, and at 3x or 4x, {choice:frame_gen_type.Fsr3} "
                                     "does.")},
     {"note.next_start", QT_TRANSLATE_NOOP("UiCatalog", "Applies the next time the game starts.")},
+    {"note.applies_next_boot", QT_TRANSLATE_NOOP("UiCatalog", "Applies on next game start.")},
+    {"note.upscaler_locks_scale",
+     QT_TRANSLATE_NOOP("UiCatalog", "Active temporal upscaler renders at 1x native scale; higher "
+                                    "scale multipliers are bypassed.")},
+    {"note.oot_upscaler_dynamic",
+     QT_TRANSLATE_NOOP("UiCatalog", "Active temporal upscaler fixes Dynamic to 100% docked / 75% "
+                                    "handheld and clamps 150%-300% to 100%.")},
     {"note.stop_game", QT_TRANSLATE_NOOP("UiCatalog", "Stop the game to change this.")},
     {"note.game_overrides",
      QT_TRANSLATE_NOOP("UiCatalog", "The running game's {text:page.game_settings} override this "
@@ -2234,20 +2237,7 @@ const Text kTexts[] = {
                                     "emulation. {exp:mvk_shader_dump} saves every shader as "
                                     "MoltenVK hands it to Metal in dump/mvk-shaders "
                                     "(thousands of files, slower start), to find out why "
-                                    "that one is refused; turn both on for that. "
-                                    "{exp:metal_trace_off} is for the Metal renderer "
-                                    "(Graphics API): normally Lichii writes a log line when "
-                                    "the app aborts or an exception goes uncaught, and asks "
-                                    "Metal which step of a failed command buffer failed; on, "
-                                    "it does neither, as before. {exp:metal_check_off} is "
-                                    "for the Metal renderer too: Metal closes the app when a "
-                                    "draw's vertex layout, targets or a texture are outside "
-                                    "what it takes (Ocarina of Time's first draw was), so "
-                                    "Lichii now rewrites the vertex layout to what the "
-                                    "shader reads, keeps 1D textures as 2D ones a pixel high "
-                                    "and skips a draw or a texture view Metal would still "
-                                    "reject, with a line in the log; on, Metal gets the "
-                                    "state as the game set it, as before.\n"
+                                    "that one is refused; turn both on for that.\n"
                                     "\n"
                                     "All apply the next time Lichii starts.")},
     {"experiments.performance.title", QT_TRANSLATE_NOOP("UiCatalog", "Performance")},
@@ -2257,9 +2247,7 @@ const Text kTexts[] = {
                                     "them, a wait for the GPU each time, even when the game "
                                     "draws them again anyway. {exp:helper_qos_off} gives the "
                                     "timing and present threads the same priority as the "
-                                    "game's. {exp:frame_deadlines} tells iOS each frame's "
-                                    "deadline, which may keep the game on the performance "
-                                    "cores; untested on a device. {exp:jit_old_tables} keeps "
+                                    "game's. {exp:jit_old_tables} keeps "
                                     "the translated code's bookkeeping as it was (about 0.3 "
                                     "GB more memory in Ocarina of Time); turn it on if a "
                                     "game that used to run crashes. {exp:fence_submit_each} "
@@ -2291,11 +2279,6 @@ const Text kTexts[] = {
                                     "before, even when nothing waits for that work (about 11 "
                                     "command buffers a frame in Kokiri Forest); turn it on "
                                     "if the screen flashes or stutters. "
-                                    "{exp:idle_submit_grace} lets the GPU thread, once it "
-                                    "runs out of commands, wait up to 0.25 ms for more "
-                                    "before it hands the GPU what it has (about 5 fewer "
-                                    "command buffers a frame on a PC, but it keeps a CPU "
-                                    "core busy meanwhile); untested on a device. "
                                     "{exp:idle_hold_off} hands the GPU what the GPU thread "
                                     "has as soon as it runs out of commands, as before, "
                                     "instead of keeping it, asleep, up to 0.5 ms while the "
@@ -2306,12 +2289,8 @@ const Text kTexts[] = {
                                     "than before. {exp:mesh_compute_in_pass} ends the render "
                                     "pass for each emulated mesh draw's compute, as before, "
                                     "instead of running that compute just before the pass; "
-                                    "turn it on if foliage looks wrong. {exp:dispatch_chain} "
-                                    "lets the game's consecutive compute dispatches share "
-                                    "one Metal compute pass (the ~150 dispatches a frame in "
-                                    "Ocarina of Time otherwise get a pass each); untested on "
-                                    "a device, turn it on to compare and off if effects "
-                                    "flicker. {exp:emulate_all_mesh} draws all mesh shaders "
+                                    "turn it on if foliage looks wrong. {exp:emulate_all_mesh} "
+                                    "draws all mesh shaders "
                                     "(most foliage) through the compute emulation instead of "
                                     "Metal mesh shaders, which hold their outputs in scarce "
                                     "GPU tile memory; untested on a device, for comparing "
@@ -2368,19 +2347,15 @@ const Text kTexts[] = {
                                     "All apply the next time Lichii starts.")},
     {"experiments.guest_memory.title", QT_TRANSLATE_NOOP("UiCatalog", "Guest Memory Access")},
     {"experiments.guest_memory.footer",
-     QT_TRANSLATE_NOOP("UiCatalog", "{exp:jit_inline_exclusives} runs the game's exclusive "
-                                    "loads and stores (LDXR/STXR, for locks and counters) "
-                                    "directly on guest memory, as on a computer, instead of "
-                                    "a call into the emulator each; Ocarina of Time uses "
-                                    "none on a computer, other games may. "
-                                    "{exp:jit_load_faults} lets a game load that hit "
-                                    "protected memory (a page the GPU wrote) keep reading "
-                                    "guest memory directly, and take the slow path only "
-                                    "after its eighth such fault instead of the first; on a "
-                                    "computer it cut Ocarina of Time's slow loads of GPU "
-                                    "pages by 70 % but saved little time. Both are off by "
-                                    "default. The \"Perf memory callbacks:\" log line counts "
-                                    "both.\n"
+     QT_TRANSLATE_NOOP("UiCatalog", "Exclusive loads and stores (LDXR/STXR, for locks and "
+                                    "counters) already run directly on guest memory on arm64. "
+                                    "{exp:jit_load_faults} (off by default) lets a game load "
+                                    "that hit protected memory (a page the GPU wrote) keep "
+                                    "reading guest memory directly, and take the slow path "
+                                    "only after its eighth such fault instead of the first; "
+                                    "on a computer it cut Ocarina of Time's slow loads of GPU "
+                                    "pages by 70 % but saved little time. The \"Perf memory "
+                                    "callbacks:\" log line counts slow memory callbacks.\n"
                                     "\n"
                                     "{exp:cpu_writes_old} keeps every game write to a memory "
                                     "page that also holds data the GPU wrote on the slow "
@@ -2419,6 +2394,20 @@ const Text kTexts[] = {
     {"experiments.metal.title", QT_TRANSLATE_NOOP("UiCatalog", "Metal Renderer")},
     {"experiments.metal.footer",
      QT_TRANSLATE_NOOP("UiCatalog", "Only for the Metal renderer (Graphics API). "
+                                    "{exp:metal_trace_off}: normally Lichii writes a log line "
+                                    "when the app aborts or an exception goes uncaught, and "
+                                    "asks Metal which step of a failed command buffer failed; "
+                                    "on, it does neither, as before.\n"
+                                    "\n"
+                                    "{exp:metal_check_off}: Metal closes the app when a "
+                                    "draw's vertex layout, targets or a texture are outside "
+                                    "what it takes (Ocarina of Time's first draw was), so "
+                                    "Lichii now rewrites the vertex layout to what the "
+                                    "shader reads, keeps 1D textures as 2D ones a pixel high "
+                                    "and skips a draw or a texture view Metal would still "
+                                    "reject, with a line in the log; on, Metal gets the "
+                                    "state as the game set it, as before.\n"
+                                    "\n"
                                     "{exp:metal_fixed_state_off} builds the game's shaders "
                                     "as before, without what the draw sets outside the "
                                     "shader: the depth range the game uses, the size of "
@@ -2778,6 +2767,24 @@ const Text kTexts[] = {
                                     "Turn one on if the picture shows stale data, objects "
                                     "flicker or the game stops; all apply the next time "
                                     "Lichii starts.")},
+    {"experiments.conflict.requires_metal",
+     QT_TRANSLATE_NOOP("UiCatalog", "Requires {setting:backend} set to {choice:backend.Metal}.")},
+    {"experiments.conflict.requires_vulkan",
+     QT_TRANSLATE_NOOP("UiCatalog", "Requires {setting:backend} set to {choice:backend.Vulkan}.")},
+    {"experiments.conflict.requires_mesh_mvk",
+     QT_TRANSLATE_NOOP("UiCatalog",
+                       "Requires {setting:moltenvk_driver} set to {choice:moltenvk_driver.Mesh}.")},
+    {"experiments.conflict.split_disabled",
+     QT_TRANSLATE_NOOP("UiCatalog", "Inactive while {setting:gpu_accuracy} is "
+                                    "{choice:gpu_accuracy.High} or {setting:dma_accuracy} is "
+                                    "{choice:dma_accuracy.Safe}.")},
+    {"experiments.conflict.fences_each",
+     QT_TRANSLATE_NOOP("UiCatalog", "Inactive while {exp:fence_submit_each} is enabled.")},
+    {"experiments.conflict.no_trim_file",
+     QT_TRANSLATE_NOOP("UiCatalog",
+                       "Inactive while guest memory uses a backing file or chunked mapping.")},
+    {"experiments.conflict.overridden",
+     QT_TRANSLATE_NOOP("UiCatalog", "Overridden by another active setting or experiment.")},
 };
 
 const Experiment kExperiments[] = {
@@ -2792,11 +2799,8 @@ const Experiment kExperiments[] = {
     {"mvk_uint8_indices", "graphics", QT_TRANSLATE_NOOP("UiCatalog", "MoltenVK Converts 8-bit Indices")},
     {"native_per_primitive", "graphics", QT_TRANSLATE_NOOP("UiCatalog", "Native Per-Primitive Mesh Attributes")},
     {"mvk_shader_dump", "graphics", QT_TRANSLATE_NOOP("UiCatalog", "MoltenVK Writes Its Shaders to Storage")},
-    {"metal_trace_off", "graphics", QT_TRANSLATE_NOOP("UiCatalog", "No Metal Crash Log Lines")},
-    {"metal_check_off", "graphics", QT_TRANSLATE_NOOP("UiCatalog", "Metal Takes the Game's Draw State Unchecked")},
     {"tc_old_eviction", "performance", QT_TRANSLATE_NOOP("UiCatalog", "Old Texture Eviction")},
     {"helper_qos_off", "performance", QT_TRANSLATE_NOOP("UiCatalog", "Helper Threads at Full Priority")},
-    {"frame_deadlines", "performance", QT_TRANSLATE_NOOP("UiCatalog", "Frame Deadlines for the CPU")},
     {"jit_old_tables", "performance", QT_TRANSLATE_NOOP("UiCatalog", "Old JIT Tables")},
     {"fence_submit_each", "performance", QT_TRANSLATE_NOOP("UiCatalog", "Submit at Every Fence")},
     {"render_passes_old", "performance", QT_TRANSLATE_NOOP("UiCatalog", "Render Passes as Before")},
@@ -2804,10 +2808,8 @@ const Experiment kExperiments[] = {
     {"targetless_full", "performance", QT_TRANSLATE_NOOP("UiCatalog", "Full-Size Passes Without Targets")},
     {"ubo_zero_tails", "performance", QT_TRANSLATE_NOOP("UiCatalog", "Zero Uniform Buffer Tails")},
     {"release_submit", "performance", QT_TRANSLATE_NOOP("UiCatalog", "Submit at Every Fence Release")},
-    {"idle_submit_grace", "performance", QT_TRANSLATE_NOOP("UiCatalog", "GPU Thread Waits for More Work")},
     {"idle_hold_off", "performance", QT_TRANSLATE_NOOP("UiCatalog", "GPU Thread Submits When Idle")},
     {"mesh_compute_in_pass", "performance", QT_TRANSLATE_NOOP("UiCatalog", "Mesh Emulation Ends Its Pass")},
-    {"dispatch_chain", "performance", QT_TRANSLATE_NOOP("UiCatalog", "Back-to-Back Dispatches Without Barriers")},
     {"emulate_all_mesh", "performance", QT_TRANSLATE_NOOP("UiCatalog", "Emulate Every Mesh Shader")},
     {"dispatch_deps", "performance", QT_TRANSLATE_NOOP("UiCatalog", "Log What Ties Dispatches to Render Passes")},
     {"guest_cores_first", "cpu_scheduling", QT_TRANSLATE_NOOP("UiCatalog", "Two Guest Cores First")},
@@ -2819,11 +2821,12 @@ const Experiment kExperiments[] = {
     {"frame_time_guest", "cpu_scheduling", QT_TRANSLATE_NOOP("UiCatalog", "Guest Cores Declare Frame Time Too")},
     {"split_std_waits", "cpu_scheduling", QT_TRANSLATE_NOOP("UiCatalog", "Graphics Threads Poll Before Sleeping")},
     {"poll_yield", "cpu_scheduling", QT_TRANSLATE_NOOP("UiCatalog", "Polling Threads Yield")},
-    {"jit_inline_exclusives", "guest_memory", QT_TRANSLATE_NOOP("UiCatalog", "Exclusive Accesses in Fastmem")},
     {"jit_load_faults", "guest_memory", QT_TRANSLATE_NOOP("UiCatalog", "Loads Keep Fastmem After a Fault")},
     {"cpu_writes_old", "guest_memory", QT_TRANSLATE_NOOP("UiCatalog", "Writes Next to GPU Data as Before")},
     {"gpu_reads_old", "guest_memory", QT_TRANSLATE_NOOP("UiCatalog", "Reads of GPU Data as Before")},
     {"hot_pages_off", "guest_memory", QT_TRANSLATE_NOOP("UiCatalog", "Watch Every Rewritten Page")},
+    {"metal_trace_off", "metal", QT_TRANSLATE_NOOP("UiCatalog", "No Metal Crash Log Lines")},
+    {"metal_check_off", "metal", QT_TRANSLATE_NOOP("UiCatalog", "Metal Takes the Game's Draw State Unchecked")},
     {"metal_fixed_state_off", "metal", QT_TRANSLATE_NOOP("UiCatalog", "Shaders Without the Draw's State")},
     {"metal_cache_plain", "metal", QT_TRANSLATE_NOOP("UiCatalog", "Game Memory Access as Before")},
     {"metal_msl_plain", "metal", QT_TRANSLATE_NOOP("UiCatalog", "Shaders Translated as Before")},

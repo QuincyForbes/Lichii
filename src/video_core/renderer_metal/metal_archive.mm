@@ -46,7 +46,9 @@ PipelineArchive::~PipelineArchive() {
         impl->add_thread.join();
     }
     Save();
+    is_open.store(false, std::memory_order_relaxed);
     @autoreleasepool {
+        impl->adds.clear();
         impl->archive = nil;
         impl->mapped_data = nil;
         impl->url = nil;
@@ -66,7 +68,7 @@ void PipelineArchive::DeferAdd(std::function<bool()> add) {
         if (!impl->add_thread.joinable()) {
             impl->add_thread = std::thread([this] {
                 pthread_setname_np("MetalArchive");
-                pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+                pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
                 for (;;) {
                     std::function<bool()> next;
                     {
@@ -87,8 +89,11 @@ void PipelineArchive::DeferAdd(std::function<bool()> add) {
                     }
                     bool added = false;
                     @autoreleasepool {
-                        std::unique_lock adding_lock{build_mutex};
-                        added = next();
+                        {
+                            std::unique_lock adding_lock{build_mutex};
+                            added = next();
+                        }
+                        next = {};
                     }
                     NoteAdded(added);
                 }
@@ -151,11 +156,13 @@ bool PipelineArchive::Open(const Device& device, const std::filesystem::path& pa
                                                                    error:&error];
         }
         if (archive == nil) {
+            is_open.store(false, std::memory_order_relaxed);
             LOG_WARNING(Render_Metal, "Metal: no pipeline archive: {}",
                         error != nil ? error.localizedDescription.UTF8String : "no reason");
             return false;
         }
         impl->archive = archive;
+        is_open.store(true, std::memory_order_relaxed);
         has_entries.store(loaded, std::memory_order_relaxed);
         recent = {};
         total = {};
@@ -172,10 +179,6 @@ bool PipelineArchive::Open(const Device& device, const std::filesystem::path& pa
                  read_only_mode ? ", read-only" : "");
     }
     return true;
-}
-
-bool PipelineArchive::IsOpen() const noexcept {
-    return impl->archive != nil;
 }
 
 void PipelineArchive::Save() {

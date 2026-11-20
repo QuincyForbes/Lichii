@@ -79,10 +79,11 @@ typedef enum LichiiSettingKind {
 } LichiiSettingKind;
 
 typedef struct LichiiSettingInfo {
-    const char* key;      ///< ini key, e.g. "resolution_setup"
-    const char* category; ///< ini group, e.g. "Renderer"
-    uint32_t category_id; ///< Settings::Category
-    int32_t kind;         ///< LichiiSettingKind
+    const char* key;                ///< ini key, e.g. "resolution_setup"
+    const char* category;           ///< ini group, e.g. "Renderer"
+    const char* category_enum_name; ///< Settings::Category enum name, e.g. "RendererMemory"
+    uint32_t category_id;           ///< Settings::Category
+    int32_t kind;                   ///< LichiiSettingKind
     bool switchable;      ///< can be overridden per game
     bool runtime_modifiable;
     bool ranged;

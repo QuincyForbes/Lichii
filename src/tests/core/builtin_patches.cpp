@@ -23,11 +23,11 @@
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
+#include "core/file_sys/texture_quality.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/file_sys/vfs/vfs_vector.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/nso.h"
-#include "video_core/ocarina_upscale.h"
 
 namespace {
 
@@ -81,11 +81,12 @@ void SetFrameTiming(const char* value) {
 #endif
 }
 
-constexpr std::array<std::pair<Common::FS::EdenPath, const char*>, 4> TestDirectories{{
+constexpr std::array<std::pair<Common::FS::EdenPath, const char*>, 5> TestDirectories{{
     {Common::FS::EdenPath::NANDDir, "nand"},
     {Common::FS::EdenPath::SDMCDir, "sdmc"},
     {Common::FS::EdenPath::LoadDir, "load"},
     {Common::FS::EdenPath::DumpDir, "dump"},
+    {Common::FS::EdenPath::CacheDir, "cache"},
 }};
 
 void WriteIps(const std::filesystem::path& path, u32 word, size_t offset = PatchOffset) {
@@ -720,7 +721,7 @@ TEST_CASE("Built-in DLSS render scale follows the NVIDIA DLSS quality", "[patch_
             Settings::values.nvidia_dlss_quality.SetValue(quality);
             Settings::values.use_docked_mode.SetValue(console);
             Settings::values.oot_resolution.SetValue(oot_res);
-            VideoCommon::SetAppliedOcarinaRenderScale(std::nullopt);
+            Settings::SetAppliedOcarinaRenderScale(std::nullopt);
         }
     } guard{prev_upscaler, prev_quality, prev_console, prev_oot_res};
 
@@ -744,7 +745,7 @@ TEST_CASE("Built-in DLSS render scale follows the NVIDIA DLSS quality", "[patch_
          }}) {
         Settings::values.nvidia_dlss_quality.SetValue(quality);
         CHECK(scale() == (DlssBuild ? word : ScaleOne));
-        CHECK(VideoCommon::AppliedOcarinaRenderScale() ==
+        CHECK(Settings::AppliedOcarinaRenderScale() ==
               (DlssBuild && word != ScaleOne ? std::optional{quality} : std::nullopt));
     }
 
@@ -754,12 +755,280 @@ TEST_CASE("Built-in DLSS render scale follows the NVIDIA DLSS quality", "[patch_
     Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Docked);
     Settings::values.upscaler.SetValue(Settings::Upscaler::Auto);
     CHECK(scale() == ScaleOne);
+    // AMD FSR 4 ignores nvidia_dlss_quality.
+    Settings::values.upscaler.SetValue(Settings::Upscaler::Fsr4);
+    CHECK(scale() == ScaleOne);
+    CHECK_FALSE(Settings::AppliedOcarinaRenderScale().has_value());
+    // A stale disabled_addons entry for Max Resolution no longer disables DLSS quality scaling.
     Settings::values.upscaler.SetValue(Settings::Upscaler::Dlss);
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
+    CHECK(scale() == (DlssBuild ? 0x52A7E809U : ScaleOne));
+    CHECK(Settings::AppliedOcarinaRenderScale() ==
+          (DlssBuild ? std::optional{Quality::Performance} : std::nullopt));
+    // Super-100 % oot_resolution keeps full guest render scale.
+    Settings::values.oot_resolution.SetValue(Settings::OotResolution::Percent150);
     CHECK(scale() == ScaleOne);
-    CHECK_FALSE(VideoCommon::AppliedOcarinaRenderScale().has_value());
+    CHECK_FALSE(Settings::AppliedOcarinaRenderScale().has_value());
 
     for (const auto& patch : context.Manager().GetPatches()) {
         CHECK(patch.name.find("render scale") == std::string::npos);
     }
+}
+
+TEST_CASE("No NDSR built-in tracks upscaler blocking and oot_anti_aliasing across resolutions",
+          "[patch_manager]") {
+    constexpr std::string_view NoNdsr = "No NDSR anti-aliasing (built-in)";
+    constexpr size_t ScaleOffset = sizeof(Loader::NSOHeader) + 0x806420;
+    constexpr std::array<size_t, 3> NdsrOffsets{
+        sizeof(Loader::NSOHeader) + 0x11AD528,
+        sizeof(Loader::NSOHeader) + 0x11B882C,
+        sizeof(Loader::NSOHeader) + 0x11B8844,
+    };
+    constexpr u32 ScaleOne = 0x52A7F009;
+    constexpr u32 Scale50 = 0x52A7E009;
+    constexpr u32 LdrbW8X0 = 0x39400008;
+    constexpr u32 MovW8Wzr = 0x2A1F03E8;
+
+    const auto prev_upscaler = Settings::values.upscaler.GetValue();
+    const auto prev_aa = Settings::values.oot_anti_aliasing.GetValue();
+    const auto prev_res = Settings::values.oot_resolution.GetValue();
+    struct Guard {
+        Settings::Upscaler upscaler;
+        Settings::OotAntiAliasing aa;
+        Settings::OotResolution res;
+        ~Guard() {
+            Settings::values.upscaler.SetValue(upscaler);
+            Settings::values.oot_anti_aliasing.SetValue(aa);
+            Settings::values.oot_resolution.SetValue(res);
+        }
+    } guard{prev_upscaler, prev_aa, prev_res};
+
+    PatchManagerTestContext context;
+    const auto manager = context.Manager();
+    auto nso = MakeMain(OcarinaBuildId, TbzInstruction);
+    nso.resize(NdsrOffsets.back() + sizeof(u32));
+    std::memcpy(nso.data() + ScaleOffset, &ScaleOne, sizeof(ScaleOne));
+    for (const size_t offset : NdsrOffsets) {
+        std::memcpy(nso.data() + offset, &LdrbW8X0, sizeof(LdrbW8X0));
+    }
+
+    const auto find_no_ndsr = [&] {
+        const auto patches = manager.GetPatches();
+        const auto it = std::ranges::find(patches, NoNdsr, &FileSys::Patch::name);
+        REQUIRE(it != patches.end());
+        REQUIRE(it->builtin.has_value());
+        return *it;
+    };
+
+    // Active temporal upscalers block No NDSR and report blocked_reason + resolved_enabled=false.
+    Settings::values.oot_anti_aliasing.SetValue(Settings::OotAntiAliasing::NoSharpening);
+    FileSys::ApplyBuiltinPatchChoice(Settings::values.disabled_addons[OcarinaTitleId], NoNdsr,
+                                     FileSys::BuiltinPatchChoice::On);
+    for (const auto upscaler : {Settings::Upscaler::Fsr3, Settings::Upscaler::Fsr4,
+                                Settings::Upscaler::Dlss, Settings::Upscaler::MetalFx}) {
+        Settings::values.upscaler.SetValue(upscaler);
+        const auto patch = find_no_ndsr();
+        CHECK_FALSE(patch.enabled);
+        CHECK_FALSE(patch.builtin->resolved_enabled);
+        CHECK(patch.builtin->blocked_reason == "Replaced by active temporal upscaler");
+        const auto out = manager.PatchNSO(nso, "main");
+        CHECK(WordAt(out, NdsrOffsets[0]) == LdrbW8X0);
+    }
+
+    // Auto blocks only on Apple; Windows/Linux Auto runs Ocarina's native pass.
+    Settings::values.upscaler.SetValue(Settings::Upscaler::Auto);
+    {
+        const auto patch = find_no_ndsr();
+#if defined(__APPLE__)
+        CHECK_FALSE(patch.enabled);
+        CHECK_FALSE(patch.builtin->resolved_enabled);
+        CHECK_FALSE(patch.builtin->blocked_reason.empty());
+#else
+        CHECK(patch.enabled);
+        CHECK(patch.builtin->resolved_enabled);
+        CHECK(patch.builtin->blocked_reason.empty());
+#endif
+    }
+
+    // With Upscaler::Game, oot_anti_aliasing=NoSharpening enables No NDSR at Full and < 100 %.
+    FileSys::ApplyBuiltinPatchChoice(Settings::values.disabled_addons[OcarinaTitleId], NoNdsr,
+                                     FileSys::BuiltinPatchChoice::FollowGlobal);
+    Settings::values.upscaler.SetValue(Settings::Upscaler::Game);
+    Settings::values.oot_anti_aliasing.SetValue(Settings::OotAntiAliasing::Game);
+    {
+        const auto patch = find_no_ndsr();
+        CHECK_FALSE(patch.enabled);
+        CHECK_FALSE(patch.builtin->resolved_enabled);
+        CHECK(patch.builtin->blocked_reason.empty());
+    }
+
+    Settings::values.oot_anti_aliasing.SetValue(Settings::OotAntiAliasing::NoSharpening);
+    for (const auto& [res, expected_scale] :
+         std::array<std::pair<Settings::OotResolution, u32>, 2>{{
+             {Settings::OotResolution::Full, ScaleOne},
+             {Settings::OotResolution::Percent50, Scale50},
+         }}) {
+        Settings::values.oot_resolution.SetValue(res);
+        const auto patch = find_no_ndsr();
+        CHECK(patch.enabled);
+        CHECK(patch.builtin->resolved_enabled);
+        CHECK(patch.builtin->source == FileSys::BuiltinPatchSource::Game);
+        CHECK(patch.builtin->blocked_reason.empty());
+        const auto out = manager.PatchNSO(nso, "main");
+        CHECK(WordAt(out, ScaleOffset) == expected_scale);
+        for (const size_t offset : NdsrOffsets) {
+            CHECK(WordAt(out, offset) == MovW8Wzr);
+        }
+    }
+}
+
+namespace {
+
+std::vector<u8> MakeTestZstdBntx(s32 edge = 1024, u16 mips = 10) {
+    constexpr u64 InfoArray = 0x198;
+    constexpr u64 NamePtr = 0x1B8;
+    constexpr u64 Brti = 0x1F8;
+    constexpr u64 MipPtr = 0x498;
+    constexpr u64 Brtd = 0xFF0;
+    std::vector<u8> out(0x1000);
+    const auto put = [&out](u64 offset, auto value) {
+        std::memcpy(out.data() + offset, &value, sizeof(value));
+    };
+    std::memcpy(out.data(), "BNTX", 4);
+    put(8, u32{0x00040101});
+    put(12, u16{0xFEFF});
+    put(14, u8{0x0C});
+    put(15, u8{0x40});
+    std::memcpy(out.data() + 0x20, "Ounc", 4);
+    put(0x24, u32{1});
+    put(0x28, InfoArray);
+    put(0x30, Brtd);
+    put(InfoArray, Brti);
+    put(NamePtr, u16{4});
+    std::memcpy(out.data() + NamePtr + 2, "Test", 4);
+    std::memcpy(out.data() + Brti, "BRTI", 4);
+    put(Brti + 0x10, u8{9});
+    put(Brti + 0x11, u8{2});
+    put(Brti + 0x16, mips);
+    put(Brti + 0x18, u32{1});
+    put(Brti + 0x1C, u32{0x1D01});
+    put(Brti + 0x20, u32{0x21});
+    put(Brti + 0x24, edge);
+    put(Brti + 0x28, edge);
+    put(Brti + 0x2C, s32{1});
+    put(Brti + 0x30, s32{1});
+    put(Brti + 0x34, s32{4});
+    put(Brti + 0x38, s32{0x100C9});
+    std::vector<u64> offsets{0x1000};
+    u64 image_size = 0;
+    s64 side = edge;
+    for (u16 i = 0; i < mips; ++i) {
+        const u64 level_bytes =
+            std::max<u64>(512, static_cast<u64>((side + 3) / 4) * static_cast<u64>((side + 3) / 4) * 8);
+        image_size += level_bytes;
+        if (i + 1 < mips) {
+            offsets.push_back(offsets.back() + level_bytes);
+        }
+        side = std::max<s64>(1, side / 2);
+    }
+    put(Brti + 0x50, static_cast<u32>(image_size));
+    put(Brti + 0x54, u32{512});
+    put(Brti + 0x60, NamePtr);
+    put(Brti + 0x70, MipPtr);
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        put(MipPtr + 8 * i, offsets[i]);
+    }
+    std::memcpy(out.data() + Brtd, "BRTD", 4);
+    put(Brtd + 8, 0x10 + image_size);
+    out.resize(0x1000 + static_cast<size_t>(image_size), 0x5A);
+    const u64 rlt = out.size();
+    out.resize(rlt + 16 + 2 * 0x18 + 2 * 8);
+    std::memcpy(out.data() + rlt, "_RLT", 4);
+    put(rlt + 4, static_cast<u32>(rlt));
+    put(rlt + 8, u32{2});
+    put(rlt + 16 + 8, u32{0});
+    put(rlt + 16 + 12, static_cast<u32>(MipPtr + 8 * mips));
+    put(rlt + 16 + 20, u32{1});
+    put(rlt + 16 + 0x18 + 8, static_cast<u32>(Brtd));
+    put(rlt + 16 + 0x18 + 12, static_cast<u32>(0x10 + image_size));
+    put(rlt + 16 + 0x18 + 16, u32{1});
+    put(rlt + 16 + 0x18 + 20, u32{1});
+    put(rlt + 16 + 0x30, u32{0x30});
+    put(rlt + 16 + 0x34, u16{1});
+    put(rlt + 16 + 0x36, u8{1});
+    put(rlt + 16 + 0x38, static_cast<u32>(MipPtr));
+    put(rlt + 16 + 0x3C, u16{1});
+    put(rlt + 16 + 0x3E, static_cast<u8>(mips));
+    put(0x18, static_cast<u32>(rlt));
+    put(0x1C, static_cast<u32>(out.size()));
+    return FileSys::MakeRawZstdFrame(out);
+}
+
+FileSys::VirtualDir MakeTextureRomFSDir() {
+    auto tex_file =
+        std::make_shared<FileSys::VectorVfsFile>(MakeTestZstdBntx(1024, 10), "hero.bntx.zs");
+    auto tex_dir = std::make_shared<FileSys::VectorVfsDirectory>(
+        std::vector<FileSys::VirtualFile>{std::move(tex_file)},
+        std::vector<FileSys::VirtualDir>{}, "Tex");
+    return std::make_shared<FileSys::VectorVfsDirectory>(
+        std::vector<FileSys::VirtualFile>{},
+        std::vector<FileSys::VirtualDir>{std::move(tex_dir)}, "");
+}
+
+u64 ReadRomFSTextureSize(const FileSys::VirtualFile& romfs) {
+    REQUIRE(romfs != nullptr);
+    const auto extracted = FileSys::ExtractRomFS(romfs);
+    REQUIRE(extracted != nullptr);
+    const auto file = extracted->GetFileRelative("Tex/hero.bntx.zs");
+    REQUIRE(file != nullptr);
+    return file->GetSize();
+}
+
+} // Anonymous namespace
+
+TEST_CASE("PatchRomFS applies texture_quality once across NSP/XCI, loose dirs, and NUP",
+          "[patch_manager]") {
+    const auto prev_tq = Settings::values.texture_quality.GetValue();
+    struct TqGuard {
+        Settings::TextureQuality prev;
+        ~TqGuard() {
+            Settings::values.texture_quality.SetValue(prev);
+        }
+    } guard{prev_tq};
+
+    PatchManagerTestContext context;
+    const auto manager = context.Manager();
+    const auto base_dir = MakeTextureRomFSDir();
+    const auto base_romfs = FileSys::CreateRomFS(base_dir);
+    const u64 full_size = ReadRomFSTextureSize(base_romfs);
+
+    Settings::values.texture_quality.SetValue(Settings::TextureQuality::Half);
+
+    // Dump RomFS (apply_layeredfs = false) leaves textures untouched.
+    const auto dumped =
+        manager.PatchRomFS(nullptr, base_romfs, FileSys::ContentRecordType::Program, nullptr, false);
+    CHECK(ReadRomFSTextureSize(dumped) == full_size);
+
+    // NSP/XCI/NCA path: drops one mip level, and a second PatchRomFS call will not drop again.
+    const auto patched = manager.PatchRomFS(nullptr, base_romfs);
+    const u64 half_size = ReadRomFSTextureSize(patched);
+    CHECK(half_size < full_size);
+    const auto patched_twice = manager.PatchRomFS(nullptr, patched);
+    CHECK(patched_twice == patched);
+    CHECK(ReadRomFSTextureSize(patched_twice) == half_size);
+
+    // Extracted loose romfs/ directory path: BuildPatchedRomFS drops once and guards PatchRomFS.
+    const auto built_dir = manager.BuildPatchedRomFS(MakeTextureRomFSDir());
+    REQUIRE(built_dir != nullptr);
+    CHECK(ReadRomFSTextureSize(built_dir) == half_size);
+    CHECK(manager.PatchRomFS(nullptr, built_dir) == built_dir);
+
+    // NUP path: ApplyTextureQuality runs before CreateLayeredRomFS; even without LayeredFS mods,
+    // CreateLayeredRomFS returns a finalized RomFS that PatchRomFS will not reduce a second time.
+    const auto nup_wrapped = FileSys::ApplyTextureQuality(MakeTextureRomFSDir(), 1);
+    const auto nup_romfs =
+        manager.CreateLayeredRomFS(nup_wrapped, FileSys::ContentRecordType::Program);
+    REQUIRE(nup_romfs != nullptr);
+    CHECK(ReadRomFSTextureSize(nup_romfs) == half_size);
+    CHECK(manager.PatchRomFS(nullptr, nup_romfs) == nup_romfs);
 }

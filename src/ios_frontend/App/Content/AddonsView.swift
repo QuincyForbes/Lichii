@@ -218,6 +218,7 @@ struct AddonsView: View {
 
     private func builtinRow(_ item: ContentBridge.Addon, _ info: ContentBridge.BuiltinPatch) -> some View {
         let included = !info.includedIn.isEmpty
+        let blocked = !info.blockedReason.isEmpty
         let name = item.name.replacingOccurrences(of: " (built-in)", with: "")
         let state = info.resolvedEnabled ? "On" : "Off"
         let decided: String
@@ -258,12 +259,16 @@ struct AddonsView: View {
             if included {
                 Text("Included in \(info.includedIn.replacingOccurrences(of: " (built-in)", with: ""))")
                     .font(.caption.weight(.semibold))
+            } else if blocked {
+                Label(info.blockedReason, systemImage: "exclamationmark.circle")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.orange)
             } else {
                 Text(info.followsGlobal ? "\(state) · follows \(decided)" : "\(state) · overridden for this game")
                     .font(.caption.weight(.semibold))
             }
         }
-        .opacity(included ? 0.5 : 1)
+        .opacity(included || blocked ? 0.55 : 1)
     }
 
     // MARK: Actions

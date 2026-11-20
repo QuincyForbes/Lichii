@@ -11,8 +11,11 @@
 
 #include <functional>
 #include <map>
+#include <span>
 #include <string>
+#include <string_view>
 #include <typeindex>
+#include <utility>
 #include "common/common_types.h"
 
 namespace Settings {
@@ -237,6 +240,14 @@ public:
      * @returns The index of the enum if the underlying setting type is an enum, else max of u32.
      */
     [[nodiscard]] virtual constexpr u32 EnumIndex() const = 0;
+
+    /**
+     * @returns Canonical name/value pairs when the setting is an enum, else an empty span.
+     */
+    [[nodiscard]] virtual std::span<const std::pair<std::string_view, u32>> Canonicalizations()
+        const noexcept {
+        return {};
+    }
 
     /**
      * @returns True if the underlying type is a floating point storage

@@ -87,11 +87,11 @@ std::filesystem::path UserDirectory() {
 // Built in so players don't have to set anything: the switches tuned for Ocarina of Time. Either
 // nx2_switches.txt overrides any of them (=0 turns one off).
 constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
-    {"EDEN_NX2_GRAPHICS_SSBO_BARE", "0"}, {"EDEN_NX2_WRITTEN_SSBO_MARK_KIB", "64"},
-    {"EDEN_NX2_ACQUIRE_PRECHECK", "2"},   {"EDEN_NX2_MACRO_SINK", "1"},
-    {"EDEN_NX2_COMPUTE_SINK", "1"},       {"EDEN_NX2_RING_PAIRS", "1"},
-    {"EDEN_NX2_UBO_INPLACE", "1"},        {"EDEN_NX2_PIPELINE_CLEAN", "1"},
-    {"EDEN_NX2_PREFLUSH", "1"},           {"EDEN_NX2_SEM_FAST", "2"},
+    {"EDEN_NX2_GRAPHICS_SSBO_BARE", "0"}, {"EDEN_NX2_ACQUIRE_PRECHECK", "2"},
+    {"EDEN_NX2_MACRO_SINK", "1"},         {"EDEN_NX2_COMPUTE_SINK", "1"},
+    {"EDEN_NX2_RING_PAIRS", "1"},         {"EDEN_NX2_UBO_INPLACE", "1"},
+    {"EDEN_NX2_PIPELINE_CLEAN", "1"},     {"EDEN_NX2_PREFLUSH", "1"},
+    {"EDEN_NX2_SEM_FAST", "2"},
     // NVIDIA's driver shader cache must hold OoT's ~120,000 prepared pipelines. Its size is a
     // Control Panel setting newer drivers no longer show; the driver also reads these variables,
     // for this process only (from Fritchii v5.5, 4012e5271e).

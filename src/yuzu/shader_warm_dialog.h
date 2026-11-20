@@ -40,7 +40,7 @@ class ShaderWarmDialog : public QDialog {
 public:
     explicit ShaderWarmDialog(Core::System& system, std::filesystem::path game_path, u64 title_id,
                               const QString& game_name, QWidget* parent = nullptr,
-                              bool compile_gpu = true);
+                              bool compile_gpu = true, bool extract_files = true);
     ~ShaderWarmDialog() override;
 
     void Start();
@@ -74,6 +74,7 @@ private:
     std::filesystem::path game_path;
     u64 title_id;
     bool compile_gpu{true};
+    bool extract_files{true};
     bool needs_boot_gpu_compile{};
 
     QLabel* stage_label{};

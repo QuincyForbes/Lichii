@@ -19,11 +19,13 @@
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QStackedWidget>
+#include <QTimer>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "qt_common/config/catalog_text.h"
 #include "yuzu/configuration/shared_widget.h"
 #include "yuzu/configuration/configure_performance.h"
 #include "yuzu/nx2_switches.h"
@@ -338,6 +340,21 @@ ConfigurePerformance::ConfigurePerformance(Performance::Platform platform_,
     rule->setFrameShadow(QFrame::Sunken);
     grid->addWidget(rule, 1, 0, 1, 2);
 
+    struct DynamicRowUi {
+        std::string line;
+        QCheckBox* box{};
+        QLabel* status{};
+        QString base_title_escaped;
+        QString base_line_escaped;
+        QStringList base_details;
+        QString base_status_text;
+        bool base_warn{};
+        bool base_recommended{};
+        bool unsupported{};
+        bool from_environment{};
+    };
+    std::vector<DynamicRowUi> dynamic_rows;
+
     int grid_row = 2;
     for (const Feature& feature : FeaturesFor(platform)) {
         const Verdict verdict = feature.check(context);
@@ -358,10 +375,11 @@ ConfigurePerformance::ConfigurePerformance(Performance::Platform platform_,
                               "this file.")
                                .arg(QString::fromLatin1(feature.name)));
         }
+        const QString title_escaped = tr(feature.title).toHtmlEscaped();
+        const QString line_escaped = QString::fromStdString(row.line).toHtmlEscaped();
         const QString tooltip =
             QStringLiteral("<p><b>%1</b><br><code>%2</code></p><p>%3</p>")
-                .arg(tr(feature.title).toHtmlEscaped(),
-                     QString::fromStdString(row.line).toHtmlEscaped(),
+                .arg(title_escaped, line_escaped,
                      details.join(QStringLiteral("\n")).toHtmlEscaped().replace(
                          QStringLiteral("\n"), QStringLiteral("</p><p>")));
 
@@ -400,6 +418,22 @@ ConfigurePerformance::ConfigurePerformance(Performance::Platform platform_,
         grid->addWidget(status, grid_row, 1);
         ++grid_row;
 
+        if (row.line == "EDEN_NX2_BANK_REUPLOAD=0" || row.line == "EDEN_NX2_SPLIT=2") {
+            dynamic_rows.push_back(DynamicRowUi{
+                .line = row.line,
+                .box = row.box,
+                .status = status,
+                .base_title_escaped = title_escaped,
+                .base_line_escaped = line_escaped,
+                .base_details = details,
+                .base_status_text = status_text,
+                .base_warn = warn,
+                .base_recommended = feature.recommended,
+                .unsupported = unsupported,
+                .from_environment = from_environment,
+            });
+        }
+
         if (feature.recommended && !unsupported) {
             recommended_lines.push_back(row.line);
         }
@@ -435,6 +469,111 @@ ConfigurePerformance::ConfigurePerformance(Performance::Platform platform_,
             .arg(QString::fromStdString(State::SwitchFilePath().string())));
     layout->addWidget(footer);
     layout->addStretch(1);
+
+    if (!dynamic_rows.empty()) {
+        const auto update_dynamic_rows = [this, dynamic_rows] {
+            const char* const env_host_import = std::getenv("EDEN_NX2_HOST_IMPORT");
+            const bool host_import_enabled =
+                state.IsEnabled("EDEN_NX2_HOST_IMPORT=1") ||
+                (env_host_import != nullptr && env_host_import[0] == '1');
+
+            auto gpu_acc = Settings::values.gpu_accuracy.GetValue(true);
+            auto dma_acc = Settings::values.dma_accuracy.GetValue(true);
+            if (QWidget* const top = window(); top != nullptr && top != this) {
+                for (auto* const w : top->findChildren<ConfigurationShared::Widget*>()) {
+                    if (w->combobox == nullptr) {
+                        continue;
+                    }
+                    if (w->GetSetting().Id() == Settings::values.gpu_accuracy.Id()) {
+                        gpu_acc =
+                            static_cast<Settings::GpuAccuracy>(w->combobox->currentData().toUInt());
+                    } else if (w->GetSetting().Id() == Settings::values.dma_accuracy.Id()) {
+                        dma_acc =
+                            static_cast<Settings::DmaAccuracy>(w->combobox->currentData().toUInt());
+                    }
+                }
+            }
+            const bool split_blocked = gpu_acc == Settings::GpuAccuracy::High ||
+                                       dma_acc == Settings::DmaAccuracy::Safe;
+
+            for (const DynamicRowUi& item : dynamic_rows) {
+                QStringList details = item.base_details;
+                QString status_text = item.base_status_text;
+                bool warn = item.base_warn;
+                bool box_enabled = true;
+
+                if (item.line == "EDEN_NX2_BANK_REUPLOAD=0" && host_import_enabled) {
+                    box_enabled = false;
+                    status_text = tr("ⓘ Covered by host import");
+                    details.append(tr("ⓘ Covered while EDEN_NX2_HOST_IMPORT=1 is enabled: native "
+                                      "64 KiB uniform banks are already read directly from guest "
+                                      "memory with no bank re-upload."));
+                } else if (item.line == "EDEN_NX2_SPLIT=2" && split_blocked && !item.unsupported) {
+                    warn = true;
+                    status_text = tr("⚠ Inactive (accuracy)");
+                    details.append(
+                        tr("⚠ Inactive while %1 is %2 or %3 is %4: cache-flushing command reads "
+                           "keep GPU commands on one thread.")
+                            .arg(UiText::SettingLabel("gpu_accuracy"),
+                                 UiText::ChoiceLabel("gpu_accuracy", "High"),
+                                 UiText::SettingLabel("dma_accuracy"),
+                                 UiText::ChoiceLabel("dma_accuracy", "Safe")));
+                }
+
+                const QString tooltip =
+                    QStringLiteral("<p><b>%1</b><br><code>%2</code></p><p>%3</p>")
+                        .arg(item.base_title_escaped, item.base_line_escaped,
+                             details.join(QStringLiteral("\n")).toHtmlEscaped().replace(
+                                 QStringLiteral("\n"), QStringLiteral("</p><p>")));
+
+                item.box->setEnabled(box_enabled);
+                item.box->setToolTip(tooltip);
+                item.status->setText(status_text);
+                item.status->setToolTip(tooltip);
+
+                QFont font = item.status->font();
+                if (warn) {
+                    font.setBold(false);
+                    item.status->setFont(font);
+                    item.status->setEnabled(true);
+                    item.status->setStyleSheet(QStringLiteral("QLabel { %1 }").arg(WarningStyle()));
+                } else if (!box_enabled) {
+                    font.setBold(false);
+                    item.status->setFont(font);
+                    item.status->setStyleSheet(QString{});
+                    item.status->setEnabled(false);
+                } else if (item.base_recommended) {
+                    font.setBold(true);
+                    item.status->setFont(font);
+                    item.status->setStyleSheet(QString{});
+                    item.status->setEnabled(true);
+                } else {
+                    font.setBold(false);
+                    item.status->setFont(font);
+                    item.status->setStyleSheet(QString{});
+                    item.status->setEnabled(false);
+                }
+            }
+        };
+
+        connect(&state, &State::Changed, this, update_dynamic_rows);
+        update_dynamic_rows();
+
+        // Connect to sibling Advanced Graphics accuracy comboboxes once attached to the dialog.
+        QTimer::singleShot(0, this, [this, update_dynamic_rows] {
+            if (QWidget* const top = window(); top != nullptr && top != this) {
+                for (auto* const w : top->findChildren<ConfigurationShared::Widget*>()) {
+                    if (w->combobox != nullptr &&
+                        (w->GetSetting().Id() == Settings::values.gpu_accuracy.Id() ||
+                         w->GetSetting().Id() == Settings::values.dma_accuracy.Id())) {
+                        connect(w->combobox, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                                this, update_dynamic_rows);
+                    }
+                }
+            }
+            update_dynamic_rows();
+        });
+    }
 
     connect(&state, &State::Changed, this, &ConfigurePerformance::Refresh);
     Refresh();
@@ -593,7 +732,7 @@ ConfigureShaders::ConfigureShaders(const Core::System& system_,
 
     add_group(tr("Compilation"), {&values.use_asynchronous_shaders, &values.use_mesh_shaders});
     add_group(tr("Caches"), {&values.use_disk_shader_cache, &values.use_vulkan_driver_pipeline_cache,
-                             &values.driver_shader_cache_size});
+                             &values.precache_shaders, &values.driver_shader_cache_size});
     layout->addStretch(1);
 }
 
@@ -603,7 +742,8 @@ bool ConfigureShaders::IsShaderSetting(u32 id) {
     const auto& v = Settings::values;
     return id == v.use_asynchronous_shaders.Id() || id == v.use_mesh_shaders.Id() ||
            id == v.use_disk_shader_cache.Id() || id == v.use_vulkan_driver_pipeline_cache.Id() ||
-           id == v.private_driver_shader_cache.Id() || id == v.driver_shader_cache_size.Id();
+           id == v.precache_shaders.Id() || id == v.private_driver_shader_cache.Id() ||
+           id == v.driver_shader_cache_size.Id();
 }
 
 void ConfigureShaders::ApplyConfiguration() {

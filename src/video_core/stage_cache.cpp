@@ -49,6 +49,13 @@ u64 EncodeReplacement(const std::optional<Shader::ReplaceConstant>& value) {
     return value ? (u64{1} << 32) | static_cast<u32>(*value) : 0;
 }
 
+struct PrecountedState {
+    const StageCache* cache{};
+    u32 count{};
+};
+
+thread_local PrecountedState tls_precounted{};
+
 } // Anonymous namespace
 
 StageCache::Recorder::Recorder(Shader::Environment& inner_) : inner{inner_} {
@@ -90,6 +97,14 @@ bool StageCache::Recorder::IsCbufStorageBufferPointer(u32 index, u32 offset) {
 bool StageCache::Recorder::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
     return Log(IndirectStoragePointer, index, offset, indirect,
                inner.IsCbufIndirectStorageBufferPointer(index, offset, indirect)) != 0;
+}
+
+std::vector<std::pair<u32, u32>> StageCache::Recorder::NullStoragePointerSlots() const {
+    return inner.NullStoragePointerSlots();
+}
+
+std::vector<u64> StageCache::Recorder::MappedStoragePointerKeys() const {
+    return inner.MappedStoragePointerKeys();
 }
 
 u32 StageCache::Recorder::ReadCbufValue(u32 index, u32 offset) {
@@ -134,6 +149,10 @@ bool StageCache::Recorder::HasHLEMacroState() const {
     return inner.HasHLEMacroState();
 }
 
+bool StageCache::Recorder::HasNativeInstructions() const {
+    return inner.HasNativeInstructions();
+}
+
 std::optional<Shader::ReplaceConstant> StageCache::Recorder::GetReplaceConstBuffer(u32 bank,
                                                                                    u32 offset) {
     const auto value = inner.GetReplaceConstBuffer(bank, offset);
@@ -164,6 +183,7 @@ std::vector<u8> StageCache::Signature(Shader::Environment& env, u64 unique_hash,
     writer.Put(env.StartAddress());
     writer.Put(env.IsProprietaryDriver());
     writer.Put(env.IsNativeProgram());
+    writer.Put(env.HasNativeInstructions());
     writer.Put(env.SPH());
     writer.Put(env.GpPassthroughMask());
     writer.Put(env.MeshRegisters());
@@ -275,7 +295,12 @@ void StageCache::Insert(std::shared_ptr<Translation> translation,
         translations[hash].push_back(std::move(translation));
     }
     Account(size);
-    CountTranslated();
+    if (tls_precounted.cache == this && tls_precounted.count > 0) {
+        --tls_precounted.count;
+    } else {
+        translated.fetch_add(1, std::memory_order_relaxed);
+        Log();
+    }
 }
 
 void StageCache::AddEmitted(const Translation& translation, std::shared_ptr<const Emitted> emitted) {
@@ -372,6 +397,11 @@ void StageCache::CountReuse(bool emitted) {
 }
 
 void StageCache::CountTranslated() {
+    if (tls_precounted.cache != this) {
+        tls_precounted = {this, 1};
+    } else {
+        ++tls_precounted.count;
+    }
     translated.fetch_add(1, std::memory_order_relaxed);
     Log();
 }

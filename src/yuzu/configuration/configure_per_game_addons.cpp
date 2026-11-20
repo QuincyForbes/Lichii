@@ -37,10 +37,35 @@
 
 namespace {
 
+template <typename Info>
+QString BuiltinBlockedReason(const Info& info) {
+    if constexpr (requires { info.blocked_reason; }) {
+        return QString::fromStdString(info.blocked_reason);
+    }
+    return {};
+}
+
+template <typename PatchT>
+QString PatchBlockedReason(const PatchT& patch) {
+    if constexpr (requires { patch.blocked_reason; }) {
+        if (!patch.blocked_reason.empty()) {
+            return QString::fromStdString(patch.blocked_reason);
+        }
+    }
+    if (patch.builtin) {
+        return BuiltinBlockedReason(*patch.builtin);
+    }
+    return {};
+}
+
 QString BuiltinVersionText(const QString& kind, FileSys::BuiltinPatchChoice choice,
-                           FileSys::BuiltinPatchSource source, const QString& included_in) {
+                           FileSys::BuiltinPatchSource source, const QString& included_in,
+                           const QString& blocked_reason = {}) {
     if (!included_in.isEmpty()) {
         return QObject::tr("%1 · included in %2").arg(kind, included_in);
+    }
+    if (!blocked_reason.isEmpty()) {
+        return QObject::tr("%1 · %2").arg(kind, blocked_reason);
     }
     using Choice = FileSys::BuiltinPatchChoice;
     if (choice != Choice::FollowGlobal) {
@@ -322,7 +347,7 @@ void ConfigurePerGameAddons::showContextMenu(const QPoint& pos) {
     QMenu menu(this);
 
     const bool all_builtin = std::ranges::all_of(selected, [](const QModelIndex& row) {
-        return row.data(BUILTIN_CHOICE).isValid();
+        return row.data(BUILTIN_CHOICE).isValid() && (row.flags() & Qt::ItemIsEnabled);
     });
     if (all_builtin) {
         QAction* follow = menu.addAction(tr("&Follow the global setting"));
@@ -437,6 +462,7 @@ void ConfigurePerGameAddons::LoadConfiguration(Loader::AppLoader* loader) {
         if (patch.builtin) {
             const auto& info = *patch.builtin;
             const auto included_in = StripBuiltinSuffix(QString::fromStdString(info.included_in));
+            const auto blocked_reason = PatchBlockedReason(patch);
             should_enable = patch.enabled;
             first_item->setData(static_cast<int>(info.choice), BUILTIN_CHOICE);
             first_item->setData(FileSys::BuiltinPatchEnabledWhenFollowing(patch.name),
@@ -446,17 +472,18 @@ void ConfigurePerGameAddons::LoadConfiguration(Loader::AppLoader* loader) {
                                 BUILTIN_CHECK);
             version_text = BuiltinVersionText(
                 QString::fromUtf8(FileSys::BuiltinPatchKindName(info.kind)), info.choice,
-                info.source, included_in);
+                info.source, included_in, blocked_reason);
+            const QString status_note =
+                !included_in.isEmpty()
+                    ? tr("Included in %1, which is on; this one does nothing while it is.")
+                          .arg(included_in)
+                : !blocked_reason.isEmpty()
+                    ? blocked_reason
+                    : tr("Right-click to follow the global setting (Configure > Graphics).");
             tooltip = tr("%1\n\n%2\n\n%3")
                           .arg(QString::fromStdString(info.description),
-                               QString::fromStdString(info.effect),
-                               included_in.isEmpty()
-                                   ? tr("Right-click to follow the global setting (Configure > "
-                                        "Graphics).")
-                                   : tr("Included in %1, which is on; this one does nothing "
-                                        "while it is.")
-                                         .arg(included_in));
-            if (!included_in.isEmpty()) {
+                               QString::fromStdString(info.effect), status_note);
+            if (!included_in.isEmpty() || !blocked_reason.isEmpty()) {
                 first_item->setEnabled(false);
             }
         }

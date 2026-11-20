@@ -346,49 +346,51 @@ Object CreateStageInComputePipelineState(const Device& device, const void* funct
             return {};
         }
     }
-    // MTLAttributeFormat has MTLVertexFormat's values.
-    MTLStageInputOutputDescriptor* stage_in = [MTLStageInputOutputDescriptor new];
-    for (size_t index = 0; index < layout.attributes.size(); ++index) {
-        const VertexAttributeState& attribute = layout.attributes[index];
-        const MTLVertexFormat format =
-            attribute.enabled != 0 ? VertexFormat(attribute.type, attribute.size)
-                                   : MTLVertexFormatInvalid;
-        if (format == MTLVertexFormatInvalid) {
-            continue;
+    @autoreleasepool {
+        // MTLAttributeFormat has MTLVertexFormat's values.
+        MTLStageInputOutputDescriptor* stage_in = [MTLStageInputOutputDescriptor new];
+        for (size_t index = 0; index < layout.attributes.size(); ++index) {
+            const VertexAttributeState& attribute = layout.attributes[index];
+            const MTLVertexFormat format =
+                attribute.enabled != 0 ? VertexFormat(attribute.type, attribute.size)
+                                       : MTLVertexFormatInvalid;
+            if (format == MTLVertexFormatInvalid) {
+                continue;
+            }
+            stage_in.attributes[index].format = static_cast<MTLAttributeFormat>(format);
+            stage_in.attributes[index].offset = attribute.offset;
+            stage_in.attributes[index].bufferIndex = VertexBufferSlot(attribute.stream);
         }
-        stage_in.attributes[index].format = static_cast<MTLAttributeFormat>(format);
-        stage_in.attributes[index].offset = attribute.offset;
-        stage_in.attributes[index].bufferIndex = VertexBufferSlot(attribute.stream);
-    }
-    for (size_t index = 0; index < layout.streams.size(); ++index) {
-        const VertexStreamState& stream = layout.streams[index];
-        if (stream.enabled == 0) {
-            continue;
+        for (size_t index = 0; index < layout.streams.size(); ++index) {
+            const VertexStreamState& stream = layout.streams[index];
+            if (stream.enabled == 0) {
+                continue;
+            }
+            MTLBufferLayoutDescriptor* buffer =
+                stage_in.layouts[VertexBufferSlot(static_cast<u32>(index))];
+            if (stream.stride == 0 || stream.divisor == ConstantStep) {
+                buffer.stepFunction = MTLStepFunctionConstant;
+                buffer.stepRate = 0;
+                buffer.stride = stream.stride != 0 ? stream.stride : 16;
+            } else if (stream.divisor != 0) {
+                buffer.stepFunction = MTLStepFunctionThreadPositionInGridY;
+                buffer.stepRate = stream.divisor;
+                buffer.stride = stream.stride;
+            } else {
+                buffer.stepFunction = index_size != 0 ? MTLStepFunctionThreadPositionInGridXIndexed
+                                                      : MTLStepFunctionThreadPositionInGridX;
+                buffer.stride = stream.stride;
+            }
         }
-        MTLBufferLayoutDescriptor* buffer =
-            stage_in.layouts[VertexBufferSlot(static_cast<u32>(index))];
-        if (stream.stride == 0 || stream.divisor == ConstantStep) {
-            buffer.stepFunction = MTLStepFunctionConstant;
-            buffer.stepRate = 0;
-            buffer.stride = stream.stride != 0 ? stream.stride : 16;
-        } else if (stream.divisor != 0) {
-            buffer.stepFunction = MTLStepFunctionThreadPositionInGridY;
-            buffer.stepRate = stream.divisor;
-            buffer.stride = stream.stride;
-        } else {
-            buffer.stepFunction = index_size != 0 ? MTLStepFunctionThreadPositionInGridXIndexed
-                                                  : MTLStepFunctionThreadPositionInGridX;
-            buffer.stride = stream.stride;
+        if (index_size != 0) {
+            stage_in.indexType = index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+            stage_in.indexBufferIndex = index_slot;
         }
+        MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
+        descriptor.computeFunction = (__bridge id<MTLFunction>)function;
+        descriptor.stageInputDescriptor = stage_in;
+        return CreateComputeState(device, descriptor, error, archive);
     }
-    if (index_size != 0) {
-        stage_in.indexType = index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
-        stage_in.indexBufferIndex = index_slot;
-    }
-    MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
-    descriptor.computeFunction = (__bridge id<MTLFunction>)function;
-    descriptor.stageInputDescriptor = stage_in;
-    return CreateComputeState(device, descriptor, error, archive);
 }
 
 Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc& desc,
@@ -400,118 +402,121 @@ Object CreateRenderPipelineState(const Device& device, const RenderPipelineDesc&
             return {};
         }
     }
-    MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
-    descriptor.vertexFunction = (__bridge id<MTLFunction>)desc.vertex_function;
-    descriptor.fragmentFunction = (__bridge id<MTLFunction>)desc.fragment_function;
-    SetTargets(descriptor, desc);
-    if (desc.tessellation != 0) {
-        // The control kernel writes half-precision factors, one set per patch.
-        descriptor.tessellationPartitionMode =
-            static_cast<MTLTessellationPartitionMode>(desc.tess_partition);
-        descriptor.tessellationOutputWindingOrder = static_cast<MTLWinding>(desc.tess_winding);
-        descriptor.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
-        descriptor.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
-        descriptor.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeNone;
-        descriptor.tessellationFactorScaleEnabled = NO;
+    @autoreleasepool {
+        MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
+        descriptor.vertexFunction = (__bridge id<MTLFunction>)desc.vertex_function;
+        descriptor.fragmentFunction = (__bridge id<MTLFunction>)desc.fragment_function;
+        SetTargets(descriptor, desc);
+        if (desc.tessellation != 0) {
+            // The control kernel writes half-precision factors, one set per patch.
+            descriptor.tessellationPartitionMode =
+                static_cast<MTLTessellationPartitionMode>(desc.tess_partition);
+            descriptor.tessellationOutputWindingOrder = static_cast<MTLWinding>(desc.tess_winding);
+            descriptor.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
+            descriptor.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
+            descriptor.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeNone;
+            descriptor.tessellationFactorScaleEnabled = NO;
 #if TARGET_OS_IPHONE
-        descriptor.maxTessellationFactor = 16;
+            descriptor.maxTessellationFactor = 16;
 #else
-        descriptor.maxTessellationFactor = 64;
+            descriptor.maxTessellationFactor = 64;
 #endif
-    } else {
-        descriptor.inputPrimitiveTopology = desc.topology_class == 0
-                                                ? MTLPrimitiveTopologyClassPoint
-                                            : desc.topology_class == 1
-                                                ? MTLPrimitiveTopologyClassLine
-                                                : MTLPrimitiveTopologyClassTriangle;
-    }
-
-    MTLVertexDescriptor* vertex = [MTLVertexDescriptor vertexDescriptor];
-    for (size_t index = 0; index < desc.attributes.size(); ++index) {
-        const VertexAttributeState& attribute = desc.attributes[index];
-        if (attribute.enabled == 0) {
-            continue;
-        }
-        const MTLVertexFormat format = VertexFormat(attribute.type, attribute.size);
-        if (format == MTLVertexFormatInvalid) {
-            continue;
-        }
-        vertex.attributes[index].format = format;
-        vertex.attributes[index].offset = attribute.offset;
-        vertex.attributes[index].bufferIndex = VertexBufferSlot(attribute.stream);
-    }
-    for (size_t index = 0; index < desc.streams.size(); ++index) {
-        const VertexStreamState& stream = desc.streams[index];
-        if (stream.enabled == 0) {
-            continue;
-        }
-        MTLVertexBufferLayoutDescriptor* layout =
-            vertex.layouts[VertexBufferSlot(static_cast<u32>(index))];
-        if (stream.stride == 0 || stream.divisor == ConstantStep) {
-            // One element for every vertex (Metal wants a non-zero stride otherwise).
-            layout.stepFunction = MTLVertexStepFunctionConstant;
-            layout.stepRate = 0;
-            layout.stride = stream.stride != 0 ? stream.stride : 16;
-        } else if (stream.divisor != 0) {
-            layout.stepFunction = MTLVertexStepFunctionPerInstance;
-            layout.stepRate = stream.divisor;
-            layout.stride = stream.stride;
         } else {
-            layout.stepFunction = MTLVertexStepFunctionPerVertex;
-            layout.stride = stream.stride;
+            descriptor.inputPrimitiveTopology = desc.topology_class == 0
+                                                    ? MTLPrimitiveTopologyClassPoint
+                                                : desc.topology_class == 1
+                                                    ? MTLPrimitiveTopologyClassLine
+                                                    : MTLPrimitiveTopologyClassTriangle;
         }
-    }
-    descriptor.vertexDescriptor = vertex;
 
-    const id<MTLBinaryArchive> binary =
-        archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
-    const auto start = std::chrono::steady_clock::now();
-    id<MTLRenderPipelineState> state = nil;
-    std::shared_lock<std::shared_mutex> building;
-    if (binary != nil) {
-        building = std::shared_lock{archive->BuildMutex()};
-        descriptor.binaryArchives = @[ binary ];
-        state = [device.GetDevice() newRenderPipelineStateWithDescriptor:descriptor
-                                                                 options:
-                                                                     MTLPipelineOptionFailOnBinaryArchiveMiss
-                                                              reflection:nil
-                                                                   error:nil];
-    }
-    if (building.owns_lock()) {
-        // Release right after the probe: holding the archive lock across the fallback compile
-        // (and the writer-preferring lock of an addition) serialized every builder.
-        building.unlock();
-    }
-    const bool hit = state != nil;
-    if (!hit && descriptor.binaryArchives != nil) {
-        descriptor.binaryArchives = nil;
-    }
-    NSError* ns_error = nil;
-    if (!hit) {
-        state = [device.GetDevice() newRenderPipelineStateWithDescriptor:descriptor
-                                                                    error:&ns_error];
-    }
-    if (building.owns_lock()) {
-        building.unlock();
-    }
-    if (state == nil) {
-        error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
-    }
-    if (binary != nil && state != nil) {
-        archive->NoteBuild(hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                     std::chrono::steady_clock::now() - start)
-                                                     .count()));
-        // A pipeline with no fragment function (depth only) is not archived: Metal then refuses
-        // to serialize the whole archive ("expecting 'fragment' stage in pipeline no. N"), so
-        // nothing was ever saved.
-        if (!hit && descriptor.fragmentFunction != nil && descriptor.rasterizationEnabled) {
-            MTLRenderPipelineDescriptor* const copy = [descriptor copy];
-            archive->DeferAdd([binary, copy] {
-                return [binary addRenderPipelineFunctionsWithDescriptor:copy error:nil] == YES;
-            });
+        MTLVertexDescriptor* vertex = [MTLVertexDescriptor vertexDescriptor];
+        for (size_t index = 0; index < desc.attributes.size(); ++index) {
+            const VertexAttributeState& attribute = desc.attributes[index];
+            if (attribute.enabled == 0) {
+                continue;
+            }
+            const MTLVertexFormat format = VertexFormat(attribute.type, attribute.size);
+            if (format == MTLVertexFormatInvalid) {
+                continue;
+            }
+            vertex.attributes[index].format = format;
+            vertex.attributes[index].offset = attribute.offset;
+            vertex.attributes[index].bufferIndex = VertexBufferSlot(attribute.stream);
         }
+        for (size_t index = 0; index < desc.streams.size(); ++index) {
+            const VertexStreamState& stream = desc.streams[index];
+            if (stream.enabled == 0) {
+                continue;
+            }
+            MTLVertexBufferLayoutDescriptor* layout =
+                vertex.layouts[VertexBufferSlot(static_cast<u32>(index))];
+            if (stream.stride == 0 || stream.divisor == ConstantStep) {
+                // One element for every vertex (Metal wants a non-zero stride otherwise).
+                layout.stepFunction = MTLVertexStepFunctionConstant;
+                layout.stepRate = 0;
+                layout.stride = stream.stride != 0 ? stream.stride : 16;
+            } else if (stream.divisor != 0) {
+                layout.stepFunction = MTLVertexStepFunctionPerInstance;
+                layout.stepRate = stream.divisor;
+                layout.stride = stream.stride;
+            } else {
+                layout.stepFunction = MTLVertexStepFunctionPerVertex;
+                layout.stride = stream.stride;
+            }
+        }
+        descriptor.vertexDescriptor = vertex;
+
+        const id<MTLBinaryArchive> binary =
+            archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
+        const auto start = std::chrono::steady_clock::now();
+        id<MTLRenderPipelineState> state = nil;
+        std::shared_lock<std::shared_mutex> building;
+        if (binary != nil) {
+            building = std::shared_lock{archive->BuildMutex()};
+            descriptor.binaryArchives = @[ binary ];
+            state = [device.GetDevice()
+                newRenderPipelineStateWithDescriptor:descriptor
+                                             options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                          reflection:nil
+                                               error:nil];
+        }
+        if (building.owns_lock()) {
+            // Release right after the probe: holding the archive lock across the fallback compile
+            // (and the writer-preferring lock of an addition) serialized every builder.
+            building.unlock();
+        }
+        const bool hit = state != nil;
+        if (!hit && descriptor.binaryArchives != nil) {
+            descriptor.binaryArchives = nil;
+        }
+        NSError* ns_error = nil;
+        if (!hit) {
+            state = [device.GetDevice() newRenderPipelineStateWithDescriptor:descriptor
+                                                                       error:&ns_error];
+        }
+        if (building.owns_lock()) {
+            building.unlock();
+        }
+        if (state == nil) {
+            error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
+        }
+        if (binary != nil && state != nil) {
+            archive->NoteBuild(
+                hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - start)
+                                          .count()));
+            // A pipeline with no fragment function (depth only) is not archived: Metal then refuses
+            // to serialize the whole archive ("expecting 'fragment' stage in pipeline no. N"), so
+            // nothing was ever saved.
+            if (!hit && descriptor.fragmentFunction != nil && descriptor.rasterizationEnabled) {
+                MTLRenderPipelineDescriptor* const copy = [descriptor copy];
+                archive->DeferAdd([binary, copy] {
+                    return [binary addRenderPipelineFunctionsWithDescriptor:copy error:nil] == YES;
+                });
+            }
+        }
+        return Retain(state);
     }
-    return Retain(state);
 }
 
 Object CreateMeshRenderPipelineState(const Device& device, const RenderPipelineDesc& desc,
@@ -527,99 +532,105 @@ Object CreateMeshRenderPipelineState(const Device& device, const RenderPipelineD
         error = "the device has no mesh pipelines";
         return {};
     }
-    MTLMeshRenderPipelineDescriptor* descriptor = [MTLMeshRenderPipelineDescriptor new];
-    descriptor.objectFunction = (__bridge id<MTLFunction>)functions.object_function;
-    descriptor.meshFunction = (__bridge id<MTLFunction>)functions.mesh_function;
-    descriptor.fragmentFunction =
-        functions.fragment_function != nullptr
-            ? (__bridge id<MTLFunction>)functions.fragment_function
-            : (desc.rasterize != 0 ? EmptyMeshFragmentFunction(device.GetDevice()) : nil);
-    if (functions.object_function != nullptr) {
-        // Metal wants the payload in 16-byte steps.
-        descriptor.payloadMemoryLength = (functions.payload_bytes + 15) & ~15U;
-        descriptor.maxTotalThreadsPerObjectThreadgroup = functions.object_threads;
-    }
-    descriptor.maxTotalThreadsPerMeshThreadgroup = functions.mesh_threads;
-    SetTargets(descriptor, desc);
-
-    const id<MTLBinaryArchive> binary =
-        archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
-    bool archived = false;
-    if (@available(iOS 18.0, macOS 15.0, *)) {
-        archived = binary != nil;
-    }
-    const auto start = std::chrono::steady_clock::now();
-    id<MTLRenderPipelineState> state = nil;
-    std::shared_lock<std::shared_mutex> building;
-    if (archived) {
-        if (@available(iOS 18.0, macOS 15.0, *)) {
-            building = std::shared_lock{archive->BuildMutex()};
-            descriptor.binaryArchives = @[ binary ];
-            state = [device.GetDevice()
-                newRenderPipelineStateWithMeshDescriptor:descriptor
-                                                 options:MTLPipelineOptionFailOnBinaryArchiveMiss
-                                              reflection:nil
-                                                   error:nil];
+    @autoreleasepool {
+        MTLMeshRenderPipelineDescriptor* descriptor = [MTLMeshRenderPipelineDescriptor new];
+        descriptor.objectFunction = (__bridge id<MTLFunction>)functions.object_function;
+        descriptor.meshFunction = (__bridge id<MTLFunction>)functions.mesh_function;
+        descriptor.fragmentFunction =
+            functions.fragment_function != nullptr
+                ? (__bridge id<MTLFunction>)functions.fragment_function
+                : (desc.rasterize != 0 ? EmptyMeshFragmentFunction(device.GetDevice()) : nil);
+        if (functions.object_function != nullptr) {
+            // Metal wants the payload in 16-byte steps.
+            descriptor.payloadMemoryLength = (functions.payload_bytes + 15) & ~15U;
+            descriptor.maxTotalThreadsPerObjectThreadgroup = functions.object_threads;
         }
-    }
-    if (building.owns_lock()) {
-        // Release right after the probe: holding the archive lock across the fallback compile
-        // (and the writer-preferring lock of an addition) serialized every builder.
-        building.unlock();
-    }
-    const bool hit = state != nil;
-    if (!hit && descriptor.binaryArchives != nil) {
-        descriptor.binaryArchives = nil;
-    }
-    NSError* ns_error = nil;
-    if (!hit) {
-        state = [device.GetDevice() newRenderPipelineStateWithMeshDescriptor:descriptor
-                                                                     options:MTLPipelineOptionNone
-                                                                  reflection:nil
-                                                                       error:&ns_error];
-    }
-    if (building.owns_lock()) {
-        building.unlock();
-    }
-    if (state == nil) {
-        error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
-    }
-    if (archived && state != nil) {
-        archive->NoteBuild(hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                     std::chrono::steady_clock::now() - start)
-                                                     .count()));
-        if (!hit && descriptor.fragmentFunction != nil && descriptor.rasterizationEnabled) {
+        descriptor.maxTotalThreadsPerMeshThreadgroup = functions.mesh_threads;
+        SetTargets(descriptor, desc);
+
+        const id<MTLBinaryArchive> binary =
+            archive != nullptr ? (__bridge id<MTLBinaryArchive>)archive->Handle() : nil;
+        bool archived = false;
+        if (@available(iOS 18.0, macOS 15.0, *)) {
+            archived = binary != nil;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        id<MTLRenderPipelineState> state = nil;
+        std::shared_lock<std::shared_mutex> building;
+        if (archived) {
             if (@available(iOS 18.0, macOS 15.0, *)) {
-                MTLMeshRenderPipelineDescriptor* const copy = [descriptor copy];
-                archive->DeferAdd([binary, copy] {
-                    return [binary addMeshRenderPipelineFunctionsWithDescriptor:copy error:nil] == YES;
-                });
+                building = std::shared_lock{archive->BuildMutex()};
+                descriptor.binaryArchives = @[ binary ];
+                state = [device.GetDevice()
+                    newRenderPipelineStateWithMeshDescriptor:descriptor
+                                                     options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                                  reflection:nil
+                                                       error:nil];
             }
         }
+        if (building.owns_lock()) {
+            // Release right after the probe: holding the archive lock across the fallback compile
+            // (and the writer-preferring lock of an addition) serialized every builder.
+            building.unlock();
+        }
+        const bool hit = state != nil;
+        if (!hit && descriptor.binaryArchives != nil) {
+            descriptor.binaryArchives = nil;
+        }
+        NSError* ns_error = nil;
+        if (!hit) {
+            state = [device.GetDevice() newRenderPipelineStateWithMeshDescriptor:descriptor
+                                                                         options:MTLPipelineOptionNone
+                                                                      reflection:nil
+                                                                           error:&ns_error];
+        }
+        if (building.owns_lock()) {
+            building.unlock();
+        }
+        if (state == nil) {
+            error = ns_error != nil ? ns_error.localizedDescription.UTF8String : "unknown error";
+        }
+        if (archived && state != nil) {
+            archive->NoteBuild(
+                hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - start)
+                                          .count()));
+            if (!hit && descriptor.fragmentFunction != nil && descriptor.rasterizationEnabled) {
+                if (@available(iOS 18.0, macOS 15.0, *)) {
+                    MTLMeshRenderPipelineDescriptor* const copy = [descriptor copy];
+                    archive->DeferAdd([binary, copy] {
+                        return [binary addMeshRenderPipelineFunctionsWithDescriptor:copy
+                                                                              error:nil] == YES;
+                    });
+                }
+            }
+        }
+        return Retain(state);
     }
-    return Retain(state);
 }
 
 Object CreateDepthStencilState(const Device& device, const DepthStencilDesc& desc) {
-    MTLDepthStencilDescriptor* descriptor = [MTLDepthStencilDescriptor new];
-    descriptor.depthCompareFunction =
-        desc.depth_test != 0 ? CompareFunction(desc.depth_func) : MTLCompareFunctionAlways;
-    descriptor.depthWriteEnabled = desc.depth_test != 0 && desc.depth_write != 0 ? YES : NO;
-    if (desc.stencil_test != 0) {
-        const auto face = [](const StencilFaceState& state) {
-            MTLStencilDescriptor* stencil = [MTLStencilDescriptor new];
-            stencil.stencilFailureOperation = StencilOperation(state.fail);
-            stencil.depthFailureOperation = StencilOperation(state.depth_fail);
-            stencil.depthStencilPassOperation = StencilOperation(state.pass);
-            stencil.stencilCompareFunction = CompareFunction(state.func);
-            stencil.readMask = state.read_mask;
-            stencil.writeMask = state.write_mask;
-            return stencil;
-        };
-        descriptor.frontFaceStencil = face(desc.front);
-        descriptor.backFaceStencil = face(desc.back);
+    @autoreleasepool {
+        MTLDepthStencilDescriptor* descriptor = [MTLDepthStencilDescriptor new];
+        descriptor.depthCompareFunction =
+            desc.depth_test != 0 ? CompareFunction(desc.depth_func) : MTLCompareFunctionAlways;
+        descriptor.depthWriteEnabled = desc.depth_test != 0 && desc.depth_write != 0 ? YES : NO;
+        if (desc.stencil_test != 0) {
+            const auto face = [](const StencilFaceState& state) {
+                MTLStencilDescriptor* stencil = [MTLStencilDescriptor new];
+                stencil.stencilFailureOperation = StencilOperation(state.fail);
+                stencil.depthFailureOperation = StencilOperation(state.depth_fail);
+                stencil.depthStencilPassOperation = StencilOperation(state.pass);
+                stencil.stencilCompareFunction = CompareFunction(state.func);
+                stencil.readMask = state.read_mask;
+                stencil.writeMask = state.write_mask;
+                return stencil;
+            };
+            descriptor.frontFaceStencil = face(desc.front);
+            descriptor.backFaceStencil = face(desc.back);
+        }
+        return Retain([device.GetDevice() newDepthStencilStateWithDescriptor:descriptor]);
     }
-    return Retain([device.GetDevice() newDepthStencilStateWithDescriptor:descriptor]);
 }
 
 } // namespace Metal

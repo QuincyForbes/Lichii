@@ -73,7 +73,6 @@
 #include "yuzu/configuration/configure_applets.h"
 #include "yuzu/configuration/configure_audio.h"
 #include "yuzu/configuration/configure_cpu.h"
-#include "yuzu/configuration/configure_frame_generation.h"
 #include "yuzu/configuration/configure_graphics.h"
 #include "yuzu/configuration/configure_graphics_advanced.h"
 #include "yuzu/configuration/configure_graphics_extensions.h"

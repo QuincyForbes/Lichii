@@ -59,17 +59,21 @@ public:
             // The compiler ends every program with an unconditional branch to itself; with a jump
             // table (whose targets live in a constant buffer) that is the only reliable end.
             if (opcode == 0x947 && computed_branch && instruction.Bits(12, 4) == 7 &&
-                target == s64{index} * 16)
+                instruction.Bits(87, 4) == 7 && instruction.Bits(84, 2) == 0 &&
+                instruction.Bits(32, 2) != 2 && target == s64{index} * 16 &&
+                index >= last_forward_target && index >= last_call_target)
                 return Result::Complete;
         }
         if (opcode == 0x949 || opcode == 0x958) computed_branch = true;
         if (computed_branch) return Result::Continue;
-        if (opcode == 0x94d && instruction.Bits(12, 4) == 7 && index >= last_forward_target) {
+        if (opcode == 0x94d && instruction.Bits(12, 4) == 7 && instruction.Bits(87, 4) == 7 &&
+            instruction.Bits(84, 2) == 0 && index >= last_forward_target) {
             if (index >= last_call_target) return Result::Complete;
             main_exited = true;
         }
-        if (opcode == 0x950 && instruction.Bits(12, 4) == 7 && main_exited &&
-            index >= last_call_target && index >= last_forward_target)
+        if (opcode == 0x950 && instruction.Bits(12, 4) == 7 && instruction.Bits(87, 4) == 7 &&
+            instruction.Bits(84, 2) == 0 && main_exited && index >= last_call_target &&
+            index >= last_forward_target)
             return Result::Complete;
         return Result::Continue;
     }

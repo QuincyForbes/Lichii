@@ -1144,8 +1144,12 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
                    progress.done, progress.total);
         std::fflush(stdout);
     };
-    const auto result = ShaderWarm::BuildWarmFilesWith(
-        system, Common::FS::ToU8String(argv[2]), title_id, options, on_progress, {});
+    std::filesystem::path game_path = Common::FS::ToU8String(argv[2]);
+    if (std::error_code ec; std::filesystem::is_directory(game_path, ec)) {
+        game_path /= "main";
+    }
+    const auto result =
+        ShaderWarm::BuildWarmFilesWith(system, game_path, title_id, options, on_progress, {});
     // The error can hold a Windows path: escape it so the summary stays valid JSON.
     std::string error;
     for (const char c : result.error) {
@@ -1223,10 +1227,6 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // A host's bench run (tools/nx2/ios_bench): its arguments are not launch parameters.
     LichiiBench::Configure(argc, argv);
 #endif
-
-    if (argc > 1 && std::string_view{argv[1]} == "--build-warm") {
-        return BuildWarm(state->system, argc, argv) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
-    }
 
     if (argc > 1 && std::string_view{argv[1]} == "--build-warm") {
         return BuildWarm(state->system, argc, argv) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
@@ -1671,31 +1671,6 @@ static void StartGame(SdlState* state, [[maybe_unused]] const Core::LaunchParams
                                     IosGameWindow(state));
     }
 #endif
-
-    // A game executing a program (e.g. restarting after a settings change) writes its launch state
-    // to the restart handoff and quits with kRestartExitCode; the launcher boots the same file again
-    // with EDEN_CLI_RESTART_HANDOFF set. Mirrors MainWindow::OnExecuteProgram.
-    state->system.RegisterExecuteProgramCallback([system = &state->system](std::size_t program_index) {
-        RestartHandoff handoff{
-            .program_index = static_cast<s32>(program_index),
-            .user_channel = system->GetUserChannel(),
-        };
-        const u64 previous_program_id = system->GetApplicationProcessProgramID();
-        if (previous_program_id > static_cast<u64>(Service::AM::AppletProgramId::MaxProgramId)) {
-            handoff.previous_program_index =
-                static_cast<s32>(previous_program_id - FileSys::GetBaseTitleID(previous_program_id));
-            handoff.program_id = previous_program_id;
-        }
-        // Without the handoff, a relaunch would boot as a frontend launch and clear temp storage.
-        if (!WriteRestartHandoff(handoff)) {
-            LOG_CRITICAL(Frontend, "ExecuteProgram: could not write {}, not restarting",
-                         Common::FS::PathToUTF8String(RestartHandoffPath()));
-            return;
-        }
-        LOG_INFO(Frontend, "ExecuteProgram: program index {}, exiting with code {} to restart",
-                 program_index, kRestartExitCode);
-        restart_requested = true;
-    });
 
     // A game executing a program (e.g. restarting after a settings change) writes its launch state
     // to the restart handoff and quits with kRestartExitCode; the launcher boots the same file again

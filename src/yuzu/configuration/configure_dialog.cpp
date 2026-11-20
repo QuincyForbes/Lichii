@@ -33,7 +33,6 @@
 #include "yuzu/configuration/configure_debug_tab.h"
 #include "yuzu/configuration/configure_dialog.h"
 #include "yuzu/configuration/configure_filesystem.h"
-#include "yuzu/configuration/configure_frame_generation.h"
 #include "yuzu/configuration/configure_general.h"
 #include "yuzu/configuration/configure_graphics.h"
 #include "yuzu/configuration/configure_graphics_advanced.h"

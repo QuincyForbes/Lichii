@@ -589,6 +589,33 @@ OotPresetCompanions OotGraphicsPresetCompanions(OotGraphicsPreset preset) {
     }
 }
 
+void ApplyOotGraphicsPreset(OotGraphicsPreset preset) {
+    const bool global = IsConfiguringGlobal();
+    const auto set = [global](auto& setting, auto value) {
+        if (!global) {
+            setting.SetGlobal(false);
+            setting.SetValue(value);
+            return;
+        }
+        const bool custom = !setting.UsingGlobal();
+        if (custom) {
+            setting.SetGlobal(true);
+        }
+        setting.SetValue(value);
+        if (custom) {
+            setting.SetGlobal(false);
+        }
+    };
+    set(values.oot_graphics_preset, preset);
+    const auto companions = OotGraphicsPresetCompanions(preset);
+    if (companions.resolution) {
+        set(values.oot_resolution, *companions.resolution);
+    }
+    if (!global && companions.textures) {
+        set(values.texture_quality, *companions.textures);
+    }
+}
+
 ResolutionSetup EffectiveResolutionSetup() {
     if (GetCurrentProgramID() != OcarinaOfTimeId) {
         return values.resolution_setup.GetValue();
@@ -641,8 +668,7 @@ std::atomic<u32> applied_ocarina_render_scale{};
 
 std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale() {
     const auto quality = values.nvidia_dlss_quality.GetValue();
-    const bool upscaler_uses_quality = NvidiaDlssChosen() || AmdFsr4Chosen();
-    if (!upscaler_uses_quality || !IsDockedMode() ||
+    if (!NvidiaDlssChosen() || !IsDockedMode() ||
         (quality != NvidiaDlssQuality::Balanced && quality != NvidiaDlssQuality::Performance &&
          quality != NvidiaDlssQuality::UltraPerformance)) {
         return std::nullopt;

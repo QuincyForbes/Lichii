@@ -120,6 +120,12 @@ std::vector<u8> ZstdDecompress(Bytes data, const ZstdDictionaries* dictionaries)
         }
     };
     thread_local Context context;
+    if (context.ctx == nullptr) {
+        context.ctx = ZSTD_createDCtx();
+        if (context.ctx == nullptr) {
+            throw ArchiveError("zstd context allocation failed");
+        }
+    }
     std::vector<u8> output(static_cast<size_t>(size));
     const size_t result =
         dictionary ? ZSTD_decompress_usingDDict(context.ctx, output.data(), output.size(),
@@ -328,12 +334,13 @@ std::vector<Member> ParseSarc(Bytes data) {
 
 struct Bnd4Member {
     std::string name;
-    std::vector<u8> owned;
-    Bytes payload;
+    Bytes raw_payload;
+    u64 unpacked{};
+    bool dcx{};
 };
 
-/// The members of a BND4 archive, with DCX compressed members unpacked. Throws on unsupported
-/// formats or sizes.
+/// The member table of a BND4 archive (DCX members are unpacked lazily one at a time during
+/// iteration). Throws on unsupported formats or sizes.
 std::vector<Bnd4Member> ParseBnd4(Bytes data) {
     Extent(data, 0, 64);
     if (!Is(data, 0, "BND4") || !Is(data, 9, std::string_view{"\0\1\0", 3}) ||
@@ -348,6 +355,7 @@ std::vector<Bnd4Member> ParseBnd4(Bytes data) {
     }
     Extent(data, 64, u64{count} * record_size);
     std::vector<Bnd4Member> result;
+    result.reserve(count);
     for (u32 index = 0; index < count; ++index) {
         const u64 record = 64 + u64{index} * record_size;
         if (!Is(data, record, std::string_view{"\x40\0\0\0\xff\xff\xff\xff", 8}) &&
@@ -377,12 +385,10 @@ std::vector<Bnd4Member> ParseBnd4(Bytes data) {
         }
         Bnd4Member member;
         member.name = std::move(filename);
-        member.payload = Extent(data, offset, size);
-        if (data[static_cast<size_t>(record)] == 0xc0) {
-            member.owned = DcxDecompress(member.payload);
-            member.payload = member.owned;
-        }
-        if (member.payload.size() != unpacked) {
+        member.raw_payload = Extent(data, offset, size);
+        member.unpacked = unpacked;
+        member.dcx = data[static_cast<size_t>(record)] == 0xc0;
+        if (!member.dcx && member.raw_payload.size() != unpacked) {
             throw ArchiveError("BND4 member size mismatch");
         }
         result.push_back(std::move(member));
@@ -519,50 +525,14 @@ std::vector<Record> ParseBnsh(Bytes data) {
     return result;
 }
 
-/// True when `data` holds the BNSH magic anywhere.
-bool HasEmbeddedBnsh(Bytes data) {
-    static constexpr std::array<u8, 8> magic{'B', 'N', 'S', 'H', 0, 0, 0, 0};
-    return std::search(data.begin(), data.end(), magic.begin(), magic.end()) != data.end();
-}
-
-/// Every BNSH file embedded in `data` with its offset, each one validated. Throws when there is
-/// none.
-std::vector<std::pair<size_t, Bytes>> FindEmbeddedBnsh(Bytes data) {
-    static constexpr std::array<u8, 8> magic{'B', 'N', 'S', 'H', 0, 0, 0, 0};
-    std::vector<std::pair<size_t, Bytes>> result;
-    size_t offset = 0;
-    for (;;) {
-        const auto it = std::search(data.begin() + static_cast<std::ptrdiff_t>(offset),
-                                    data.end(), magic.begin(), magic.end());
-        if (it == data.end()) {
-            break;
-        }
-        offset = static_cast<size_t>(it - data.begin());
-        const auto header = Extent(data, offset, 0x20);
-        const u32 size = Le<u32>(header, 0x1c);
-        if (size < 0x98) {
-            throw ArchiveError("invalid embedded BNSH size");
-        }
-        const auto bnsh = Extent(data, offset, size);
-        ParseBnsh(bnsh);
-        result.emplace_back(offset, bnsh);
-        offset += size;
-    }
-    if (result.empty()) {
-        throw ArchiveError("container contains no supported BNSH");
-    }
-    return result;
-}
-
-/// The BNSH files of a BFSHA archive, after its header checks.
-std::vector<std::pair<size_t, Bytes>> FindBnsh(Bytes data) {
+/// Validates a BFSHA archive header before scanning its embedded BNSH files.
+void ValidateBfshaHeader(Bytes data) {
     if (data.size() < 0x20 || !Is(data, 0, "FSHA")) {
         throw ArchiveError("not a BFSHA archive");
     }
     if (!Is(data, 0xc, "\xff\xfe") || Le<u32>(data, 0x1c) != data.size()) {
         throw ArchiveError("invalid BFSHA byte order or size");
     }
-    return FindEmbeddedBnsh(data);
 }
 
 /// The records of a CGSB container (one stage, up to 16 programs). Throws when the platform or
@@ -806,8 +776,7 @@ std::vector<Record> ParseBahs(Bytes data) {
             throw ArchiveError("invalid BAHS code extent");
         }
         const u64 code_offset = pool + code_relative;
-        const u64 code_size =
-            info->stage == ProgramStage::Compute ? declared : instruction_allocation;
+        const u64 code_size = info->stage == ProgramStage::Compute ? declared : allocation;
         const auto code = Extent(data, code_offset, code_size);
         if (info->stage == ProgramStage::Task || info->stage == ProgramStage::Mesh) {
             const u32 header_type = HeaderType(code);
@@ -847,8 +816,51 @@ struct Walker {
     /// Passes every record to the caller's record callback.
     void Emit(const std::vector<Record>& records) const {
         for (const auto& record : records) {
+            if (stop.stop_requested()) {
+                return;
+            }
             on_record(ShaderRecord{record.stage, record.code, record.control, record.maxwell});
         }
+    }
+
+    /// Scans `data` once for embedded BNSH files, parsing and emitting each one in a single pass.
+    /// Returns true when at least one BNSH was found (or `stop` interrupted).
+    bool EmitEmbeddedBnsh(Bytes data, bool allow_empty, int depth) const {
+        if (depth + 1 > 12) {
+            throw ArchiveError("excessive container nesting");
+        }
+        static constexpr std::array<u8, 8> magic{'B', 'N', 'S', 'H', 0, 0, 0, 0};
+        bool found = false;
+        const u8* ptr = data.data();
+        const u8* const end = ptr + data.size();
+        while (end - ptr >= 8) {
+            if (stop.stop_requested()) {
+                return true;
+            }
+            const auto* const hit =
+                static_cast<const u8*>(std::memchr(ptr, 'B', static_cast<size_t>(end - ptr - 7)));
+            if (hit == nullptr) {
+                break;
+            }
+            if (std::memcmp(hit, magic.data(), magic.size()) != 0) {
+                ptr = hit + 1;
+                continue;
+            }
+            const size_t offset = static_cast<size_t>(hit - data.data());
+            const auto header = Extent(data, offset, 0x20);
+            const u32 size = Le<u32>(header, 0x1c);
+            if (size < 0x98) {
+                throw ArchiveError("invalid embedded BNSH size");
+            }
+            const auto bnsh = Extent(data, offset, size);
+            Emit(ParseBnsh(bnsh));
+            found = true;
+            ptr = data.data() + offset + size;
+        }
+        if (!found && !allow_empty) {
+            throw ArchiveError("container contains no supported BNSH");
+        }
+        return found;
     }
 
     /// Walks one archive member, reporting its error to the caller instead of stopping the walk.
@@ -877,31 +889,36 @@ struct Walker {
             Walk(inner, name + "!dcx", depth + 1);
         } else if (Is(data, 0, "SARC")) {
             for (const auto& member : ParseSarc(data)) {
+                if (stop.stop_requested()) {
+                    return;
+                }
                 WalkMember(member.payload, name + "!" + member.name, depth + 1);
             }
         } else if (Is(data, 0, "BND4")) {
             for (const auto& member : ParseBnd4(data)) {
-                WalkMember(member.payload, name + "!" + member.name, depth + 1);
-            }
-        } else if (Is(data, 0, "FSHA")) {
-            for (const auto& [offset, bnsh] : FindBnsh(data)) {
-                Walk(bnsh, name + fmt::format("!BNSH@{:x}", offset), depth + 1);
-            }
-        } else if (data.size() >= 4 && Is(data, 0, "YB") && data[2] <= 7 && data[3] == 0 &&
-                   IsEffectSet(Lower(name))) {
-            if (HasEmbeddedBnsh(data)) {
-                for (const auto& [offset, bnsh] : FindEmbeddedBnsh(data)) {
-                    Walk(bnsh, name + fmt::format("!BNSH@{:x}", offset), depth + 1);
+                if (stop.stop_requested()) {
+                    return;
+                }
+                if (member.dcx) {
+                    const auto unpacked = DcxDecompress(member.raw_payload);
+                    if (unpacked.size() != member.unpacked) {
+                        throw ArchiveError("BND4 member size mismatch");
+                    }
+                    WalkMember(unpacked, name + "!" + member.name, depth + 1);
+                } else {
+                    WalkMember(member.raw_payload, name + "!" + member.name, depth + 1);
                 }
             }
+        } else if (Is(data, 0, "FSHA")) {
+            ValidateBfshaHeader(data);
+            EmitEmbeddedBnsh(data, false, depth);
+        } else if (data.size() >= 4 && Is(data, 0, "YB") && data[2] <= 7 && data[3] == 0 &&
+                   IsEffectSet(Lower(name))) {
+            EmitEmbeddedBnsh(data, true, depth);
         } else if (Is(data, 0, "VFXB")) {
             // Particle effect binaries (Fire Emblem's Effect/Particle/*.ptcl): the GPU particle
             // programs are embedded BNSH files; most effects have none.
-            if (HasEmbeddedBnsh(data)) {
-                for (const auto& [offset, bnsh] : FindEmbeddedBnsh(data)) {
-                    Walk(bnsh, name + fmt::format("!BNSH@{:x}", offset), depth + 1);
-                }
-            }
+            EmitEmbeddedBnsh(data, true, depth);
         } else if (Is(data, 0, "BNSH")) {
             Emit(ParseBnsh(data));
         } else if (Is(data, 0, "CGSB")) {
@@ -918,10 +935,7 @@ struct Walker {
             const auto lower = Lower(name);
             if ((EndsWith(lower, ".pck") || EndsWith(lower, ".pck!zstd") ||
                  EndsWith(lower, ".blarc") || EndsWith(lower, ".blarc!zstd")) &&
-                HasEmbeddedBnsh(data)) {
-                for (const auto& [offset, bnsh] : FindEmbeddedBnsh(data)) {
-                    Walk(bnsh, name + fmt::format("!BNSH@{:x}", offset), depth + 1);
-                }
+                EmitEmbeddedBnsh(data, true, depth)) {
                 return;
             }
             for (const std::string_view skip :
@@ -1020,6 +1034,33 @@ void WalkArchive(std::span<const u8> data, const std::string& name,
                  std::stop_token stop) {
     const Walker walker{dictionaries, on_record, on_member_error, std::move(stop)};
     walker.Walk(data, name, 0);
+}
+
+void WalkArchive(std::vector<u8>&& data, const std::string& name,
+                 const ZstdDictionaries* dictionaries,
+                 const std::function<void(const ShaderRecord&)>& on_record,
+                 const std::function<void(const std::string&)>& on_member_error,
+                 std::stop_token stop) {
+    std::vector<u8> owned = std::move(data);
+    std::string current_name = name;
+    int depth = 0;
+    while (!stop.stop_requested() && depth <= 12) {
+        if (Is(owned, 0, "\x28\xb5\x2f\xfd")) {
+            auto inner = ZstdDecompress(owned, dictionaries);
+            owned = std::move(inner);
+            current_name += "!zstd";
+            ++depth;
+        } else if (Is(owned, 0, std::string_view{"DCX\0", 4})) {
+            auto inner = DcxDecompress(owned);
+            owned = std::move(inner);
+            current_name += "!dcx";
+            ++depth;
+        } else {
+            break;
+        }
+    }
+    const Walker walker{dictionaries, on_record, on_member_error, std::move(stop)};
+    walker.Walk(owned, current_name, depth);
 }
 
 } // namespace VideoCommon::ShaderWarm

@@ -13,12 +13,15 @@
 #include <iterator>
 #include <mutex>
 #include <system_error>
+#include <type_traits>
 
 #include <boost/container/small_vector.hpp>
 
 #include "common/cityhash.h"
+#include "common/fs/file.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "common/zstd_compression.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
@@ -308,7 +311,136 @@ void ApplyVisualWorkaround(Shader::IR::Program& program, u64 hash) {
     }
 }
 
-constexpr u64 StageMslMagic = 0x3156534754534C4DULL; // "MLSTGSV1"
+static_assert(std::is_trivially_copyable_v<ShaderTranslate::ResourceSlot>);
+static_assert(std::is_trivially_copyable_v<ShaderTranslate::TessellationSlots>);
+
+constexpr std::array<char, 8> StageMslMagic{'M', 'T', 'L', 'S', 'T', 'G', '0', '2'};
+constexpr u32 StageMslVersion = 2;
+constexpr u32 MaxMslSourceBytes = 16U << 20;
+constexpr u32 MaxStageRecordBytes = 40U << 20;
+
+struct StageFileHeader {
+    std::array<char, 8> magic;
+    u32 version;
+    u32 reserved;
+};
+static_assert(sizeof(StageFileHeader) == 16);
+
+struct StageRecordHeader {
+    u128 key;
+    u32 uncompressed_size;
+    u32 compressed_size;
+};
+static_assert(sizeof(StageRecordHeader) == 24);
+
+[[nodiscard]] u32 StageStampTag(u64 build_stamp) noexcept {
+    if (build_stamp == 0) {
+        return 0;
+    }
+    const u32 hashed = static_cast<u32>(
+        Common::CityHash64(reinterpret_cast<const char*>(&build_stamp), sizeof(build_stamp)));
+    return hashed != 0 ? hashed : 1U;
+}
+
+[[nodiscard]] std::vector<u8> SerializeStageResult(const ShaderTranslate::Result& res) {
+    std::vector<u8> buf;
+    buf.reserve(res.source.size() + res.source_without_reduction.size() + res.entry_point.size() +
+                res.slots.size() * sizeof(ShaderTranslate::ResourceSlot) +
+                res.outputs.size() * 32 + 64);
+    const auto put_bytes = [&](const void* src, size_t len) {
+        if (len != 0) {
+            const auto* const ptr = static_cast<const u8*>(src);
+            buf.insert(buf.end(), ptr, ptr + len);
+        }
+    };
+    const auto put_u32 = [&](u32 val) { put_bytes(&val, sizeof(val)); };
+    const auto put_str = [&](std::string_view str) {
+        put_u32(static_cast<u32>(str.size()));
+        put_bytes(str.data(), str.size());
+    };
+
+    put_str(res.source);
+    put_str(res.source_without_reduction);
+    put_str(res.entry_point);
+
+    put_u32(static_cast<u32>(res.slots.size()));
+    put_bytes(res.slots.data(), res.slots.size() * sizeof(ShaderTranslate::ResourceSlot));
+
+    put_u32(static_cast<u32>(res.outputs.size()));
+    for (const ShaderTranslate::InterfaceVariable& var : res.outputs) {
+        put_u32(var.location);
+        put_u32(var.builtin);
+        put_u32(var.vecsize);
+        const u8 per_patch = var.per_patch ? 1U : 0U;
+        put_bytes(&per_patch, sizeof(per_patch));
+        put_str(var.name);
+    }
+
+    put_bytes(&res.tessellation_slots, sizeof(res.tessellation_slots));
+    put_u32(res.reduction_slot);
+    put_u32(res.spill_slot);
+    put_u32(res.sampler_spill_slot);
+    put_u32(res.array_spill_slot);
+    put_u32(res.array_spill_entries);
+    return buf;
+}
+
+[[nodiscard]] std::optional<ShaderTranslate::Result> DeserializeStageResult(
+    std::span<const u8> data) {
+    size_t cursor = 0;
+    const auto get_bytes = [&](void* dst, size_t len) -> bool {
+        if (len > data.size() - cursor) {
+            return false;
+        }
+        if (len != 0) {
+            std::memcpy(dst, data.data() + cursor, len);
+            cursor += len;
+        }
+        return true;
+    };
+    const auto get_u32 = [&](u32& out) -> bool { return get_bytes(&out, sizeof(out)); };
+    const auto get_str = [&](std::string& out, u32 max_len) -> bool {
+        u32 len{};
+        if (!get_u32(len) || len > max_len || len > data.size() - cursor) {
+            return false;
+        }
+        out.assign(reinterpret_cast<const char*>(data.data() + cursor), len);
+        cursor += len;
+        return true;
+    };
+
+    ShaderTranslate::Result res{};
+    u32 num_slots{};
+    u32 num_outputs{};
+    if (!get_str(res.source, MaxMslSourceBytes) ||
+        !get_str(res.source_without_reduction, MaxMslSourceBytes) ||
+        !get_str(res.entry_point, 4096) || !get_u32(num_slots) || num_slots > 4096) {
+        return std::nullopt;
+    }
+    res.slots.resize(num_slots);
+    if (!get_bytes(res.slots.data(), num_slots * sizeof(ShaderTranslate::ResourceSlot))) {
+        return std::nullopt;
+    }
+    if (!get_u32(num_outputs) || num_outputs > 4096) {
+        return std::nullopt;
+    }
+    res.outputs.resize(num_outputs);
+    for (ShaderTranslate::InterfaceVariable& var : res.outputs) {
+        u8 per_patch{};
+        if (!get_u32(var.location) || !get_u32(var.builtin) || !get_u32(var.vecsize) ||
+            !get_bytes(&per_patch, sizeof(per_patch)) || !get_str(var.name, 4096)) {
+            return std::nullopt;
+        }
+        var.per_patch = per_patch != 0;
+    }
+    if (!get_bytes(&res.tessellation_slots, sizeof(res.tessellation_slots)) ||
+        !get_u32(res.reduction_slot) || !get_u32(res.spill_slot) ||
+        !get_u32(res.sampler_spill_slot) || !get_u32(res.array_spill_slot) ||
+        !get_u32(res.array_spill_entries) || cursor != data.size() || res.source.empty()) {
+        return std::nullopt;
+    }
+    return res;
+}
 
 [[nodiscard]] bool StageMslCacheEnabled() {
     static const bool enabled = [] {
@@ -362,170 +494,307 @@ constexpr u64 StageMslMagic = 0x3156534754534C4DULL; // "MLSTGSV1"
 
 } // Anonymous namespace
 
+bool StageMslCache::HasValidEntries(const std::filesystem::path& file_path, u64 build_stamp) {
+    if (!StageMslCacheEnabled()) {
+        return true;
+    }
+    Common::FS::IOFile file{file_path, Common::FS::FileAccessMode::Read,
+                            Common::FS::FileType::BinaryFile,
+                            Common::FS::FileShareFlag::ShareReadWrite};
+    if (!file.IsOpen()) {
+        return false;
+    }
+    const u64 file_size = file.GetSize();
+    if (file_size <= sizeof(StageFileHeader) + sizeof(StageRecordHeader)) {
+        return false;
+    }
+    StageFileHeader hdr{};
+    if (!file.ReadObject(hdr) || hdr.magic != StageMslMagic || hdr.version != StageMslVersion) {
+        return false;
+    }
+    return build_stamp == 0 || hdr.reserved == StageStampTag(build_stamp);
+}
+
 void StageMslCache::Open(const std::filesystem::path& file_path, u64 build_stamp) {
     if (!StageMslCacheEnabled()) {
         return;
     }
+    std::scoped_lock save_lock{save_mutex};
     std::unique_lock lock{mutex};
     path = file_path;
     stamp = build_stamp;
+    valid_file_size = 0;
     open = true;
-    dirty = false;
-    entries.clear();
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) {
+    read_file.reset();
+    disk_index.clear();
+    pending_entries.clear();
+
+    if (path.filename() == "metal_stages.v2.bin") {
+        std::error_code remove_ec;
+        std::filesystem::remove(path.parent_path() / "metal_stages.v1.bin", remove_ec);
+    }
+
+    auto scan_file = std::make_shared<Common::FS::IOFile>(
+        path, Common::FS::FileAccessMode::Read, Common::FS::FileType::BinaryFile,
+        Common::FS::FileShareFlag::ShareReadWrite);
+    if (!scan_file->IsOpen()) {
         return;
     }
     const auto start = std::chrono::steady_clock::now();
-    u64 magic{}, stored_stamp{}, count{};
-    if (!in.read(reinterpret_cast<char*>(&magic), sizeof(magic)) ||
-        !in.read(reinterpret_cast<char*>(&stored_stamp), sizeof(stored_stamp)) ||
-        !in.read(reinterpret_cast<char*>(&count), sizeof(count)) || magic != StageMslMagic ||
-        (stamp != 0 && stored_stamp != stamp) || count > 262144) {
+    StageFileHeader hdr{};
+    if (!scan_file->ReadObject(hdr) || hdr.magic != StageMslMagic ||
+        hdr.version != StageMslVersion ||
+        (stamp != 0 && hdr.reserved != StageStampTag(stamp))) {
         return;
     }
-    const auto read_str = [&](std::string& out, u32 max_len) {
-        u32 len{};
-        if (!in.read(reinterpret_cast<char*>(&len), sizeof(len)) || len > max_len) {
-            return false;
+    const u64 file_size = scan_file->GetSize();
+    u64 pos = sizeof(StageFileHeader);
+    while (pos + sizeof(StageRecordHeader) <= file_size) {
+        if (!scan_file->Seek(static_cast<s64>(pos))) {
+            break;
         }
-        out.resize(len);
-        return len == 0 || static_cast<bool>(in.read(out.data(), len));
-    };
-    entries.reserve(static_cast<size_t>(count));
-    for (u64 i = 0; i < count; ++i) {
-        u128 key{};
-        ShaderTranslate::Result res{};
-        u32 num_slots{}, num_outputs{};
-        if (!in.read(reinterpret_cast<char*>(&key), sizeof(key)) ||
-            !read_str(res.source, 16U << 20) ||
-            !read_str(res.source_without_reduction, 16U << 20) ||
-            !read_str(res.entry_point, 4096) ||
-            !in.read(reinterpret_cast<char*>(&num_slots), sizeof(num_slots)) || num_slots > 4096) {
-            entries.clear();
-            return;
+        StageRecordHeader rec{};
+        if (!scan_file->ReadObject(rec)) {
+            break;
         }
-        res.slots.resize(num_slots);
-        if (num_slots != 0 &&
-            !in.read(reinterpret_cast<char*>(res.slots.data()),
-                     static_cast<std::streamsize>(num_slots * sizeof(ShaderTranslate::ResourceSlot)))) {
-            entries.clear();
-            return;
+        const u64 payload_offset = pos + sizeof(StageRecordHeader);
+        if (rec.uncompressed_size == 0 || rec.uncompressed_size > MaxStageRecordBytes ||
+            rec.compressed_size == 0 || rec.compressed_size > MaxStageRecordBytes ||
+            rec.compressed_size > file_size - payload_offset) {
+            break;
         }
-        if (!in.read(reinterpret_cast<char*>(&num_outputs), sizeof(num_outputs)) ||
-            num_outputs > 4096) {
-            entries.clear();
-            return;
-        }
-        res.outputs.resize(num_outputs);
-        if (num_outputs != 0 &&
-            !in.read(reinterpret_cast<char*>(res.outputs.data()),
-                     static_cast<std::streamsize>(num_outputs *
-                                                  sizeof(ShaderTranslate::InterfaceVariable)))) {
-            entries.clear();
-            return;
-        }
-        if (!in.read(reinterpret_cast<char*>(&res.tessellation_slots),
-                     sizeof(res.tessellation_slots)) ||
-            !in.read(reinterpret_cast<char*>(&res.reduction_slot), sizeof(u32)) ||
-            !in.read(reinterpret_cast<char*>(&res.spill_slot), sizeof(u32)) ||
-            !in.read(reinterpret_cast<char*>(&res.sampler_spill_slot), sizeof(u32)) ||
-            !in.read(reinterpret_cast<char*>(&res.array_spill_slot), sizeof(u32)) ||
-            !in.read(reinterpret_cast<char*>(&res.array_spill_entries), sizeof(u32)) ||
-            res.source.empty()) {
-            entries.clear();
-            return;
-        }
-        entries.emplace(key, std::move(res));
+        disk_index.insert_or_assign(rec.key, DiskSlice{
+                                                 .offset = payload_offset,
+                                                 .comp_size = rec.compressed_size,
+                                                 .uncomp_size = rec.uncompressed_size,
+                                             });
+        pos = payload_offset + rec.compressed_size;
     }
+    if (pos < file_size) {
+        scan_file.reset();
+        std::error_code resize_ec;
+        std::filesystem::resize_file(path, pos, resize_ec);
+        scan_file = std::make_shared<Common::FS::IOFile>(
+            path, Common::FS::FileAccessMode::Read, Common::FS::FileType::BinaryFile,
+            Common::FS::FileShareFlag::ShareReadWrite);
+        if (!scan_file->IsOpen()) {
+            disk_index.clear();
+            return;
+        }
+    }
+    valid_file_size = pos;
+    read_file = std::move(scan_file);
     const double ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
             .count();
-    LOG_INFO(Render_Metal, "Metal: stage MSL cache {} loaded ({} stages, {:.1f} ms)",
-             path.string(), entries.size(), ms);
+    LOG_INFO(Render_Metal, "Metal: stage MSL cache {} indexed ({} stages, {} KiB, {:.1f} ms)",
+             path.string(), disk_index.size(), valid_file_size >> 10, ms);
 }
 
-void StageMslCache::Save() {
-    std::shared_lock lock{mutex};
-    if (!open || !dirty || path.empty()) {
+void StageMslCache::Flush() {
+    if (!StageMslCacheEnabled()) {
         return;
     }
-    std::error_code ec;
-    std::filesystem::create_directories(path.parent_path(), ec);
-    std::filesystem::path tmp = path;
-    tmp += ".tmp";
+    std::scoped_lock save_lock{save_mutex};
+    std::filesystem::path target_path;
+    u64 target_stamp{};
+    u64 start_offset{};
+    bool need_reader = false;
+    std::vector<std::pair<u128, std::shared_ptr<const ShaderTranslate::Result>>> batch;
     {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out.is_open()) {
+        std::shared_lock lock{mutex};
+        if (!open || path.empty() || pending_entries.empty()) {
             return;
         }
-        const u64 magic = StageMslMagic;
-        const u64 count = entries.size();
-        out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
-        out.write(reinterpret_cast<const char*>(&stamp), sizeof(stamp));
-        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
-        const auto write_str = [&](const std::string& str) {
-            const u32 len = static_cast<u32>(str.size());
-            out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-            if (len != 0) {
-                out.write(str.data(), len);
+        target_path = path;
+        target_stamp = stamp;
+        start_offset = valid_file_size;
+        need_reader = !read_file || !read_file->IsOpen();
+        batch.reserve(pending_entries.size());
+        for (const auto& [key, res_ptr] : pending_entries) {
+            if (!disk_index.contains(key) && res_ptr) {
+                batch.emplace_back(key, res_ptr);
             }
-        };
-        for (const auto& [key, res] : entries) {
-            out.write(reinterpret_cast<const char*>(&key), sizeof(key));
-            write_str(res.source);
-            write_str(res.source_without_reduction);
-            write_str(res.entry_point);
-            const u32 num_slots = static_cast<u32>(res.slots.size());
-            out.write(reinterpret_cast<const char*>(&num_slots), sizeof(num_slots));
-            if (num_slots != 0) {
-                out.write(reinterpret_cast<const char*>(res.slots.data()),
-                          static_cast<std::streamsize>(num_slots *
-                                                       sizeof(ShaderTranslate::ResourceSlot)));
-            }
-            const u32 num_outputs = static_cast<u32>(res.outputs.size());
-            out.write(reinterpret_cast<const char*>(&num_outputs), sizeof(num_outputs));
-            if (num_outputs != 0) {
-                out.write(reinterpret_cast<const char*>(res.outputs.data()),
-                          static_cast<std::streamsize>(
-                              num_outputs * sizeof(ShaderTranslate::InterfaceVariable)));
-            }
-            out.write(reinterpret_cast<const char*>(&res.tessellation_slots),
-                      sizeof(res.tessellation_slots));
-            out.write(reinterpret_cast<const char*>(&res.reduction_slot), sizeof(u32));
-            out.write(reinterpret_cast<const char*>(&res.spill_slot), sizeof(u32));
-            out.write(reinterpret_cast<const char*>(&res.sampler_spill_slot), sizeof(u32));
-            out.write(reinterpret_cast<const char*>(&res.array_spill_slot), sizeof(u32));
-            out.write(reinterpret_cast<const char*>(&res.array_spill_entries), sizeof(u32));
         }
-        if (!out.good()) {
-            lock.unlock();
+    }
+    if (batch.empty()) {
+        std::unique_lock lock{mutex};
+        for (auto it = pending_entries.begin(); it != pending_entries.end();) {
+            if (disk_index.contains(it->first)) {
+                it = pending_entries.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        return;
+    }
+
+    struct PreparedRecord {
+        u128 key;
+        u32 uncomp_size;
+        std::vector<u8> compressed;
+    };
+    std::vector<PreparedRecord> prepared;
+    prepared.reserve(batch.size());
+    size_t total_append_bytes = 0;
+    for (const auto& [key, res_ptr] : batch) {
+        const std::vector<u8> raw = SerializeStageResult(*res_ptr);
+        if (raw.empty() || raw.size() > MaxStageRecordBytes) {
+            continue;
+        }
+        std::vector<u8> comp = Common::Compression::CompressDataZSTD(raw.data(), raw.size(), 1);
+        if (comp.empty() || comp.size() > MaxStageRecordBytes) {
+            continue;
+        }
+        total_append_bytes += sizeof(StageRecordHeader) + comp.size();
+        prepared.push_back(PreparedRecord{
+            .key = key,
+            .uncomp_size = static_cast<u32>(raw.size()),
+            .compressed = std::move(comp),
+        });
+    }
+    if (prepared.empty()) {
+        return;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(target_path.parent_path(), ec);
+
+    std::vector<u8> write_buf;
+    const u64 base_offset = start_offset == 0 ? sizeof(StageFileHeader) : start_offset;
+    write_buf.reserve((start_offset == 0 ? sizeof(StageFileHeader) : 0) + total_append_bytes);
+    if (start_offset == 0) {
+        const StageFileHeader hdr{
+            .magic = StageMslMagic,
+            .version = StageMslVersion,
+            .reserved = StageStampTag(target_stamp),
+        };
+        const auto* const hdr_bytes = reinterpret_cast<const u8*>(&hdr);
+        write_buf.insert(write_buf.end(), hdr_bytes, hdr_bytes + sizeof(hdr));
+    }
+
+    std::vector<std::pair<u128, DiskSlice>> new_slices;
+    new_slices.reserve(prepared.size());
+    u64 running_offset = base_offset;
+    for (const PreparedRecord& item : prepared) {
+        const StageRecordHeader rec{
+            .key = item.key,
+            .uncompressed_size = item.uncomp_size,
+            .compressed_size = static_cast<u32>(item.compressed.size()),
+        };
+        const auto* const rec_bytes = reinterpret_cast<const u8*>(&rec);
+        write_buf.insert(write_buf.end(), rec_bytes, rec_bytes + sizeof(rec));
+        write_buf.insert(write_buf.end(), item.compressed.begin(), item.compressed.end());
+        const u64 payload_offset = running_offset + sizeof(StageRecordHeader);
+        new_slices.emplace_back(item.key, DiskSlice{
+                                              .offset = payload_offset,
+                                              .comp_size = rec.compressed_size,
+                                              .uncomp_size = rec.uncompressed_size,
+                                          });
+        running_offset = payload_offset + rec.compressed_size;
+    }
+
+    std::shared_ptr<Common::FS::IOFile> opened_reader;
+    if (start_offset == 0) {
+        std::filesystem::path tmp = target_path;
+        tmp += ".tmp";
+        {
+            Common::FS::IOFile out{tmp, Common::FS::FileAccessMode::Write,
+                                   Common::FS::FileType::BinaryFile,
+                                   Common::FS::FileShareFlag::ShareReadWrite};
+            if (!out.IsOpen() || out.WriteSpan<u8>(write_buf) != write_buf.size() || !out.Flush()) {
+                out.Close();
+                std::filesystem::remove(tmp, ec);
+                return;
+            }
+        }
+        std::filesystem::rename(tmp, target_path, ec);
+        if (ec) {
             std::filesystem::remove(tmp, ec);
             return;
         }
+        need_reader = true;
+    } else {
+        Common::FS::IOFile out{target_path, Common::FS::FileAccessMode::ReadWrite,
+                               Common::FS::FileType::BinaryFile,
+                               Common::FS::FileShareFlag::ShareReadWrite};
+        if (!out.IsOpen() || !out.Seek(static_cast<s64>(start_offset))) {
+            return;
+        }
+        if (out.WriteSpan<u8>(write_buf) != write_buf.size() || !out.Flush()) {
+            static_cast<void>(out.SetSize(start_offset));
+            return;
+        }
     }
-    const size_t saved_count = entries.size();
-    const std::filesystem::path dst_path = path;
-    lock.unlock();
-    std::unique_lock write_lock{mutex};
-    std::filesystem::rename(tmp, dst_path, ec);
-    if (!ec) {
-        dirty = false;
-        LOG_INFO(Render_Metal, "Metal: stage MSL cache {} written ({} stages)", dst_path.string(),
-                 saved_count);
+
+    if (need_reader) {
+        opened_reader = std::make_shared<Common::FS::IOFile>(
+            target_path, Common::FS::FileAccessMode::Read, Common::FS::FileType::BinaryFile,
+            Common::FS::FileShareFlag::ShareReadWrite);
+        if (!opened_reader->IsOpen()) {
+            return;
+        }
     }
+
+    size_t total_indexed = 0;
+    {
+        std::unique_lock lock{mutex};
+        if (!open || path != target_path || stamp != target_stamp) {
+            return;
+        }
+        if (opened_reader) {
+            read_file = std::move(opened_reader);
+        }
+        valid_file_size = running_offset;
+        for (const auto& [key, slice] : new_slices) {
+            disk_index.insert_or_assign(key, slice);
+            pending_entries.erase(key);
+        }
+        if (pending_entries.empty() && pending_entries.bucket_count() > 256) {
+            std::unordered_map<u128, std::shared_ptr<const ShaderTranslate::Result>, KeyHasher>{}
+                .swap(pending_entries);
+        }
+        total_indexed = disk_index.size();
+    }
+    LOG_DEBUG(Render_Metal, "Metal: stage MSL cache {} flushed +{} stages ({} total, {} KiB)",
+              target_path.string(), new_slices.size(), total_indexed, running_offset >> 10);
 }
 
 std::optional<ShaderTranslate::Result> StageMslCache::Find(const u128& key) const {
     if (!StageMslCacheEnabled()) {
         return std::nullopt;
     }
-    std::shared_lock lock{mutex};
-    const auto it = entries.find(key);
-    if (it == entries.end()) {
+    DiskSlice slice{};
+    std::shared_ptr<Common::FS::IOFile> reader;
+    {
+        std::shared_lock lock{mutex};
+        if (!open) {
+            return std::nullopt;
+        }
+        if (const auto it = pending_entries.find(key);
+            it != pending_entries.end() && it->second != nullptr) {
+            return *it->second;
+        }
+        const auto disk_it = disk_index.find(key);
+        if (disk_it == disk_index.end()) {
+            return std::nullopt;
+        }
+        slice = disk_it->second;
+        reader = read_file;
+    }
+    if (!reader || !reader->IsOpen() || slice.comp_size == 0 || slice.uncomp_size == 0 ||
+        slice.comp_size > MaxStageRecordBytes || slice.uncomp_size > MaxStageRecordBytes) {
         return std::nullopt;
     }
-    return it->second;
+    std::vector<u8> compressed(slice.comp_size);
+    if (reader->ReadBytesAt(compressed, slice.offset) != slice.comp_size) {
+        return std::nullopt;
+    }
+    std::vector<u8> uncompressed(slice.uncomp_size);
+    if (Common::Compression::DecompressDataZSTD(compressed, uncompressed) != slice.uncomp_size) {
+        return std::nullopt;
+    }
+    return DeserializeStageResult(uncompressed);
 }
 
 void StageMslCache::Insert(const u128& key, const ShaderTranslate::Result& result) {
@@ -533,14 +802,20 @@ void StageMslCache::Insert(const u128& key, const ShaderTranslate::Result& resul
         return;
     }
     std::unique_lock lock{mutex};
-    if (entries.emplace(key, result).second) {
-        dirty = true;
+    if (!open || disk_index.contains(key) || pending_entries.contains(key)) {
+        return;
     }
+    pending_entries.emplace(key, std::make_shared<const ShaderTranslate::Result>(result));
 }
 
 size_t StageMslCache::Size() const {
     std::shared_lock lock{mutex};
-    return entries.size();
+    return disk_index.size() + pending_entries.size();
+}
+
+size_t StageMslCache::PendingSize() const {
+    std::shared_lock lock{mutex};
+    return pending_entries.size();
 }
 
 u64 PipelineTranslator::VisualWorkaroundEdits() noexcept {
@@ -907,7 +1182,6 @@ bool PipelineTranslator::TranslatePrograms(const GraphicsPipelineKey& key,
                 Shader::Maxwell::Flow::CFG cfg(recorder, pools.flow_block, cfg_offset, index == 0);
                 programs[index] =
                     TranslateProgram(pools.inst, pools.block, recorder, cfg, host_info);
-                stage_cache->CountTranslated();
                 auto translation = std::make_shared<Cache::Translation>();
                 translation->signature = std::move(signature);
                 translation->reads = recorder.TakeReads();
@@ -2097,9 +2371,6 @@ std::optional<StageProgram> PipelineTranslator::Compute(u64 unique_hash,
         Shader::Environment& active_env = reused ? env : static_cast<Shader::Environment&>(recorder);
         Shader::Maxwell::Flow::CFG cfg{active_env, pools.flow_block, env.StartAddress()};
         auto program = TranslateProgram(pools.inst, pools.block, active_env, cfg, host_info);
-        if (!reused) {
-            stage_cache->CountTranslated();
-        }
         if (VideoCommon::FeatureCensus::Enabled()) {
             VideoCommon::FeatureCensus::NoteProgram(unique_hash, program);
         }
@@ -2206,7 +2477,6 @@ std::optional<StageProgram> PipelineTranslator::WarmSingleStage(const GraphicsPi
         Shader::IR::Program program =
             TranslateProgram(pools.inst, pools.block, active_env, cfg, host_info);
         if (!stage_reuse.reused[slot]) {
-            stage_cache->CountTranslated();
             auto translation = std::make_shared<Cache::Translation>();
             translation->signature = std::move(signature);
             translation->reads = recorder.TakeReads();

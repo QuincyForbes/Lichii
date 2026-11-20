@@ -24,10 +24,15 @@ constexpr std::array<std::string_view, 1> OcarinaReplaces{
 constexpr std::array<std::string_view, 1> MarioKartKeys{
     "mkw_frame_rate",
 };
-constexpr std::array<GameSettings, 2> Games{{
+constexpr std::array<std::string_view, 2> HyruleWarriorsKeys{
+    "hyrule_dynamic_fps",
+    "hyrule_30fps",
+};
+constexpr std::array<GameSettings, 3> Games{{
     {OcarinaOfTimeProgramId, "The Legend of Zelda: Ocarina of Time", OcarinaKeys,
      OcarinaReplaces},
     {MarioKartWorldProgramId, "Mario Kart World", MarioKartKeys, {}},
+    {HyruleWarriorsProgramId, "Hyrule Warriors: Age of Imprisonment", HyruleWarriorsKeys, {}},
 }};
 } // namespace
 

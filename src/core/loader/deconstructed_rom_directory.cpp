@@ -104,9 +104,7 @@ FileSys::VirtualDir FindLooseRomFSDirectory(const FileSys::VirtualDir& parent) {
     return nullptr;
 }
 
-// RomFS for a loose ExeFS: the first .romfs file next to main, else a romfs/ directory next to
-// the exefs/ directory (the usual layout of an extracted title).
-FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
+FileSys::VirtualFile FindLooseRomFSFile(const FileSys::VirtualDir& exefs_dir) {
     if (exefs_dir == nullptr) {
         return nullptr;
     }
@@ -115,34 +113,16 @@ FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
             return f;
         }
     }
+    return nullptr;
+}
 
-    const auto build_from = [](const FileSys::VirtualDir& romfs_dir) -> FileSys::VirtualFile {
-        if (romfs_dir == nullptr) {
-            return nullptr;
-        }
-        // Building it walks every file and keeps an object for each (title 1: 206k files, ~150
-        // MiB), so loaders of the same directory share one build while any of them holds it.
-        static std::mutex cache_mutex;
-        static std::map<std::string, std::weak_ptr<FileSys::VfsFile>> cache;
-        std::scoped_lock lk{cache_mutex};
-        auto& cached = cache[romfs_dir->GetFullPath()];
-        if (auto built = cached.lock()) {
-            return built;
-        }
-        LOG_INFO(Loader, "Using RomFS directory next to the ExeFS");
-        const auto started = std::chrono::steady_clock::now();
-        auto built = FileSys::CreateRomFS(romfs_dir);
-        LOG_INFO(Loader, "Loose RomFS image ready: elapsed_ms={}",
-                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                     std::chrono::steady_clock::now() - started)
-                     .count());
-        cached = built;
-        return built;
-    };
-
+FileSys::VirtualDir FindLooseRomFSSourceDir(const FileSys::VirtualDir& exefs_dir) {
+    if (exefs_dir == nullptr) {
+        return nullptr;
+    }
     if (const auto parent = exefs_dir->GetParentDirectory()) {
         if (const auto romfs_dir = FindLooseRomFSDirectory(parent)) {
-            return build_from(romfs_dir);
+            return romfs_dir;
         }
         // Some base dumps carry only the executable and leave every file in an update, so the
         // base has no romfs at all (Pokemon Pokopia: base/romfs does not exist, the 6.9 GB of
@@ -198,12 +178,42 @@ FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
                     }
                     LOG_INFO(Loader, "Base RomFS is absent, using the update RomFS (version {})",
                              newest_version);
-                    return build_from(romfs_dir);
+                    return romfs_dir;
                 }
             }
         }
     }
     return nullptr;
+}
+
+// RomFS for a loose ExeFS: the first .romfs file next to main, else a romfs/ directory next to
+// the exefs/ directory (the usual layout of an extracted title).
+FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
+    if (auto romfs_file = FindLooseRomFSFile(exefs_dir)) {
+        return romfs_file;
+    }
+    const auto romfs_dir = FindLooseRomFSSourceDir(exefs_dir);
+    if (romfs_dir == nullptr) {
+        return nullptr;
+    }
+    // Building it walks every file and keeps an object for each (title 1: 206k files, ~150
+    // MiB), so loaders of the same directory share one build while any of them holds it.
+    static std::mutex cache_mutex;
+    static std::map<std::string, std::weak_ptr<FileSys::VfsFile>> cache;
+    std::scoped_lock lk{cache_mutex};
+    auto& cached = cache[romfs_dir->GetFullPath()];
+    if (auto built = cached.lock()) {
+        return built;
+    }
+    LOG_INFO(Loader, "Using RomFS directory next to the ExeFS");
+    const auto started = std::chrono::steady_clock::now();
+    auto built = FileSys::CreateRomFS(romfs_dir);
+    LOG_INFO(Loader, "Loose RomFS image ready: elapsed_ms={}",
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - started)
+                 .count());
+    cached = built;
+    return built;
 }
 
 // The newest three-digit tag in a directory's file names of the form <prefix>NNN.<anything>.
@@ -436,16 +446,32 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
     }
     metadata.Print();
 
-    // Loose-ExeFS loads bypass the NCA/NSP loaders, which are the ones that normally apply
-    // LayeredFS to the RomFS; apply it here so mods in user/load/<titleid>/ work too.
-    if (LooseRomFS() != nullptr) {
+    // Loose-ExeFS and extracted-NSP loads provide their own RomFS rather than delegating to an
+    // outer NCA/NUP/NX loader. When backed by an unpacked romfs/ directory, wrap the directory
+    // before building the RomFS image so only one RomFS table is built in memory.
+    if (standalone || !override_update) {
         const FileSys::PatchManager patch_manager(
             metadata.GetTitleID(), system.GetFileSystemController(), system.GetContentProvider());
-        auto patched = patch_manager.PatchRomFS(nullptr, romfs);
-        if (patched != nullptr) {
-            romfs = std::move(patched);
-            LOG_INFO(Loader, "Applied RomFS patches (LayeredFS) for title {:016X}",
-                     metadata.GetTitleID());
+        if (!romfs_resolved && FindLooseRomFSFile(romfs_exefs_dir) == nullptr) {
+            if (const auto romfs_dir = FindLooseRomFSSourceDir(romfs_exefs_dir)) {
+                if (auto patched = patch_manager.BuildPatchedRomFS(romfs_dir)) {
+                    romfs_resolved = true;
+                    romfs = std::move(patched);
+                    LOG_INFO(Loader, "Built patched RomFS directory for title {:016X}",
+                             metadata.GetTitleID());
+                }
+            }
+        }
+        if (LooseRomFS() != nullptr) {
+            const auto before = romfs;
+            auto patched = patch_manager.PatchRomFS(nullptr, romfs);
+            if (patched != nullptr) {
+                romfs = std::move(patched);
+                if (romfs != before) {
+                    LOG_INFO(Loader, "Applied RomFS patches for title {:016X}",
+                             metadata.GetTitleID());
+                }
+            }
         }
     }
 

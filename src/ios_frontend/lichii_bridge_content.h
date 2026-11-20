@@ -119,7 +119,7 @@ bool lichii_content_set_addon_enabled(uint64_t program_id, const char* toggle_ke
 /// A built-in patch's per-game choice: 0 follows the global setting of its kind, 1 on, 2 off.
 /// Saves the config. A "builtin" entry of the add-on list carries "builtin": {"kind","game",
 /// "description","effect","choice":"global|on|off","source":"game|global|default",
-/// "resolved_enabled","included_in"}.
+/// "resolved_enabled","included_in","blocked_reason"}.
 bool lichii_content_set_builtin_patch_choice(uint64_t program_id, const char* name, int choice);
 
 /// Names of the games that ship built-in patches: ["The Legend of Zelda: Ocarina of Time"].

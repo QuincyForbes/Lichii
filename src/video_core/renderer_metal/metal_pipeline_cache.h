@@ -59,10 +59,15 @@ struct OfflineWarmSummary {
 };
 
 /// Offline ahead-of-time compilation of extracted `warm-compute.bin` and `warm-graphics.bin` into
-/// `metal_stages.v1.bin` and `metal_pipelines.bin` (`MTLBinaryArchive`), without booting the game.
+/// `metal_stages.v2.bin` and `metal_pipelines.bin` (`MTLBinaryArchive`), without booting the game.
 OfflineWarmSummary CompileWarmShadersOffline(
     u64 title_id, std::stop_token stop,
     const std::function<void(size_t done, size_t total, std::string_view stage)>& on_progress = {});
+
+/// Whether `title_id` has Metal warm shader work pending (missing/stale warm files, missing or
+/// mismatched `.done` stamp for the current GPU family and settings variant, or missing
+/// `metal_stages.v2.bin` when `entries > 0`).
+[[nodiscard]] bool MetalWarmPending(u64 title_id);
 
 /// EDEN_NX2_METAL_REDUCTION_VARIANTS (default on; 0: every program samples through the sampler
 /// reduction rewrite as before): the vertex, pixel and compute programs with the rewrite are
@@ -355,9 +360,7 @@ public:
                            const VideoCore::DiskResourceLoadCallback& callback);
 
     /// Shader precache: queues the compute programs of the title's precache file (built from the
-    /// game files by the frontend). When `only_if_unmarked` is false, loads entries even when the
-    /// `.done` marker already matches so Boot 2+ populates `compute_cache` from `metal_stages.v1.bin`
-    /// and `metal_pipelines.bin`.
+    /// game files by the frontend).
     std::optional<VideoCommon::ShaderWarm::WarmStamp> QueuePrecacheFile(
         u64 title_id, u32 apple_family,
         const std::function<void(const ComputePipelineKey&, VideoCommon::FileEnvironment)>& queue,
@@ -522,6 +525,7 @@ private:
 
     PipelineArchive archive;
     PipelineFiles files;
+    std::mutex lifecycle_mutex;
     std::chrono::steady_clock::time_point archive_saved{std::chrono::steady_clock::now()};
     std::chrono::steady_clock::time_point used_saved{std::chrono::steady_clock::now()};
     std::size_t background_listener{};
@@ -540,7 +544,7 @@ private:
     u64 refused{};
 
     /// Frames ended (TickFrame), and the memory pressure signal eviction last answered.
-    u64 frame_count{};
+    std::atomic<u64> frame_count{};
     u32 evict_pressure_generation{};
     u64 pressure_evictions_skipped{};
     std::function<bool()> skip_check;

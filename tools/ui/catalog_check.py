@@ -6,9 +6,10 @@
     python3 -I tools/ui/catalog_check.py [-v]
 
 Fails (exit 1) when
-  - a setting (src/common/settings.h, src/qt_common/config/uisettings.h) has no catalogue entry, or
-    an entry names a setting that doesn't exist;
+  - a setting (src/common/settings.h, src/qt_common/config/uisettings.h) has no catalogue entry,
+    an entry names a setting that doesn't exist, or an entry is duplicated;
   - a value of an enum a listed setting uses has no choice entry;
+  - a {setting:...}, {choice:...}, {exp:...} or {text:...} reference in the catalogue is broken;
   - an experiment switch the iOS app or its bridge uses has no entry, or an entry no code uses;
   - an environment variable an experiment sets (EDEN_NX2_*) is missing from dist/nx2_switches.txt;
   - an app writes a catalogue name or text itself: a string literal in the iOS app's Swift files,
@@ -72,31 +73,48 @@ def noop_texts(block):
     return out
 
 
-def parse_catalog():
+def parse_catalog(problems):
     text = CATALOG.read_text(encoding="utf-8")
 
     def array(name):
         start = text.index(name)
-        return text[start:text.index("\n};\n", start)]
+        return text[start:text.index("\n};\n", start) + 1]
 
     settings = {}
     for m in re.finditer(r'\{"([A-Za-z0-9_]+)",(.*?)\},\n', array("const Setting kSettings[]"), re.S):
+        key = m.group(1)
+        if key in settings:
+            problems.append(f"duplicate catalogue setting {key}")
         values = noop_texts(m.group(2))
         shown = re.search(r"\n\s+((?:Desktop|IOS|Windows|Linux|MacOS|Apple|Nowhere|Everywhere|Android)"
                           r"(?: \| \w+)*)", m.group(2))
-        settings[m.group(1)] = {"label": values[0] if values else None,
-                                "help": values[1] if len(values) > 1 else None,
-                                "reason": values[2] if len(values) > 2 else None,
-                                "shown": shown.group(1) if shown else "Everywhere"}
-    choices = [(m.group(1), m.group(2), unescape(c_strings(m.group(3))))
-               for m in re.finditer(r'CHOICE(?:_ON)?\((\w+), (\w+), QT_TRANSLATE_NOOP\("\w+",\s*((?:"(?:[^"\\]|\\.)*"\s*)+)\)',
-                                    array("const Choice kChoices[]"))]
-    texts = {m.group(1): unescape(c_strings(m.group(2)))
-             for m in re.finditer(r'\{"([a-z0-9_.A-Z]+)",\s*QT_TRANSLATE_NOOP\("\w+",\s*((?:"(?:[^"\\]|\\.)*"\s*)+)\)\}',
-                                  array("const Text kTexts[]"))}
-    experiments = {m.group(1): (m.group(2), unescape(c_strings(m.group(3))))
-                   for m in re.finditer(r'\{"(\w+)", "(\w+)",\s*QT_TRANSLATE_NOOP\("\w+",\s*((?:"(?:[^"\\]|\\.)*"\s*)+)\)\}',
-                                        array("const Experiment kExperiments[]"))}
+        settings[key] = {"label": values[0] if values else None,
+                         "help": values[1] if len(values) > 1 else None,
+                         "reason": values[2] if len(values) > 2 else None,
+                         "shown": shown.group(1) if shown else "Everywhere"}
+    choices = []
+    seen_choices = set()
+    for m in re.finditer(r'CHOICE(?:_ON)?\((\w+), (\w+), QT_TRANSLATE_NOOP\("\w+",\s*((?:"(?:[^"\\]|\\.)*"\s*)+)\)',
+                         array("const Choice kChoices[]")):
+        pair = (m.group(1), m.group(2))
+        if pair in seen_choices:
+            problems.append(f"duplicate catalogue choice {pair[0]}.{pair[1]}")
+        seen_choices.add(pair)
+        choices.append((m.group(1), m.group(2), unescape(c_strings(m.group(3)))))
+    texts = {}
+    for m in re.finditer(r'\{"([a-z0-9_.A-Z]+)",\s*QT_TRANSLATE_NOOP\("\w+",\s*((?:"(?:[^"\\]|\\.)*"\s*)+)\)\}',
+                         array("const Text kTexts[]")):
+        ident = m.group(1)
+        if ident in texts:
+            problems.append(f"duplicate catalogue text {ident}")
+        texts[ident] = unescape(c_strings(m.group(2)))
+    experiments = {}
+    for m in re.finditer(r'\{"(\w+)", "(\w+)",\s*QT_TRANSLATE_NOOP\("\w+",\s*((?:"(?:[^"\\]|\\.)*"\s*)+)\)\}',
+                         array("const Experiment kExperiments[]")):
+        ident = m.group(1)
+        if ident in experiments:
+            problems.append(f"duplicate catalogue experiment {ident}")
+        experiments[ident] = (m.group(2), unescape(c_strings(m.group(3))))
     return settings, choices, texts, experiments
 
 
@@ -144,7 +162,7 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
     problems = []
-    settings, choices, texts, experiments = parse_catalog()
+    settings, choices, texts, experiments = parse_catalog(problems)
 
     keys, types = setting_declarations()
     for key in sorted(set(keys) - set(settings)):
@@ -162,6 +180,47 @@ def main():
         for value in enums[enum]:
             if (enum, value) not in have:
                 problems.append(f"{key}: {enum}::{value} has no choice entry")
+
+    catalog_strings = []
+    for key, s in settings.items():
+        for field in ("label", "help", "reason"):
+            if s[field]:
+                catalog_strings.append((f"setting {key} ({field})", s[field]))
+    for enum, value, label in choices:
+        catalog_strings.append((f"choice {enum}.{value}", label))
+    for ident, text in texts.items():
+        catalog_strings.append((f"text {ident}", text))
+    for ident, (_, label) in experiments.items():
+        catalog_strings.append((f"experiment {ident}", label))
+    for where, content in catalog_strings:
+        for m in re.finditer(r"\{([^{}:]+):([^{}]*)\}", content):
+            kind, ref = m.group(1), m.group(2)
+            if kind == "setting":
+                target = settings.get(ref)
+                if target is None:
+                    problems.append(f"{where}: {{{kind}:{ref}}} names no setting")
+                elif target["label"] is None:
+                    problems.append(f"{where}: {{{kind}:{ref}}} has no label")
+            elif kind == "choice":
+                if "." not in ref:
+                    problems.append(f"{where}: {{{kind}:{ref}}} must be key.Value")
+                else:
+                    skey, val = ref.split(".", 1)
+                    enum = types.get(skey)
+                    if skey not in keys:
+                        problems.append(f"{where}: {{{kind}:{ref}}} names no setting {skey}")
+                    elif enum not in enums:
+                        problems.append(f"{where}: {{{kind}:{ref}}}: {skey} is not an enum setting")
+                    elif (enum, val) not in have:
+                        problems.append(f"{where}: {{{kind}:{ref}}}: {enum}::{val} has no choice entry")
+            elif kind == "exp":
+                if ref not in experiments:
+                    problems.append(f"{where}: {{{kind}:{ref}}} names no experiment")
+            elif kind == "text":
+                if ref not in texts:
+                    problems.append(f"{where}: {{{kind}:{ref}}} names no text")
+            else:
+                problems.append(f"{where}: unknown placeholder {{{kind}:{ref}}}")
 
     swift = "\n".join(p.read_text(encoding="utf-8") for p in (ROOT / "src/ios_frontend/App").rglob("*.swift"))
     bridge = (ROOT / "src/ios_frontend/lichii_bridge_platform.cpp").read_text(encoding="utf-8")

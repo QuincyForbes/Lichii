@@ -25,6 +25,8 @@
 #include <QMessageBox>
 #include <QPixmap>
 #include <QPushButton>
+#include <QRadioButton>
+#include <QShowEvent>
 #include <QSlider>
 #include <QSpinBox>
 #include <QStandardItemModel>
@@ -40,6 +42,7 @@
 #include <vulkan/vulkan_core.h>
 
 #include "common/common_types.h"
+#include "common/game_presets.h"
 #include "common/game_settings.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -65,15 +68,6 @@
 #endif
 
 namespace {
-
-template <typename E>
-std::vector<std::pair<u32, QString>> EnumItems(const std::map<E, QString>& names) {
-    std::vector<std::pair<u32, QString>> items;
-    for (const auto& [value, name] : names) {
-        items.emplace_back(static_cast<u32>(value), name);
-    }
-    return items;
-}
 
 QString JoinOrNone(const QStringList& names) {
     return names.isEmpty() ? UiText::Text("list.none_yet") : names.join(QStringLiteral(", "));
@@ -102,7 +96,7 @@ QString BuiltinPatchGames() {
 }
 
 void SetComboItemAvailability(QComboBox* combobox, u32 value, bool visible, bool enabled,
-                              const QString& disabled_tooltip = {}) {
+                              const QString& disabled_tooltip = {}, bool allow_current = true) {
     if (combobox == nullptr) {
         return;
     }
@@ -117,8 +111,8 @@ void SetComboItemAvailability(QComboBox* combobox, u32 value, bool visible, bool
     }
     if (auto* const model = qobject_cast<QStandardItemModel*>(combobox->model())) {
         if (QStandardItem* const item = model->item(row)) {
-            item->setEnabled((visible && enabled) || is_current);
-            item->setToolTip(enabled ? QString() : disabled_tooltip);
+            item->setEnabled((visible && enabled) || (allow_current && is_current));
+            item->setToolTip(disabled_tooltip);
         }
     }
 }
@@ -131,7 +125,14 @@ void GateComboItem(QComboBox* combobox, E value, bool offered) {
 template <typename E>
 void EnableComboItem(QComboBox* combobox, E value, bool enabled,
                      const QString& disabled_tooltip = {}) {
-    SetComboItemAvailability(combobox, static_cast<u32>(value), true, enabled, disabled_tooltip);
+    SetComboItemAvailability(combobox, static_cast<u32>(value), true, enabled,
+                             enabled ? QString() : disabled_tooltip);
+}
+
+template <typename E>
+void SetComboItemEnabled(QComboBox* combobox, E value, bool enabled,
+                         const QString& tooltip = {}) {
+    SetComboItemAvailability(combobox, static_cast<u32>(value), true, enabled, tooltip, false);
 }
 
 } // namespace
@@ -221,6 +222,16 @@ ConfigureGraphics::ConfigureGraphics(
     if (resolution_combobox != nullptr) {
         connect(resolution_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged),
                 update_screenshot_info);
+        connect(resolution_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                [this] { UpdateFeatureAvailability(); });
+    }
+    if (oot_resolution_combobox != nullptr) {
+        connect(oot_resolution_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                [this] { UpdateFeatureAvailability(); });
+    }
+    if (texture_quality_combobox != nullptr) {
+        connect(texture_quality_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                [this] { UpdateFeatureAvailability(); });
     }
 
     api_combobox->setEnabled(!UISettings::values.has_broken_vulkan && api_combobox->isEnabled());
@@ -336,108 +347,12 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     std::vector<QWidget*> hold_api;
     QCheckBox* flow_scale_auto_checkbox = nullptr;
     QComboBox* oot_preset_combobox = nullptr;
-    QComboBox* texture_quality_combobox = nullptr;
     QComboBox* frame_gen_motion_combobox = nullptr;
-    const bool runtime_lock = !system.IsPoweredOn();
-    const auto make_enum_row = [&](Settings::BasicSetting* s, const QString& label_text,
-                                   const QString& tooltip_text,
-                                   const std::vector<std::pair<u32, QString>>& items,
-                                   QComboBox*& out_combobox) -> QWidget* {
-        if (!Settings::IsConfiguringGlobal() && !s->Switchable()) {
-            return nullptr;
-        }
-        QWidget* row = new QWidget(this);
-        QHBoxLayout* layout = new QHBoxLayout(row);
-        layout->setContentsMargins(0, 0, 0, 0);
-        QLabel* label = new QLabel(label_text, row);
-        label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-        QComboBox* cb = new QComboBox(row);
-        cb->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-        const u32 current_val = static_cast<u32>(std::strtoul(s->ToString().c_str(), nullptr, 0));
-        int current_idx = 0;
-        int idx = 0;
-        for (const auto& [val, text] : items) {
-            cb->addItem(text, val);
-            if (val == current_val) {
-                current_idx = idx;
-            }
-            ++idx;
-        }
-        cb->setCurrentIndex(current_idx);
-        layout->addWidget(label);
-        layout->addWidget(cb);
-
-        if (!Settings::IsConfiguringGlobal()) {
-            QPushButton* restore_btn =
-                ConfigurationShared::Widget::CreateRestoreGlobalButton(s->UsingGlobal(), row);
-            layout->addWidget(restore_btn);
-            connect(cb, QOverload<int>::of(&QComboBox::activated), row, [restore_btn] {
-                restore_btn->setEnabled(true);
-                restore_btn->setVisible(true);
-            });
-            connect(restore_btn, &QAbstractButton::clicked, row, [s, cb, restore_btn](bool) {
-                restore_btn->setEnabled(false);
-                restore_btn->setVisible(false);
-                const u32 global_val =
-                    static_cast<u32>(std::strtoul(s->ToStringGlobal().c_str(), nullptr, 0));
-                const int found = cb->findData(global_val);
-                if (found >= 0) {
-                    cb->setCurrentIndex(found);
-                }
-            });
-            apply_funcs.push_back([s, cb, restore_btn](bool powered_on) {
-                if (s->RuntimeModifiable() || !powered_on) {
-                    const bool using_global = !restore_btn->isEnabled();
-                    s->SetGlobal(using_global);
-                    if (!using_global) {
-                        s->LoadString(std::to_string(cb->currentData().toUInt()));
-                    }
-                }
-            });
-        } else {
-            apply_funcs.push_back([s, cb](bool powered_on) {
-                if (s->RuntimeModifiable() || !powered_on) {
-                    s->LoadString(std::to_string(cb->currentData().toUInt()));
-                }
-            });
-        }
-
-        bool enable = runtime_lock || s->RuntimeModifiable();
-        QString reason;
-        if (!enable) {
-            reason = UiText::Text("note.stop_game");
-        }
-        if (s->Switchable() && Settings::IsConfiguringGlobal() && !runtime_lock &&
-            !s->UsingGlobal()) {
-            enable = false;
-            reason = UiText::Text("note.game_overrides");
-        }
-        row->setEnabled(enable);
-        row->setToolTip(reason.isEmpty() ? tooltip_text
-                                         : tooltip_text + QStringLiteral("\n\n") + reason);
-        out_combobox = cb;
-        return row;
-    };
 
     for (const auto setting : Settings::values.linkage.by_category[Settings::Category::Renderer]) {
-        if (setting->Id() == Settings::values.frame_gen_motion.Id()) {
-            if (QWidget* row = make_enum_row(
-                    setting, UiText::SettingLabel("frame_gen_motion"),
-                    UiText::SettingHelp("frame_gen_motion"),
-                    EnumItems(UiText::ChoiceNames<Settings::FrameGenMotion>()),
-                    frame_gen_motion_combobox)) {
-                hold_graphics.emplace(setting->Id(), row);
-            }
-            continue;
-        }
-        if (setting->Id() == Settings::values.frame_gen_flow_quality.Id()) {
-            QComboBox* quality_cb = nullptr;
-            if (QWidget* row = make_enum_row(
-                    setting, UiText::SettingLabel("frame_gen_flow_quality"),
-                    UiText::SettingHelp("frame_gen_flow_quality"),
-                    EnumItems(UiText::ChoiceNames<Settings::FrameGenFlowQuality>()), quality_cb)) {
-                hold_graphics.emplace(setting->Id(), row);
-            }
+        // Pure game tweaks that are not in GamesWithSettings() belong solely to ConfigurePerGameTweaks.
+        if (Settings::IsGameTweak(setting->GetLabel()) &&
+            Settings::GameOfSetting(setting->GetLabel()) == nullptr) {
             continue;
         }
 #ifndef HAS_RESHADE
@@ -500,6 +415,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                                 records, [](const auto& r) { return r.dlss_capable; }));
                         });
             }
+        } else if (setting->Id() == Settings::values.frame_gen_motion.Id()) {
+            frame_gen_motion_combobox = widget->combobox;
         } else if (setting->Id() == Settings::values.nvidia_dlss_quality.Id()) {
             nvidia_dlss_quality_combobox = widget->combobox;
             if (nvidia_dlss_quality_combobox != nullptr) {
@@ -705,6 +622,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         ui->groupBox->setTitle(QString());
         ui->groupBox->setProperty("lichiiPlain", true);
         ui->groupBox->setFlat(true);
+        const QString upscaling_title = UiText::Text("category.Upscaling");
         for (const auto& [title, text, ids] : sections) {
             std::vector<QWidget*> widgets;
             for (const u32 id : ids) {
@@ -731,10 +649,21 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             if (!text.isEmpty()) {
                 graphics_layout.addWidget(LichiiStyle::Footer(text, this));
             }
+            if (title == upscaling_title && effective_summary_label == nullptr) {
+                effective_summary_label = LichiiStyle::Footer(QString(), this);
+                effective_summary_label->setTextFormat(Qt::RichText);
+                graphics_layout.addWidget(effective_summary_label);
+            }
+        }
+        if (effective_summary_label == nullptr) {
+            effective_summary_label = LichiiStyle::Footer(QString(), this);
+            effective_summary_label->setTextFormat(Qt::RichText);
+            graphics_layout.addWidget(effective_summary_label);
         }
     }
 
-    // A phone preset of Ocarina of Time's graphics also picks its resolution and texture quality.
+    // A phone preset of Ocarina of Time's graphics also picks its resolution (and per-game texture
+    // quality, without degrading global texture quality for other games).
     if (oot_preset_combobox != nullptr) {
         const auto pick = [](QComboBox* box, u32 value) {
             if (box == nullptr) {
@@ -742,21 +671,21 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             }
             if (const int index = box->findData(value); index >= 0) {
                 box->setCurrentIndex(index);
+                emit box->activated(index);
             }
         };
         QComboBox* const preset_box = oot_preset_combobox;
-        connect(preset_box, &QComboBox::activated, this,
-                [this, pick, preset_box, texture_quality_combobox](int index) {
-                    const auto companions = Settings::OotGraphicsPresetCompanions(
-                        static_cast<Settings::OotGraphicsPreset>(
-                            preset_box->itemData(index).toUInt()));
-                    if (companions.resolution) {
-                        pick(oot_resolution_combobox, static_cast<u32>(*companions.resolution));
-                    }
-                    if (companions.textures) {
-                        pick(texture_quality_combobox, static_cast<u32>(*companions.textures));
-                    }
-                });
+        connect(preset_box, &QComboBox::activated, this, [this, pick, preset_box](int index) {
+            const auto companions = Settings::OotGraphicsPresetCompanions(
+                static_cast<Settings::OotGraphicsPreset>(preset_box->itemData(index).toUInt()));
+            if (companions.resolution) {
+                pick(oot_resolution_combobox, static_cast<u32>(*companions.resolution));
+            }
+            if (!Settings::IsConfiguringGlobal() && companions.textures) {
+                pick(texture_quality_combobox, static_cast<u32>(*companions.textures));
+            }
+            UpdateFeatureAvailability();
+        });
     }
 
     // The manual flow scale is only read while Auto Flow Scale is off.
@@ -1024,9 +953,64 @@ void ConfigureGraphics::changeEvent(QEvent* event) {
     QWidget::changeEvent(event);
 }
 
+void ConfigureGraphics::showEvent(QShowEvent* event) {
+    ConfigurationShared::Tab::showEvent(event);
+    ConnectDockedModeWidgets();
+    UpdateFeatureAvailability();
+}
+
 void ConfigureGraphics::RetranslateUI() {
     ui->retranslateUi(this);
     UiText::ApplyCatalogue(this);
+    UpdateFeatureAvailability();
+}
+
+void ConfigureGraphics::ConnectDockedModeWidgets() {
+    QWidget* const top = window();
+    if (top == nullptr || top == this) {
+        return;
+    }
+    constexpr char hooked_prop[] = "lichii_gfx_docked_hooked";
+    const auto hook_button = [this, hooked_prop](QAbstractButton* btn) {
+        if (btn == nullptr || btn->property(hooked_prop).toBool()) {
+            return;
+        }
+        btn->setProperty(hooked_prop, true);
+        connect(btn, &QAbstractButton::toggled, this, [this] { UpdateFeatureAvailability(); });
+    };
+    for (auto* const w : top->findChildren<ConfigurationShared::Widget*>()) {
+        if (w->GetSetting().Id() == Settings::values.use_docked_mode.Id()) {
+            for (const auto& [_, radio] : w->radio_buttons) {
+                hook_button(radio);
+            }
+            if (w->restore_button != nullptr && !w->restore_button->property(hooked_prop).toBool()) {
+                w->restore_button->setProperty(hooked_prop, true);
+                connect(w->restore_button, &QAbstractButton::clicked, this,
+                        [this] { UpdateFeatureAvailability(); });
+            }
+        }
+    }
+    hook_button(top->findChild<QRadioButton*>(QStringLiteral("radioDocked")));
+    hook_button(top->findChild<QRadioButton*>(QStringLiteral("radioUndocked")));
+}
+
+bool ConfigureGraphics::IsSelectedDockedMode() const {
+    if (QWidget* const top = window(); top != nullptr && top != this) {
+        for (const auto* const w : top->findChildren<ConfigurationShared::Widget*>()) {
+            if (w->GetSetting().Id() == Settings::values.use_docked_mode.Id()) {
+                for (const auto& [id, radio] : w->radio_buttons) {
+                    if (radio != nullptr && radio->isChecked()) {
+                        return id == static_cast<u32>(Settings::ConsoleMode::Docked);
+                    }
+                }
+            }
+        }
+        if (const auto* const radio_docked =
+                top->findChild<QRadioButton*>(QStringLiteral("radioDocked"))) {
+            return radio_docked->isChecked();
+        }
+    }
+    return Settings::IsDockedMode();
 }
 
 void ConfigureGraphics::UpdateBackgroundColorButton(QColor color) {
@@ -1137,13 +1121,76 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
                                       frame_gen_dlssg_chosen ||
                                       (dlss_offered && upscaler_is(Settings::Upscaler::Auto)));
     }
-    // Ocarina of Time's fixed sizes are DLSS's input when DLSS Quality is Automatic: name the mode
-    // each one corresponds to.
+#endif
+
+    const bool temporal_upscaler =
+        upscaler_is(Settings::Upscaler::Fsr3) || upscaler_is(Settings::Upscaler::Fsr4) ||
+        upscaler_is(Settings::Upscaler::Dlss) || upscaler_is(Settings::Upscaler::MetalFx)
+#ifdef __APPLE__
+        || upscaler_is(Settings::Upscaler::Auto)
+#endif
+        ;
+
     if (oot_resolution_combobox != nullptr) {
-        const bool auto_dlss_quality =
-            nvidia_dlss_quality_combobox == nullptr ||
-            nvidia_dlss_quality_combobox->currentData().toUInt() ==
-                static_cast<u32>(Settings::DlssQuality::Auto);
+        const QString above_100_tooltip =
+            temporal_upscaler
+                ? tr("Temporal upscalers render at 1x scale (up to 100% scene resolution) and "
+                     "reconstruct higher output themselves.")
+                : QString{};
+        SetComboItemEnabled(oot_resolution_combobox, Settings::OotResolution::Percent150,
+                            !temporal_upscaler, above_100_tooltip);
+        SetComboItemEnabled(oot_resolution_combobox, Settings::OotResolution::Percent200,
+                            !temporal_upscaler, above_100_tooltip);
+        SetComboItemEnabled(oot_resolution_combobox, Settings::OotResolution::Percent300,
+                            !temporal_upscaler, above_100_tooltip);
+
+        const bool docked = IsSelectedDockedMode();
+        const bool dlss_selected = upscaler_is(Settings::Upscaler::Dlss);
+        const auto dlss_quality =
+            nvidia_dlss_quality_combobox != nullptr
+                ? static_cast<Settings::DlssQuality>(
+                      nvidia_dlss_quality_combobox->currentData().toUInt())
+                : Settings::values.nvidia_dlss_quality.GetValue();
+        const bool auto_dlss_quality = dlss_quality == Settings::DlssQuality::Auto;
+        const bool explicit_dlss_scale =
+            dlss_selected && (dlss_quality == Settings::DlssQuality::Balanced ||
+                              dlss_quality == Settings::DlssQuality::Performance ||
+                              dlss_quality == Settings::DlssQuality::UltraPerformance);
+        const u32 dlss_quality_enum = Settings::EnumMetadata<Settings::DlssQuality>::Index();
+        const QString explicit_quality_label =
+            UiText::ChoiceLabel(dlss_quality_enum, static_cast<u32>(dlss_quality));
+        const QString explicit_override_pct =
+            dlss_quality == Settings::DlssQuality::Balanced
+                ? UiText::ChoiceLabel("oot_resolution", "Percent87")
+            : dlss_quality == Settings::DlssQuality::Performance
+                ? UiText::ChoiceLabel("oot_resolution", "Percent75")
+            : dlss_quality == Settings::DlssQuality::UltraPerformance
+                ? UiText::ChoiceLabel("oot_resolution", "Percent50")
+                : QString{};
+
+        if (explicit_dlss_scale) {
+            const QString dyn_tooltip =
+                docked ? tr("With %1 set to %2 in Docked mode, Dynamic is overridden to %3 → 4K.")
+                             .arg(UiText::SettingLabel("nvidia_dlss_quality"),
+                                  explicit_quality_label, explicit_override_pct)
+                       : tr("Temporal upscalers use a fixed render resolution (75% in Handheld).");
+            SetComboItemEnabled(oot_resolution_combobox, Settings::OotResolution::Game, false,
+                                dyn_tooltip);
+            SetComboItemEnabled(
+                oot_resolution_combobox, Settings::OotResolution::Full, true,
+                docked ? tr("In Docked mode, %1 (%2) overrides 100% to render at %3 → 4K. "
+                            "Set %1 to %4 to render at 100%.")
+                             .arg(UiText::SettingLabel("nvidia_dlss_quality"),
+                                  explicit_quality_label, explicit_override_pct,
+                                  UiText::ChoiceLabel("nvidia_dlss_quality", "Auto"))
+                       : tr("In Handheld mode, 100% renders at 1920×1080 (the %1 render-scale "
+                            "patch applies in Docked mode only).")
+                             .arg(explicit_quality_label));
+        } else {
+            SetComboItemEnabled(oot_resolution_combobox, Settings::OotResolution::Game, true);
+            SetComboItemEnabled(oot_resolution_combobox, Settings::OotResolution::Full, true);
+        }
+
         const auto& names =
             combobox_translations.at(Settings::EnumMetadata<Settings::OotResolution>::Index());
         for (int i = 0; i < oot_resolution_combobox->count(); ++i) {
@@ -1152,11 +1199,26 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
             if (name == names.end()) {
                 continue;
             }
-            QString mode;
-            if (dlss_on && auto_dlss_quality) {
-                const u32 dlss_quality_enum =
-                    Settings::EnumMetadata<Settings::DlssQuality>::Index();
-                switch (static_cast<Settings::OotResolution>(value)) {
+            const auto res = static_cast<Settings::OotResolution>(value);
+            QString item_text = name->second;
+            if (dlss_selected && auto_dlss_quality) {
+                QString mode;
+                bool caps_1440p = false;
+                switch (res) {
+                case Settings::OotResolution::Game:
+                    item_text = docked ? tr("%1 (fixed 100% - DLSS %2 to 4K)")
+                                             .arg(name->second,
+                                                  UiText::ChoiceLabel(
+                                                      dlss_quality_enum,
+                                                      static_cast<u32>(
+                                                          Settings::DlssQuality::Quality)))
+                                       : tr("%1 (fixed 75% - DLSS %2)")
+                                             .arg(name->second,
+                                                  UiText::ChoiceLabel(
+                                                      dlss_quality_enum,
+                                                      static_cast<u32>(
+                                                          Settings::DlssQuality::Performance)));
+                    break;
                 case Settings::OotResolution::Full:
                     mode = QStringLiteral("DLSS %1").arg(UiText::ChoiceLabel(
                         dlss_quality_enum, static_cast<u32>(Settings::DlssQuality::Quality)));
@@ -1170,21 +1232,67 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
                         dlss_quality_enum, static_cast<u32>(Settings::DlssQuality::Performance)));
                     break;
                 case Settings::OotResolution::Percent50:
-                case Settings::OotResolution::Percent40:
-                case Settings::OotResolution::Percent33:
                     mode = QStringLiteral("DLSS %1").arg(UiText::ChoiceLabel(
                         dlss_quality_enum,
                         static_cast<u32>(Settings::DlssQuality::UltraPerformance)));
                     break;
+                case Settings::OotResolution::Percent40:
+                case Settings::OotResolution::Percent33:
+                    // Streamline DLSS caps <= 3.0x ratio to 2560x1440 at 1024x576 (never 4K).
+                    mode = QStringLiteral("DLSS %1").arg(UiText::ChoiceLabel(
+                        dlss_quality_enum,
+                        static_cast<u32>(Settings::DlssQuality::UltraPerformance)));
+                    caps_1440p = true;
+                    break;
                 default:
                     break;
                 }
+                if (!mode.isEmpty()) {
+                    if (caps_1440p) {
+                        item_text = docked ? tr("%1 - %2 (1440p max)").arg(name->second, mode)
+                                           : tr("%1 - %2").arg(name->second, mode);
+                    } else {
+                        item_text = docked ? tr("%1 - %2 to 4K").arg(name->second, mode)
+                                           : tr("%1 - %2").arg(name->second, mode);
+                    }
+                }
+            } else if (explicit_dlss_scale) {
+                switch (res) {
+                case Settings::OotResolution::Game:
+                case Settings::OotResolution::Full:
+                    item_text =
+                        docked ? tr("%1 - uses DLSS %2 (%3 to 4K)")
+                                     .arg(name->second, explicit_quality_label,
+                                          explicit_override_pct)
+                               : (res == Settings::OotResolution::Game
+                                      ? tr("%1 (fixed 75% in Handheld)").arg(name->second)
+                                      : tr("%1 (1080p in Handheld; DLSS %2 scale needs Docked)")
+                                            .arg(name->second, explicit_quality_label));
+                    break;
+                case Settings::OotResolution::Percent40:
+                case Settings::OotResolution::Percent33:
+                    item_text = docked ? tr("%1 - overrides DLSS %2 (1440p max)")
+                                             .arg(name->second, explicit_quality_label)
+                                       : tr("%1 - overrides DLSS %2")
+                                             .arg(name->second, explicit_quality_label);
+                    break;
+                case Settings::OotResolution::Percent87:
+                case Settings::OotResolution::Percent75:
+                case Settings::OotResolution::Percent56:
+                case Settings::OotResolution::Percent50:
+                    item_text = tr("%1 - overrides DLSS %2 render scale")
+                                    .arg(name->second, explicit_quality_label);
+                    break;
+                default:
+                    break;
+                }
+            } else if (temporal_upscaler && res == Settings::OotResolution::Game) {
+                item_text = docked ? tr("%1 (fixed 100% with upscaler)").arg(name->second)
+                                   : tr("%1 (fixed 75% with upscaler)").arg(name->second);
             }
-            oot_resolution_combobox->setItemText(
-                i, mode.isEmpty() ? name->second : tr("%1 - %2 to 4K").arg(name->second, mode));
+            oot_resolution_combobox->setItemText(i, item_text);
         }
     }
-#endif
 #if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
     if (amd_fsr4_panel != nullptr) {
         const VkDeviceInfo::Record* fsr4_record =
@@ -1247,6 +1355,292 @@ void ConfigureGraphics::UpdateFeatureAvailability() {
                     tr("Requires %1 on an NVIDIA GeForce RTX 40/50 GPU.")
                         .arg(UiText::ChoiceLabel("upscaler", "Dlss")));
 #endif
+
+    UpdateEffectiveSummary();
+}
+
+void ConfigureGraphics::UpdateEffectiveSummary() {
+    if (effective_summary_label == nullptr) {
+        return;
+    }
+
+    const bool docked = IsSelectedDockedMode();
+    const QString mode_label = docked ? UiText::ChoiceLabel("use_docked_mode", "Docked")
+                                      : UiText::ChoiceLabel("use_docked_mode", "Handheld");
+
+    const auto upscaler =
+        upscaler_combobox != nullptr
+            ? static_cast<Settings::Upscaler>(upscaler_combobox->currentData().toUInt())
+            : Settings::values.upscaler.GetValue();
+    const auto dlss_quality =
+        nvidia_dlss_quality_combobox != nullptr
+            ? static_cast<Settings::DlssQuality>(
+                  nvidia_dlss_quality_combobox->currentData().toUInt())
+            : Settings::values.nvidia_dlss_quality.GetValue();
+    const auto tex_quality =
+        texture_quality_combobox != nullptr
+            ? static_cast<Settings::TextureQuality>(texture_quality_combobox->currentData().toUInt())
+            : Settings::values.texture_quality.GetValue();
+
+    const bool temporal_upscaler =
+        upscaler == Settings::Upscaler::Fsr3 || upscaler == Settings::Upscaler::Fsr4 ||
+        upscaler == Settings::Upscaler::Dlss || upscaler == Settings::Upscaler::MetalFx
+#ifdef __APPLE__
+        || upscaler == Settings::Upscaler::Auto
+#endif
+        ;
+
+    const QString upscaler_name = [&] {
+        switch (upscaler) {
+        case Settings::Upscaler::Dlss:
+            return QStringLiteral("DLSS");
+        case Settings::Upscaler::Fsr4:
+            return QStringLiteral("FSR 4");
+        case Settings::Upscaler::Fsr3:
+            return QStringLiteral("FSR 3.1");
+        case Settings::Upscaler::MetalFx:
+            return UiText::ChoiceLabel("upscaler", "MetalFx");
+        case Settings::Upscaler::Auto:
+#ifdef __APPLE__
+            return UiText::ChoiceLabel("upscaler", "MetalFx");
+#else
+            return UiText::ChoiceLabel("upscaler", "Auto");
+#endif
+        case Settings::Upscaler::Game:
+            return UiText::ChoiceLabel("upscaler", "Game");
+        }
+        return QString{};
+    }();
+
+    QStringList parts;
+
+    if (resolution_combobox != nullptr) {
+        const auto res_setup =
+            static_cast<Settings::ResolutionSetup>(resolution_combobox->currentData().toUInt());
+        const auto factor_for = [](Settings::ResolutionSetup s) -> double {
+            switch (s) {
+            case Settings::ResolutionSetup::Res1_4X:
+                return 0.25;
+            case Settings::ResolutionSetup::Res1_2X:
+                return 0.5;
+            case Settings::ResolutionSetup::Res3_4X:
+                return 0.75;
+            case Settings::ResolutionSetup::Res1X:
+                return 1.0;
+            case Settings::ResolutionSetup::Res5_4X:
+                return 1.25;
+            case Settings::ResolutionSetup::Res3_2X:
+                return 1.5;
+            case Settings::ResolutionSetup::Res2X:
+                return 2.0;
+            case Settings::ResolutionSetup::Res3X:
+                return 3.0;
+            case Settings::ResolutionSetup::Res4X:
+                return 4.0;
+            case Settings::ResolutionSetup::Res5X:
+                return 5.0;
+            case Settings::ResolutionSetup::Res6X:
+                return 6.0;
+            case Settings::ResolutionSetup::Res7X:
+                return 7.0;
+            case Settings::ResolutionSetup::Res8X:
+                return 8.0;
+            }
+            return 1.0;
+        };
+        const double factor = factor_for(res_setup);
+        const int base_w = docked ? 1920 : 1280;
+        const int base_h = docked ? 1080 : 720;
+        const int out_w = static_cast<int>(base_w * factor + 0.5);
+        const int out_h = static_cast<int>(base_h * factor + 0.5);
+        const QString scale_label = UiText::ChoiceLabel(
+            Settings::EnumMetadata<Settings::ResolutionSetup>::Index(),
+            static_cast<u32>(res_setup));
+
+        QString general_desc;
+        if (temporal_upscaler && res_setup != Settings::ResolutionSetup::Res1X) {
+            general_desc = tr("%1 (%2×%3 from %4×%5; %6 expects 1x)")
+                               .arg(scale_label)
+                               .arg(out_w)
+                               .arg(out_h)
+                               .arg(base_w)
+                               .arg(base_h)
+                               .arg(upscaler_name);
+        } else if (upscaler == Settings::Upscaler::Dlss || upscaler == Settings::Upscaler::Fsr4 ||
+                   upscaler == Settings::Upscaler::Fsr3 ||
+                   upscaler == Settings::Upscaler::MetalFx) {
+            general_desc = tr("%1 (%2×%3 base, DLSS games reconstruct via %4)")
+                               .arg(scale_label)
+                               .arg(out_w)
+                               .arg(out_h)
+                               .arg(upscaler_name);
+        } else {
+            general_desc = tr("%1 (%2×%3 from %4×%5)")
+                               .arg(scale_label)
+                               .arg(out_w)
+                               .arg(out_h)
+                               .arg(base_w)
+                               .arg(base_h);
+        }
+        parts << (oot_resolution_combobox != nullptr
+                      ? tr("Games: %1").arg(general_desc)
+                      : tr("Render → Output: %1").arg(general_desc));
+    }
+
+    if (oot_resolution_combobox != nullptr) {
+        const auto raw_oot =
+            static_cast<Settings::OotResolution>(oot_resolution_combobox->currentData().toUInt());
+        const bool above_100 = raw_oot == Settings::OotResolution::Percent150 ||
+                               raw_oot == Settings::OotResolution::Percent200 ||
+                               raw_oot == Settings::OotResolution::Percent300;
+        auto eff_oot = Settings::OcarinaGameResolution(raw_oot);
+        if (temporal_upscaler) {
+            eff_oot = (eff_oot == Settings::OotResolution::Game)
+                          ? (docked ? Settings::OotResolution::Full
+                                    : Settings::OotResolution::Percent75)
+                          : eff_oot;
+        }
+        if (docked && eff_oot == Settings::OotResolution::Percent33) {
+            eff_oot = Settings::OotResolution::Percent40;
+        }
+        bool overridden_by_dlss_quality = false;
+        if (docked && (upscaler == Settings::Upscaler::Dlss ||
+                       upscaler == Settings::Upscaler::Fsr4) &&
+            eff_oot == Settings::OotResolution::Full &&
+            (raw_oot == Settings::OotResolution::Full || raw_oot == Settings::OotResolution::Game ||
+             above_100)) {
+            if (dlss_quality == Settings::DlssQuality::Balanced) {
+                eff_oot = Settings::OotResolution::Percent87;
+                overridden_by_dlss_quality = true;
+            } else if (dlss_quality == Settings::DlssQuality::Performance) {
+                eff_oot = Settings::OotResolution::Percent75;
+                overridden_by_dlss_quality = true;
+            } else if (dlss_quality == Settings::DlssQuality::UltraPerformance) {
+                eff_oot = Settings::OotResolution::Percent50;
+                overridden_by_dlss_quality = true;
+            }
+        }
+
+        const auto scene_dims = [docked](Settings::OotResolution r) -> std::pair<int, int> {
+            switch (r) {
+            case Settings::OotResolution::Percent33:
+                return docked ? std::pair{1024, 576} : std::pair{640, 360};
+            case Settings::OotResolution::Percent40:
+                return docked ? std::pair{1024, 576} : std::pair{768, 432};
+            case Settings::OotResolution::Percent50:
+                return docked ? std::pair{1280, 720} : std::pair{960, 540};
+            case Settings::OotResolution::Percent56:
+                return docked ? std::pair{1440, 810} : std::pair{1080, 608};
+            case Settings::OotResolution::Percent75:
+                return docked ? std::pair{1920, 1080} : std::pair{1440, 810};
+            case Settings::OotResolution::Percent87:
+                return docked ? std::pair{2240, 1260} : std::pair{1664, 936};
+            default:
+                return docked ? std::pair{2560, 1440} : std::pair{1920, 1080};
+            }
+        };
+
+        QString oot_desc;
+        if (!temporal_upscaler && above_100) {
+            const double mult = raw_oot == Settings::OotResolution::Percent150   ? 1.5
+                                : raw_oot == Settings::OotResolution::Percent200 ? 2.0
+                                                                                 : 3.0;
+            const auto [base_w, base_h] = scene_dims(Settings::OotResolution::Full);
+            const int out_w = static_cast<int>(base_w * mult + 0.5);
+            const int out_h = static_cast<int>(base_h * mult + 0.5);
+            oot_desc = tr("%1×%2 (%3x scale)").arg(out_w).arg(out_h).arg(mult, 0, 'g', 2);
+        } else if (eff_oot == Settings::OotResolution::Game) {
+            oot_desc = docked ? tr("Dynamic (up to 2560×1440) → 2560×1440")
+                              : tr("Dynamic (up to 1920×1080) → 1920×1080");
+        } else {
+            const auto [sw, sh] = scene_dims(eff_oot);
+            const QString pct_text = UiText::ChoiceLabel(
+                Settings::EnumMetadata<Settings::OotResolution>::Index(),
+                static_cast<u32>(eff_oot));
+            int out_w = docked ? 2560 : 1920;
+            int out_h = docked ? 1440 : 1080;
+            QString note;
+#ifndef __APPLE__
+            if (temporal_upscaler && docked) {
+                const bool dlss_dlaa = upscaler == Settings::Upscaler::Dlss &&
+                                       dlss_quality == Settings::DlssQuality::Dlaa;
+                const bool dlss_exceeds_3x = upscaler == Settings::Upscaler::Dlss &&
+                                             (sw * 3 < 3840 || sh * 3 < 2160);
+                if (dlss_dlaa) {
+                    out_w = sw;
+                    out_h = sh;
+                    note = UiText::ChoiceLabel("nvidia_dlss_quality", "Dlaa");
+                } else if (dlss_exceeds_3x) {
+                    note = tr("%1, capped ≤3.0x").arg(upscaler_name);
+                } else {
+                    out_w = 3840;
+                    out_h = 2160;
+                    note = upscaler_name;
+                }
+            } else if (temporal_upscaler) {
+                note = upscaler_name;
+            }
+#else
+            if (temporal_upscaler) {
+                note = upscaler_name;
+            }
+#endif
+            if (overridden_by_dlss_quality) {
+                const QString q_label = UiText::ChoiceLabel(
+                    Settings::EnumMetadata<Settings::DlssQuality>::Index(),
+                    static_cast<u32>(dlss_quality));
+                oot_desc = tr("%1×%2 (%3 via %4 %5) → %6×%7")
+                               .arg(sw)
+                               .arg(sh)
+                               .arg(pct_text, upscaler_name, q_label)
+                               .arg(out_w)
+                               .arg(out_h);
+            } else if (temporal_upscaler && above_100) {
+                oot_desc = tr("%1×%2 (clamped to 100% by %3) → %4×%5")
+                               .arg(sw)
+                               .arg(sh)
+                               .arg(upscaler_name)
+                               .arg(out_w)
+                               .arg(out_h);
+            } else if (!note.isEmpty()) {
+                oot_desc = tr("%1×%2 (%3) → %4×%5 (%6)")
+                               .arg(sw)
+                               .arg(sh)
+                               .arg(pct_text)
+                               .arg(out_w)
+                               .arg(out_h)
+                               .arg(note);
+            } else {
+                oot_desc = tr("%1×%2 (%3) → %4×%5")
+                               .arg(sw)
+                               .arg(sh)
+                               .arg(pct_text)
+                               .arg(out_w)
+                               .arg(out_h);
+            }
+        }
+        parts << (resolution_combobox != nullptr
+                      ? tr("Ocarina of Time: %1").arg(oot_desc)
+                      : tr("3D Scene → Output: %1").arg(oot_desc));
+    }
+
+    const QString tex_desc = [&] {
+        switch (tex_quality) {
+        case Settings::TextureQuality::Full:
+            return tr("Full (mip 0)");
+        case Settings::TextureQuality::Half:
+            return tr("Half (mip +1 on ≥512px)");
+        case Settings::TextureQuality::Quarter:
+            return tr("Quarter (mip +2 on ≥512px)");
+        }
+        return QString{};
+    }();
+    parts << tr("Textures: %1").arg(tex_desc);
+
+    effective_summary_label->setText(
+        tr("<b>Effective Resolution &amp; Textures (%1):</b> %2")
+            .arg(mode_label.toHtmlEscaped(),
+                 parts.join(QStringLiteral(" · ")).toHtmlEscaped()));
 }
 
 void ConfigureGraphics::UpdateLosslessStatus() {
