@@ -84,6 +84,9 @@ struct FormatInfo {
 /// Device::SupportsMeshShaders for plain C++.
 [[nodiscard]] bool DeviceSupportsMeshShaders(const Device& device);
 
+/// Device::Supports32BitFloatFiltering for plain C++.
+[[nodiscard]] bool DeviceSupports32BitFloatFiltering(const Device& device);
+
 /// Creates a standalone Metal Device from plain C++ (returns null when no Metal GPU is available).
 [[nodiscard]] std::unique_ptr<Device, void (*)(Device*)> CreateOfflineDevice();
 
@@ -174,6 +177,7 @@ struct SamplerOptions {
     bool force_nearest{};      ///< No filtering (integer views)
     bool drop_compare{};       ///< No comparison (a plain sample of a compare sampler)
     bool srgb_border{};        ///< The sRGB border colour (sRGB views)
+    bool red_only_border{};    ///< Border whiteness decided by the red channel alone (R / depth)
 };
 
 /// A sampler for a guest sampler descriptor (TSC entry).
@@ -193,6 +197,9 @@ struct SamplerOptions {
 
 /// A bilinear sampler clamping to the edge, for the renderer's own passes.
 [[nodiscard]] Object CreateLinearClampSampler(const Device& device);
+
+/// A bilinear sampler clamping to the edge in unnormalized texel coordinates.
+[[nodiscard]] Object CreateUnnormalizedLinearSampler(const Device& device);
 
 /// An MTLLibrary built from MSL source (Metal's compiler, at run time); empty with `error` set
 /// on failure.

@@ -16,6 +16,7 @@
 #include <atomic>
 #include <compare>
 #include <cstddef>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <string_view>
@@ -568,6 +569,18 @@ OotResolution OcarinaUpscaledResolution(OotResolution resolution, Upscaler upsca
         return resolution;
     }
     switch (upscaler) {
+#if defined(__APPLE__)
+    case Upscaler::Auto: {
+        if (values.renderer_backend.GetValue() != RendererBackend::Metal) {
+            return resolution;
+        }
+        if (const char* const env = std::getenv("EDEN_NX2_METAL_OOT_TEMPORAL");
+            env != nullptr && env[0] == '0') {
+            return resolution;
+        }
+        return docked ? OotResolution::Full : OotResolution::Percent75;
+    }
+#endif
     case Upscaler::Fsr3:
     case Upscaler::Fsr4:
     case Upscaler::Dlss:

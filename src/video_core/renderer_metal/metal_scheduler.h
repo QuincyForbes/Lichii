@@ -77,6 +77,12 @@ enum class BlitBlend : u8 {
     Coverage,      ///< src * src alpha + dst * (1 - src alpha)
 };
 
+enum class BlitColorOp : u8 {
+    Copy,
+    SrgbToLinear,
+    Square,
+};
+
 /// A scaled copy of a rectangle of a 2D texture view into a render target, drawn with a
 /// triangle (Fermi2D blits, presentation). A mirrored rectangle (end before start) flips.
 struct BlitPass {
@@ -92,6 +98,7 @@ struct BlitPass {
     bool keep_dst{true};
     /// How the source is put over dst (presented layers above the first).
     BlitBlend blend{BlitBlend::None};
+    BlitColorOp color_op{BlitColorOp::Copy};
 };
 
 /// A copy between a multisampled texture and a single-sampled one that holds each sample as a
@@ -367,6 +374,12 @@ public:
     /// Whether a copy may go ahead of the segment. The caller answers for the destination not
     /// being read or written in the segment so far.
     [[nodiscard]] bool CanUploadAhead() const noexcept;
+
+    /// Whether CopyBuffer(..., ahead = true) will actually record ahead of the segment.
+    [[nodiscard]] bool CanCopyBufferAhead() const noexcept;
+
+    /// Whether `buffer` is referenced by any uncommitted command buffer of the current tick.
+    [[nodiscard]] bool IsBufferActiveInOpenCommands(BufferHandle buffer) const;
 
     /// Whether a staging buffer upload into `texture` may go ahead of the open render pass.
     [[nodiscard]] bool CanUploadTextureAhead(TextureHandle texture) const noexcept;

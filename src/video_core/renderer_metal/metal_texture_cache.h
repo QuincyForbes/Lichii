@@ -380,6 +380,10 @@ public:
         return desc;
     }
 
+    [[nodiscard]] const TextureDesc& ActiveDesc() const noexcept {
+        return rescaled ? scaled_desc : desc;
+    }
+
     void ReleaseToPool();
 
     u64 allocation_tick{};

@@ -141,6 +141,7 @@ public:
         }
         Settings::values.disabled_addons.erase(OcarinaTitleId);
         Settings::values.oot_resolution.SetValue(resolution);
+        Settings::values.upscaler.SetValue(upscaler);
         Settings::values.patch_performance.SetValue(Settings::GamePatchMode::Auto);
         SetFrameTiming(nullptr);
         std::error_code error;
@@ -157,6 +158,7 @@ public:
 
 private:
     const Settings::OotResolution resolution = Settings::values.oot_resolution.GetValue();
+    const Settings::Upscaler upscaler = Settings::values.upscaler.GetValue();
     std::array<std::filesystem::path, TestDirectories.size()> previous;
     const std::filesystem::path root =
         std::filesystem::temp_directory_path() /
@@ -218,6 +220,7 @@ TEST_CASE("Built-in Max Resolution patch is gated on build id and original word"
 
     SECTION("The game's dynamic resolution skips") {
         Settings::values.oot_resolution.SetValue(Settings::OotResolution::Game);
+        Settings::values.upscaler.SetValue(Settings::Upscaler::Game);
         REQUIRE(PatchMain(context, OcarinaBuildId, TbzInstruction) == TbzInstruction);
     }
 }
@@ -237,6 +240,7 @@ TEST_CASE("Built-in Max Resolution patch defers to a user mod at the same offset
     SECTION("The game's dynamic resolution keeps the mod") {
         PatchManagerTestContext context{BranchInstruction};
         Settings::values.oot_resolution.SetValue(Settings::OotResolution::Game);
+        Settings::values.upscaler.SetValue(Settings::Upscaler::Game);
         REQUIRE(PatchMain(context, OcarinaBuildId, TbzInstruction) == BranchInstruction);
     }
 }
@@ -289,7 +293,13 @@ TEST_CASE("Ocarina resolution setting picks Max Resolution's path and its scale"
         Settings::values.upscaler.SetValue(dlss ? Settings::Upscaler::Dlss
                                                 : Settings::Upscaler::Auto);
         setting.SetValue(OotResolution::Game);
-        CHECK(words() == (!dlss ? std::pair{TbzInstruction, ScaleOne}
+#if defined(__APPLE__)
+        const bool fixed_game =
+            dlss || Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Metal;
+#else
+        const bool fixed_game = dlss;
+#endif
+        CHECK(words() == (!fixed_game ? std::pair{TbzInstruction, ScaleOne}
                           : Settings::IsDockedMode() ? std::pair{BranchInstruction, ScaleOne}
                                                      : std::pair{BranchInstruction, Scale75}));
         setting.SetValue(OotResolution::Full);
@@ -518,6 +528,7 @@ TEST_CASE("Ocarina frame timing: FPS Unlock at every frame rate, Dark's routine 
     SetFrameTiming(nullptr);
 
     Settings::values.oot_resolution.SetValue(Settings::OotResolution::Game);
+    Settings::values.upscaler.SetValue(Settings::Upscaler::Game);
     patched = manager.PatchNSO(nso, "main");
     REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicCallInstruction);
     REQUIRE(WordAt(patched) == TbzInstruction);
@@ -554,6 +565,7 @@ TEST_CASE("Built-in frame timing rejects mismatched or truncated modules transac
           "[patch_manager]") {
     PatchManagerTestContext context;
     Settings::values.oot_resolution.SetValue(Settings::OotResolution::Game);
+    Settings::values.upscaler.SetValue(Settings::Upscaler::Game);
     auto nso = MakeDynamicMain();
     std::string module = "main";
     u64 title = OcarinaTitleId;
@@ -636,6 +648,7 @@ TEST_CASE("Built-in frame timing leaves both records alone when a user mod chang
     }
     PatchManagerTestContext context{mod_word, offset};
     Settings::values.oot_resolution.SetValue(Settings::OotResolution::Game);
+    Settings::values.upscaler.SetValue(Settings::Upscaler::Game);
     const auto nso = MakeDynamicMain();
     auto expected = nso;
     std::memcpy(expected.data() + offset, &mod_word, sizeof(mod_word));

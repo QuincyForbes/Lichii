@@ -20,6 +20,7 @@
 #include "video_core/dlss_contract.h"
 #include "video_core/nx2.h"
 #include "video_core/ocarina_upscale.h"
+#include "video_core/render_probe.h"
 #include "video_core/renderer_metal/metal_coverage.h"
 #include "video_core/renderer_metal/metal_formats.h"
 #include "video_core/renderer_metal/metal_fsr3_upscaler.h"
@@ -227,6 +228,105 @@ namespace {
     };
     return Extent3D{clip(width, offset.x, extent.width), clip(height, offset.y, extent.height),
                     clip(depth, offset.z, extent.depth)};
+}
+
+[[nodiscard]] Extent3D ClipExtent(const TextureDesc& desc, s32 level, VideoCommon::Offset3D offset,
+                                  VideoCommon::Extent3D extent) {
+    const u32 width = (std::max)(desc.width >> level, 1U);
+    const u32 height = (std::max)(desc.height >> level, 1U);
+    const u32 depth = desc.kind == TextureKind::e3D ? (std::max)(desc.depth >> level, 1U) : 1U;
+    const auto clip = [](u32 limit, s32 start, u32 size) {
+        const u32 begin = static_cast<u32>((std::max)(start, 0));
+        return begin >= limit ? 0U : (std::min)(size, limit - begin);
+    };
+    return Extent3D{clip(width, offset.x, extent.width), clip(height, offset.y, extent.height),
+                    clip(depth, offset.z, extent.depth)};
+}
+
+[[nodiscard]] bool IsPixelFormatFloatingPoint(PixelFormat format) noexcept {
+    switch (format) {
+    case PixelFormat::R16G16B16A16_FLOAT:
+    case PixelFormat::R16G16B16X16_FLOAT:
+    case PixelFormat::B10G11R11_FLOAT:
+    case PixelFormat::E5B9G9R9_FLOAT:
+    case PixelFormat::R32G32B32A32_FLOAT:
+    case PixelFormat::R32G32B32_FLOAT:
+    case PixelFormat::R32G32_FLOAT:
+    case PixelFormat::R32_FLOAT:
+    case PixelFormat::R16G16_FLOAT:
+    case PixelFormat::R16_FLOAT:
+    case PixelFormat::BC6H_UFLOAT:
+    case PixelFormat::BC6H_SFLOAT:
+    case PixelFormat::D32_FLOAT:
+    case PixelFormat::D32_FLOAT_S8_UINT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] bool Is32BitFloatFormat(PixelFormat format) noexcept {
+    switch (format) {
+    case PixelFormat::R32_FLOAT:
+    case PixelFormat::R32G32_FLOAT:
+    case PixelFormat::R32G32B32_FLOAT:
+    case PixelFormat::R32G32B32A32_FLOAT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] bool RedOnlyFormat(PixelFormat format) noexcept {
+    switch (format) {
+    case PixelFormat::R8_UNORM:
+    case PixelFormat::R8_SNORM:
+    case PixelFormat::R8_SINT:
+    case PixelFormat::R8_UINT:
+    case PixelFormat::R16_FLOAT:
+    case PixelFormat::R16_UNORM:
+    case PixelFormat::R16_SNORM:
+    case PixelFormat::R16_UINT:
+    case PixelFormat::R16_SINT:
+    case PixelFormat::R32_FLOAT:
+    case PixelFormat::R32_UINT:
+    case PixelFormat::R32_SINT:
+    case PixelFormat::BC4_UNORM:
+    case PixelFormat::BC4_SNORM:
+    case PixelFormat::EAC_R11_UNORM:
+    case PixelFormat::EAC_R11_SNORM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] std::optional<std::array<u32, 2>> ActualTextureDimensions(const ImageView& view,
+                                                                        TextureHandle handle) {
+    if (handle == nullptr) {
+        return std::nullopt;
+    }
+    return [&]<typename Facts = TextureFacts>() -> std::optional<std::array<u32, 2>> {
+        if constexpr (requires(Facts f) {
+                          f.width;
+                          f.height;
+                      }) {
+            const Facts facts = DescribeTexture(handle);
+            if (facts.format == 0 || facts.width == 0 || facts.height == 0) {
+                return std::nullopt;
+            }
+            return std::array{facts.width, facts.height};
+        } else {
+            const Image* const image = view.BackingImage();
+            if (image == nullptr) {
+                return std::nullopt;
+            }
+            const TextureDesc& desc = image->ActiveDesc();
+            const u32 level = static_cast<u32>(view.range.base.level);
+            return std::array{(std::max)(desc.width >> level, 1U),
+                              (std::max)(desc.height >> level, 1U)};
+        }
+    }();
 }
 
 // EDEN_NX2_METAL_SPARSE=0: large images over Switch 2 sparse regions are made whole.
@@ -471,12 +571,18 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
         dst.info.num_samples != src.info.num_samples) {
         return;
     }
-    const auto [sx, sy] = VideoCommon::SamplesLog2(src.info.num_samples);
     const bool src_3d = src.info.type == ImageType::e3D;
     const bool dst_3d = dst.info.type == ImageType::e3D;
     for (const VideoCommon::ImageCopy& copy : copies) {
-        const Extent3D extent = ClipExtent(src.info, sx, sy, copy.src_subresource.base_level,
-                                           copy.src_offset, copy.extent);
+        const Extent3D src_extent = ClipExtent(src.ActiveDesc(), copy.src_subresource.base_level,
+                                               copy.src_offset, copy.extent);
+        const Extent3D dst_extent = ClipExtent(dst.ActiveDesc(), copy.dst_subresource.base_level,
+                                               copy.dst_offset, copy.extent);
+        const Extent3D extent{
+            .width = (std::min)(src_extent.width, dst_extent.width),
+            .height = (std::min)(src_extent.height, dst_extent.height),
+            .depth = (std::min)(src_extent.depth, dst_extent.depth),
+        };
         if (extent.width == 0 || extent.height == 0 || extent.depth == 0) {
             continue;
         }
@@ -613,7 +719,7 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
             continue;
         }
         const Extent3D extent = ClipExtent(
-            src.info, 0, 0, copy.src_subresource.base_level, copy.src_offset,
+            src.ActiveDesc(), copy.src_subresource.base_level, copy.src_offset,
             VideoCommon::Extent3D{Common::AlignUp(copy.extent.width, src_block_width),
                                   Common::AlignUp(copy.extent.height, src_block_height),
                                   copy.extent.depth});
@@ -623,7 +729,7 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
         const u32 blocks_x = Common::DivCeil(extent.width, src_block_width);
         const u32 blocks_y = Common::DivCeil(extent.height, src_block_height);
         const Extent3D dst_extent = ClipExtent(
-            dst.info, 0, 0, copy.dst_subresource.base_level, copy.dst_offset,
+            dst.ActiveDesc(), copy.dst_subresource.base_level, copy.dst_offset,
             VideoCommon::Extent3D{blocks_x * dst_block_width, blocks_y * dst_block_height,
                                   extent.depth});
         if (dst_extent.width == 0 || dst_extent.height == 0 || dst_extent.depth == 0) {
@@ -723,15 +829,16 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                                     const Region2D& dst_region, const Region2D& src_region,
                                     Tegra::Engines::Fermi2D::Filter filter,
                                     Tegra::Engines::Fermi2D::Operation operation) {
+    using Operation = Tegra::Engines::Fermi2D::Operation;
     TextureHandle source = src.Handle(Shader::TextureType::Color2D);
     std::array<s32, 4> src_rect{src_region.start.x, src_region.start.y, src_region.end.x,
                                 src_region.end.y};
     if (src.Samples() > 1 && dst.Samples() == 1 && MsaaEnabled()) {
         // A resolve, as Vulkan's vkCmdResolveImage, when both rectangles are the whole of one
         // size: Metal's resolve store action takes the whole render area.
-        const bool whole = src_region.start.x == 0 && src_region.start.y == 0 &&
-                           dst_region.start.x == 0 && dst_region.start.y == 0 &&
-                           src_region.end.x == dst_region.end.x &&
+        const bool whole = operation == Operation::SrcCopy && src_region.start.x == 0 &&
+                           src_region.start.y == 0 && dst_region.start.x == 0 &&
+                           dst_region.start.y == 0 && src_region.end.x == dst_region.end.x &&
                            src_region.end.y == dst_region.end.y &&
                            dst_region.end.x == static_cast<s32>(dst.size.width) &&
                            dst_region.end.y == static_cast<s32>(dst.size.height);
@@ -776,7 +883,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                  dst.format);
         return;
     }
-    const BlitPass pass{
+    BlitPass pass{
         .src = source,
         .src_rect = src_rect,
         .dst = dst.RenderTarget(),
@@ -787,6 +894,21 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
         .linear = !depth && filter == Tegra::Engines::Fermi2D::Filter::Bilinear,
         .keep_dst = true,
     };
+    if (!depth) {
+        switch (operation) {
+        case Operation::SrcCopySrgbToLinear:
+            pass.color_op = BlitColorOp::SrgbToLinear;
+            break;
+        case Operation::SrcCopySquare:
+            pass.color_op = BlitColorOp::Square;
+            break;
+        case Operation::BlendPremult:
+            pass.blend = BlitBlend::Premultiplied;
+            break;
+        default:
+            break;
+        }
+    }
     if (!scheduler.Blit(pass)) {
         LOG_ONCE(warned_format, "Metal: a blit into format {} was dropped", dst.format);
     }
@@ -998,6 +1120,8 @@ bool TextureCacheRuntime::Fsr3TemporalUpscale(Framebuffer* dst_framebuffer, Imag
         LOG_INFO(Render_Metal, "Metal: DLSS replaced by FSR 3.1: {}x{} -> {}x{}", render_size[0],
                  render_size[1], output_size[0], output_size[1]);
     }
+    VideoCore::Probe::StoreScene(render_size[0], render_size[1], output_size[0], output_size[1],
+                                 "FSR 3.1");
     return true;
 }
 
@@ -1080,21 +1204,25 @@ bool TextureCacheRuntime::MetalFxTemporalUpscale(Framebuffer* dst_framebuffer, I
     constexpr bool use_history = true;
     ImageView* const depth = &depth_view;
     const std::array<u32, 2> output_size{dst_framebuffer->Width(), dst_framebuffer->Height()};
-    const bool whole_input = HostExtent(input_color) == render_size;
-    const auto same_size = [&](const ImageView& view) {
-        return !whole_input || (input_color.size.width == view.size.width &&
-                                input_color.size.height == view.size.height);
-    };
     if (!IsPlainBaseView(dst) || !IsPlainBaseView(input_color) ||
         !IsPlainBaseView(motion_vectors) || !IsPlainBaseView(*depth) ||
         dst_framebuffer->Samples() != 1 || !IsColor(dst.HostClass()) ||
         !ViewFitsExtent(input_color, render_size) || !ViewFitsExtent(dst, output_size) ||
         !ViewFitsExtent(motion_vectors, render_size) || !ViewFitsExtent(*depth, render_size) ||
-        motion_vectors.format != PixelFormat::R16G16_FLOAT || !same_size(motion_vectors) ||
-        depth->format != PixelFormat::D32_FLOAT || !same_size(*depth) ||
+        motion_vectors.format != PixelFormat::R16G16_FLOAT ||
+        depth->format != PixelFormat::D32_FLOAT ||
         input_color.ImageHandle() == dst.ImageHandle() ||
         !DlssContract::ValidColorFormats(input_color.format, dst.format, use_history) ||
         !DlssContract::ValidGeometry(render_size, output_size, jitter, motion_scale)) {
+        return false;
+    }
+    const TextureHandle color_handle = input_color.Handle(Shader::TextureType::Color2D);
+    const TextureHandle depth_handle = depth->Handle(Shader::TextureType::Color2D);
+    const TextureHandle motion_handle = motion_vectors.Handle(Shader::TextureType::Color2D);
+    const auto color_dims = ActualTextureDimensions(input_color, color_handle);
+    const auto depth_dims = ActualTextureDimensions(*depth, depth_handle);
+    const auto motion_dims = ActualTextureDimensions(motion_vectors, motion_handle);
+    if (!color_dims || depth_dims != color_dims || motion_dims != color_dims) {
         return false;
     }
     if (!temporal) {
@@ -1105,22 +1233,20 @@ bool TextureCacheRuntime::MetalFxTemporalUpscale(Framebuffer* dst_framebuffer, I
         }
         temporal = std::make_unique<TemporalUpscaler>();
     }
-    // A gap in the evaluations (frame gap > 1, elapsed > 250 ms) or extent change starts history again.
+    // A gap in the evaluations (frame gap > 1, elapsed > 250 ms) or backing texture / output size
+    // change starts history again; smooth DRS render_size changes inside the same input_color
+    // texture keep history intact.
     const auto now = std::chrono::steady_clock::now();
     const bool reset = !temporal_last_evaluation ||
                        now - *temporal_last_evaluation > std::chrono::milliseconds{250} ||
                        !temporal_last_frame || pool_frame > *temporal_last_frame + 1 ||
-                       temporal_last_render != render_size || temporal_last_output != output_size;
-    temporal_last_evaluation = now;
-    temporal_last_frame = pool_frame;
-    temporal_last_render = render_size;
-    temporal_last_output = output_size;
+                       temporal_last_render != *color_dims || temporal_last_output != output_size;
     const TextureHandle output = temporal->Upscale(
         device, scheduler,
         {
-            .color = input_color.Handle(Shader::TextureType::Color2D),
-            .depth = depth->Handle(Shader::TextureType::Color2D),
-            .motion = motion_vectors.Handle(Shader::TextureType::Color2D),
+            .color = color_handle,
+            .depth = depth_handle,
+            .motion = motion_handle,
             .render_size = render_size,
             .output_size = output_size,
             .jitter = jitter,
@@ -1128,10 +1254,12 @@ bool TextureCacheRuntime::MetalFxTemporalUpscale(Framebuffer* dst_framebuffer, I
                                     motion_scale[1] * static_cast<f32>(render_size[1])},
             .reset = reset,
             .depth_reversed = true,
-            .auto_exposure = true,
+            .auto_exposure = IsPixelFormatFloatingPoint(input_color.format),
         });
     if (output == nullptr) {
-        temporal_unsupported = true;
+        if (temporal->Failed()) {
+            temporal_unsupported = true;
+        }
         return false;
     }
     const s32 width = static_cast<s32>(output_size[0]);
@@ -1147,15 +1275,20 @@ bool TextureCacheRuntime::MetalFxTemporalUpscale(Framebuffer* dst_framebuffer, I
             .linear = false,
             .keep_dst = true,
         })) {
-        temporal_unsupported = true;
         return false;
     }
+    temporal_last_evaluation = now;
+    temporal_last_frame = pool_frame;
+    temporal_last_render = *color_dims;
+    temporal_last_output = output_size;
     static bool logged{};
     if (!logged) {
         logged = true;
         LOG_INFO(Render_Metal, "Metal: DLSS replaced by MetalFX temporal: {}x{} -> {}x{}",
                  render_size[0], render_size[1], output_size[0], output_size[1]);
     }
+    VideoCore::Probe::StoreScene(render_size[0], render_size[1], output_size[0], output_size[1],
+                                 "MetalFX Temporal");
     return true;
 }
 
@@ -1194,7 +1327,6 @@ bool TextureCacheRuntime::UpscaleWithCameraMotion(Framebuffer* dst_framebuffer,
     }
     if (!camera_motion_pass->Record(depth.Handle(Shader::TextureType::Color2D), render_size,
                                     reprojection)) {
-        temporal_unsupported = true;
         return false;
     }
     const TextureHandle output = temporal->Upscale(
@@ -1209,12 +1341,14 @@ bool TextureCacheRuntime::UpscaleWithCameraMotion(Framebuffer* dst_framebuffer,
             // The motion vectors are in render pixels.
             .motion_vector_scale = {1.0f, 1.0f},
             .reset = reset,
-            // Ocarina's scene has its depth at 0 at the camera and is tonemapped already.
+            // Ocarina's scene has its depth at 0 at the camera and linear B10G11R11_FLOAT colour.
             .depth_reversed = false,
-            .auto_exposure = false,
+            .auto_exposure = true,
         });
     if (output == nullptr) {
-        temporal_unsupported = true;
+        if (temporal->Failed()) {
+            temporal_unsupported = true;
+        }
         return false;
     }
     const s32 width = static_cast<s32>(output_size[0]);
@@ -1230,7 +1364,6 @@ bool TextureCacheRuntime::UpscaleWithCameraMotion(Framebuffer* dst_framebuffer,
             .linear = false,
             .keep_dst = true,
         })) {
-        temporal_unsupported = true;
         return false;
     }
     static bool logged{};
@@ -1239,6 +1372,8 @@ bool TextureCacheRuntime::UpscaleWithCameraMotion(Framebuffer* dst_framebuffer,
         LOG_INFO(Render_Metal, "Metal: anti-aliasing replaced by MetalFX temporal: {}x{} -> {}x{}",
                  render_size[0], render_size[1], output_size[0], output_size[1]);
     }
+    VideoCore::Probe::StoreScene(render_size[0], render_size[1], output_size[0], output_size[1],
+                                 "MetalFX Temporal");
     return true;
 }
 
@@ -2041,11 +2176,14 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const ImageViewInfo& info, Im
         const bool any_r = std::ranges::any_of(view_swizzle, [](u8 s) {
             return static_cast<SwizzleSource>(s) == SwizzleSource::R;
         });
+        const bool any_g = std::ranges::any_of(view_swizzle, [](u8 s) {
+            return static_cast<SwizzleSource>(s) == SwizzleSource::G;
+        });
         const bool stencil_aspect =
             format == PixelFormat::S8_UINT ||
             ((format == PixelFormat::D24_UNORM_S8_UINT ||
               format == PixelFormat::D32_FLOAT_S8_UINT) &&
-             !any_r) ||
+             any_g && !any_r) ||
             (format == PixelFormat::S8_UINT_D24_UNORM && any_r);
         if (stencil_aspect && image.HostFormat().format == Fmt::Depth32Float_Stencil8 &&
             samples == 1) {
@@ -2056,6 +2194,8 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const ImageViewInfo& info, Im
             for (u8& source : view_swizzle) {
                 if (static_cast<SwizzleSource>(source) == SwizzleSource::G) {
                     source = static_cast<u8>(SwizzleSource::R);
+                } else if (static_cast<SwizzleSource>(source) == SwizzleSource::B) {
+                    source = static_cast<u8>(SwizzleSource::Zero);
                 }
             }
         }
@@ -2065,12 +2205,14 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const ImageViewInfo& info, Im
                    HostSwizzle(view_swizzle[3], host.swizzle)};
     }
     // A render target in another format than its image draws through a view of that format.
-    if (image_texture != nullptr && host_format != image.HostFormat().format &&
-        host_format != Fmt::X32_Stencil8 && !is_3d_slice && image_kind != TextureKind::e3D) {
-        render_view = CreateTextureView(image_texture, host_format, image_kind, 0,
-                                        static_cast<u32>(image.info.resources.levels), 0,
-                                        static_cast<u32>(image.info.resources.layers),
-                                        IdentitySwizzle);
+    if (is_render_target && image_texture != nullptr && host_format != image.HostFormat().format &&
+        host_format != Fmt::X32_Stencil8) {
+        const u32 view_layers =
+            image_kind == TextureKind::e3D ? 1U : static_cast<u32>(image.info.resources.layers);
+        render_view =
+            CreateTextureView(image_texture, host_format, image_kind, 0,
+                              static_cast<u32>(image.info.resources.levels), 0, view_layers,
+                              IdentitySwizzle);
     }
 }
 
@@ -2245,16 +2387,17 @@ TextureHandle ImageView::SampledHandle(Shader::TextureType texture_type, bool mu
 }
 
 Attachment ImageView::RenderTarget() const noexcept {
+    const TextureHandle target_texture = render_view ? render_view.Get() : image_texture;
     if (is_3d_slice) {
         return Attachment{
-            .texture = image_texture,
+            .texture = target_texture,
             .level = static_cast<u32>(range.base.level),
             .slice = 0,
             .depth_plane = static_cast<u32>(range.base.layer),
         };
     }
     return Attachment{
-        .texture = render_view ? render_view.Get() : image_texture,
+        .texture = target_texture,
         .level = static_cast<u32>(range.base.level),
         .slice = static_cast<u32>(range.base.layer),
     };
@@ -2271,9 +2414,6 @@ f32 TextureCacheRuntime::OcarinaLodBias() {
                 Settings::IsDockedMode());
             const auto mode = Settings::OcarinaDlssModeFor(effective_res);
             bias = VideoCommon::OcarinaFsrLodBias(backend, mode);
-            if (bias == 0.0f && backend == VideoCommon::OcarinaUpscaleBackend::Dlss) {
-                bias = VideoCommon::OcarinaDlssLodBias(mode);
-            }
         }
         ocarina_lod_bias = bias;
     }
@@ -2326,6 +2466,7 @@ void* Sampler::HandleFor(const ImageView& view, bool is_depth) {
         DropCompare = 4,
         DropBias = 8,
         Srgb = 16,
+        RedOnlyBorder = 32,
         TemporalBiasShift = 8,
     };
     u16 key = 0;
@@ -2334,7 +2475,8 @@ void* Sampler::HandleFor(const ImageView& view, bool is_depth) {
     }
     if (has_linear_filtering &&
         (VideoCore::Surface::IsPixelFormatInteger(view.format) ||
-         view.HostClass() == FormatClass::Stencil)) {
+         view.HostClass() == FormatClass::Stencil ||
+         (Is32BitFloatFormat(view.format) && !DeviceSupports32BitFloatFiltering(*device)))) {
         key |= ForceNearest;
     }
     // A compare sampler read by a plain sample: Maxwell ignores the comparison.
@@ -2344,8 +2486,8 @@ void* Sampler::HandleFor(const ImageView& view, bool is_depth) {
     const Image* const image = view.BackingImage();
     const bool gpu_written = image != nullptr && True(image->flags & ImageFlagBits::GpuModified);
     if (added_lod_bias != 0.0f) {
-        if (!VideoCommon::KeepOcarinaFsrLodBias(true, runtime->ocarina_upscaler_failed,
-                                                gpu_written)) {
+        if (!VideoCommon::KeepOcarinaFsrLodBias(Settings::IsDockedMode(),
+                                                runtime->ocarina_upscaler_failed, gpu_written)) {
             key |= DropBias;
         }
     } else if (!gpu_written && runtime->temporal_lod_bias < -0.125f &&
@@ -2358,6 +2500,9 @@ void* Sampler::HandleFor(const ImageView& view, bool is_depth) {
     }
     if (has_srgb_border && VideoCore::Surface::IsPixelFormatSRGB(view.format)) {
         key |= Srgb;
+    }
+    if (is_depth || IsDepth(view.HostClass()) || RedOnlyFormat(view.format)) {
+        key |= RedOnlyBorder;
     }
     if (key == 0) {
         return sampler.Get();
@@ -2376,6 +2521,7 @@ void* Sampler::HandleFor(const ImageView& view, bool is_depth) {
                                      .force_nearest = (key & ForceNearest) != 0,
                                      .drop_compare = (key & DropCompare) != 0,
                                      .srgb_border = (key & Srgb) != 0,
+                                     .red_only_border = (key & RedOnlyBorder) != 0,
                                  });
     void* const handle = state.Get();
     variants.push_back(Variant{.key = key, .state = std::move(state)});

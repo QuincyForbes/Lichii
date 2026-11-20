@@ -94,6 +94,7 @@ enum class Op : u16 {
     CTexture,
     CSampler,
     CUseResource,
+    CMemoryBarrier,
     CStageIn,
     CDispatch,
     CDispatchIndirect,
@@ -1003,6 +1004,11 @@ LICHII_STAGE_BINDS(Mesh, 3)
     Metal::Rec::Put(cmd, Metal::Rec::UseArgs{static_cast<u32>(usage), 0});
 }
 
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope {
+    LICHII_REC(CMemoryBarrier);
+    Metal::Rec::Put(cmd, Metal::Rec::U32Args{static_cast<u32>(scope), 0});
+}
+
 - (void)setStageInRegion:(MTLRegion)region {
     LICHII_REC(CStageIn);
     Metal::Rec::Put(cmd, Metal::Rec::DispatchArgs{Metal::Rec::ToSize3(region.origin),
@@ -1468,6 +1474,9 @@ inline void Recorder::Execute(const Cmd& c, const Chunk& chunk) {
             break;
         case Op::CUseResource:
             [e useResource:obj usage:static_cast<MTLResourceUsage>(Get<UseArgs>(c).usage)];
+            break;
+        case Op::CMemoryBarrier:
+            [e memoryBarrierWithScope:static_cast<MTLBarrierScope>(Get<U32Args>(c).a)];
             break;
         case Op::CStageIn: {
             const DispatchArgs args = Get<DispatchArgs>(c);

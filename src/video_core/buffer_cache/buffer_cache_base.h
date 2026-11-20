@@ -806,6 +806,7 @@ public:
         u64 cpu_epoch{};
         u64 gpu_epoch{};
         u64 tick{};
+        u64 usage_serial{};
         u64 frame{};
     };
     /// Named uniform_sync_memo here: uniform_bind_memo below is the EXP18 binding memo.
@@ -961,6 +962,7 @@ private:
     bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
 
     [[nodiscard]] static bool BindMemoEnabled();
+    [[nodiscard]] u64 CurrentUsageSerial() const noexcept;
     [[nodiscard]] bool BindMemoHit(const BindMemo& memo, Buffer& buffer, BufferId buffer_id,
                                    DAddr device_addr, u32 size, u32 offset, const char* kind,
                                    size_t stage, u32 index);

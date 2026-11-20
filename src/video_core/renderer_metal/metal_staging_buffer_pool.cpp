@@ -171,7 +171,7 @@ StagingBufferRef StagingBufferPool::Stream(size_t size, size_t alignment) {
         return Request(size);
     }
     if (!stream) {
-        stream = CreateBuffer(device, stream_size, true, &stream_contents);
+        stream = CreateBuffer(device, stream_size + 65536, true, &stream_contents);
         ASSERT_MSG(stream && stream_contents != nullptr, "Metal stream buffer failed");
     }
     u64 offset = Common::AlignUp(stream_offset, (std::max)(alignment, size_t{16}));
@@ -207,7 +207,8 @@ StagingBufferRef StagingBufferPool::RequestUpload(size_t size, size_t alignment)
         return Request(size);
     }
     if (!upload_stream) {
-        upload_stream = CreateBuffer(device, stream_size, true, &upload_stream_contents, true);
+        upload_stream =
+            CreateBuffer(device, stream_size + 65536, true, &upload_stream_contents, true);
         ASSERT_MSG(upload_stream && upload_stream_contents != nullptr,
                    "Metal upload stream buffer failed");
     }

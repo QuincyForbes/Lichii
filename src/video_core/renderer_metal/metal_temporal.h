@@ -36,18 +36,22 @@ public:
         /// Linear HDR colour (the games' DLSS inputs); Ocarina's scene is tonemapped already.
         bool auto_exposure{true};
         /// Where this frame's colour counts over the history (0..1, R16F at the render size):
-        /// MetalFX's reactive mask (iOS 18, macOS 15; ignored before). Null: none.
+        /// MetalFX's reactive mask (iOS 17.4, macOS 14.4; ignored before). Null: none.
         TextureHandle reactive{};
     };
 
-    /// Whether MetalFX takes a reactive mask on this OS.
+    /// Whether MetalFX takes a reactive mask on this OS / GPU.
     [[nodiscard]] static bool ReactiveMaskSupported();
+    [[nodiscard]] static bool ReactiveMaskSupported(const Device& device);
 
     TemporalUpscaler();
     ~TemporalUpscaler();
 
     /// Whether this GPU and OS run MetalFX temporal upscaling.
     [[nodiscard]] static bool IsSupported(const Device& device);
+
+    /// Whether MetalFX permanently declined on this GPU/OS.
+    [[nodiscard]] bool Failed() const noexcept;
 
     /// Encodes one evaluation on the scheduler's command buffer. The output (RGBA16F at the
     /// output size), or null when MetalFX can't run (logged once; later calls return null too).

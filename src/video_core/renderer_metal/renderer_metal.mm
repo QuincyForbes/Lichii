@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -687,13 +688,16 @@ RendererMetal::RendererMetal(Core::Frontend::EmuWindow& emu_window,
                              std::unique_ptr<Core::Frontend::GraphicsContext> context_)
     : RendererBase(emu_window, std::move(context_)), gpu{gpu_},
       impl{std::make_unique<Impl>(emu_window, gpu_, device_memory)} {
+    VideoCore::Probe::StoreScene(0, 0, 0, 0, nullptr);
 #ifdef HAS_RESHADE
     // The post-processing chain the settings name, as Vulkan's renderer loads it.
     VideoCore::FxChain::Instance().LoadFromSettings();
 #endif
 }
 
-RendererMetal::~RendererMetal() = default;
+RendererMetal::~RendererMetal() {
+    VideoCore::Probe::StoreScene(0, 0, 0, 0, nullptr);
+}
 
 bool RendererMetal::Impl::DrawLayers(std::span<const Tegra::FramebufferConfig> framebuffers,
                                      Attachment target, u32 target_format,
@@ -741,16 +745,18 @@ bool RendererMetal::Impl::DrawLayers(std::span<const Tegra::FramebufferConfig> f
         const bool anti_aliased = already_upscaled || source.anti_aliased;
         const s32 screen_width = static_cast<s32>(screen.right - screen.left);
         const s32 screen_height = static_cast<s32>(screen.bottom - screen.top);
-        if (apply_filters && PresentPasses::Enabled() && screen_width > 0 && screen_height > 0) {
+        const bool passes_enabled =
+            apply_filters && PresentPasses::Enabled() && screen_width > 0 && screen_height > 0;
+        PresentPasses::Source passes_source{
+            .texture = texture,
+            .size = {source.scaled_width, source.scaled_height},
+            .render = {source.scaled_width, source.scaled_height},
+            .crop = {crop.left, crop.top, crop.right, crop.bottom},
+        };
+        if (passes_enabled) {
             // Vulkan's Layer::ConfigureDraw: anti-aliasing over the layer's texture (skipped when
             // Ocarina temporal AA/upscaling already ran), then FSR/FSR3/SGSR to the screen's size,
             // then the window filter.
-            PresentPasses::Source passes_source{
-                .texture = texture,
-                .size = {source.scaled_width, source.scaled_height},
-                .render = {source.scaled_width, source.scaled_height},
-                .crop = {crop.left, crop.top, crop.right, crop.bottom},
-            };
             if (!anti_aliased && !is_applet) {
                 passes_source = present.AntiAlias(
                     passes_source, Settings::values.anti_aliasing.GetValue());
@@ -771,16 +777,6 @@ bool RendererMetal::Impl::DrawLayers(std::span<const Tegra::FramebufferConfig> f
                     passes_source, filter,
                     {static_cast<u32>(screen_width), static_cast<u32>(screen_height)});
             }
-            if (PresentPasses::HasWindowShader(filter) &&
-                present.DrawWindow(
-                    passes_source, filter, target, target_format,
-                    {layout.width, layout.height},
-                    {static_cast<s32>(screen.left), static_cast<s32>(screen.top),
-                     static_cast<s32>(screen.right), static_cast<s32>(screen.bottom)},
-                    drawn, blend)) {
-                drawn = true;
-                continue;
-            }
             texture = passes_source.texture;
             const f32 pass_width = static_cast<f32>(passes_source.size[0]);
             const f32 pass_height = static_cast<f32>(passes_source.size[1]);
@@ -791,8 +787,23 @@ bool RendererMetal::Impl::DrawLayers(std::span<const Tegra::FramebufferConfig> f
             linear = filter != Settings::ScalingFilter::NearestNeighbor &&
                      filter != Settings::ScalingFilter::Mmpx;
         }
+        const s32 src_width = std::abs(src_rect[2] - src_rect[0]);
+        const s32 src_height = std::abs(src_rect[3] - src_rect[1]);
+        const char* const probed_upscaler =
+            VideoCore::Probe::scene_upscaler.load(std::memory_order_relaxed);
+        const bool has_scene_temporal =
+            probed_upscaler != nullptr &&
+            (std::string_view{probed_upscaler}.starts_with("Metal") ||
+             std::string_view{probed_upscaler}.starts_with("FSR") ||
+             std::string_view{probed_upscaler} == "DLSS");
+        const bool auto_spatial =
+            filter == Settings::ScalingFilter::ScaleForce &&
+            Settings::values.upscaler.GetValue() == Settings::Upscaler::MetalFx &&
+            !has_scene_temporal && src_width > 0 && src_height > 0 &&
+            screen_width > src_width && screen_height > src_height;
+        bool spatial_upscaled = false;
         if (!drawn && apply_filters && !already_upscaled && !is_applet &&
-            filter == Settings::ScalingFilter::MetalFxSpatial) {
+            (filter == Settings::ScalingFilter::MetalFxSpatial || auto_spatial)) {
             const u32 out_width = screen.right - screen.left;
             const u32 out_height = screen.bottom - screen.top;
             const bool full_target = target.texture != nullptr && target.level == 0 &&
@@ -812,7 +823,18 @@ bool RendererMetal::Impl::DrawLayers(std::span<const Tegra::FramebufferConfig> f
                 src_rect = {0, 0, static_cast<s32>(out_width),
                             static_cast<s32>(out_height)};
                 linear = false;
+                spatial_upscaled = true;
             }
+        }
+        if (passes_enabled && !spatial_upscaled && PresentPasses::HasWindowShader(filter) &&
+            present.DrawWindow(
+                passes_source, filter, target, target_format,
+                {layout.width, layout.height},
+                {static_cast<s32>(screen.left), static_cast<s32>(screen.top),
+                 static_cast<s32>(screen.right), static_cast<s32>(screen.bottom)},
+                drawn, blend)) {
+            drawn = true;
+            continue;
         }
         const bool layer_drawn = scheduler.Blit(BlitPass{
             .src = texture,

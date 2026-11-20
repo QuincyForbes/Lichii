@@ -120,11 +120,11 @@ constexpr OcarinaUpscaleBackend SelectOcarinaUpscaler(bool fsr_enabled, bool dls
 using Settings::AppliedOcarinaRenderScale;
 
 /// EDEN_NX2_DLSS_JITTER (boot, 0 = off): DLSS or MetalFX gets the camera jitter the FSR path uses.
-/// 1 = the jitter as FSR gets it (default), 2 = with its vertical sign flipped.
+/// 1 = the jitter as FSR gets it, 2 = with its vertical sign flipped.
 inline int OcarinaDlssJitterMode() {
     static const int mode = [] {
         const char* value = std::getenv("EDEN_NX2_DLSS_JITTER");
-        return value != nullptr ? std::atoi(value) : 1;
+        return value != nullptr ? std::atoi(value) : 0;
     }();
     return mode;
 }

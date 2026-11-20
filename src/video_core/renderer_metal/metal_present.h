@@ -132,6 +132,7 @@ private:
         /// Textures by binding: [binding] is sampled from inputs[binding].
         std::span<const TextureHandle> inputs;
         bool nearest{};
+        bool unnormalized{};
         Attachment target;
         u32 format{};
         std::array<u32, 2> size{};
@@ -161,6 +162,7 @@ private:
     std::map<std::tuple<Shader, Shader, u32, BlitBlend>, Object> pipelines;
     Object linear;
     Object nearest;
+    Object unnormalized_linear;
     Target anti_aliased;
     Target smaa_edges;
     Target smaa_weights;

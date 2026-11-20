@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdlib>
 #include <exception>
@@ -49,6 +50,7 @@ constexpr u32 MetalSamplerSlots = 16;
                                           bool fragment, u32 buffer_slot);
 void InlinePreciseHelpers(std::string& source);
 void GuardObjectGridDispatch(std::string& source, const std::string& entry_point);
+void PatchMeshCulledPrimitiveCount(std::string& source);
 void FlipMeshPositionY(std::string& source);
 
 /// EDEN_NX2_METAL_OPTNONE_HELPERS=1: keeps SPIRV-Cross's [[clang::optnone]] spvFAdd/spvFSub/
@@ -251,7 +253,6 @@ struct Declared {
     u32 binding;
     bool combined; ///< Takes a texture and a sampler
     bool spillable_single; ///< Read-only sampled/separate texture (not storage or buffer)
-    bool immutable_buffer; ///< Read-only constant/storage buffer safe for MTLMutabilityImmutable
     ResourceKind kind;
     u32 count; ///< Array elements, each a slot
 };
@@ -1323,30 +1324,25 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
         const spv::ExecutionModel model = Model(stage);
         const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
         std::vector<Declared> declared;
-        const auto add = [&](const auto& list, bool combined, bool sampled, bool is_uniform,
-                             bool is_ssbo, ResourceKind kind) {
+        const auto add = [&](const auto& list, bool combined, bool sampled, ResourceKind kind) {
             for (const spirv_cross::Resource& resource : list) {
                 const spirv_cross::SPIRType& type = compiler.get_type(resource.base_type_id);
-                const bool non_writable_ssbo =
-                    is_ssbo &&
-                    compiler.get_buffer_block_flags(resource.id).get(spv::DecorationNonWritable);
                 declared.push_back(Declared{
                     .set = compiler.get_decoration(resource.id, spv::DecorationDescriptorSet),
                     .binding = compiler.get_decoration(resource.id, spv::DecorationBinding),
                     .combined = combined,
                     .spillable_single = sampled && type.image.dim != spv::DimBuffer,
-                    .immutable_buffer = is_uniform || non_writable_ssbo,
                     .kind = kind,
                     .count = ArrayCount(compiler, resource),
                 });
             }
         };
-        add(resources.uniform_buffers, false, false, true, false, ResourceKind::Buffer);
-        add(resources.storage_buffers, false, false, false, true, ResourceKind::Buffer);
-        add(resources.sampled_images, true, true, false, false, ResourceKind::Texture);
-        add(resources.separate_images, false, true, false, false, ResourceKind::Texture);
-        add(resources.storage_images, false, false, false, false, ResourceKind::Texture);
-        add(resources.separate_samplers, false, false, false, false, ResourceKind::Sampler);
+        add(resources.uniform_buffers, false, false, ResourceKind::Buffer);
+        add(resources.storage_buffers, false, false, ResourceKind::Buffer);
+        add(resources.sampled_images, true, true, ResourceKind::Texture);
+        add(resources.separate_images, false, true, ResourceKind::Texture);
+        add(resources.storage_images, false, false, ResourceKind::Texture);
+        add(resources.separate_samplers, false, false, ResourceKind::Sampler);
         std::ranges::sort(declared, [](const Declared& lhs, const Declared& rhs) {
             return lhs.set != rhs.set ? lhs.set < rhs.set : lhs.binding < rhs.binding;
         });
@@ -1525,7 +1521,6 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
             result.sampler_spill_slot = buffers++;
         }
         if (array_entries != 0) {
-            mark_immutable(buffers, 1);
             result.array_spill_slot = buffers++;
             result.array_spill_entries = array_entries;
         }
@@ -1601,8 +1596,11 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                 GuardObjectGridDispatch(result.source, cleansed_entry);
             }
         }
-        if (stage == Stage::Mesh && options.flip_vertex_y) {
-            FlipMeshPositionY(result.source);
+        if (stage == Stage::Mesh) {
+            PatchMeshCulledPrimitiveCount(result.source);
+            if (options.flip_vertex_y) {
+                FlipMeshPositionY(result.source);
+            }
         }
         if (spilled != 0) {
             const SpillStatus status =
@@ -1633,9 +1631,6 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                 return result;
             }
             if (status == SpillStatus::Unused) {
-                if (result.array_spill_slot < 31) {
-                    result.immutable_buffer_mask &= ~(1U << result.array_spill_slot);
-                }
                 result.array_spill_slot = ~0U;
                 result.array_spill_entries = 0;
             }
@@ -1663,9 +1658,10 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
         }
         const bool reducible = stage == Stage::Vertex || stage == Stage::Fragment ||
                                stage == Stage::Compute;
-        // The reduction rewrite reads the entry's [[sampler(n)]] parameters: not with spills.
-        if (reducible && options.sampler_reduction && !resources.sampled_images.empty() &&
-            spilled_samplers == 0 && array_entries == 0 &&
+        // The reduction rewrite reads the entry's direct [[sampler(0..15)]] parameters.
+        if (reducible && options.sampler_reduction &&
+            (!resources.sampled_images.empty() || !resources.separate_images.empty()) &&
+            buffers < MetalBufferSlots &&
             !(stage == Stage::Vertex && buffers + 1 > options.first_vertex_buffer_slot)) {
             if (!cleansed_entry.empty()) {
                 std::string plain = result.source;
@@ -2325,6 +2321,53 @@ void GuardObjectGridDispatch(std::string& source, const std::string& entry_point
     }
 }
 
+/// SPIRV-Cross emits an early return on `spvMeshSizes.y == 0` without calling
+/// `spvMesh.set_primitive_count(0)`, leaving the mesh workgroup's primitive count uninitialized.
+void PatchMeshCulledPrimitiveCount(std::string& source) {
+    if (source.find("spvMesh.set_primitive_count(") == std::string::npos) {
+        return;
+    }
+    constexpr std::string_view Cond = "if (spvMeshSizes.y == 0";
+    for (size_t at = source.find(Cond); at != std::string::npos;) {
+        size_t pos = at + Cond.size();
+        if (pos < source.size() && source[pos] == 'u') {
+            ++pos;
+        }
+        if (pos >= source.size() || source[pos] != ')') {
+            at = source.find(Cond, pos);
+            continue;
+        }
+        ++pos;
+        while (pos < source.size() && std::isspace(static_cast<unsigned char>(source[pos])) != 0) {
+            ++pos;
+        }
+        if (pos >= source.size() || source[pos] != '{') {
+            at = source.find(Cond, pos);
+            continue;
+        }
+        const size_t brace_open = pos;
+        const size_t brace_close = MatchingBracket(source, brace_open);
+        if (brace_close == std::string_view::npos) {
+            break;
+        }
+        const std::string_view body =
+            std::string_view(source).substr(brace_open + 1, brace_close - brace_open - 1);
+        if (Trim(body) == "return;") {
+            const size_t ret_at = source.find("return;", brace_open + 1);
+            const size_t line_begin = source.rfind('\n', ret_at);
+            const std::string indent =
+                line_begin == std::string::npos
+                    ? std::string{"        "}
+                    : source.substr(line_begin + 1, ret_at - (line_begin + 1));
+            const std::string inserted = "spvMesh.set_primitive_count(0);\n" + indent;
+            source.insert(ret_at, inserted);
+            at = source.find(Cond, brace_close + 1 + inserted.size());
+            continue;
+        }
+        at = source.find(Cond, brace_close + 1);
+    }
+}
+
 /// SPIRV-Cross flips BuiltInPosition.y in mesh shaders only when Position is inside a struct
 /// (gl_MeshPerVertexEXT); our recompiler emits a plain BuiltIn::Position vec4 array, leaving Y
 /// unflipped unless negated here.
@@ -2634,6 +2677,37 @@ SpillStatus SpillArrays(std::string& source, const std::string& entry_point, u32
                   "\nstruct spvArraySpill\n{\n" + members +
                       "};\nstatic_assert(sizeof(spvArraySpill) == " +
                       std::to_string(u64{total_entries} * 8) + "ul, \"spvArraySpill layout\");\n\n");
+    const bool has_unspilled_resource_array =
+        std::ranges::any_of(slots, [](const ResourceSlot& slot) {
+            return (slot.kind == ResourceKind::Texture || slot.kind == ResourceKind::Sampler) &&
+                   slot.count > 1 && !slot.in_array_table;
+        });
+    if (has_unspilled_resource_array) {
+        for (const SpilledMember& member : spilled_members) {
+            if (!member.type.starts_with("array<")) {
+                continue;
+            }
+            const std::string from = "thread const " + member.type + "&";
+            const std::string to = "constant " + member.type + "&";
+            for (size_t pos = source.find(from); pos != std::string::npos;
+                 pos = source.find(from, pos + to.size())) {
+                source.replace(pos, from.size(), to);
+            }
+        }
+    } else {
+        static constexpr std::array<std::pair<std::string_view, std::string_view>, 3>
+            array_param_rewrites{{
+                {"thread const array<texture", "constant array<texture"},
+                {"thread const array<depth", "constant array<depth"},
+                {"thread const array<sampler", "constant array<sampler"},
+            }};
+        for (const auto& [from, to] : array_param_rewrites) {
+            for (size_t pos = source.find(from); pos != std::string::npos;
+                 pos = source.find(from, pos + to.size())) {
+                source.replace(pos, from.size(), to);
+            }
+        }
+    }
     return SpillStatus::Rewritten;
 }
 
@@ -2706,8 +2780,11 @@ u32 RewriteSamplerReduction(std::string& source, const std::string& entry_point,
     }
     const size_t open = at + needle.size() - 1;
     const size_t close = MatchingBracket(source, open);
-    const size_t body_close = close == std::string::npos ? close : source.find('{', close);
-    if (close == std::string::npos || body_close == std::string::npos) {
+    const size_t body_open = close == std::string::npos ? close : source.find('{', close);
+    const size_t body_end =
+        body_open == std::string::npos ? std::string::npos : MatchingBracket(source, body_open);
+    if (close == std::string::npos || body_open == std::string::npos ||
+        body_end == std::string::npos) {
         return ~0U;
     }
     std::unordered_map<std::string, bool> textures; // 2D float textures by name
@@ -2719,9 +2796,15 @@ u32 RewriteSamplerReduction(std::string& source, const std::string& entry_point,
             continue;
         }
         if (parameter->type == "texture2d<float>" && parameter->attribute.starts_with("texture(")) {
-            textures[parameter->name] = true;
+            const u32 slot = static_cast<u32>(std::atoi(parameter->attribute.c_str() + 8));
+            if (slot < ArraySpillBase) {
+                textures[parameter->name] = true;
+            }
         } else if (parameter->type == "sampler" && parameter->attribute.starts_with("sampler(")) {
-            samplers[parameter->name] = static_cast<u32>(std::atoi(parameter->attribute.c_str() + 8));
+            const u32 slot = static_cast<u32>(std::atoi(parameter->attribute.c_str() + 8));
+            if (slot < MetalSamplerSlots) {
+                samplers[parameter->name] = slot;
+            }
         }
     }
     if (textures.empty() || samplers.empty()) {
@@ -2730,17 +2813,19 @@ u32 RewriteSamplerReduction(std::string& source, const std::string& entry_point,
     // The samples in the body, from the end so the positions before them hold.
     std::vector<std::pair<size_t, size_t>> calls; // begin of the object, end of the call
     const std::string call = ".sample(";
-    for (size_t found = source.find(call, body_close); found != std::string::npos;
+    for (size_t found = source.find(call, body_open);
+         found != std::string::npos && found < body_end;
          found = source.find(call, found + call.size())) {
         size_t begin = found;
-        while (begin > body_close && IsIdentifier(source[begin - 1])) {
+        while (begin > body_open && IsIdentifier(source[begin - 1])) {
             --begin;
         }
-        if (begin == found || !textures.contains(source.substr(begin, found - begin))) {
+        if (begin == found || (begin > body_open && source[begin - 1] == '.') ||
+            !textures.contains(source.substr(begin, found - begin))) {
             continue;
         }
         const size_t end = MatchingBracket(source, found + call.size() - 1);
-        if (end != std::string::npos) {
+        if (end != std::string::npos && end < body_end) {
             calls.emplace_back(begin, end + 1);
         }
     }
@@ -2762,7 +2847,7 @@ u32 RewriteSamplerReduction(std::string& source, const std::string& entry_point,
         }
         const std::string sampler(arguments[0]);
         const std::string coordinate(arguments[1]);
-        const std::string implicit = fragment ? texture + ".calculate_unclamped_lod(" + sampler +
+        const std::string implicit = fragment ? texture + ".calculate_clamped_lod(" + sampler +
                                                     ", " + coordinate + ")"
                                               : "0.0f";
         std::string lod;

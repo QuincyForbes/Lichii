@@ -108,6 +108,103 @@ bool EnvironmentOn(const char* name) {
     return value == nullptr || value[0] != '0';
 }
 
+Object MakePointClampSampler(const Device& device) {
+    Tegra::Texture::TSCEntry point_tsc{};
+    point_tsc.wrap_u.Assign(Tegra::Texture::WrapMode::ClampToEdge);
+    point_tsc.wrap_v.Assign(Tegra::Texture::WrapMode::ClampToEdge);
+    point_tsc.wrap_p.Assign(Tegra::Texture::WrapMode::ClampToEdge);
+    point_tsc.mag_filter.Assign(Tegra::Texture::TextureFilter::Nearest);
+    point_tsc.min_filter.Assign(Tegra::Texture::TextureFilter::Nearest);
+    point_tsc.mipmap_filter.Assign(Tegra::Texture::TextureMipmapFilter::None);
+    return CreateSampler(device, point_tsc);
+}
+
+bool IsCameraCut(const VideoCommon::OcarinaMatrix& m) {
+    const auto jumped = [&](f32 clip_z) {
+        const f32 x = clip_z * m[2] + m[3];
+        const f32 y = clip_z * m[6] + m[7];
+        const f32 w = clip_z * m[14] + m[15];
+        if (!std::isfinite(w) || w <= 0.2f || w >= 5.0f) {
+            return true;
+        }
+        return std::abs(x / w) > 0.75f || std::abs(y / w) > 0.75f;
+    };
+    return jumped(0.95f) || jumped(1.0f);
+}
+
+constexpr std::string_view OcarinaLinearMsl = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+static inline float3 sanitize_finite(float3 v) {
+    uint3 exp_bits = as_type<uint3>(v) & uint3(0x7f800000u);
+    bool3 ok = exp_bits != uint3(0x7f800000u);
+    return select(float3(0.0f), v, ok);
+}
+
+static inline float3 encode_srgb(float3 linear_val) {
+    linear_val = max(linear_val, float3(0.0f));
+    float3 hi = 1.055f * pow(linear_val, float3(1.0f / 2.4f)) - 0.055f;
+    float3 lo = 12.92f * linear_val;
+    return select(hi, lo, linear_val < float3(0.0031308f));
+}
+
+kernel void ocarina_linear_color(
+    texture2d<float, access::sample> guest_color [[texture(0)]],
+    texture2d<float, access::write> dlss_color [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= dlss_color.get_width() || gid.y >= dlss_color.get_height()) {
+        return;
+    }
+    float3 c = max(sanitize_finite(guest_color.read(gid, 0).rgb), float3(0.0f));
+    float3 linear_c = min(c * c, float3(65504.0f));
+    dlss_color.write(float4(linear_c, 1.0f), gid);
+}
+
+kernel void ocarina_linear_output(
+    texture2d<float, access::sample> dlss_color [[texture(0)]],
+    texture2d<float, access::write> guest_color [[texture(1)]],
+    sampler samp [[sampler(0)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint w = guest_color.get_width();
+    uint h = guest_color.get_height();
+    if (gid.x >= w || gid.y >= h) {
+        return;
+    }
+    float2 uv = (float2(gid) + 0.5f) / float2(float(w), float(h));
+    float3 sampled = dlss_color.sample(samp, uv, level(0.0f)).rgb;
+    float3 linear_c = max(sanitize_finite(sampled), float3(0.0f));
+    guest_color.write(float4(linear_c, 1.0f), gid);
+}
+
+kernel void ocarina_linear_4k_composite(
+    texture2d<float, access::sample> dlss_scene [[texture(0)]],
+    texture2d<float, access::sample> native_scene [[texture(1)]],
+    texture2d<float, access::sample> native_composite [[texture(2)]],
+    texture2d<float, access::write> output_color [[texture(3)]],
+    sampler samp [[sampler(0)]],
+    constant uint& use_dlss [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= output_color.get_width() || gid.y >= output_color.get_height()) {
+        return;
+    }
+    float2 uv = (float2(gid) + 0.5f) * float2(1.0f / 3840.0f, 1.0f / 2160.0f);
+    float3 comp = native_composite.sample(samp, uv, level(0.0f)).rgb;
+    if (use_dlss != 0u) {
+        float3 reference = native_scene.sample(samp, uv, level(0.0f)).rgb;
+        float3 overlay = comp - reference;
+        float difference = max(max(abs(overlay.r), abs(overlay.g)), abs(overlay.b));
+        if (difference < 0.12f) {
+            float3 linear_scene = max(sanitize_finite(dlss_scene.read(gid, 0).rgb), float3(0.0f));
+            float3 scene = encode_srgb(linear_scene);
+            float coverage = smoothstep(0.025f, 0.12f, difference);
+            comp = mix(scene + overlay, comp, coverage);
+        }
+    }
+    output_color.write(float4(clamp(comp, 0.0f, 1.0f), 1.0f), gid);
+}
+)";
+
 /// One of the host compute shaders through the translator into `pass` (OcarinaTemporal::Pass).
 template <typename PassT>
 bool BuildPass(const Device& device, PassT& pass, std::span<const u32> code, std::string& error,
@@ -352,10 +449,8 @@ bool OcarinaTemporal::HandheldEnabled() {
 
 bool OcarinaTemporal::Present4kEnabled() {
     static const bool enabled = [] {
-        if (const char* const value = std::getenv("EDEN_NX2_METAL_OOT_4K")) {
-            return value[0] != '0';
-        }
-        return !TranslateForIos;
+        const char* const value = std::getenv("EDEN_NX2_METAL_OOT_4K");
+        return value != nullptr && value[0] == '1';
     }();
     return enabled;
 }
@@ -440,14 +535,7 @@ bool OcarinaTemporal::Prepare() {
     failed = true;
     std::string error;
     sampler = CreateLinearClampSampler(device);
-    Tegra::Texture::TSCEntry point_tsc{};
-    point_tsc.wrap_u.Assign(Tegra::Texture::WrapMode::ClampToEdge);
-    point_tsc.wrap_v.Assign(Tegra::Texture::WrapMode::ClampToEdge);
-    point_tsc.wrap_p.Assign(Tegra::Texture::WrapMode::ClampToEdge);
-    point_tsc.mag_filter.Assign(Tegra::Texture::TextureFilter::Nearest);
-    point_tsc.min_filter.Assign(Tegra::Texture::TextureFilter::Nearest);
-    point_tsc.mipmap_filter.Assign(Tegra::Texture::TextureMipmapFilter::None);
-    point_sampler = CreateSampler(device, point_tsc);
+    point_sampler = MakePointClampSampler(device);
     // The scene depth (binding 0) is a depth texture.
     ShaderTranslate::Options motion_options{};
     motion_options.depth_images = {{0, 0}};
@@ -456,6 +544,43 @@ bool OcarinaTemporal::Prepare() {
         !BuildPass(device, output_pass, OCARINA_DLSS_OUTPUT_COMP_SPV, error) || !sampler ||
         !point_sampler) {
         LOG_WARNING(Render_Metal, "Metal: Ocarina temporal upscale unavailable: {}", error);
+        return false;
+    }
+    linear_library = CreateLibrary(device, OcarinaLinearMsl, error);
+    const auto build_msl_pass = [&](Pass& pass, std::string_view entry,
+                                    std::vector<ShaderTranslate::ResourceSlot> pass_slots) {
+        pass.function = linear_library ? CreateFunction(linear_library.Get(), entry) : Object{};
+        pass.state = pass.function
+                         ? CreateComputePipelineState(device, pass.function.Get(), error, nullptr,
+                                                      GroupSize * GroupSize)
+                         : Object{};
+        pass.slots = std::move(pass_slots);
+        return static_cast<bool>(pass.state);
+    };
+    using ShaderTranslate::PushConstantSet;
+    using ShaderTranslate::ResourceKind;
+    if (!build_msl_pass(linear_color_pass, "ocarina_linear_color",
+                        {
+                            {.set = 0, .binding = 0, .kind = ResourceKind::Texture, .index = 0},
+                            {.set = 0, .binding = 1, .kind = ResourceKind::Texture, .index = 1},
+                        }) ||
+        !build_msl_pass(linear_output_pass, "ocarina_linear_output",
+                        {
+                            {.set = 0, .binding = 0, .kind = ResourceKind::Texture, .index = 0},
+                            {.set = 0, .binding = 1, .kind = ResourceKind::Texture, .index = 1},
+                            {.set = 0, .binding = 0, .kind = ResourceKind::Sampler, .index = 0},
+                        }) ||
+        !build_msl_pass(
+            linear_composite_pass, "ocarina_linear_4k_composite",
+            {
+                {.set = PushConstantSet, .binding = 0, .kind = ResourceKind::Buffer, .index = 0},
+                {.set = 0, .binding = 0, .kind = ResourceKind::Texture, .index = 0},
+                {.set = 0, .binding = 1, .kind = ResourceKind::Texture, .index = 1},
+                {.set = 0, .binding = 2, .kind = ResourceKind::Texture, .index = 2},
+                {.set = 0, .binding = 3, .kind = ResourceKind::Texture, .index = 3},
+                {.set = 0, .binding = 0, .kind = ResourceKind::Sampler, .index = 0},
+            })) {
+        LOG_WARNING(Render_Metal, "Metal: Ocarina linear temporal shaders unavailable: {}", error);
         return false;
     }
     prepared = true;
@@ -518,7 +643,10 @@ bool OcarinaTemporal::PrepareActor() {
     if (!sampler) {
         sampler = CreateLinearClampSampler(device);
     }
-    if (!actor_state || !sampler) {
+    if (!point_sampler) {
+        point_sampler = MakePointClampSampler(device);
+    }
+    if (!actor_state || !sampler || !point_sampler) {
         actor_error = error.empty() ? "no sampler" : error;
         LOG_WARNING(Render_Metal, "Metal: Ocarina actor motion unavailable: {}", error);
         return false;
@@ -600,7 +728,9 @@ bool OcarinaTemporal::Resize(std::array<u32, 2> extent) {
 
 void OcarinaTemporal::Run(const Pass& pass, std::span<const TextureHandle> inputs,
                           TextureHandle output, std::span<const u8> push_constants,
-                          std::array<u32, 2> extent) {
+                          std::array<u32, 2> extent, bool linear_filter) {
+    void* const bound_sampler =
+        linear_filter || !point_sampler ? sampler.Get() : point_sampler.Get();
     // The host shaders: the sampled inputs at bindings 0.., the written image after them.
     scheduler.BeginCompute(pass.state.Get());
     for (const ShaderTranslate::ResourceSlot& slot : pass.slots) {
@@ -617,7 +747,7 @@ void OcarinaTemporal::Run(const Pass& pass, std::span<const TextureHandle> input
                                   false, slot.binding >= inputs.size());
             break;
         case ShaderTranslate::ResourceKind::Sampler:
-            scheduler.BindSampler(ShaderStage::Compute, slot.index, sampler.Get());
+            scheduler.BindSampler(ShaderStage::Compute, slot.index, bound_sampler);
             break;
         }
     }
@@ -752,7 +882,7 @@ bool OcarinaTemporal::DrawActor(TextureHandle depth, std::array<u32, 2> extent,
             scheduler.BindTexture(ShaderStage::Fragment, resource.index, depth, false, false);
             break;
         case ShaderTranslate::ResourceKind::Sampler:
-            scheduler.BindSampler(ShaderStage::Fragment, resource.index, sampler.Get());
+            scheduler.BindSampler(ShaderStage::Fragment, resource.index, point_sampler.Get());
             break;
         }
     }
@@ -785,14 +915,53 @@ bool OcarinaTemporal::EncodeMotion(TextureHandle depth, std::array<u32, 2> exten
     return true;
 }
 
-void OcarinaTemporal::SaveEffectsBase(TextureHandle scene, std::array<u32, 2> extent, u64 frame) {
-    if (scene == nullptr || extent[0] == 0 || extent[1] == 0 || !PrepareEffects()) {
+bool OcarinaTemporal::EnsureEffectsBias(std::array<u32, 2> extent) {
+    if (extent[0] == 0 || extent[1] == 0) {
+        return false;
+    }
+    if (effects.extent == extent && effects.bias) {
+        return true;
+    }
+    if (effects.base || effects.bias) {
+        scheduler.Finish();
+    }
+    effects = {};
+    effects.extent = extent;
+    effects.bias = CreateTexture(device, {.kind = TextureKind::e2D,
+                                          .format = Fmt::R16Float,
+                                          .width = extent[0],
+                                          .height = extent[1],
+                                          .render_target = true,
+                                          .shader_write = true,
+                                          .pixel_format_view = false});
+    if (!effects.bias) {
+        effects = {};
+        return false;
+    }
+    ClearEffectsBias();
+    return true;
+}
+
+void OcarinaTemporal::ClearEffectsBias() {
+    if (!effects.bias || effects.extent[0] == 0 || effects.extent[1] == 0) {
         return;
     }
-    if (effects.extent != extent || !effects.base) {
-        if (effects.base) {
-            scheduler.Finish();
-        }
+    ClearPass clear{};
+    clear.color[0] = {.texture = effects.bias.Get()};
+    clear.clear_color[0] = true;
+    clear.color_value[0] = {0.0, 0.0, 0.0, 0.0};
+    clear.width = effects.extent[0];
+    clear.height = effects.extent[1];
+    scheduler.Clear(clear);
+    effects.bias_zeroed = true;
+}
+
+void OcarinaTemporal::SaveEffectsBase(TextureHandle scene, std::array<u32, 2> extent, u64 frame) {
+    if (scene == nullptr || extent[0] == 0 || extent[1] == 0 || !PrepareEffects() ||
+        !EnsureEffectsBias(extent)) {
+        return;
+    }
+    if (!effects.base) {
         const auto make = [&](u32 format) {
             return CreateTexture(device, {.kind = TextureKind::e2D,
                                           .format = format,
@@ -801,13 +970,11 @@ void OcarinaTemporal::SaveEffectsBase(TextureHandle scene, std::array<u32, 2> ex
                                           .shader_write = true,
                                           .pixel_format_view = false});
         };
-        effects = {};
-        effects.extent = extent;
         effects.base = make(Fmt::RGBA16Float);
         effects.marks = {make(Fmt::R8Unorm), make(Fmt::R8Unorm)};
-        effects.bias = make(Fmt::R16Float);
-        if (!effects.base || !effects.marks[0] || !effects.marks[1] || !effects.bias) {
-            effects = {};
+        if (!effects.base || !effects.marks[0] || !effects.marks[1]) {
+            effects.base = {};
+            effects.marks = {};
             return;
         }
     }
@@ -826,7 +993,7 @@ void OcarinaTemporal::MarkEffects(TextureHandle scene, u64 frame) {
 }
 
 bool OcarinaTemporal::EncodeEffectsBias(u64 frame, std::array<u32, 2> extent) {
-    if (effects.marked_frame != frame || effects.extent != extent || !motion ||
+    if (effects.marked_frame != frame || effects.extent != extent || !effects.bias || !motion ||
         size != extent) {
         return false;
     }
@@ -838,6 +1005,7 @@ bool OcarinaTemporal::EncodeEffectsBias(u64 frame, std::array<u32, 2> extent) {
     const u32 control = has_previous ? 1U : 0U;
     Run(effects_bias_pass, inputs, effects.bias.Get(),
         std::span(reinterpret_cast<const u8*>(&control), sizeof(control)), extent);
+    effects.bias_zeroed = false;
     return true;
 }
 
@@ -874,27 +1042,58 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
         reason = "motion pass not made";
         return false;
     }
-    Run(color_pass, frame.color, color.Get(), {}, frame.extent);
     const bool bias_encoded = EffectsEnabled() && EncodeEffectsBias(frame.frame, frame.extent);
     const auto now = std::chrono::steady_clock::now();
     const f32 elapsed =
         last_evaluation
             ? std::chrono::duration<f32, std::milli>(now - *last_evaluation).count()
             : 16.67f;
+    const auto approx_equal = [](f32 a, f32 b) {
+        return std::abs(a - b) <= (std::max)(0.001f, 1e-4f * (std::max)(std::abs(a), std::abs(b)));
+    };
+    const bool camera_cut =
+        !std::ranges::equal(frame.previous, last_view_projection, approx_equal) ||
+        IsCameraCut(*transform);
     const bool reset = !last_frame || frame.frame != *last_frame + 1 ||
                        last_render_size != frame.extent || last_output_size != output_size ||
-                       last_backend != backend || elapsed > 250.0f ||
-                       !std::ranges::equal(frame.previous, last_view_projection,
-                                           [](f32 a, f32 b) { return std::abs(a - b) < 0.001f; });
+                       last_backend != backend || elapsed > 250.0f || camera_cut;
 
     TextureHandle output = nullptr;
     if (backend == UpscaleBackend::Dlss) {
-        const bool reactive = bias_encoded && TemporalUpscaler::ReactiveMaskSupported();
+        Run(linear_color_pass, frame.color, color.Get(), {}, frame.extent);
+        TextureHandle depth_input = frame.depth;
+        if (frame.depth_size[0] != 0 && frame.depth_size != frame.extent) {
+            if (cropped_depth_size != frame.extent || !cropped_depth) {
+                if (cropped_depth) {
+                    scheduler.Finish();
+                }
+                cropped_depth = CreateTexture(device, {.kind = TextureKind::e2D,
+                                                       .format = Fmt::Depth32Float,
+                                                       .width = frame.extent[0],
+                                                       .height = frame.extent[1],
+                                                       .render_target = true,
+                                                       .pixel_format_view = false});
+                cropped_depth_size = frame.extent;
+            }
+            if (cropped_depth) {
+                scheduler.CopyTexture(frame.depth, 0, 0, {}, {frame.extent[0], frame.extent[1], 1},
+                                      cropped_depth.Get(), 0, 0, {});
+                depth_input = cropped_depth.Get();
+            }
+        }
+        TextureHandle reactive_mask = nullptr;
+        if (EffectsEnabled() && TemporalUpscaler::ReactiveMaskSupported(device) &&
+            EnsureEffectsBias(frame.extent)) {
+            if (!bias_encoded && !effects.bias_zeroed) {
+                ClearEffectsBias();
+            }
+            reactive_mask = effects.bias.Get();
+        }
         output = upscaler.Upscale(
             device, scheduler,
             {
                 .color = color.Get(),
-                .depth = frame.depth,
+                .depth = depth_input,
                 .motion = motion.Get(),
                 .render_size = frame.extent,
                 .output_size = output_size,
@@ -905,16 +1104,18 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
                 .motion_vector_scale = {1.0f, 1.0f},
                 .reset = reset,
                 .depth_reversed = false,
-                .auto_exposure = false,
-                .reactive = reactive ? effects.bias.Get() : nullptr,
+                .auto_exposure = true,
+                .reactive = reactive_mask,
             });
         if (output != nullptr) {
-            if (reactive) {
+            if (bias_encoded && reactive_mask != nullptr) {
                 ++effects_frames;
             }
         } else {
-            metalfx_failed = true;
-            backend = Backend();
+            if (upscaler.Failed()) {
+                metalfx_failed = true;
+            }
+            backend = ResolveBackend(device, true, fsr3_failed);
         }
     }
     if (output == nullptr && backend == UpscaleBackend::Fsr) {
@@ -922,6 +1123,7 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
             reason = "camera projection invalid";
             return false;
         }
+        Run(color_pass, frame.color, color.Get(), {}, frame.extent);
         if (!fsr3) {
             fsr3 = std::make_unique<Fsr3Upscaler>(device, scheduler,
                                                   Fsr3Upscaler::Profile::OcarinaLdr);
@@ -958,33 +1160,16 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
         if (Backend() == UpscaleBackend::Native) {
             failed = true;
         }
-        reason = metalfx_failed && !fsr3_failed ? "MetalFX declined the frame"
-                                                : "FSR 3.1 declined the frame";
+        reason = fsr3_failed ? "FSR 3.1 declined the frame" : "MetalFX declined the frame";
         return false;
     }
 
     last_upscaled = output;
     if (frame.target != nullptr) {
         const bool same_size = output_size == frame.target_size;
-        void* const out_sampler = same_size && point_sampler ? point_sampler.Get() : sampler.Get();
-        scheduler.BeginCompute(output_pass.state.Get());
-        for (const ShaderTranslate::ResourceSlot& slot : output_pass.slots) {
-            switch (slot.kind) {
-            case ShaderTranslate::ResourceKind::Buffer:
-                break;
-            case ShaderTranslate::ResourceKind::Texture:
-                scheduler.BindTexture(ShaderStage::Compute, slot.index,
-                                      slot.binding == 0 ? output : frame.target, false,
-                                      slot.binding != 0);
-                break;
-            case ShaderTranslate::ResourceKind::Sampler:
-                scheduler.BindSampler(ShaderStage::Compute, slot.index, out_sampler);
-                break;
-            }
-        }
-        scheduler.Dispatch({(frame.target_size[0] + GroupSize - 1) / GroupSize,
-                            (frame.target_size[1] + GroupSize - 1) / GroupSize, 1},
-                           {GroupSize, GroupSize, 1});
+        const Pass& out_pass =
+            backend == UpscaleBackend::Dlss ? linear_output_pass : output_pass;
+        Run(out_pass, output, frame.target, {}, frame.target_size, !same_size);
     }
     last_evaluation = now;
     last_frame = frame.frame;
@@ -1033,7 +1218,8 @@ TextureHandle OcarinaTemporal::Composite4k(TextureHandle native_composite, u64 f
         return nullptr;
     }
     constexpr std::array<u32, 2> CompositeExtent{3840, 2160};
-    if (!composite_pass.state) {
+    const bool linear_scene = last_backend == VideoCommon::OcarinaUpscaleBackend::Dlss;
+    if (!linear_scene && !composite_pass.state) {
         std::string error;
         if (!BuildPass(device, composite_pass, OCARINA_DLSS_4K_COMPOSITE_COMP_SPV, error)) {
             LOG_WARNING(Render_Metal, "Metal: Ocarina 4K composite pass unavailable: {}", error);
@@ -1055,8 +1241,9 @@ TextureHandle OcarinaTemporal::Composite4k(TextureHandle native_composite, u64 f
     }
     const std::array<TextureHandle, 3> inputs{last_upscaled, native_scene.Get(), native_composite};
     const u32 use_dlss = !failed ? 1U : 0U;
-    Run(composite_pass, inputs, composite.Get(),
-        std::span(reinterpret_cast<const u8*>(&use_dlss), sizeof(use_dlss)), CompositeExtent);
+    Run(linear_scene ? linear_composite_pass : composite_pass, inputs, composite.Get(),
+        std::span(reinterpret_cast<const u8*>(&use_dlss), sizeof(use_dlss)), CompositeExtent,
+        true);
     composited_frame = frame;
     return composite.Get();
 }

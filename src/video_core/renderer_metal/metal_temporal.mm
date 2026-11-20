@@ -25,7 +25,6 @@ struct ScalerKey {
     MTLPixelFormat reactive{};
     NSUInteger input_width{};
     NSUInteger input_height{};
-    std::array<u32, 2> render{};
     std::array<u32, 2> output{};
     bool auto_exposure{};
 
@@ -42,6 +41,8 @@ struct TemporalUpscaler::Impl {
     id scaler = nil;
     id<MTLTexture> output = nil;
     ScalerKey key{};
+    ScalerKey failed_key{};
+    bool has_failed_key{};
     bool first_evaluation{};
     bool failed{};
 };
@@ -58,10 +59,18 @@ bool TemporalUpscaler::IsSupported(const Device& device) {
 }
 
 bool TemporalUpscaler::ReactiveMaskSupported() {
-    if (@available(iOS 18.0, macOS 15.0, *)) {
+    if (@available(iOS 17.4, macOS 14.4, *)) {
         return true;
     }
     return false;
+}
+
+bool TemporalUpscaler::ReactiveMaskSupported(const Device& device) {
+    return IsSupported(device) && ReactiveMaskSupported();
+}
+
+bool TemporalUpscaler::Failed() const noexcept {
+    return impl->failed;
 }
 
 TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& scheduler,
@@ -70,8 +79,8 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
     if (state.failed) {
         return nullptr;
     }
-    // The caller falls back to the game's own upscaler; this says why, once.
-    const auto decline = [&state](const char* reason) -> TextureHandle {
+    // Permanent GPU/OS absence disables the scaler; per-frame validation declines that frame only.
+    const auto decline_permanent = [&state](const char* reason) -> TextureHandle {
         LOG_WARNING(Render_Metal, "MetalFX temporal: declined, {}", reason);
         state.failed = true;
         return nullptr;
@@ -82,13 +91,35 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
         const id<MTLTexture> motion = AsTexture(inputs.motion);
         const id<MTLTexture> reactive =
             ReactiveMaskSupported() ? AsTexture(inputs.reactive) : nil;
-        if (color == nil || depth == nil || motion == nil) {
-            return decline("an input has no texture");
+        if (color == nil || depth == nil || motion == nil || inputs.render_size[0] == 0 ||
+            inputs.render_size[1] == 0 || inputs.output_size[0] == 0 ||
+            inputs.output_size[1] == 0) {
+            return nullptr;
         }
-        if (color.width < inputs.render_size[0] || color.height < inputs.render_size[1] ||
-            depth.width < inputs.render_size[0] || depth.height < inputs.render_size[1] ||
-            motion.width < inputs.render_size[0] || motion.height < inputs.render_size[1]) {
-            return decline("an input is smaller than the render size");
+        if (depth.width != color.width || depth.height != color.height ||
+            motion.width != color.width || motion.height != color.height ||
+            (reactive != nil &&
+             (reactive.width != color.width || reactive.height != color.height))) {
+            return nullptr;
+        }
+        if (color.width < inputs.render_size[0] || color.height < inputs.render_size[1]) {
+            return nullptr;
+        }
+        f32 min_scale = 1.0f;
+        f32 max_scale = 3.0f;
+        if (@available(iOS 17.0, macOS 14.0, *)) {
+            min_scale = [MTLFXTemporalScalerDescriptor
+                supportedInputContentMinScaleForDevice:device.GetDevice()];
+            max_scale = [MTLFXTemporalScalerDescriptor
+                supportedInputContentMaxScaleForDevice:device.GetDevice()];
+        }
+        const f32 scale_x =
+            static_cast<f32>(inputs.output_size[0]) / static_cast<f32>(inputs.render_size[0]);
+        const f32 scale_y =
+            static_cast<f32>(inputs.output_size[1]) / static_cast<f32>(inputs.render_size[1]);
+        if (scale_x < min_scale || scale_x > max_scale || scale_y < min_scale ||
+            scale_y > max_scale) {
+            return nullptr;
         }
         const ScalerKey key{
             .color = color.pixelFormat,
@@ -97,16 +128,18 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
             .reactive = reactive != nil ? reactive.pixelFormat : MTLPixelFormatInvalid,
             .input_width = color.width,
             .input_height = color.height,
-            .render = inputs.render_size,
             .output = inputs.output_size,
             .auto_exposure = inputs.auto_exposure,
         };
+        if (state.has_failed_key && state.failed_key == key) {
+            return nullptr;
+        }
         if (state.scaler == nil || !(state.key == key)) {
+            if (![MTLFXTemporalScalerDescriptor supportsDevice:device.GetDevice()]) {
+                return decline_permanent("not supported on this GPU");
+            }
             if (state.output != nil) {
                 scheduler.Finish();
-            }
-            if (![MTLFXTemporalScalerDescriptor supportsDevice:device.GetDevice()]) {
-                return decline("not supported on this GPU");
             }
             MTLFXTemporalScalerDescriptor* descriptor =
                 [[MTLFXTemporalScalerDescriptor alloc] init];
@@ -119,16 +152,13 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
             descriptor.outputWidth = key.output[0];
             descriptor.outputHeight = key.output[1];
             descriptor.autoExposureEnabled = key.auto_exposure ? YES : NO;
-            // The game renders into part of larger textures: MetalFX reads the render size.
-            if (key.render[0] != key.input_width || key.render[1] != key.input_height) {
-                const f32 scale_x = static_cast<f32>(key.output[0]) / key.render[0];
-                const f32 scale_y = static_cast<f32>(key.output[1]) / key.render[1];
-                descriptor.inputContentPropertiesEnabled = YES;
-                descriptor.inputContentMinScale = (std::min)(scale_x, scale_y);
-                descriptor.inputContentMaxScale = (std::max)(scale_x, scale_y);
-            }
+            // Dynamic Resolution Scaling updates inputContentWidth/Height per frame without
+            // rebuilding the scaler or resetting history.
+            descriptor.inputContentPropertiesEnabled = YES;
+            descriptor.inputContentMinScale = min_scale;
+            descriptor.inputContentMaxScale = max_scale;
             if (key.reactive != MTLPixelFormatInvalid) {
-                if (@available(iOS 18.0, macOS 15.0, *)) {
+                if (@available(iOS 17.4, macOS 14.4, *)) {
                     descriptor.reactiveMaskTextureEnabled = YES;
                     descriptor.reactiveMaskTextureFormat = key.reactive;
                 }
@@ -145,9 +175,10 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
             }
             if (scaler == nil) {
                 LOG_WARNING(Render_Metal, "MetalFX temporal: no scaler for {}x{} in {}x{} -> {}x{}",
-                            key.render[0], key.render[1], key.input_width, key.input_height,
-                            key.output[0], key.output[1]);
-                state.failed = true;
+                            inputs.render_size[0], inputs.render_size[1], key.input_width,
+                            key.input_height, key.output[0], key.output[1]);
+                state.failed_key = key;
+                state.has_failed_key = true;
                 return nullptr;
             }
             MTLTextureDescriptor* output = [MTLTextureDescriptor
@@ -160,29 +191,36 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
             output.usage = scaler.outputTextureUsage | MTLTextureUsageShaderRead;
             state.output = [device.GetDevice() newTextureWithDescriptor:output];
             if (state.output == nil) {
-                return decline("no output texture");
+                state.failed_key = key;
+                state.has_failed_key = true;
+                return nullptr;
             }
             state.scaler = scaler;
             state.key = key;
+            state.has_failed_key = false;
             state.first_evaluation = true;
             LOG_INFO(Render_Metal,
-                     "MetalFX temporal: {}x{} in {}x{} textures -> {}x{}, reactive mask {}",
-                     key.render[0], key.render[1], key.input_width, key.input_height,
-                     key.output[0], key.output[1],
+                     "MetalFX temporal: {}x{} in {}x{} textures -> {}x{}, auto exposure {}, "
+                     "reactive mask {}",
+                     inputs.render_size[0], inputs.render_size[1], key.input_width,
+                     key.input_height, key.output[0], key.output[1],
+                     key.auto_exposure ? "on" : "off",
                      key.reactive != MTLPixelFormatInvalid ? "on" : "off");
         }
         id<MTLFXTemporalScaler> scaler = state.scaler;
         if (!HasUsage(color, scaler.colorTextureUsage) ||
             !HasUsage(depth, scaler.depthTextureUsage) ||
             !HasUsage(motion, scaler.motionTextureUsage)) {
-            return decline("an input lacks the usage MetalFX needs");
+            return nullptr;
         }
-        if (reactive != nil) {
-            if (@available(iOS 18.0, macOS 15.0, *)) {
+        if (@available(iOS 17.4, macOS 14.4, *)) {
+            if (reactive != nil) {
                 if (!HasUsage(reactive, scaler.reactiveTextureUsage)) {
-                    return decline("the reactive mask lacks the usage MetalFX needs");
+                    return nullptr;
                 }
                 scaler.reactiveMaskTexture = reactive;
+            } else {
+                scaler.reactiveMaskTexture = nil;
             }
         }
         scaler.colorTexture = color;
@@ -208,11 +246,11 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
             const char* const reason = exception.reason.UTF8String;
             LOG_ERROR(Render_Metal, "MetalFX temporal: encoding raised: {}",
                       reason != nullptr ? reason : "no reason given");
-            return decline("encoding raised an exception");
+            return nullptr;
         }
         return (__bridge void*)state.output;
     }
-    return decline("needs iOS 16 or macOS 13");
+    return decline_permanent("needs iOS 16 or macOS 13");
 }
 
 } // namespace Metal

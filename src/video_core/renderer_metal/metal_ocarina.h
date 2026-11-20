@@ -144,6 +144,8 @@ public:
         std::array<u32, 2> target_size;
         /// Upscaler evaluation extent (defaults to target_size; 3840x2160 for 4K HUD composite).
         std::array<u32, 2> output_size{};
+        /// Underlying scene depth texture dimensions when padded larger than extent.
+        std::array<u32, 2> depth_size{};
         VideoCommon::OcarinaMatrix current;
         VideoCommon::OcarinaMatrix previous;
         u64 frame;
@@ -193,6 +195,11 @@ public:
 
     /// Active backend for this session (Native when disabled or all backends failed).
     [[nodiscard]] VideoCommon::OcarinaUpscaleBackend Backend();
+
+    /// Backend that evaluated the most recent Record() call.
+    [[nodiscard]] VideoCommon::OcarinaUpscaleBackend LastBackend() const noexcept {
+        return last_backend;
+    }
 
     /// Whether a temporal upscaler (MetalFX or FSR 3.1) is available and has not failed.
     [[nodiscard]] bool Available();
@@ -293,17 +300,22 @@ private:
         std::optional<u64> base_frame;
         std::optional<u64> marked_frame;
         std::optional<u64> previous_marked_frame;
+        bool bias_zeroed{};
     };
 
     bool Prepare();
     bool PrepareActor();
     bool PrepareEffects();
+    bool EnsureEffectsBias(std::array<u32, 2> extent);
+    void ClearEffectsBias();
     bool Resize(std::array<u32, 2> extent);
     void Run(const Pass& pass, std::span<const TextureHandle> inputs, TextureHandle output,
-             std::span<const u8> push_constants, std::array<u32, 2> size);
+             std::span<const u8> push_constants, std::array<u32, 2> size,
+             bool linear_filter = false);
     void Run(const Pass& pass, TextureHandle input, TextureHandle output,
-             std::span<const u8> push_constants, std::array<u32, 2> pass_size) {
-        Run(pass, std::span(&input, 1), output, push_constants, pass_size);
+             std::span<const u8> push_constants, std::array<u32, 2> pass_size,
+             bool linear_filter = false) {
+        Run(pass, std::span(&input, 1), output, push_constants, pass_size, linear_filter);
     }
     bool DrawActor(TextureHandle depth, std::array<u32, 2> extent, const ActorMotion& actor,
                    std::array<f32, 2> jitter);
@@ -316,6 +328,10 @@ private:
     Pass motion_pass;
     Pass color_pass;
     Pass output_pass;
+    Object linear_library;
+    Pass linear_color_pass;
+    Pass linear_output_pass;
+    Pass linear_composite_pass;
     Pass effects_base_pass;
     Pass effects_mark_pass;
     Pass effects_bias_pass;
@@ -325,6 +341,8 @@ private:
     Object point_sampler;
     Object motion;
     Object color;
+    Object cropped_depth;
+    std::array<u32, 2> cropped_depth_size{};
     Object native_scene;
     Object composite;
     TextureHandle last_upscaled{};

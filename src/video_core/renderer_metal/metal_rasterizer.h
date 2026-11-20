@@ -321,7 +321,8 @@ private:
     /// Vulkan's TryOcarinaUpscale: the upscale pass (views: the scene, then the target) replaced
     /// by OcarinaTemporal; false when the game's pass (or the bilinear one) must run.
     bool TryOcarinaTemporal(u64 native_key, u64 shader_hash,
-                            std::span<const VideoCommon::ImageViewInOut> views);
+                            std::span<const VideoCommon::ImageViewInOut> views,
+                            std::array<u32, 2>* out_output_extent = nullptr);
 
     /// Counts a replaced or declined upscale pass and logs the summary every 600 (Vulkan's
     /// CountOcarinaUpscale).
@@ -458,7 +459,7 @@ private:
     /// `handle`, or with the pipeline check a texture of zeros of `type` in its place when the
     /// view has none (refused by the checks, or a null descriptor); counted as a guard.
     [[nodiscard]] TextureHandle OrPlaceholder(const ImageView& view, TextureHandle handle,
-                                              Shader::TextureType type);
+                                              Shader::TextureType type, bool is_depth = false);
 
     /// The zero textures OrPlaceholder binds, made once outside a render pass.
     void MakePlaceholders();
@@ -622,6 +623,7 @@ private:
         BufferHandle copy;
         u64 copy_offset;
         BufferHandle buffer;
+        Buffer* buffer_obj{};
         u64 offset;
         u64 size;
     };
@@ -945,8 +947,10 @@ private:
         bool wanted{};
         bool has_count{}; ///< Else every record is drawn
         BufferHandle records{};
+        Buffer* records_obj{};
         u64 records_offset{};
         BufferHandle count{};
+        Buffer* count_obj{};
         u64 count_offset{};
         u32 draws{};
         u32 stride_words{};
@@ -981,8 +985,9 @@ private:
     /// The last render pass with a draw that writes storage.
     u64 pass_stores{};
     u64 barrier_pass_ends{};
-    /// One 1x1 RGBA8 texture of zeros per shader texture type (OrPlaceholder).
+    /// One 1x1 RGBA8 / Depth32Float texture of zeros per shader texture type (OrPlaceholder).
     std::array<Object, Shader::NUM_TEXTURE_TYPES> placeholders;
+    std::array<Object, Shader::NUM_TEXTURE_TYPES> depth_placeholders;
     Object placeholder_zeros;
     bool placeholders_made{};
     bool graphics_report_logged{};

@@ -329,9 +329,10 @@ bool PresentPasses::Draw(const Pass& pass) {
             return false;
         }
     }
-    Object& sampler = pass.nearest ? nearest : linear;
+    Object& sampler = pass.unnormalized ? unnormalized_linear : (pass.nearest ? nearest : linear);
     if (!sampler) {
-        sampler = MakeSampler(device, !pass.nearest);
+        sampler = pass.unnormalized ? CreateUnnormalizedLinearSampler(device)
+                                    : MakeSampler(device, !pass.nearest);
         if (!sampler) {
             return false;
         }
@@ -708,6 +709,7 @@ bool PresentPasses::TemporalFilter(const TemporalInputs& inputs) {
     if (!Draw({.vertex = Shader::FullScreenVertex,
                .fragment = Shader::TemporalUpscale,
                .inputs = upscale_inputs,
+               .unnormalized = true,
                .target = inputs.target,
                .format = inputs.format,
                .size = inputs.size,

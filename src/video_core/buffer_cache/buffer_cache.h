@@ -4724,17 +4724,27 @@ bool BufferCache<P>::BindMemoEnabled() {
 }
 
 template <class P>
+u64 BufferCache<P>::CurrentUsageSerial() const noexcept {
+    if constexpr (requires { runtime.UsageSerial(); }) {
+        return runtime.UsageSerial();
+    } else {
+        return runtime.CurrentTick();
+    }
+}
+
+template <class P>
 bool BufferCache<P>::BindMemoHit(const BindMemo& memo, Buffer& buffer, BufferId buffer_id,
                                  DAddr device_addr, u32 size, u32 offset, const char* kind,
                                  size_t stage, u32 index) {
     if constexpr (IS_OPENGL) {
         return false;
     } else {
+        const u64 current_usage_serial = CurrentUsageSerial();
         if (!memo.valid || memo.channel != channel_state || memo.buffer_id != buffer_id ||
             memo.device_addr != device_addr || memo.size != size ||
             memo.cpu_epoch != memory_tracker.CpuEpoch() ||
             memo.gpu_epoch != memory_tracker.GpuEpoch() || memo.frame != frame_tick ||
-            memo.tick != runtime.CurrentTick()) {
+            memo.tick != runtime.CurrentTick() || memo.usage_serial != current_usage_serial) {
             Nx2Profile::Add(Nx2Profile::Counter::BindMemoMisses, 1);
             return false;
         }
@@ -4783,6 +4793,7 @@ void BufferCache<P>::BindMemoNote(BindMemo& memo, BufferId buffer_id, DAddr devi
             .cpu_epoch = cpu_epoch_before,
             .gpu_epoch = memory_tracker.GpuEpoch(),
             .tick = runtime.CurrentTick(),
+            .usage_serial = CurrentUsageSerial(),
             .frame = frame_tick,
         };
     }
@@ -4791,7 +4802,9 @@ void BufferCache<P>::BindMemoNote(BindMemo& memo, BufferId buffer_id, DAddr devi
 template <class P>
 void BufferCache<P>::BindMemoNoteUsage(BindMemo& memo) {
     if constexpr (!IS_OPENGL) {
-        if (memo.valid && memo.tick == runtime.CurrentTick() && memo.frame == frame_tick) {
+        const u64 current_usage_serial = CurrentUsageSerial();
+        if (memo.valid && memo.tick == runtime.CurrentTick() &&
+            memo.usage_serial == current_usage_serial && memo.frame == frame_tick) {
             memo.usage_marked = true;
         }
     }

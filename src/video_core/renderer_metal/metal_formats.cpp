@@ -265,6 +265,10 @@ FormatInfo SurfaceFormat(PixelFormat format, bool converted) {
             .attachable = true,
             .storage = !srgb,
             .format_class = FormatClass::Float,
+            .swizzle = format == PixelFormat::G4R4_UNORM
+                           ? std::array<u8, 4>{Swizzle::Green, Swizzle::Red, Swizzle::Zero,
+                                               Swizzle::One}
+                           : IdentitySwizzle,
         };
     }
     const Entry entry = Lookup(format);

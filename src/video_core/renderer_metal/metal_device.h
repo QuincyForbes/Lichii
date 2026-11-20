@@ -50,6 +50,10 @@ public:
         return bc_textures;
     }
 
+    [[nodiscard]] bool Supports32BitFloatFiltering() const noexcept {
+        return float32_filtering;
+    }
+
     /// Bytes the GPU should keep resident: recommendedMaxWorkingSetSize on macOS, the memory the
     /// process may still allocate on iOS (unified memory).
     [[nodiscard]] u64 MemoryBudget() const;
@@ -64,6 +68,7 @@ private:
     u32 apple_family{};
     bool mesh_shaders{};
     bool bc_textures{};
+    bool float32_filtering{};
 };
 
 } // namespace Metal

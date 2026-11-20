@@ -1068,7 +1068,7 @@ void PipelineCache::EvictUnusedPipelines() {
 }
 
 namespace {
-constexpr u64 MetalStageCanonicalVersion = 3ULL;
+constexpr u64 MetalStageCanonicalVersion = 4ULL;
 
 [[nodiscard]] u64 MetalWarmVariant(u32 apple_family, bool mesh_shaders) {
     const auto& resolution = Settings::values.resolution_info;
@@ -2561,6 +2561,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::BuildInBackground(bool& pending
 void* PipelineCache::RenderState(GraphicsPipeline& pipeline, RenderPipelineDesc& desc,
                                  bool& building_state, u32 reducing) {
     building_state = false;
+    static const bool async_states = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_ASYNC_STATES");
+        return value != nullptr && value[0] == '1';
+    }();
     if (!builders) {
         return pipeline.RenderState(device, desc, reducing);
     }
@@ -2571,7 +2575,7 @@ void* PipelineCache::RenderState(GraphicsPipeline& pipeline, RenderPipelineDesc&
     const std::pair<const GraphicsPipeline*, u64> state_key{&pipeline, hash};
     auto it = state_builds.find(state_key);
     if (it == state_builds.end()) {
-        if (!MayBeSkipped()) {
+        if (!async_states || !MayBeSkipped()) {
             // Nothing queued and the draw waits: built here as before.
             return pipeline.RenderState(device, desc, reducing);
         }

@@ -214,7 +214,7 @@ struct NativeMesh {
     bool failed{};
 };
 
-/// EDEN_NX2_METAL_MESH_NATIVE / EDEN_NX2_METAL_NATIVE_MESH (default on; 0: emulated).
+/// EDEN_NX2_METAL_MESH_NATIVE / EDEN_NX2_METAL_NATIVE_MESH (default off; 1: native Metal mesh).
 [[nodiscard]] bool NativeMeshEnabled();
 
 /// EDEN_NX2_METAL_MESH_PER_PRIMITIVE (default on; 0: mesh programs with per-primitive generics

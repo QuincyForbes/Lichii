@@ -195,6 +195,10 @@ const char* ViewFormatReason(MTLPixelFormat from, MTLPixelFormat to) {
     return nullptr;
 }
 
+bool SupportsAtomicTextureUsage(u32 format) {
+    return format == Fmt::R32Uint || format == Fmt::R32Sint || format == Fmt::RG32Uint;
+}
+
 MTLTextureDescriptor* MakeTextureDescriptor(const TextureDesc& desc) {
     MTLTextureDescriptor* descriptor = [MTLTextureDescriptor new];
     descriptor.textureType = TextureType(desc.kind);
@@ -221,6 +225,11 @@ MTLTextureDescriptor* MakeTextureDescriptor(const TextureDesc& desc) {
     }
     if (desc.shader_write) {
         usage |= MTLTextureUsageShaderWrite;
+        if (SupportsAtomicTextureUsage(desc.format)) {
+            if (@available(iOS 17.0, macOS 14.0, *)) {
+                usage |= MTLTextureUsageShaderAtomic;
+            }
+        }
     }
     descriptor.usage = usage;
     // Metal orders the encoders until the scheduler tracks hazards itself (untracked heaps).
@@ -244,6 +253,10 @@ u32 DeviceAppleFamily(const Device& device) {
 
 bool DeviceSupportsMeshShaders(const Device& device) {
     return device.SupportsMeshShaders();
+}
+
+bool DeviceSupports32BitFloatFiltering(const Device& device) {
+    return device.Supports32BitFloatFiltering();
 }
 
 std::unique_ptr<Device, void (*)(Device*)> CreateOfflineDevice() {
@@ -480,6 +493,11 @@ Object CreateTextureBufferView(BufferHandle buffer, u64 offset, u32 elements, u3
         MTLTextureUsage usage = MTLTextureUsageShaderRead;
         if (writable) {
             usage |= MTLTextureUsageShaderWrite;
+            if (SupportsAtomicTextureUsage(format)) {
+                if (@available(iOS 17.0, macOS 14.0, *)) {
+                    usage |= MTLTextureUsageShaderAtomic;
+                }
+            }
         }
         MTLTextureDescriptor* descriptor = [MTLTextureDescriptor
             textureBufferDescriptorWithPixelFormat:static_cast<MTLPixelFormat>(format)
@@ -518,6 +536,20 @@ Object CreateLinearClampSampler(const Device& device) {
         descriptor.magFilter = MTLSamplerMinMagFilterLinear;
         descriptor.sAddressMode = MTLSamplerAddressModeClampToEdge;
         descriptor.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        return Retain([device.GetDevice() newSamplerStateWithDescriptor:descriptor]);
+    }
+}
+
+Object CreateUnnormalizedLinearSampler(const Device& device) {
+    @autoreleasepool {
+        MTLSamplerDescriptor* descriptor = [[MTLSamplerDescriptor alloc] init];
+        descriptor.minFilter = MTLSamplerMinMagFilterLinear;
+        descriptor.magFilter = MTLSamplerMinMagFilterLinear;
+        descriptor.mipFilter = MTLSamplerMipFilterNotMipmapped;
+        descriptor.sAddressMode = MTLSamplerAddressModeClampToEdge;
+        descriptor.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        descriptor.rAddressMode = MTLSamplerAddressModeClampToEdge;
+        descriptor.normalizedCoordinates = NO;
         return Retain([device.GetDevice() newSamplerStateWithDescriptor:descriptor]);
     }
 }
@@ -571,7 +603,8 @@ Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc,
         case WrapMode::Mirror: return MTLSamplerAddressModeMirrorRepeat;
         case WrapMode::ClampToEdge: return MTLSamplerAddressModeClampToEdge;
         case WrapMode::Clamp:
-            return !plain && tsc.mag_filter.Value() == TextureFilter::Linear
+            return !plain && tsc.mag_filter.Value() == TextureFilter::Linear &&
+                           !options.force_nearest
                        ? MTLSamplerAddressModeClampToBorderColor
                        : MTLSamplerAddressModeClampToEdge;
         case WrapMode::Border: return MTLSamplerAddressModeClampToBorderColor;
@@ -603,7 +636,15 @@ Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc,
         // Metal has three border colours and no custom one: the guest's nearest (exact for
         // transparent black, opaque black and opaque white).
         const auto border = options.srgb_border ? tsc.SrgbBorderColor() : tsc.BorderColor();
-        if (border[3] < 0.5f) {
+        if (options.red_only_border) {
+            if (border[0] >= 0.5f) {
+                descriptor.borderColor = MTLSamplerBorderColorOpaqueWhite;
+            } else if (border[3] >= 0.5f) {
+                descriptor.borderColor = MTLSamplerBorderColorOpaqueBlack;
+            } else {
+                descriptor.borderColor = MTLSamplerBorderColorTransparentBlack;
+            }
+        } else if (border[3] < 0.5f) {
             descriptor.borderColor = MTLSamplerBorderColorTransparentBlack;
         } else if (border[0] + border[1] + border[2] > 1.5f) {
             descriptor.borderColor = MTLSamplerBorderColorOpaqueWhite;
@@ -640,7 +681,7 @@ Object CreateSampler(const Device& device, const Tegra::Texture::TSCEntry& tsc,
         if (@available(iOS 26.0, macOS 26.0, *)) {
             if (!plain && SamplerBiasSupported(device)) {
                 descriptor.lodBias =
-                    std::clamp(tsc.LodBias() + options.added_lod_bias, -15.0f, 15.0f);
+                    std::clamp(tsc.LodBias() + options.added_lod_bias, -16.0f, 15.9375f);
                 switch (tsc.reduction_filter.Value()) {
                 case SamplerReduction::Min:
                     descriptor.reductionMode = MTLSamplerReductionModeMinimum;
@@ -684,6 +725,7 @@ namespace {
     if (safe_math) {
         if (@available(iOS 18.0, macOS 15.0, *)) {
             options.mathMode = MTLMathModeSafe;
+            options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
         } else {
             options.fastMathEnabled = NO;
         }

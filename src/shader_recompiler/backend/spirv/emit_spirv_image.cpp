@@ -7,6 +7,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include <boost/container/static_vector.hpp>
 
 #include "common/settings.h"
@@ -810,10 +812,37 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id co
     return color;
 }
 
+namespace {
+bool GuardNanEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_GUARD_NAN");
+        if (value == nullptr) {
+            value = std::getenv("EDEN_NX2_NAN_GUARD");
+        }
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+Id GuardNanColor(EmitContext& ctx, Id color) {
+    if (!GuardNanEnabled()) {
+        return color;
+    }
+    const Id exp_mask{ctx.Const(0x7f800000U, 0x7f800000U, 0x7f800000U, 0x7f800000U)};
+    const Id u1x4{ctx.TypeVector(ctx.U1, 4)};
+    const Id is_non_finite{
+        ctx.OpIEqual(u1x4, ctx.OpBitwiseAnd(ctx.U32[4], color, exp_mask), exp_mask)};
+    return ctx.OpSelect(ctx.U32[4], is_non_finite, ctx.ConstantNull(ctx.U32[4]), color);
+}
+} // Anonymous namespace
+
 void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords, Id color) {
     const auto info{inst->Flags<IR::TextureInstInfo>()};
     const auto [image, is_integer] = Image(ctx, index, info);
     if (!is_integer) {
+        if (info.image_format == ImageFormat::Typeless) {
+            color = GuardNanColor(ctx, color);
+        }
         color = ctx.OpBitcast(ctx.F32[4], color);
     }
     ctx.OpImageWrite(image, coords, color);

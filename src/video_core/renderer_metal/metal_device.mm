@@ -47,8 +47,11 @@ Device::Device() {
         bc_textures = device.supportsBCTextureCompression;
     }
 #else
-    bc_textures = true;
+    bc_textures = device.supportsBCTextureCompression;
 #endif
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        float32_filtering = device.supports32BitFloatFiltering;
+    }
 
     LOG_INFO(Render_Metal,
              "Metal: {} (Apple GPU family {}, Metal 3 {}, mesh shaders {}, BC textures {}, "

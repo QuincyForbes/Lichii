@@ -350,9 +350,7 @@ const ScalingStatusTelemetry& QueryScalingStatusTelemetry() {
         Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
         static_cast<u32>(filter_setting));
 
-    const QString metalfx_name =
-        UiText::ChoiceLabel(Settings::EnumMetadata<Settings::FrameGenType>::Index(),
-                            static_cast<u32>(Settings::FrameGenType::MetalFx));
+    const QString metalfx_name = UiText::ChoiceLabel("upscaler", "MetalFx");
     const std::string_view scene_sv = probed_scene != nullptr ? probed_scene : "";
     if (scene_sv == "DLSS") {
         out.scene_upscaler_label = QStringLiteral("DLSS");
@@ -392,37 +390,29 @@ const ScalingStatusTelemetry& QueryScalingStatusTelemetry() {
     } else if (backend == Settings::RendererBackend::Vulkan ||
                backend == Settings::RendererBackend::Metal) {
         if (!out.scene_upscaler_label.isEmpty()) {
-            out.status_bar_upscaler_text = out.scene_upscaler_label;
-        } else if (upscaler_setting == Settings::Upscaler::MetalFx) {
-#if defined(__APPLE__)
-            out.status_bar_upscaler_text = metalfx_name;
-#endif
-        } else if (upscaler_setting == Settings::Upscaler::Fsr3) {
-            out.status_bar_upscaler_text = QStringLiteral("FSR 3.1");
+            out.status_bar_upscaler_text = out.scene_upscaler_label.toUpper();
         }
         if (!out.status_bar_upscaler_text.isEmpty()) {
             out.status_bar_upscaler_tooltip =
                 QCoreApplication::translate("MainWindow", "%1 active — window filter: %2.")
-                    .arg(out.status_bar_upscaler_text, raw_filter_label);
+                    .arg(out.scene_upscaler_label, raw_filter_label);
         }
     }
 
     // Performance-overlay upscaler summary.
-    [[maybe_unused]] const u32 upscaler_enum = Settings::EnumMetadata<Settings::Upscaler>::Index();
     QString upscaler_label;
     switch (upscaler_setting) {
     case Settings::Upscaler::MetalFx:
 #if defined(__APPLE__)
         if (backend == Settings::RendererBackend::Metal ||
             backend == Settings::RendererBackend::Vulkan) {
-            upscaler_label = !out.scene_upscaler_label.isEmpty() ? out.scene_upscaler_label
-                                                                 : metalfx_name;
+            upscaler_label = !out.scene_upscaler_label.isEmpty()
+                                 ? out.scene_upscaler_label
+                                 : UiText::Text("overlay.dlss_idle").arg(metalfx_name);
             break;
         }
 #endif
-        upscaler_label = UiText::Text("overlay.dlss_off")
-                             .arg(UiText::ChoiceLabel(
-                                 upscaler_enum, static_cast<u32>(Settings::Upscaler::MetalFx)));
+        upscaler_label = UiText::Text("overlay.dlss_off").arg(metalfx_name);
         break;
     case Settings::Upscaler::Game:
         upscaler_label = UiText::Text("overlay.game_dlss");
@@ -491,7 +481,8 @@ const ScalingStatusTelemetry& QueryScalingStatusTelemetry() {
             Settings::OcarinaGameResolution(oot_res), upscaler_setting, docked);
 #ifdef __APPLE__
         if (eff_oot == Settings::OotResolution::Game &&
-            upscaler_setting == Settings::Upscaler::Auto) {
+            upscaler_setting == Settings::Upscaler::Auto &&
+            backend == Settings::RendererBackend::Vulkan) {
             eff_oot = docked ? Settings::OotResolution::Full : Settings::OotResolution::Percent75;
         }
 #endif

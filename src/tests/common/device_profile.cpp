@@ -352,8 +352,21 @@ TEST_CASE("Ocarina of Time's dynamic resolution is fixed under a temporal upscal
           OotResolution::Percent75);
     CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::Fsr4, true) ==
           OotResolution::Full);
+#if defined(__APPLE__)
+    const auto previous_backend = Settings::values.renderer_backend.GetValue();
+    Settings::values.renderer_backend.SetValue(Settings::RendererBackend::Metal);
+    CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::Auto, false) ==
+          OotResolution::Percent75);
+    CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::Auto, true) ==
+          OotResolution::Full);
+    Settings::values.renderer_backend.SetValue(Settings::RendererBackend::Vulkan);
     CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::Auto, false) ==
           OotResolution::Game);
+    Settings::values.renderer_backend.SetValue(previous_backend);
+#else
+    CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::Auto, false) ==
+          OotResolution::Game);
+#endif
     CHECK(Settings::OcarinaUpscaledResolution(OotResolution::Game, Upscaler::Game, true) ==
           OotResolution::Game);
     // A resolution the player picked stays.

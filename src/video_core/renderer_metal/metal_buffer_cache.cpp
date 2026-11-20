@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 
 #include "common/alignment.h"
 #include "video_core/gpu_split.h"
@@ -28,14 +29,57 @@ Buffer::Buffer(BufferCacheRuntime&, VideoCommon::NullBufferParams null_params)
 
 Buffer::Buffer(BufferCacheRuntime& runtime_, VAddr cpu_addr_, u64 size_bytes_, bool)
     : VideoCommon::BufferBase(cpu_addr_, size_bytes_), runtime{&runtime_},
-      bytes{Common::AlignUp(size_bytes_, 16)}, tracker{size_bytes_} {
+      bytes{Common::AlignUp((std::max)(size_bytes_, u64{16}), 16) + 65536},
+      tracker{size_bytes_} {
     buffer = CreateBuffer(runtime_.device, bytes, runtime_.shared_buffers, &host_ptr);
-    freshly_zeroed = host_ptr != nullptr;
+    freshly_zeroed_ = buffer.Get() != nullptr;
     runtime->allocated_bytes += bytes;
+}
+
+Buffer::Buffer(Buffer&& other) noexcept
+    : VideoCommon::BufferBase(std::move(other)),
+      runtime{std::exchange(other.runtime, nullptr)},
+      buffer{std::move(other.buffer)},
+      host_ptr{std::exchange(other.host_ptr, nullptr)},
+      bytes{std::exchange(other.bytes, 0)},
+      tracker{std::move(other.tracker)},
+      usage_serial{std::exchange(other.usage_serial, 0)},
+      last_usage_tick{std::exchange(other.last_usage_tick, 0)},
+      freshly_zeroed_{std::exchange(other.freshly_zeroed_, false)} {
+    if (runtime != nullptr && buffer) {
+        runtime->RelocateBuffer(&other, this);
+    }
+}
+
+Buffer& Buffer::operator=(Buffer&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    if (buffer && runtime != nullptr) {
+        runtime->RelocateBuffer(this, nullptr);
+        if (runtime->write_hook != nullptr) {
+            runtime->write_hook(runtime->write_hook_user, buffer.Get(), 0, ~u64{0});
+        }
+        runtime->allocated_bytes -= bytes;
+    }
+    VideoCommon::BufferBase::operator=(std::move(other));
+    runtime = std::exchange(other.runtime, nullptr);
+    buffer = std::move(other.buffer);
+    host_ptr = std::exchange(other.host_ptr, nullptr);
+    bytes = std::exchange(other.bytes, 0);
+    tracker = std::move(other.tracker);
+    usage_serial = std::exchange(other.usage_serial, 0);
+    last_usage_tick = std::exchange(other.last_usage_tick, 0);
+    freshly_zeroed_ = std::exchange(other.freshly_zeroed_, false);
+    if (runtime != nullptr && buffer) {
+        runtime->RelocateBuffer(&other, this);
+    }
+    return *this;
 }
 
 Buffer::~Buffer() {
     if (buffer && runtime != nullptr) {
+        runtime->RelocateBuffer(this, nullptr);
         if (runtime->write_hook != nullptr) {
             runtime->write_hook(runtime->write_hook_user, buffer.Get(), 0, ~u64{0});
         }
@@ -47,11 +91,6 @@ void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
     if (runtime == nullptr) {
         return;
     }
-    if (skip_next_clear_usage) {
-        skip_next_clear_usage = false;
-        return;
-    }
-    freshly_zeroed = false;
     last_usage_tick = runtime->scheduler.CurrentTick();
     if (const u64 serial = runtime->scheduler.SegmentSerial(); serial != usage_serial) {
         usage_serial = serial;
@@ -66,20 +105,29 @@ bool Buffer::IsRegionUsed(u64 offset, u64 size) const noexcept {
 }
 
 bool Buffer::IsInFlight() const noexcept {
-    if (runtime == nullptr || last_usage_tick == 0) {
+    if (runtime == nullptr || !buffer) {
         return false;
     }
-    if (last_usage_tick >= runtime->scheduler.CurrentTick()) {
-        return true;
+    const u64 current = runtime->scheduler.CurrentTick();
+    return last_usage_tick >= current || !runtime->scheduler.IsFree(last_usage_tick) ||
+           runtime->scheduler.IsBufferActiveInOpenCommands(Handle());
+}
+
+void Buffer::RefreshTick() noexcept {
+    if (runtime != nullptr) {
+        last_usage_tick = runtime->scheduler.CurrentTick();
     }
-    return !runtime->scheduler.IsFree(last_usage_tick);
 }
 
 void Buffer::NoteUsed() const noexcept {
     if (runtime != nullptr) {
-        freshly_zeroed = false;
         last_usage_tick = runtime->scheduler.CurrentTick();
     }
+}
+
+bool Buffer::ConsumeFreshlyZeroed(u32 offset) noexcept {
+    const bool zeroed = std::exchange(freshly_zeroed_, false);
+    return zeroed && offset == 0;
 }
 
 BufferCacheRuntime::BufferCacheRuntime(const Device& device_, Scheduler& scheduler_,
@@ -138,7 +186,7 @@ bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {
         dst_offset += source.size;
     }
     bindings.push_back({Binding::Kind::Buffer, is_written, entry.buffer.Get(), 0,
-                        static_cast<u32>(multi_range_total), {}});
+                        static_cast<u32>(multi_range_total), {}, nullptr});
     Coverage::NoteGuard("storage buffer gathered from several mappings");
     return true;
 }
@@ -193,7 +241,7 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick, u64) {
 
 bool BufferCacheRuntime::CanReorderUpload(
     const Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies) const noexcept {
-    return scheduler.CanUploadAhead() &&
+    return scheduler.CanCopyBufferAhead() && !scheduler.UsedInOrder(buffer.Handle()) &&
            std::ranges::none_of(copies, [&](const VideoCommon::BufferCopy& copy) {
                return buffer.IsRegionUsed(copy.dst_offset, copy.size);
            });
@@ -236,7 +284,6 @@ void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, BufferHandle src_buffer,
             return;
         }
         if (dst_buffer.HostPtr() != nullptr && !dst_buffer.IsInFlight()) {
-            dst_buffer.freshly_zeroed = false;
             u8* const dst_ptr = dst_buffer.HostPtr();
             for (const VideoCommon::BufferCopy& copy : copies) {
                 if (copy.size == 0) {
@@ -252,7 +299,7 @@ void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, BufferHandle src_buffer,
         }
         const StagingBufferRef staged = staging_pool.RequestUpload(upload_scratch_size, 16);
         std::memcpy(staged.mapped_span.data(), upload_scratch.data(), upload_scratch_size);
-        const bool ahead = can_reorder_upload && scheduler.CanUploadAhead();
+        const bool ahead = can_reorder_upload && scheduler.CanCopyBufferAhead();
         dst_buffer.NoteUsed();
         if (!ahead) {
             for (const VideoCommon::BufferCopy& copy : copies) {
@@ -268,7 +315,7 @@ void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, BufferHandle src_buffer,
         }
         return;
     }
-    const bool ahead = can_reorder_upload && scheduler.CanUploadAhead();
+    const bool ahead = can_reorder_upload && scheduler.CanCopyBufferAhead();
     dst_buffer.NoteUsed();
     if (!ahead) {
         for (const VideoCommon::BufferCopy& copy : copies) {
@@ -281,7 +328,7 @@ void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, BufferHandle src_buffer,
 void BufferCacheRuntime::CopyBuffer(BufferHandle dst_buffer, Buffer& src_buffer,
                                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
                                     bool can_reorder_upload) {
-    const bool ahead = can_reorder_upload && scheduler.CanUploadAhead();
+    const bool ahead = can_reorder_upload && scheduler.CanCopyBufferAhead();
     src_buffer.NoteUsed();
     if (!ahead) {
         for (const VideoCommon::BufferCopy& copy : copies) {
@@ -294,7 +341,7 @@ void BufferCacheRuntime::CopyBuffer(BufferHandle dst_buffer, Buffer& src_buffer,
 void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, Buffer& src_buffer,
                                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
                                     bool can_reorder_upload) {
-    const bool ahead = can_reorder_upload && scheduler.CanUploadAhead();
+    const bool ahead = can_reorder_upload && scheduler.CanCopyBufferAhead();
     src_buffer.NoteUsed();
     dst_buffer.NoteUsed();
     if (!ahead) {
@@ -307,16 +354,16 @@ void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, Buffer& src_buffer,
 }
 
 void BufferCacheRuntime::ClearBuffer(Buffer& dest_buffer, u32 offset, size_t size, u32 value) {
+    if (dest_buffer.ConsumeFreshlyZeroed(offset) && value == 0) {
+        if (write_hook != nullptr && size != 0) {
+            write_hook(write_hook_user, dest_buffer.Handle(), offset, size);
+        }
+        return;
+    }
     if (dest_buffer.HostPtr() != nullptr && !dest_buffer.IsInFlight()) {
         if (write_hook != nullptr && size != 0) {
             write_hook(write_hook_user, dest_buffer.Handle(), offset, size);
         }
-        if (dest_buffer.freshly_zeroed && value == 0 && offset == 0) {
-            dest_buffer.freshly_zeroed = false;
-            dest_buffer.skip_next_clear_usage = true;
-            return;
-        }
-        dest_buffer.freshly_zeroed = false;
         u8* const dst = dest_buffer.HostPtr() + offset;
         const u8 byte = static_cast<u8>(value);
         if (value == u32{byte} * 0x01010101U) {
@@ -330,7 +377,6 @@ void BufferCacheRuntime::ClearBuffer(Buffer& dest_buffer, u32 offset, size_t siz
                 std::memcpy(dst + at, &value, size - at);
             }
         }
-        dest_buffer.skip_next_clear_usage = true;
         return;
     }
     dest_buffer.NoteUsed();
@@ -363,6 +409,27 @@ BufferHandle BufferCacheRuntime::Nx2MeshMirror() {
     return nx2_mesh_mirror.Get();
 }
 
+void BufferCacheRuntime::RelocateBuffer(const Buffer* from, Buffer* to) noexcept {
+    for (Binding& binding : bindings) {
+        if (binding.buffer_obj == from) {
+            binding.buffer_obj = to;
+        }
+    }
+    if (index_state.buffer_obj == from) {
+        index_state.buffer_obj = to;
+    }
+    for (VertexState& state : vertex_states) {
+        if (state.buffer_obj == from) {
+            state.buffer_obj = to;
+        }
+    }
+    for (VertexState& state : feedback_states) {
+        if (state.buffer_obj == from) {
+            state.buffer_obj = to;
+        }
+    }
+}
+
 void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format,
                                          u32 num_indices, u32 base_vertex, BufferHandle buffer,
                                          u32 offset, u32 size) {
@@ -374,6 +441,23 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
         .base_vertex = base_vertex,
         .format = index_format,
         .topology = topology,
+    };
+}
+
+void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format,
+                                         u32 num_indices, u32 base_vertex, Buffer& buffer,
+                                         u32 offset, u32 size) {
+    buffer.NoteUsed();
+    const BufferHandle handle = buffer.Handle();
+    index_state = IndexState{
+        .buffer = handle,
+        .offset = offset,
+        .size = size,
+        .count = num_indices,
+        .base_vertex = base_vertex,
+        .format = index_format,
+        .topology = topology,
+        .buffer_obj = handle != nullptr ? &buffer : nullptr,
     };
 }
 
@@ -389,7 +473,7 @@ void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 fir
 void BufferCacheRuntime::BindVertexBuffer(u32 index, BufferHandle buffer, u32 offset, u32 size,
                                           u32 stride) {
     if (index < vertex_states.size()) {
-        vertex_states[index] = VertexState{buffer, offset, size, stride};
+        vertex_states[index] = VertexState{buffer, offset, size, stride, nullptr};
     }
 }
 
@@ -399,15 +483,17 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& ho
         if (binding >= vertex_states.size()) {
             break;
         }
-        const Buffer* const buffer = host_bindings.buffers[index];
+        Buffer* const buffer = host_bindings.buffers[index];
         if (buffer != nullptr) {
             buffer->NoteUsed();
         }
+        const BufferHandle handle = buffer != nullptr ? buffer->Handle() : nullptr;
         vertex_states[binding] = VertexState{
-            .buffer = buffer != nullptr ? buffer->Handle() : nullptr,
+            .buffer = handle,
             .offset = static_cast<u32>(host_bindings.offsets[index]),
             .size = static_cast<u32>(host_bindings.sizes[index]),
             .stride = static_cast<u32>(host_bindings.strides[index]),
+            .buffer_obj = handle != nullptr ? buffer : nullptr,
         };
     }
 }
@@ -418,32 +504,50 @@ void BufferCacheRuntime::BindTransformFeedbackBuffer(u32 index, BufferHandle buf
         if (write_hook != nullptr && buffer != nullptr && size != 0) {
             write_hook(write_hook_user, buffer, offset, size);
         }
-        feedback_states[index] = VertexState{buffer, offset, size, 0};
+        feedback_states[index] = VertexState{buffer, offset, size, 0, nullptr};
     }
 }
 
 void BufferCacheRuntime::BindTransformFeedbackBuffers(
     VideoCommon::HostBindings<Buffer>& host_bindings) {
     for (size_t index = 0; index < host_bindings.buffers.size(); ++index) {
-        const Buffer* const buffer = host_bindings.buffers[index];
+        if (index >= feedback_states.size()) {
+            break;
+        }
+        Buffer* const buffer = host_bindings.buffers[index];
         if (buffer != nullptr) {
             buffer->NoteUsed();
         }
-        BindTransformFeedbackBuffer(static_cast<u32>(index),
-                                    buffer != nullptr ? buffer->Handle() : nullptr,
-                                    static_cast<u32>(host_bindings.offsets[index]),
-                                    static_cast<u32>(host_bindings.sizes[index]));
+        const BufferHandle handle = buffer != nullptr ? buffer->Handle() : nullptr;
+        const u32 offset = static_cast<u32>(host_bindings.offsets[index]);
+        const u32 size = static_cast<u32>(host_bindings.sizes[index]);
+        if (write_hook != nullptr && handle != nullptr && size != 0) {
+            write_hook(write_hook_user, handle, offset, size);
+        }
+        feedback_states[index] = VertexState{
+            .buffer = handle,
+            .offset = offset,
+            .size = size,
+            .stride = 0,
+            .buffer_obj = handle != nullptr ? buffer : nullptr,
+        };
     }
 }
 
 std::span<u8> BufferCacheRuntime::BindMappedUniformBuffer(size_t, u32, u32 size) {
-    const StagingBufferRef ref = staging_pool.RequestUpload(size, GetUniformBufferAlignment());
+    const u32 alloc_size = StreamUniformAllocationSize(size);
+    stream_uniform_readable_bytes = 0;
+    const StagingBufferRef ref =
+        staging_pool.RequestUpload(alloc_size, GetUniformBufferAlignment());
+    if (alloc_size > size) {
+        std::memset(ref.mapped_span.data() + size, 0, alloc_size - size);
+    }
     last_stream_uniform = StreamUniformRef{
         .buffer = ref.buffer,
         .offset = static_cast<u32>(ref.offset),
     };
     RebindStreamUniform(last_stream_uniform, size);
-    return ref.mapped_span;
+    return alloc_size > size ? ref.mapped_span.first(size) : ref.mapped_span;
 }
 
 } // namespace Metal

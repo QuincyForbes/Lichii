@@ -315,7 +315,7 @@ static_assert(std::is_trivially_copyable_v<ShaderTranslate::ResourceSlot>);
 static_assert(std::is_trivially_copyable_v<ShaderTranslate::TessellationSlots>);
 
 constexpr std::array<char, 8> StageMslMagic{'M', 'T', 'L', 'S', 'T', 'G', '0', '2'};
-constexpr u32 StageMslVersion = 3;
+constexpr u32 StageMslVersion = 4;
 constexpr u32 MaxMslSourceBytes = 16U << 20;
 constexpr u32 MaxStageRecordBytes = 40U << 20;
 
@@ -902,7 +902,9 @@ PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_m
         .support_storage_buffer_16bit = true,
         .support_int64 = true,
         .support_vertex_instance_id = false,
-        .support_float_controls = false,
+        .support_float_controls = true,
+        .support_fp16_signed_zero_nan_preserve = true,
+        .support_fp32_signed_zero_nan_preserve = true,
         .support_vote = true,
         // Metal has simd_shuffle_up/down/xor (SPIRV-Cross's ShuffleUp/Down/Xor), as MoltenVK
         // reports VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT: without, every relative shuffle
@@ -946,15 +948,15 @@ PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_m
     constexpr u32 Limit = Shader::HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT;
     host_info = Shader::HostTranslateInfo{
         .min_ssbo_alignment = 16,
-        .max_per_stage_descriptor_sampled_images = Limit,
-        .max_per_stage_resources = Limit,
+        .max_per_stage_descriptor_sampled_images = 500000U,
+        .max_per_stage_resources = 500000U,
         .max_per_stage_descriptor_storage_buffers = Limit,
-        .max_descriptor_set_samplers = Limit,
+        .max_descriptor_set_samplers = 2048U,
         .max_descriptor_set_uniform_buffers = Limit,
         .max_descriptor_set_uniform_buffers_dynamic = Limit,
         .max_descriptor_set_storage_buffers = Limit,
         .max_descriptor_set_storage_buffers_dynamic = Limit,
-        .max_descriptor_set_sampled_images = Limit,
+        .max_descriptor_set_sampled_images = 500000U,
         .max_descriptor_set_storage_images = Limit,
         .max_descriptor_set_input_attachements = Limit,
         .support_float64 = false,
@@ -1937,7 +1939,7 @@ bool NativeMeshEnabled() {
         if (value == nullptr) {
             value = std::getenv("EDEN_NX2_METAL_NATIVE_MESH");
         }
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     return enabled;
 }

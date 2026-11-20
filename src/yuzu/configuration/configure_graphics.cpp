@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -1430,11 +1431,21 @@ void ConfigureGraphics::UpdateEffectiveSummary() {
             ? static_cast<Settings::TextureQuality>(texture_quality_combobox->currentData().toUInt())
             : Settings::values.texture_quality.GetValue();
 
+#ifdef __APPLE__
+    const auto backend = GetCurrentGraphicsBackend();
+    const bool metal_oot_temporal = [] {
+        const char* const env = std::getenv("EDEN_NX2_METAL_OOT_TEMPORAL");
+        return env == nullptr || env[0] != '0';
+    }();
+    const bool apple_auto_temporal =
+        (backend == Settings::RendererBackend::Metal && metal_oot_temporal) ||
+        backend == Settings::RendererBackend::Vulkan;
+#endif
     const bool temporal_upscaler =
         upscaler == Settings::Upscaler::Fsr3 || upscaler == Settings::Upscaler::Fsr4 ||
         upscaler == Settings::Upscaler::Dlss || upscaler == Settings::Upscaler::MetalFx
 #ifdef __APPLE__
-        || upscaler == Settings::Upscaler::Auto
+        || (upscaler == Settings::Upscaler::Auto && apple_auto_temporal)
 #endif
         ;
 
@@ -1450,7 +1461,8 @@ void ConfigureGraphics::UpdateEffectiveSummary() {
             return UiText::ChoiceLabel("upscaler", "MetalFx");
         case Settings::Upscaler::Auto:
 #ifdef __APPLE__
-            return UiText::ChoiceLabel("upscaler", "MetalFx");
+            return apple_auto_temporal ? UiText::ChoiceLabel("upscaler", "MetalFx")
+                                       : UiText::ChoiceLabel("upscaler", "Auto");
 #else
             return UiText::ChoiceLabel("upscaler", "Auto");
 #endif
@@ -1629,7 +1641,21 @@ void ConfigureGraphics::UpdateEffectiveSummary() {
                 note = upscaler_name;
             }
 #else
-            if (temporal_upscaler) {
+            const char* const oot_4k_env = std::getenv("EDEN_NX2_METAL_OOT_4K");
+            const bool metal_oot_4k =
+                backend == Settings::RendererBackend::Metal && oot_4k_env != nullptr &&
+                oot_4k_env[0] != '\0' && oot_4k_env[0] != '0';
+            if (temporal_upscaler && docked && metal_oot_4k) {
+                const bool metalfx_upscaler =
+                    upscaler == Settings::Upscaler::MetalFx || upscaler == Settings::Upscaler::Auto;
+                if (metalfx_upscaler && (sw * 3 < 3840 || sh * 3 < 2160)) {
+                    note = tr("%1, capped ≤3.0x").arg(upscaler_name);
+                } else {
+                    out_w = 3840;
+                    out_h = 2160;
+                    note = upscaler_name;
+                }
+            } else if (temporal_upscaler) {
                 note = upscaler_name;
             }
 #endif

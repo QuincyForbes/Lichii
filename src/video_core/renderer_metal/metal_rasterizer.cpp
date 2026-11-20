@@ -302,6 +302,20 @@ bool MayBeGpuModified(DAddr addr, u64 size) {
     }
     return false;
 }
+
+[[nodiscard]] bool IsDepth(FormatClass format_class) noexcept {
+    return format_class == FormatClass::Depth || format_class == FormatClass::DepthStencil;
+}
+
+[[nodiscard]] bool HasGlobalWrites(const Shader::Info& info) noexcept {
+    return info.stores_global_memory || info.uses_global_increment ||
+           info.uses_global_decrement || info.uses_int64_bit_atomics ||
+           info.uses_atomic_f32_add || info.uses_atomic_f16x2_add ||
+           info.uses_atomic_f16x2_min || info.uses_atomic_f16x2_max ||
+           info.uses_atomic_f32x2_add || info.uses_atomic_f32x2_min ||
+           info.uses_atomic_f32x2_max || info.uses_atomic_s32_min ||
+           info.uses_atomic_s32_max;
+}
 } // Anonymous namespace
 
 AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_cache_,
@@ -408,6 +422,7 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
       accelerate_dma{buffer_cache, texture_cache, scheduler_},
       fence_manager{*this, gpu_, texture_cache, buffer_cache, query_cache, scheduler_},
       frame_dump{device_, scheduler_}, flash_watch{device_, scheduler_} {
+    VideoCore::Probe::StoreScene(0, 0, 0, 0, nullptr);
     pipeline_cache.SetSkipCheck([this] { return DrawMayBeSkipped(); });
     buffer_cache_runtime.SetWriteHook(
         [](void* user, BufferHandle buf, u64 offset, u64 size) {
@@ -1150,7 +1165,7 @@ std::vector<TextureHandle> RasterizerMetal::PrepareTexelBuffers(std::span<const 
                                  binding.size);
             if (writable) {
                 texel_writebacks.push_back({copy.buffer, copy.offset, binding.buffer,
-                                            binding.offset, binding.size});
+                                            binding.buffer_obj, binding.offset, binding.size});
             }
             buffer = copy.buffer;
             offset = copy.offset;
@@ -1955,6 +1970,9 @@ RasterizerMetal::MeshArena& RasterizerMetal::AcquireMeshArena() {
 
 void RasterizerMetal::FinishTexelWritebacks() {
     for (const TexelWriteback& writeback : texel_writebacks) {
+        if (writeback.buffer_obj != nullptr) {
+            writeback.buffer_obj->RefreshTick();
+        }
         scheduler.CopyBuffer(writeback.copy, writeback.copy_offset, writeback.buffer,
                              writeback.offset, writeback.size);
     }
@@ -2001,16 +2019,20 @@ std::string RasterizerMetal::GraphicsMemoryReport() const {
 }
 
 TextureHandle RasterizerMetal::OrPlaceholder(const ImageView& view, TextureHandle handle,
-                                             Shader::TextureType type) {
+                                             Shader::TextureType type, bool is_depth) {
     if (handle != nullptr || !PipelineCheckEnabled() || type == Shader::TextureType::Buffer) {
         return handle;
     }
     // A texture or view Metal refused (or a null descriptor) reads zeros, as Vulkan's null
     // image, instead of a texture Metal leaves undefined.
     if (view.image_id != VideoCommon::NULL_IMAGE_ID) {
-        Coverage::NoteGuard("refused texture read as zeros");
+        Coverage::NoteGuard(is_depth ? "non-depth or refused texture read as zero depth"
+                                     : "refused texture read as zeros");
     }
     const size_t index = static_cast<size_t>(type);
+    if (is_depth && index < depth_placeholders.size() && depth_placeholders[index]) {
+        return depth_placeholders[index].Get();
+    }
     return index < placeholders.size() ? placeholders[index].Get() : nullptr;
 }
 
@@ -2018,7 +2040,7 @@ void RasterizerMetal::MakePlaceholders() {
     if (placeholders_made || !PipelineCheckEnabled()) {
         return;
     }
-    // Made before any render pass is open: filling them takes a blit encoder.
+    // Made before any render pass is open: filling them takes a blit / clear pass.
     placeholders_made = true;
     for (size_t index = 0; index < placeholders.size(); ++index) {
         const auto type = static_cast<Shader::TextureType>(index);
@@ -2039,6 +2061,25 @@ void RasterizerMetal::MakePlaceholders() {
         for (u32 layer = 0; layer < layers && placeholder; ++layer) {
             scheduler.CopyBufferToTexture(placeholder_zeros.Get(), 0, 4, 4, placeholder.Get(), 0,
                                           layer, {}, {});
+        }
+        if (desc.kind == TextureKind::e2D || desc.kind == TextureKind::e2DArray ||
+            desc.kind == TextureKind::Cube || desc.kind == TextureKind::CubeArray) {
+            Object& depth_placeholder = depth_placeholders[index];
+            TextureDesc depth_desc = desc;
+            depth_desc.format = Fmt::Depth32Float;
+            depth_desc.render_target = true;
+            depth_desc.shader_write = false;
+            depth_desc.pixel_format_view = false;
+            depth_placeholder = CreateTexture(device, depth_desc);
+            for (u32 layer = 0; layer < layers && depth_placeholder; ++layer) {
+                ClearPass clear{};
+                clear.depth = {.texture = depth_placeholder.Get(), .level = 0, .slice = layer};
+                clear.clear_depth = true;
+                clear.depth_value = 0.0;
+                clear.width = 1;
+                clear.height = 1;
+                scheduler.Clear(clear);
+            }
         }
     }
 }
@@ -2069,10 +2110,13 @@ bool RasterizerMetal::NeedsReducingVariant(const StageProgram& program,
     if (program.reduction_slot == ~0U) {
         return false;
     }
-    // Metal's sampler states reduce with linear min, mag and mip filters (CreateSampler; not with
-    // EDEN_NX2_METAL_SAMPLERS=0, which makes plain ones): bit 2 of SamplerReductionBits, the
-    // others only being set with linear min and mag filters.
+    // Apple M1-M4 hardware ignores MTLSamplerDescriptor.reductionMode (metal-coverage.md row F16),
+    // so shader-emulated reduction is used unless EDEN_NX2_METAL_NATIVE_REDUCTION=1 opts in.
     static const bool native_reduction = [this] {
+        const char* const native_env = std::getenv("EDEN_NX2_METAL_NATIVE_REDUCTION");
+        if (native_env == nullptr || native_env[0] != '1') {
+            return false;
+        }
         const char* const value = std::getenv("EDEN_NX2_METAL_SAMPLERS");
         return SamplerBiasSupported(device) && (value == nullptr || value[0] != '0');
     }();
@@ -2092,10 +2136,13 @@ bool RasterizerMetal::NeedsReducingVariant(const StageProgram& program,
             }
             // An integer or stencil view takes a nearest sampler variant (Sampler::HandleFor): no
             // reduction.
-            if (native_reduction && (bits & 4) != 0 && view < views.size()) {
+            if (view < views.size()) {
                 const ImageView& image_view = texture_cache.GetImageView(views[view].id);
-                if (!VideoCore::Surface::IsPixelFormatInteger(image_view.format) &&
-                    image_view.HostClass() != FormatClass::Stencil) {
+                if (VideoCore::Surface::IsPixelFormatInteger(image_view.format) ||
+                    image_view.HostClass() == FormatClass::Stencil) {
+                    continue;
+                }
+                if (native_reduction && (bits & 4) != 0) {
                     continue;
                 }
             }
@@ -2160,7 +2207,27 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
         }
         scheduler.BindTexture(metal_stage, slot_value, texture, on_buffer, write);
     };
+    const auto bind_u64_table = [&](u32 slot, std::span<const u64> table) {
+        if (slot == ~0U || table.empty()) {
+            return;
+        }
+        const size_t bytes = table.size() * sizeof(u64);
+        if (bytes <= 4096) {
+            scheduler.BindBytes(metal_stage, slot, table.data(), static_cast<u32>(bytes));
+            return;
+        }
+        const StagingBufferRef upload =
+            staging_pool.RequestUpload(bytes, buffer_cache_runtime.GetUniformBufferAlignment());
+        if (upload.mapped_span.size() >= bytes) {
+            std::memcpy(upload.mapped_span.data(), table.data(), bytes);
+            scheduler.BindBuffer(metal_stage, slot, upload.buffer, static_cast<u32>(upload.offset),
+                                 false);
+        }
+    };
+    const size_t num_ubos = static_cast<size_t>(std::popcount(info.constant_buffer_mask));
+    const bool force_ssbo_write = HasGlobalWrites(info);
     size_t next_buffer = 0;
+    size_t buffer_ordinal = 0;
     for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
         for (u32 element = 0; element < slot.count; ++element) {
             const u32 slot_index = slot.index + element;
@@ -2176,10 +2243,14 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                         spill_table.resize(slot.spill + 1, 0);
                     }
                     if (next_buffer < pending.size()) {
-                        spill_table[slot.spill] = scheduler.UseBuffer(
-                            metal_stage, pending[next_buffer].buffer, pending[next_buffer].offset,
-                            pending[next_buffer].is_written);
-                        ++next_buffer;
+                        const Binding& b = pending[next_buffer++];
+                        const bool is_ssbo = buffer_ordinal++ >= num_ubos;
+                        const bool write = b.is_written || (is_ssbo && force_ssbo_write);
+                        if (is_ssbo && force_ssbo_write && !b.is_written && b.size != 0) {
+                            InvalidateConvertedIndices(b.buffer, b.offset, b.size);
+                        }
+                        spill_table[slot.spill] =
+                            scheduler.UseBuffer(metal_stage, b.buffer, b.offset, write);
                     }
                     break;
                 }
@@ -2207,10 +2278,13 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                     ++next_buffer;
                 }
                 if (next_buffer < pending.size()) {
-                    scheduler.BindBuffer(metal_stage, slot_index, pending[next_buffer].buffer,
-                                         pending[next_buffer].offset,
-                                         pending[next_buffer].is_written);
-                    ++next_buffer;
+                    const Binding& b = pending[next_buffer++];
+                    const bool is_ssbo = buffer_ordinal++ >= num_ubos;
+                    const bool write = b.is_written || (is_ssbo && force_ssbo_write);
+                    if (is_ssbo && force_ssbo_write && !b.is_written && b.size != 0) {
+                        InvalidateConvertedIndices(b.buffer, b.offset, b.size);
+                    }
+                    scheduler.BindBuffer(metal_stage, slot_index, b.buffer, b.offset, write);
                 }
                 break;
             case ShaderTranslate::ResourceKind::Texture:
@@ -2227,10 +2301,7 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
         }
     }
 
-    if (program.spill_slot != ~0U && !spill_table.empty()) {
-        scheduler.BindBytes(metal_stage, program.spill_slot, spill_table.data(),
-                            static_cast<u32>(spill_table.size() * sizeof(u64)));
-    }
+    bind_u64_table(program.spill_slot, spill_table);
     // Texture slots in binding order: texel buffers, image buffers, textures, images.
     const size_t read_texel_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
     const size_t texel_buffers =
@@ -2293,9 +2364,12 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
             }
             ImageView& image_view = texture_cache.GetImageView(view_id);
             if (texture_slot < texture_slots.size()) {
-                const TextureHandle tex_handle = OrPlaceholder(
-                    image_view, image_view.SampledHandle(desc.type, desc.is_multisample),
-                    desc.type);
+                const TextureHandle sampled =
+                    desc.is_depth && !IsDepth(image_view.HostClass())
+                        ? nullptr
+                        : image_view.SampledHandle(desc.type, desc.is_multisample);
+                const TextureHandle tex_handle =
+                    OrPlaceholder(image_view, sampled, desc.type, desc.is_depth);
                 if (tex_in_array) {
                     const u32 entry = texture_slots[texture_slot] & ~ArrayEntryFlag;
                     prev_tex_res = scheduler.UseTexture(metal_stage, tex_handle, false, false);
@@ -2331,7 +2405,9 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                     scheduler.BindSampler(metal_stage, sampler_slots[sampler], handle);
                 }
             }
-            if (has_sampler_slot && sampler_slots[sampler] < 16) {
+            if (has_sampler_slot && sampler_slots[sampler] < 16 &&
+                !VideoCore::Surface::IsPixelFormatInteger(image_view.format) &&
+                image_view.HostClass() != FormatClass::Stencil) {
                 reduction_modes |= texture_cache.GetSampler(samp_id).ReductionBits()
                                    << (sampler_slots[sampler] * 4);
             }
@@ -2342,10 +2418,7 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
         scheduler.BindBytes(metal_stage, program.reduction_slot, &reduction_modes,
                             static_cast<u32>(sizeof(reduction_modes)));
     }
-    if (program.sampler_spill_slot != ~0U && !sampler_table.empty()) {
-        scheduler.BindBytes(metal_stage, program.sampler_spill_slot, sampler_table.data(),
-                            static_cast<u32>(sampler_table.size() * sizeof(u64)));
-    }
+    bind_u64_table(program.sampler_spill_slot, sampler_table);
     for (const auto& desc : info.image_descriptors) {
         for (u32 element = 0; element < desc.count; ++element) {
             const size_t view_index = view++;
@@ -2365,21 +2438,7 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
             ++texture_slot;
         }
     }
-    if (!array_table.empty()) {
-        const size_t bytes = array_table.size() * sizeof(u64);
-        if (bytes <= 4096) {
-            scheduler.BindBytes(metal_stage, program.array_spill_slot, array_table.data(),
-                                static_cast<u32>(bytes));
-        } else {
-            const StagingBufferRef table =
-                staging_pool.RequestUpload(bytes, buffer_cache_runtime.GetUniformBufferAlignment());
-            if (table.mapped_span.size() >= bytes) {
-                std::memcpy(table.mapped_span.data(), array_table.data(), bytes);
-                scheduler.BindBuffer(metal_stage, program.array_spill_slot, table.buffer,
-                                     static_cast<u32>(table.offset), false);
-            }
-        }
-    }
+    bind_u64_table(program.array_spill_slot, array_table);
 }
 
 template <typename CbufAddrFn>
@@ -2527,8 +2586,12 @@ void RasterizerMetal::CollectStageDescriptors(
             }
             continue;
         }
+        const bool null_pointer_handles = VideoCore::Nx2Debug::Experiment(21) != 0;
         for (u32 element = 0; element < desc.count; ++element) {
-            const auto handle = read_handle(desc, element);
+            const auto handle =
+                null_pointer_handles && VideoCommon::HandleIsStoragePointer(info, desc, element)
+                    ? VideoCommon::NULL_TEXTURE_HANDLE
+                    : read_handle(desc, element);
             views.push_back({.index = handle.first});
             if (use_bind_memo) {
                 sampler_handles.push_back(handle.second);
@@ -2731,12 +2794,23 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         : mesh != nullptr     ? pipeline.MeshEmulationBindingKinds()
                               : pipeline.DefaultBindingKinds();
     ResolveStageBindings(false, true, binding_kinds, views, sampler_handles, samplers);
+    const u64 clock_before = texture_cache.BindingClock();
+    texture_cache.UpdateRenderTargets(false);
+    const bool bindings_invalidated = [&]<typename TC = TextureCache>(const TC& tc) {
+        if constexpr (requires { tc.HasDeletedImages(); }) {
+            return tc.BindingClock() != clock_before || tc.HasDeletedImages();
+        } else {
+            return tc.BindingClock() != clock_before;
+        }
+    }(texture_cache);
+    if (bindings_invalidated) {
+        ResolveStageBindings(false, true, binding_kinds, views, sampler_handles, samplers);
+    }
     for (size_t index = 0; index < stages.size(); ++index) {
         if (!absent(index)) {
             PrepareSampleGrids(programs[index]->info, std::span(views).subspan(first_view[index]));
         }
     }
-    texture_cache.UpdateRenderTargets(false);
     TrackOcarinaCamera();
     NoteCameraMotionDraw();
     UpdateOcarinaJitter();
@@ -2757,7 +2831,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                 continue;
             }
             const Shader::Info& info = programs[index]->info;
-            if (info.stores_global_memory || any_written(info.storage_buffers_descriptors) ||
+            if (HasGlobalWrites(info) || any_written(info.storage_buffers_descriptors) ||
                 any_written(info.image_descriptors) ||
                 any_written(info.image_buffer_descriptors)) {
                 return true;
@@ -2857,6 +2931,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                 VideoCommon::ObtainBufferSynchronize::FullSynchronize,
                 VideoCommon::ObtainBufferOperation::DoNothing);
             mesh_indirect.records = records->Handle();
+            mesh_indirect.records_obj = records;
             mesh_indirect.records_offset = records_offset;
             if (mesh_indirect.has_count) {
                 const auto [count, count_offset] = buffer_cache.ObtainBuffer(
@@ -2864,6 +2939,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                     VideoCommon::ObtainBufferSynchronize::FullSynchronize,
                     VideoCommon::ObtainBufferOperation::DoNothing);
                 mesh_indirect.count = count->Handle();
+                mesh_indirect.count_obj = count;
                 mesh_indirect.count_offset = count_offset;
             }
         }
@@ -4168,6 +4244,37 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
     if (scheduler.SegmentSerial() != draw_segment) {
         // Committed in the middle of the draw: what the buffer cache noted as used is gone.
         scheduler.BlockAhead();
+        for (const auto& list : stage_bindings) {
+            for (const Binding& b : list) {
+                if (b.buffer_obj != nullptr) {
+                    b.buffer_obj->RefreshTick();
+                }
+            }
+        }
+        for (const auto& v : vertex_states) {
+            if (v.buffer_obj != nullptr) {
+                v.buffer_obj->RefreshTick();
+            }
+        }
+        if (const auto& idx = buffer_cache_runtime.Index(); idx.buffer_obj != nullptr) {
+            idx.buffer_obj->RefreshTick();
+        }
+        for (const auto& fb : buffer_cache_runtime.TransformFeedbacks()) {
+            if (fb.buffer_obj != nullptr) {
+                fb.buffer_obj->RefreshTick();
+            }
+        }
+        for (const TexelWriteback& wb : texel_writebacks) {
+            if (wb.buffer_obj != nullptr) {
+                wb.buffer_obj->RefreshTick();
+            }
+        }
+        if (mesh_indirect.records_obj != nullptr) {
+            mesh_indirect.records_obj->RefreshTick();
+        }
+        if (mesh_indirect.count_obj != nullptr) {
+            mesh_indirect.count_obj->RefreshTick();
+        }
     }
     DrawState draw{};
     draw.pipeline = state;
@@ -4406,8 +4513,19 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         : offset_mode == 1U ? regs.polygon_offset_line_enable != 0
                             : regs.polygon_offset_fill_enable != 0;
     if (polygon_offset_enabled) {
-        // The hardware halves the depth bias units (as OpenGL and Vulkan apply it).
-        draw.depth_bias = regs.depth_bias / 2.0f;
+        const bool is_d24 = regs.zeta_enable != 0 &&
+                            (regs.zeta.format == Tegra::DepthFormat::Z24_UNORM_S8_UINT ||
+                             regs.zeta.format == Tegra::DepthFormat::S8Z24_UNORM ||
+                             regs.zeta.format == Tegra::DepthFormat::X8Z24_UNORM ||
+                             regs.zeta.format == Tegra::DepthFormat::V8Z24_UNORM);
+        if (is_d24) {
+            constexpr double rescale_factor =
+                static_cast<double>(1ULL << 8) / static_cast<double>(0x1.ep+127);
+            draw.depth_bias =
+                static_cast<f32>(static_cast<double>(regs.depth_bias) * rescale_factor);
+        } else {
+            draw.depth_bias = regs.depth_bias / 2.0f;
+        }
         // Per-pixel slope term: scaled back to guest pixels on a rescaled target, or shadow
         // maps get self-shadow stripes above 1x (zortos293/Lichii#1925).
         draw.slope_scale =
@@ -5086,8 +5204,13 @@ void RasterizerMetal::UpdateOcarinaJitter() {
     // against the scene depth at the scene size, so a depth pre-pass and the colour passes move
     // together and shadow maps, half-size and full-screen passes stay put.
     const auto& regs = maxwell3d->regs;
-    if (oot_temporal_frame && *oot_temporal_frame + 1 >= oot_frame && regs.depth_test_enable &&
-        oot_motion.extent[0] != 0 && VulkanSwitchesEnabled() &&
+    const bool sample_query_only =
+        regs.zpass_pixel_count_enable != 0 && !regs.depth_write_enabled;
+    const bool excluded_draw =
+        sample_query_only ||
+        maxwell3d->draw_manager.draw_state.topology == Maxwell::PrimitiveTopology::Points;
+    if (!excluded_draw && oot_temporal_frame && *oot_temporal_frame + 1 >= oot_frame &&
+        regs.depth_test_enable && oot_motion.extent[0] != 0 && VulkanSwitchesEnabled() &&
         VideoCommon::OcarinaJitterEnabled(ocarina_temporal.Backend())) {
         const auto& targets = texture_cache.GetRenderTargets();
         if (targets.depth_buffer_id) {
@@ -5410,7 +5533,8 @@ std::optional<Tegra::Texture::TICEntry> RasterizerMetal::ReadComputeTic(u32 inde
 }
 
 bool RasterizerMetal::TryOcarinaTemporal(u64 native_key, u64 shader_hash,
-                                         std::span<const VideoCommon::ImageViewInOut> views) {
+                                         std::span<const VideoCommon::ImageViewInOut> views,
+                                         std::array<u32, 2>* out_output_extent) {
     // Logs why the game's own upscale draws when the reason changes and every 120th repeat.
     const auto fail = [this](const char* reason) {
         CountOcarinaTemporal(false, reason);
@@ -5470,10 +5594,13 @@ bool RasterizerMetal::TryOcarinaTemporal(u64 native_key, u64 shader_hash,
     if (!target_1440p && target_1080p && !OcarinaTemporal::HandheldEnabled()) {
         return fail("handheld temporal upscale disabled");
     }
+    const bool using_dlss =
+        ocarina_temporal.Backend() == VideoCommon::OcarinaUpscaleBackend::Dlss;
     const bool native_resolution =
-        ocarina_temporal.Backend() == VideoCommon::OcarinaUpscaleBackend::Dlss &&
-        Settings::values.nvidia_dlss_quality.GetValue() == Settings::DlssQuality::Dlaa;
-    const bool upscale_4k = pass_1440p && !native_resolution;
+        using_dlss && Settings::values.nvidia_dlss_quality.GetValue() == Settings::DlssQuality::Dlaa;
+    const bool dlss_exceeds_3x =
+        using_dlss && (extent[0] * 3 < 3840 || extent[1] * 3 < 2160);
+    const bool upscale_4k = pass_1440p && !native_resolution && !dlss_exceeds_3x;
     const bool scaled_scene =
         extent[0] <= target.size.width && extent[1] <= target.size.height &&
         std::abs(static_cast<int>(extent[0] * 9) - static_cast<int>(extent[1] * 16)) <= 32;
@@ -5506,6 +5633,9 @@ bool RasterizerMetal::TryOcarinaTemporal(u64 native_key, u64 shader_hash,
     const std::array<u32, 2> output_extent = native_resolution ? extent
                                              : present_4k      ? std::array<u32, 2>{3840, 2160}
                                                                : target_extent;
+    if (out_output_extent != nullptr) {
+        *out_output_extent = output_extent;
+    }
     // Without Link's pose the motion comes from the camera alone.
     OcarinaActorMesh actor{};
     const bool has_actor = OcarinaTemporal::ActorEnabled() && ReadOcarinaActor(actor);
@@ -5518,6 +5648,7 @@ bool RasterizerMetal::TryOcarinaTemporal(u64 native_key, u64 shader_hash,
                 .extent = extent,
                 .target_size = target_extent,
                 .output_size = output_extent,
+                .depth_size = {depth.size.width, depth.size.height},
                 .current = oot_motion.current,
                 .previous = oot_motion.previous,
                 .frame = oot_frame,
@@ -5804,15 +5935,37 @@ bool RasterizerMetal::DrawMayBeSkipped() {
         skip_decision = false;
         return false;
     }
+    const auto& regs = maxwell3d->regs;
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
+    if (native) {
+        const u32 color_count =
+            (std::min)(static_cast<u32>(regs.rt_control.count), static_cast<u32>(NUM_RT));
+        bool writes_color = false;
+        for (u32 index = 0; index < color_count; ++index) {
+            const auto& rt = regs.rt[index];
+            if (rt.Address() == 0 || rt.format == Tegra::RenderTargetFormat::NONE) {
+                continue;
+            }
+            const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : index];
+            if (mask.R != 0 || mask.G != 0 || mask.B != 0 || mask.A != 0) {
+                writes_color = true;
+                break;
+            }
+        }
+        if (!writes_color) {
+            skip_decision = false;
+            return false;
+        }
+    }
     bool recurring = true;
     if (mode == 2 && native) {
         recurring = texture_cache.ClassifyDrawTargets().kind ==
                     VideoCommon::DrawTargetClass::Recurring;
     }
+    const bool depth_enabled = regs.zeta_enable != 0 && regs.depth_test_enable != 0;
     const u32 elements = maxwell3d->draw_manager.draw_state.draw_element_count;
-    skip_decision = Vulkan::CanDiscardPendingDraw(native, maxwell3d->regs.zeta_enable != 0,
-                                                  elements, elements, mode != 0, recurring);
+    skip_decision = Vulkan::CanDiscardPendingDraw(native, depth_enabled, elements, elements,
+                                                  mode != 0, recurring);
     return skip_decision;
 }
 
@@ -6210,14 +6363,15 @@ void RasterizerMetal::DispatchCompute() {
     if (!kepler_compute->GetIndirectComputeAddress() &&
         OcarinaTemporal::IsTemporalPass(native_key, pipeline->Key().unique_hash, info) &&
         OcarinaTemporalEnabled()) {
-        if (TryOcarinaTemporal(native_key, pipeline->Key().unique_hash, views)) {
-            const ImageView& color = texture_cache.GetImageView(views[0].id);
+        std::array<u32, 2> output_extent{};
+        if (TryOcarinaTemporal(native_key, pipeline->Key().unique_hash, views, &output_extent)) {
             const ImageView& target = texture_cache.GetImageView(views[1].id);
             const char* const backend_name =
-                ocarina_temporal.Backend() == VideoCommon::OcarinaUpscaleBackend::Fsr ? "FSR 3.1"
-                                                                                      : "MetalFX";
-            VideoCore::Probe::StoreScene(color.size.width, color.size.height, target.size.width,
-                                         target.size.height, backend_name);
+                ocarina_temporal.LastBackend() == VideoCommon::OcarinaUpscaleBackend::Fsr
+                    ? "FSR 3.1"
+                    : "MetalFX Temporal";
+            VideoCore::Probe::StoreScene(oot_motion.extent[0], oot_motion.extent[1],
+                                         output_extent[0], output_extent[1], backend_name);
             texture_cache.MarkModification(target.image_id);
             Coverage::Note(Coverage::Work::Dispatch, Coverage::Path::Replaced);
             return;
@@ -6295,17 +6449,32 @@ void RasterizerMetal::DispatchCompute() {
     // The group counts' buffer first: bringing it up to date may end the open encoder.
     const auto indirect = kepler_compute->GetIndirectComputeAddress();
     BufferHandle indirect_buffer{};
+    Buffer* indirect_buffer_obj{};
     u64 indirect_offset{};
     if (indirect) {
         const auto [buffer, offset] = buffer_cache.ObtainBuffer(
             *indirect, 12, VideoCommon::ObtainBufferSynchronize::FullSynchronize,
             VideoCommon::ObtainBufferOperation::DoNothing);
         indirect_buffer = buffer->Handle();
+        indirect_buffer_obj = buffer;
         indirect_offset = offset;
     }
     if (scheduler.SegmentSerial() != dispatch_segment) {
         // Committed in the middle of the dispatch: what the buffer cache noted as used is gone.
         scheduler.BlockAhead();
+        for (const Binding& b : bindings) {
+            if (b.buffer_obj != nullptr) {
+                b.buffer_obj->RefreshTick();
+            }
+        }
+        for (const TexelWriteback& wb : texel_writebacks) {
+            if (wb.buffer_obj != nullptr) {
+                wb.buffer_obj->RefreshTick();
+            }
+        }
+        if (indirect_buffer_obj != nullptr) {
+            indirect_buffer_obj->RefreshTick();
+        }
     }
     // G19: a program that addresses a packed R16 surface bytewise declares it as an R32 image of
     // half the width. Vulkan's shadow: the texels go through a buffer into an R32Uint texture

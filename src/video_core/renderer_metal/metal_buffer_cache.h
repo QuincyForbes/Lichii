@@ -34,8 +34,8 @@ public:
                     bool sparse_compatible_);
     ~Buffer();
 
-    Buffer(Buffer&&) = default;
-    Buffer& operator=(Buffer&&) = default;
+    Buffer(Buffer&& other) noexcept;
+    Buffer& operator=(Buffer&& other) noexcept;
 
     [[nodiscard]] BufferHandle Handle() const noexcept {
         return buffer.Get();
@@ -70,7 +70,11 @@ public:
 
     [[nodiscard]] bool IsInFlight() const noexcept;
 
+    void RefreshTick() noexcept;
+
     void NoteUsed() const noexcept;
+
+    [[nodiscard]] bool ConsumeFreshlyZeroed(u32 offset) noexcept;
 
 private:
     friend BufferCacheRuntime;
@@ -83,8 +87,7 @@ private:
     /// The scheduler segment the tracker holds the uses of.
     u64 usage_serial{};
     mutable u64 last_usage_tick{};
-    mutable bool freshly_zeroed{};
-    bool skip_next_clear_usage{};
+    bool freshly_zeroed_{};
 };
 
 /// One resource the next draw or dispatch binds, in binding order.
@@ -96,6 +99,7 @@ struct Binding {
     u32 offset{};
     u32 size{};
     VideoCore::Surface::PixelFormat format{};
+    Buffer* buffer_obj{};
 };
 
 class BufferCacheRuntime {
@@ -115,6 +119,10 @@ public:
 
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return scheduler.CurrentTick();
+    }
+
+    [[nodiscard]] u64 UsageSerial() const noexcept {
+        return scheduler.SegmentSerial();
     }
 
     [[nodiscard]] bool IsFree(u64 tick) const noexcept {
@@ -145,7 +153,7 @@ public:
     }
 
     [[nodiscard]] u64 GetBufferAllocationTail() const noexcept {
-        return 0;
+        return 65536;
     }
 
     /// 16 bytes on Apple Silicon GPUs (Apple7+), 256 bytes on Intel / AMD macOS GPUs.
@@ -207,6 +215,8 @@ public:
 
     void BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format, u32 num_indices,
                          u32 base_vertex, BufferHandle buffer, u32 offset, u32 size);
+    void BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format, u32 num_indices,
+                         u32 base_vertex, Buffer& buffer, u32 offset, u32 size);
 
     void BindQuadIndexBuffer(PrimitiveTopology topology, u32 first, u32 count);
 
@@ -224,7 +234,17 @@ public:
     };
     static_assert(std::is_trivially_copyable_v<StreamUniformRef>);
 
-    /// A stream slice of exactly `size` bytes, bound next.
+    void SetStreamUniformReadableSize(u32 bytes) noexcept {
+        stream_uniform_readable_bytes = bytes;
+    }
+
+    [[nodiscard]] u32 StreamUniformAllocationSize(u32 size) const noexcept {
+        return (stream_uniform_readable_bytes > size && stream_uniform_readable_bytes <= 65536U)
+                   ? stream_uniform_readable_bytes
+                   : size;
+    }
+
+    /// A stream slice of `size` bytes (zero-padded up to the shader's readable size), bound next.
     std::span<u8> BindMappedUniformBuffer(size_t stage, u32 binding_index, u32 size);
 
     [[nodiscard]] StreamUniformRef LastStreamUniformRef() const noexcept {
@@ -232,12 +252,15 @@ public:
     }
 
     void RebindStreamUniform(const StreamUniformRef& ref, u32 size) {
-        bindings.push_back({Binding::Kind::Buffer, false, ref.buffer, ref.offset, size, {}});
+        stream_uniform_readable_bytes = 0;
+        bindings.push_back({Binding::Kind::Buffer, false, ref.buffer, ref.offset, size, {},
+                            nullptr});
     }
 
     void BindUniformBuffer(const Buffer& buffer, u32 offset, u32 size) {
         buffer.NoteUsed();
-        bindings.push_back({Binding::Kind::Buffer, false, buffer.Handle(), offset, size, {}});
+        Buffer* const obj = buffer.Handle() != nullptr ? const_cast<Buffer*>(&buffer) : nullptr;
+        bindings.push_back({Binding::Kind::Buffer, false, buffer.Handle(), offset, size, {}, obj});
     }
 
     void BindStorageBuffer(const Buffer& buffer, u32 offset, u32 size, bool is_written) {
@@ -245,14 +268,17 @@ public:
         if (is_written && write_hook != nullptr && size != 0) {
             write_hook(write_hook_user, buffer.Handle(), offset, size);
         }
-        bindings.push_back({Binding::Kind::Buffer, is_written, buffer.Handle(), offset, size, {}});
+        Buffer* const obj = buffer.Handle() != nullptr ? const_cast<Buffer*>(&buffer) : nullptr;
+        bindings.push_back(
+            {Binding::Kind::Buffer, is_written, buffer.Handle(), offset, size, {}, obj});
     }
 
     void BindTextureBuffer(Buffer& buffer, u32 offset, u32 size,
                            VideoCore::Surface::PixelFormat format) {
         buffer.NoteUsed();
+        Buffer* const obj = buffer.Handle() != nullptr ? &buffer : nullptr;
         bindings.push_back(
-            {Binding::Kind::TexelBuffer, false, buffer.Handle(), offset, size, format});
+            {Binding::Kind::TexelBuffer, false, buffer.Handle(), offset, size, format, obj});
     }
 
     /// A storage buffer whose guest range spans several mappings (BufferCache's multi-range
@@ -300,6 +326,7 @@ public:
         PrimitiveTopology topology{};
         bool quads{}; ///< Quads drawn as triangles (BindQuadIndexBuffer)
         u32 quad_first{};
+        Buffer* buffer_obj{};
     };
 
     struct VertexState {
@@ -307,6 +334,7 @@ public:
         u32 offset{};
         u32 size{};
         u32 stride{};
+        Buffer* buffer_obj{};
     };
 
     [[nodiscard]] const IndexState& Index() const noexcept {
@@ -325,6 +353,8 @@ public:
     }
 
 private:
+    void RelocateBuffer(const Buffer* from, Buffer* to) noexcept;
+
     const Device& device;
     Scheduler& scheduler;
     StagingBufferPool& staging_pool;
@@ -357,6 +387,7 @@ private:
     size_t upload_scratch_size{};
     u64 upload_scratch_large_frame{};
     StreamUniformRef last_stream_uniform{};
+    u32 stream_uniform_readable_bytes{};
     WriteHook write_hook{};
     void* write_hook_user{};
 };

@@ -107,6 +107,24 @@ fragment float4 blit_float(BlitOut in [[stage_in]], texture2d<float> src [[textu
     return src.sample(smp, in.uv);
 }
 
+fragment float4 blit_float_srgb_to_linear(BlitOut in [[stage_in]],
+                                          texture2d<float> src [[texture(0)]],
+                                          sampler smp [[sampler(0)]]) {
+    float4 color = src.sample(smp, in.uv);
+    const float3 c = color.rgb;
+    const float3 lo = c / 12.92f;
+    const float3 hi = pow((c + 0.055f) / 1.055f, float3(2.4f));
+    color.rgb = select(hi, lo, c <= 0.04045f);
+    return color;
+}
+
+fragment float4 blit_float_square(BlitOut in [[stage_in]], texture2d<float> src [[texture(0)]],
+                                  sampler smp [[sampler(0)]]) {
+    float4 color = src.sample(smp, in.uv);
+    color.rgb = color.rgb * color.rgb;
+    return color;
+}
+
 fragment uint4 blit_uint(BlitOut in [[stage_in]], texture2d<uint> src [[texture(0)]]) {
     const float2 size = float2(src.get_width(), src.get_height());
     return src.read(uint2(clamp(in.uv * size, float2(0.0), size - 1.0)));
@@ -668,6 +686,40 @@ bool SameRootTexture(TextureHandle a, TextureHandle b) {
     return a != nullptr && b != nullptr && RootTextureHandle(a) == RootTextureHandle(b);
 }
 
+void UseTextureResources(__unsafe_unretained id<MTLRenderCommandEncoder> encoder,
+                         __unsafe_unretained id<MTLTexture> metal_texture, MTLResourceUsage usage,
+                         MTLRenderStages stages, bool on_buffer) {
+    [encoder useResource:metal_texture usage:usage stages:stages];
+    id<MTLBuffer> __unsafe_unretained backing = on_buffer ? metal_texture.buffer : nil;
+    for (id<MTLTexture> __unsafe_unretained parent = metal_texture.parentTexture; parent != nil;
+         parent = parent.parentTexture) {
+        [encoder useResource:parent usage:usage stages:stages];
+        if (on_buffer && backing == nil) {
+            backing = parent.buffer;
+        }
+    }
+    if (backing != nil) {
+        [encoder useResource:backing usage:usage stages:stages];
+    }
+}
+
+void UseTextureResources(__unsafe_unretained id<MTLComputeCommandEncoder> encoder,
+                         __unsafe_unretained id<MTLTexture> metal_texture, MTLResourceUsage usage,
+                         bool on_buffer) {
+    [encoder useResource:metal_texture usage:usage];
+    id<MTLBuffer> __unsafe_unretained backing = on_buffer ? metal_texture.buffer : nil;
+    for (id<MTLTexture> __unsafe_unretained parent = metal_texture.parentTexture; parent != nil;
+         parent = parent.parentTexture) {
+        [encoder useResource:parent usage:usage];
+        if (on_buffer && backing == nil) {
+            backing = parent.buffer;
+        }
+    }
+    if (backing != nil) {
+        [encoder useResource:backing usage:usage];
+    }
+}
+
 std::pair<u32, u32> MipExtent(id<MTLTexture> texture, u32 level) {
     return {(std::max)(static_cast<u32>(texture.width) >> level, 1U),
             (std::max)(static_cast<u32>(texture.height) >> level, 1U)};
@@ -1189,8 +1241,7 @@ struct ComputeHazardState {
         }
     }
 
-    void BeforeDispatch(__unsafe_unretained id<MTLComputeCommandEncoder> encoder,
-                        bool has_recorder) {
+    void BeforeDispatch(__unsafe_unretained id<MTLComputeCommandEncoder> encoder) {
         for (const void* buf : pending_buffers) {
             if (Contains(written_buffers, buf)) {
                 pending_scope |= MTLBarrierScopeBuffers;
@@ -1203,7 +1254,7 @@ struct ComputeHazardState {
                 break;
             }
         }
-        if (pending_scope != 0 && encoder != nil && !has_recorder) {
+        if (pending_scope != 0 && encoder != nil) {
             [encoder memoryBarrierWithScope:pending_scope];
             if ((pending_scope & MTLBarrierScopeBuffers) != 0) {
                 written_buffers.clear();
@@ -1794,6 +1845,20 @@ struct Scheduler::Impl {
         compute_clobbered_by_copy = false;
     }
 
+    void NoteActiveBuffer(const void* buffer) {
+        if (buffer == nullptr) {
+            return;
+        }
+        const uintptr_t key = reinterpret_cast<uintptr_t>(buffer);
+        ActiveBufferNote& cached =
+            active_buffer_cache[((key >> 4) ^ (key >> 12)) % active_buffer_cache.size()];
+        if (cached.object == buffer && cached.tick == current_tick) {
+            return;
+        }
+        cached = {buffer, current_tick};
+        active_buffers.insert(buffer);
+    }
+
     /// A copy recorded in order reads or writes `buffer`: no copy into it goes ahead any more.
     void NoteInOrder(BufferHandle buffer) {
         if (buffer != nullptr &&
@@ -1801,6 +1866,7 @@ struct Scheduler::Impl {
                 in_order_buffers.rend()) {
             in_order_buffers.push_back(buffer);
         }
+        NoteActiveBuffer(buffer);
     }
 
     /// In-order work writes `buffer` (a copy's destination or storage write).
@@ -1901,6 +1967,15 @@ struct Scheduler::Impl {
         if (write) {
             NoteTextureWrite(texture);
         }
+        if (on_buffer) {
+            if (const void* const raw_root = RootTextureHandle(texture); raw_root != nullptr) {
+                if (const id<MTLBuffer> __unsafe_unretained backing =
+                        UnretainedTexture(raw_root).buffer;
+                    backing != nil) {
+                    NoteActiveBuffer((__bridge const void*)backing);
+                }
+            }
+        }
         if (on_buffer || !ImageNoteSkipEnabled()) {
             NoteSegmentTexture(texture, write);
         }
@@ -1991,9 +2066,10 @@ struct Scheduler::Impl {
                 if (active_hazards != nullptr) {
                     active_hazards->NoteTexture(bind.object, bind.on_buffer, bind.write);
                 }
-                [enc useResource:UnretainedTexture(bind.object)
-                           usage:bind.write ? (MTLResourceUsageRead | MTLResourceUsageWrite)
-                                            : MTLResourceUsageRead];
+                UseTextureResources(enc, UnretainedTexture(bind.object),
+                                    bind.write ? (MTLResourceUsageRead | MTLResourceUsageWrite)
+                                               : MTLResourceUsageRead,
+                                    bind.on_buffer);
                 if (in_order && bind.write) {
                     NoteTextureWrite(bind.object);
                     NoteSegmentTexture(bind.object, true);
@@ -2027,9 +2103,8 @@ struct Scheduler::Impl {
                 return false;
             }
         }
-        if (recorder == nullptr &&
-            (ComputeHazardState::Contains(hazards.written_buffers, src) ||
-             ComputeHazardState::Contains(hazards.written_buffers, dst))) {
+        if (ComputeHazardState::Contains(hazards.written_buffers, src) ||
+            ComputeHazardState::Contains(hazards.written_buffers, dst)) {
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             hazards.written_buffers.clear();
         }
@@ -2177,6 +2252,9 @@ struct Scheduler::Impl {
         if (kernel_checked && CheckedConflict(buffer)) {
             LeaveChecked(nullptr);
         }
+        if (active_compute != nil) {
+            NoteActiveBuffer(buffer);
+        }
         if (active_hazards != nullptr) {
             active_hazards->NoteBuffer(buffer, writes);
         }
@@ -2197,22 +2275,41 @@ struct Scheduler::Impl {
         if (texture == nullptr) {
             return;
         }
+        const bool was_in_order = active_compute != nil && active_compute == compute;
+        const u64 restored_before = samples_restored;
         if (write) {
             Written(texture);
+        } else {
+            SamplesNeeded(texture);
         }
+        const bool restored = samples_restored != restored_before;
         NoteTextureTouched(texture);
+        const void* const raw_root =
+            (on_buffer || kernel_checked) ? RootTextureHandle(texture) : nullptr;
+        const id<MTLBuffer> __unsafe_unretained backing =
+            raw_root != nullptr ? UnretainedTexture(raw_root).buffer : nil;
         if (active_compute != nil && active_compute != compute) {
-            if (kernel_checked) {
-                const void* const raw_root = RootTextureHandle(texture);
-                const id<MTLBuffer> __unsafe_unretained backing =
-                    raw_root != nullptr ? UnretainedTexture(raw_root).buffer : nil;
-                if (segment_written_textures.contains(raw_root) || PendingClearOn(texture) ||
+            if (restored || PendingClearOn(texture)) {
+                LeaveChecked(texture);
+            } else if (kernel_checked) {
+                if (segment_written_textures.contains(raw_root) ||
                     (backing != nil && CheckedConflict((__bridge const void*)backing))) {
                     LeaveChecked(texture);
                 }
-            } else if (PendingClearOn(texture)) {
-                LeaveChecked(texture);
             }
+        } else if (was_in_order && compute == nil) {
+            OpenInOrderCompute();
+            ReplayComputeBinds(&compute_pipeline, true);
+        }
+        if (active_compute != nil && active_compute == compute && pending_clear &&
+            PendingClearOn(texture)) {
+            EndEncoder();
+            FlushClear();
+            OpenInOrderCompute();
+            ReplayComputeBinds(&compute_pipeline, true);
+        }
+        if (on_buffer && active_compute != nil && backing != nil) {
+            NoteActiveBuffer((__bridge const void*)backing);
         }
         if (active_hazards != nullptr) {
             active_hazards->NoteTexture(texture, on_buffer, write);
@@ -2225,12 +2322,6 @@ struct Scheduler::Impl {
         }
         if (on_buffer || !ImageNoteSkipEnabled()) {
             NoteSegmentTexture(texture, write);
-        }
-        if (pending_clear && PendingClearOn(texture)) {
-            EndEncoder();
-            FlushClear();
-            OpenInOrderCompute();
-            ReplayComputeBinds(&compute_pipeline, true);
         }
     }
 
@@ -2327,6 +2418,7 @@ struct Scheduler::Impl {
             bound = active_bound;
             break;
         }
+        NoteActiveBuffer(buffer);
         const bool cached = StateCacheEnabled() && slot < bound->buffers.size();
         if (cached && bound->buffers[slot] == buffer &&
             (buffer == nullptr || bound->offsets[slot] == offset)) {
@@ -2534,10 +2626,11 @@ struct Scheduler::Impl {
     /// Something reads the samples of `texture`.
     void SamplesNeeded(const void* texture) {
         NoteTextureTouched(texture);
-        if (shadows.empty()) {
+        if (shadows.empty() || texture == nullptr) {
             return;
         }
-        if (const auto it = shadows.find(const_cast<void*>(texture));
+        const void* const root = RootTextureHandle(texture);
+        if (const auto it = shadows.find(const_cast<void*>(root != nullptr ? root : texture));
             it != shadows.end() && it->second.dropped) {
             RestoreSamples(it->first, it->second);
         }
@@ -2545,10 +2638,12 @@ struct Scheduler::Impl {
 
     /// Something writes part or all of the samples of `texture`: the resolve no longer holds.
     void Written(const void* texture) {
-        if (shadows.empty()) {
+        if (shadows.empty() || texture == nullptr) {
             return;
         }
-        if (const auto it = shadows.find(const_cast<void*>(texture)); it != shadows.end()) {
+        const void* const root = RootTextureHandle(texture);
+        if (const auto it = shadows.find(const_cast<void*>(root != nullptr ? root : texture));
+            it != shadows.end()) {
             if (it->second.dropped) {
                 RestoreSamples(it->first, it->second);
             }
@@ -2948,16 +3043,32 @@ struct Scheduler::Impl {
         }
     }
 
-    id<MTLRenderPipelineState> BlitPipeline(MTLPixelFormat format, BlitBlend blend) {
-        const u64 key = (static_cast<u64>(format) << 8) | static_cast<u64>(blend);
+    id<MTLRenderPipelineState> BlitPipeline(MTLPixelFormat format, BlitBlend blend,
+                                            BlitColorOp color_op) {
+        const FormatClass format_class = ClassOf(static_cast<u32>(format));
+        const BlitColorOp effective_op =
+            format_class == FormatClass::Float ? color_op : BlitColorOp::Copy;
+        const u64 key = (static_cast<u64>(format) << 16) | (static_cast<u64>(effective_op) << 8) |
+                        static_cast<u64>(blend);
         if (const auto it = blit_pipelines.find(key); it != blit_pipelines.end()) {
             return it->second;
         }
         id<MTLRenderPipelineState> pipeline = nil;
-        const FormatClass format_class = ClassOf(static_cast<u32>(format));
         NSString* fragment = nil;
         switch (format_class) {
-        case FormatClass::Float: fragment = @"blit_float"; break;
+        case FormatClass::Float:
+            switch (effective_op) {
+            case BlitColorOp::Copy:
+                fragment = @"blit_float";
+                break;
+            case BlitColorOp::SrgbToLinear:
+                fragment = @"blit_float_srgb_to_linear";
+                break;
+            case BlitColorOp::Square:
+                fragment = @"blit_float_square";
+                break;
+            }
+            break;
         case FormatClass::Uint: fragment = @"blit_uint"; break;
         case FormatClass::Sint: fragment = @"blit_sint"; break;
         case FormatClass::Depth: fragment = @"blit_depth"; break;
@@ -3604,6 +3715,13 @@ struct Scheduler::Impl {
     u32 segment_render_passes{};
     u64 force_split_serial{};
     bool ahead_blocked{};
+    /// Buffers referenced by any uncommitted command buffer of the current tick.
+    struct ActiveBufferNote {
+        const void* object;
+        u64 tick;
+    };
+    std::array<ActiveBufferNote, 512> active_buffer_cache{};
+    std::unordered_set<const void*> active_buffers;
     /// Buffers the segment's copies read or write in order.
     std::vector<const void*> in_order_buffers;
     /// Buffers the segment's work writes on the GPU in order.
@@ -3653,7 +3771,7 @@ struct Scheduler::Impl {
     id<MTLLibrary> library = nil;
     id<MTLSamplerState> nearest = nil;
     id<MTLSamplerState> linear = nil;
-    /// By format << 8 | BlitBlend.
+    /// By (format << 16) | (BlitColorOp << 8) | BlitBlend.
     std::unordered_map<u64, id<MTLRenderPipelineState>> blit_pipelines;
 
     u64 current_tick{1};
@@ -3875,6 +3993,7 @@ u64 Scheduler::Flush(CommitReason reason) {
                 std::scoped_lock lock{impl->completed_mutex};
             }
             impl->completed_cv.notify_all();
+            impl->active_buffers.clear();
             impl->NextSegment();
             impl->tick_splits = 0;
             impl->flush_pending = false;
@@ -3945,6 +4064,7 @@ u64 Scheduler::Flush(CommitReason reason) {
             }
         }
         impl->command_buffer = nil;
+        impl->active_buffers.clear();
         impl->NextSegment();
         impl->tick_splits = 0;
         impl->flush_pending = false;
@@ -4053,8 +4173,9 @@ void Scheduler::CopyBuffer(BufferHandle src, u64 src_offset, BufferHandle dst, u
     if (size == 0 || src == nullptr || dst == nullptr) {
         return;
     }
-    const bool goes_ahead =
-        ahead && CanUploadAhead() && (impl->render != nil || impl->segment_render_passes != 0);
+    impl->NoteActiveBuffer(src);
+    impl->NoteActiveBuffer(dst);
+    const bool goes_ahead = ahead && CanCopyBufferAhead();
     if (!goes_ahead) {
         impl->NoteInOrder(src);
         impl->NoteInOrderWrite(dst);
@@ -4100,6 +4221,47 @@ u64 Scheduler::SegmentSerial() const noexcept {
 
 bool Scheduler::CanUploadAhead() const noexcept {
     return AheadEnabled() && !impl->ahead_blocked && !impl->segment_opaque;
+}
+
+bool Scheduler::CanCopyBufferAhead() const noexcept {
+    return CanUploadAhead() && (impl->render != nil || impl->segment_render_passes != 0);
+}
+
+bool Scheduler::IsBufferActiveInOpenCommands(BufferHandle buffer) const {
+    if (buffer == nullptr) {
+        return false;
+    }
+    const bool open_commands = impl->command_buffer != nil || impl->upload_buffer != nil ||
+                               impl->kernel_buffer != nil || impl->ahead_buffer != nil ||
+                               impl->tick_splits != 0;
+    if (!open_commands) {
+        return false;
+    }
+    if (impl->active_buffers.contains(buffer) || impl->segment_bound.contains(buffer)) {
+        return true;
+    }
+    if (std::find(impl->in_order_buffers.begin(), impl->in_order_buffers.end(), buffer) !=
+            impl->in_order_buffers.end() ||
+        std::find(impl->in_order_written_buffers.begin(), impl->in_order_written_buffers.end(),
+                  buffer) != impl->in_order_written_buffers.end()) {
+        return true;
+    }
+    const auto in_stage = [buffer](const StageBindings& bound) noexcept {
+        return std::find(bound.buffers.begin(), bound.buffers.end(), buffer) !=
+               bound.buffers.end();
+    };
+    if (impl->render != nil &&
+        (in_stage(impl->vertex_bound) || in_stage(impl->fragment_bound) ||
+         in_stage(impl->object_bound) || in_stage(impl->mesh_bound))) {
+        return true;
+    }
+    if (impl->compute != nil && in_stage(impl->compute_bound)) {
+        return true;
+    }
+    if (impl->kernel_compute != nil && in_stage(impl->kernel_bound)) {
+        return true;
+    }
+    return false;
 }
 
 bool Scheduler::CanUploadTextureAhead(TextureHandle texture) const noexcept {
@@ -4201,6 +4363,7 @@ void Scheduler::CopyBufferToTexture(BufferHandle src, u64 offset, u32 bytes_per_
     if (src == nullptr || dst == nullptr) {
         return;
     }
+    impl->NoteActiveBuffer(src);
     const bool goes_ahead = ahead && CanUploadTextureAhead(dst) && !impl->WrittenInOrder(src);
     if (!goes_ahead) {
         impl->Touch(dst);
@@ -4427,7 +4590,8 @@ bool Scheduler::Blit(const BlitPass& blit) {
         return false;
     }
     const MTLPixelFormat format = static_cast<MTLPixelFormat>(blit.dst_format);
-    const id<MTLRenderPipelineState> pipeline = impl->BlitPipeline(format, blit.blend);
+    const id<MTLRenderPipelineState> pipeline =
+        impl->BlitPipeline(format, blit.blend, blit.color_op);
     if (pipeline == nil) {
         return false;
     }
@@ -4803,7 +4967,7 @@ bool Scheduler::DepthToBuffer(TextureHandle src_handle, u32 level, u32 slice, Of
         state.compute_hazards.ResetPending();
         state.compute_hazards.NoteTexture(src_handle, false, false);
         state.compute_hazards.NoteBuffer(dst, true);
-        state.compute_hazards.BeforeDispatch(encoder, state.recorder != nullptr);
+        state.compute_hazards.BeforeDispatch(encoder);
         state.compute_pipeline = (__bridge const void*)state.depth_download;
         state.compute_bound.textures[0] = &InlineBytes;
         state.compute_bound.textures[1] = &InlineBytes;
@@ -4902,7 +5066,7 @@ bool Scheduler::Pack16(u32 mode, bool to_buffer, TextureHandle texture_handle, u
         state.compute_hazards.ResetPending();
         state.compute_hazards.NoteTexture(texture_handle, false, !to_buffer);
         state.compute_hazards.NoteBuffer(buffer, to_buffer);
-        state.compute_hazards.BeforeDispatch(encoder, state.recorder != nullptr);
+        state.compute_hazards.BeforeDispatch(encoder);
         state.compute_pipeline = (__bridge const void*)pipeline;
         state.compute_bound.textures[0] = &InlineBytes;
         state.compute_bound.buffers[0] = &InlineBytes;
@@ -4950,7 +5114,7 @@ bool Scheduler::SwapPacked(BufferHandle buffer, u64 offset, u32 width, u32 rows,
         const id<MTLComputeCommandEncoder> __unsafe_unretained encoder = state.compute;
         state.compute_hazards.ResetPending();
         state.compute_hazards.NoteBuffer(buffer, true);
-        state.compute_hazards.BeforeDispatch(encoder, state.recorder != nullptr);
+        state.compute_hazards.BeforeDispatch(encoder);
         state.compute_pipeline = (__bridge const void*)state.swap_packed;
         state.compute_bound.buffers[0] = &InlineBytes;
         state.compute_bound.buffers[1] = &InlineBytes;
@@ -5318,7 +5482,11 @@ void Scheduler::SetResolveShadow(TextureHandle msaa, TextureHandle shadow) {
 }
 
 TextureHandle Scheduler::ResolveShadow(TextureHandle msaa) const noexcept {
-    const auto it = impl->shadows.find(msaa);
+    if (impl->shadows.empty() || msaa == nullptr) {
+        return nullptr;
+    }
+    const void* const root = RootTextureHandle(msaa);
+    const auto it = impl->shadows.find(const_cast<void*>(root != nullptr ? root : msaa));
     return it != impl->shadows.end() && it->second.valid ? it->second.shadow : nullptr;
 }
 
@@ -5491,8 +5659,11 @@ u64 Scheduler::UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset, boo
     if (stage == ShaderStage::Compute) {
         impl->ComputeBuffer(buffer, write);
         impl->LogComputeBind(ComputeBind::Kind::UseBuffer, 0, buffer, offset, write);
-    } else if (write && impl->render != nil) {
-        impl->NoteInOrderWrite(buffer);
+    } else if (impl->render != nil) {
+        impl->NoteActiveBuffer(buffer);
+        if (write) {
+            impl->NoteInOrderWrite(buffer);
+        }
     }
     const id<MTLBuffer> __unsafe_unretained metal_buffer = UnretainedBuffer(buffer);
     const MTLResourceUsage usage =
@@ -5665,13 +5836,13 @@ u64 Scheduler::UseTexture(ShaderStage stage, TextureHandle texture, bool write, 
                 : stage == ShaderStage::Fragment ? MTLRenderStageFragment
                 : stage == ShaderStage::Object   ? MTLRenderStageObject
                                                  : MTLRenderStageMesh;
-            [r_enc useResource:metal_texture usage:usage stages:stages];
+            UseTextureResources(r_enc, metal_texture, usage, stages, on_buffer);
         }
         break;
     case ShaderStage::Compute:
         if (const id<MTLComputeCommandEncoder> __unsafe_unretained c_enc = impl->active_compute;
             c_enc != nil) {
-            [c_enc useResource:metal_texture usage:usage];
+            UseTextureResources(c_enc, metal_texture, usage, on_buffer);
         }
         break;
     }
@@ -5734,6 +5905,7 @@ void Scheduler::DrawIndirect(u32 primitive, BufferHandle buffer, u64 offset) {
     if (r_enc == nil || buffer == nullptr) {
         return;
     }
+    impl->NoteActiveBuffer(buffer);
     [r_enc drawPrimitives:static_cast<MTLPrimitiveType>(primitive)
            indirectBuffer:UnretainedBuffer(buffer)
      indirectBufferOffset:offset];
@@ -5746,6 +5918,8 @@ void Scheduler::DrawIndexedIndirect(u32 primitive, u32 index_size, BufferHandle 
     if (r_enc == nil || buffer == nullptr || index_buffer == nullptr) {
         return;
     }
+    impl->NoteActiveBuffer(index_buffer);
+    impl->NoteActiveBuffer(buffer);
     [r_enc drawIndexedPrimitives:static_cast<MTLPrimitiveType>(primitive)
                        indexType:index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
                      indexBuffer:UnretainedBuffer(index_buffer)
@@ -5816,7 +5990,7 @@ void Scheduler::Dispatch(std::array<u32, 3> groups, std::array<u32, 3> group_siz
         return;
     }
     if (impl->active_hazards != nullptr) {
-        impl->active_hazards->BeforeDispatch(encoder, impl->recorder != nullptr);
+        impl->active_hazards->BeforeDispatch(encoder);
     }
     [encoder dispatchThreadgroups:MTLSizeMake(groups[0], groups[1], groups[2])
             threadsPerThreadgroup:MTLSizeMake(group_size[0], group_size[1], group_size[2])];
@@ -5833,7 +6007,7 @@ void Scheduler::DispatchIndirect(BufferHandle buffer, u64 offset, std::array<u32
         return;
     }
     if (impl->active_hazards != nullptr) {
-        impl->active_hazards->BeforeDispatch(encoder, impl->recorder != nullptr);
+        impl->active_hazards->BeforeDispatch(encoder);
     }
     [encoder dispatchThreadgroupsWithIndirectBuffer:UnretainedBuffer(buffer)
                                indirectBufferOffset:offset
@@ -5852,7 +6026,7 @@ void Scheduler::DispatchStageIn(u32 first, u32 count, u32 first_instance, u32 in
         return;
     }
     if (impl->active_hazards != nullptr) {
-        impl->active_hazards->BeforeDispatch(encoder, impl->recorder != nullptr);
+        impl->active_hazards->BeforeDispatch(encoder);
     }
     [encoder setStageInRegion:MTLRegionMake2D(first, first_instance, count, instances)];
     [encoder dispatchThreads:MTLSizeMake(count, instances, 1)
@@ -5868,6 +6042,7 @@ void Scheduler::SetTessellationFactorBuffer(BufferHandle buffer, u64 offset) {
     if (r_enc == nil || buffer == nullptr) {
         return;
     }
+    impl->NoteActiveBuffer(buffer);
     [r_enc setTessellationFactorBuffer:UnretainedBuffer(buffer) offset:offset instanceStride:0];
 }
 
@@ -5917,6 +6092,7 @@ void Scheduler::DrawMeshThreadgroupsIndirect(BufferHandle buffer, u64 offset, u3
     if (r_enc == nil || buffer == nullptr) {
         return;
     }
+    impl->NoteActiveBuffer(buffer);
     [r_enc drawMeshThreadgroupsWithIndirectBuffer:UnretainedBuffer(buffer)
                              indirectBufferOffset:offset
                       threadsPerObjectThreadgroup:MTLSizeMake((std::max)(object_threads, 1U), 1, 1)
@@ -5931,6 +6107,7 @@ void Scheduler::DrawIndexed(u32 primitive, u32 index_count, u32 index_size,
     if (r_enc == nil || index_count == 0 || instance_count == 0 || index_buffer == nullptr) {
         return;
     }
+    impl->NoteActiveBuffer(index_buffer);
     [r_enc drawIndexedPrimitives:static_cast<MTLPrimitiveType>(primitive)
                       indexCount:index_count
                        indexType:index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
