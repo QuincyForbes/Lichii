@@ -11,6 +11,10 @@
 #include "common/game_settings.h"
 #include "common/settings.h"
 
+#ifdef LoadString
+#undef LoadString
+#endif
+
 namespace Settings {
 
 struct RecommendedSetting {

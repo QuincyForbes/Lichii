@@ -18,6 +18,10 @@
 #include <utility>
 #include "common/common_types.h"
 
+#ifdef LoadString
+#undef LoadString
+#endif
+
 namespace Settings {
 
 enum class Category : u32 {
