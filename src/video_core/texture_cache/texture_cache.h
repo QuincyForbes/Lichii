@@ -5124,13 +5124,10 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     if (!image.info.rescaleable) {
         return false;
     }
-    const u32 max_scaled_extent = [this]() noexcept {
-        if constexpr (requires { runtime.GetMaxScaledExtent(); }) {
-            return runtime.GetMaxScaledExtent();
-        } else {
-            return (std::numeric_limits<u32>::max)();
-        }
-    }();
+    u32 max_scaled_extent = (std::numeric_limits<u32>::max)();
+    if constexpr (requires { runtime.GetMaxScaledExtent(); }) {
+        max_scaled_extent = runtime.GetMaxScaledExtent();
+    }
     // Past the device's limits the scaled image is invalid. Ocarina of Time's 12288x12288
     // sun shadow map is 18432 wide at 1.5x and 24576 at 2x, over AMD's 16384, and drawing
     // into it hangs the GPU (#1885).
@@ -5178,13 +5175,10 @@ void TextureCache<P>::NoteRescaleTrace(ImageBase& image, std::string_view role) 
     } else if (Settings::values.resolution_info.downscale && !info.downscaleable) {
         state = "native: too small to downscale";
     } else if (!ImageCanRescale(image)) {
-        const u32 max_scaled_extent = [this]() noexcept {
-            if constexpr (requires { runtime.GetMaxScaledExtent(); }) {
-                return runtime.GetMaxScaledExtent();
-            } else {
-                return (std::numeric_limits<u32>::max)();
-            }
-        }();
+        u32 max_scaled_extent = (std::numeric_limits<u32>::max)();
+        if constexpr (requires { runtime.GetMaxScaledExtent(); }) {
+            max_scaled_extent = runtime.GetMaxScaledExtent();
+        }
         bool host_limited =
             !ScaledImageFits(info, Settings::values.resolution_info, max_scaled_extent);
         if constexpr (requires { runtime.CanRescaleImage(info); }) {
