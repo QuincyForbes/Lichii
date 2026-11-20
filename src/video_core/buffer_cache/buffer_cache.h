@@ -4727,8 +4727,10 @@ template <class P>
 u64 BufferCache<P>::CurrentUsageSerial() const noexcept {
     if constexpr (requires { runtime.UsageSerial(); }) {
         return runtime.UsageSerial();
-    } else {
+    } else if constexpr (requires { runtime.CurrentTick(); }) {
         return runtime.CurrentTick();
+    } else {
+        return 0;
     }
 }
 
