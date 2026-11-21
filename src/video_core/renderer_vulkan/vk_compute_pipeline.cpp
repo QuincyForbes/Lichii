@@ -925,7 +925,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             GPUVAddr cur = gpu_addr;
             u64 remaining = byte_size;
             while (remaining != 0) {
-                const u64 step = (std::min)(remaining, u64{0x1000} - (cur & 0xfffULL));
+                const u64 step = (std::min<u64>)(remaining, u64{0x1000} - (cur & u64{0xfff}));
                 const auto mapped = gpu_memory.GpuToCpuAddress(cur);
                 if (!mapped) {
                     has_unbounded_access = true;
