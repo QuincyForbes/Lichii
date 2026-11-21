@@ -4,6 +4,10 @@
 #include <cstdlib>
 #include <cstring>
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
+
 #include "video_core/renderer_metal/metal_index_convert.h"
 
 namespace Metal::IndexConvert {
@@ -65,6 +69,62 @@ bool RotatesForProvokingVertex(Topology topology) noexcept {
 
 bool RestartsStrips(Topology topology) noexcept {
     return topology == Topology::TriangleStrip || topology == Topology::LineStrip;
+}
+
+bool HasU16RestartIndex(std::span<const u8> source, u32 count) noexcept {
+    const size_t bytes = size_t{count} * sizeof(u16);
+    if (count == 0 || source.size() < bytes) {
+        return false;
+    }
+    const u8* ptr = source.data();
+    u32 i = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    for (; i + 32 <= count; i += 32, ptr += 64) {
+        const uint16x8_t v0 = vld1q_u16(reinterpret_cast<const uint16_t*>(ptr));
+        const uint16x8_t v1 = vld1q_u16(reinterpret_cast<const uint16_t*>(ptr + 16));
+        const uint16x8_t v2 = vld1q_u16(reinterpret_cast<const uint16_t*>(ptr + 32));
+        const uint16x8_t v3 = vld1q_u16(reinterpret_cast<const uint16_t*>(ptr + 48));
+        const uint16x8_t m01 = vmaxq_u16(v0, v1);
+        const uint16x8_t m23 = vmaxq_u16(v2, v3);
+        if (vmaxvq_u16(vmaxq_u16(m01, m23)) == 0xFFFFU) {
+            return true;
+        }
+    }
+    for (; i + 8 <= count; i += 8, ptr += 16) {
+        if (vmaxvq_u16(vld1q_u16(reinterpret_cast<const uint16_t*>(ptr))) == 0xFFFFU) {
+            return true;
+        }
+    }
+#endif
+    for (; i < count; ++i, ptr += 2) {
+        u16 val;
+        std::memcpy(&val, ptr, sizeof(u16));
+        if (val == 0xFFFFU) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsPrefixInvariant(u32 mode) noexcept {
+    switch (mode) {
+    case 1:
+    case 2:
+    case 3:
+    case 5:
+    case 6:
+    case 8:
+    case 11:
+    case 12:
+    case 13:
+    case 14:
+    case 15:
+    case 16:
+    case 17:
+        return true;
+    default:
+        return false;
+    }
 }
 
 Topology ConvertedTopology(Topology topology, bool provoking_last) noexcept {
@@ -192,21 +252,51 @@ u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 f
         }
         if (!source.empty() && source.size() >= size_t{count} * index_size) {
             const u32 tris = count / 3 * 3;
+            const u8* ptr = source.data();
+            if (index_size == 1) {
+                if (restart) {
+                    for (u32 vertex = 0; vertex < tris; vertex += 3) {
+                        const u8 a = ptr[vertex];
+                        const u8 b = ptr[vertex + 1];
+                        const u8 c = ptr[vertex + 2];
+                        out[written++] = c == 0xFF ? 0xFFFFFFFFU : u32{c};
+                        out[written++] = a == 0xFF ? 0xFFFFFFFFU : u32{a};
+                        out[written++] = b == 0xFF ? 0xFFFFFFFFU : u32{b};
+                    }
+                } else {
+                    for (u32 vertex = 0; vertex < tris; vertex += 3) {
+                        out[written++] = u32{ptr[vertex + 2]};
+                        out[written++] = u32{ptr[vertex]};
+                        out[written++] = u32{ptr[vertex + 1]};
+                    }
+                }
+                return written;
+            }
             if (index_size == 2) {
-                const u8* ptr = source.data();
-                for (u32 vertex = 0; vertex < tris; vertex += 3) {
-                    u16 a, b, c;
-                    std::memcpy(&a, ptr + size_t{vertex} * 2, 2);
-                    std::memcpy(&b, ptr + size_t{vertex + 1} * 2, 2);
-                    std::memcpy(&c, ptr + size_t{vertex + 2} * 2, 2);
-                    out[written++] = restart && c == 0xFFFF ? 0xFFFFFFFFU : u32{c};
-                    out[written++] = restart && a == 0xFFFF ? 0xFFFFFFFFU : u32{a};
-                    out[written++] = restart && b == 0xFFFF ? 0xFFFFFFFFU : u32{b};
+                if (restart) {
+                    for (u32 vertex = 0; vertex < tris; vertex += 3) {
+                        u16 a, b, c;
+                        std::memcpy(&a, ptr + size_t{vertex} * 2, 2);
+                        std::memcpy(&b, ptr + size_t{vertex + 1} * 2, 2);
+                        std::memcpy(&c, ptr + size_t{vertex + 2} * 2, 2);
+                        out[written++] = c == 0xFFFF ? 0xFFFFFFFFU : u32{c};
+                        out[written++] = a == 0xFFFF ? 0xFFFFFFFFU : u32{a};
+                        out[written++] = b == 0xFFFF ? 0xFFFFFFFFU : u32{b};
+                    }
+                } else {
+                    for (u32 vertex = 0; vertex < tris; vertex += 3) {
+                        u16 a, b, c;
+                        std::memcpy(&a, ptr + size_t{vertex} * 2, 2);
+                        std::memcpy(&b, ptr + size_t{vertex + 1} * 2, 2);
+                        std::memcpy(&c, ptr + size_t{vertex + 2} * 2, 2);
+                        out[written++] = u32{c};
+                        out[written++] = u32{a};
+                        out[written++] = u32{b};
+                    }
                 }
                 return written;
             }
             if (index_size == 4) {
-                const u8* ptr = source.data();
                 for (u32 vertex = 0; vertex < tris; vertex += 3) {
                     u32 a, b, c;
                     std::memcpy(&a, ptr + size_t{vertex} * 4, 4);
@@ -226,6 +316,58 @@ u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 f
     case Topology::TriangleStrip: {
         if (!provoking_last) {
             break;
+        }
+        if (!source.empty() && source.size() >= size_t{count} * index_size &&
+            (index_size == 2 || index_size == 4)) {
+            if (count < 3) {
+                return 0;
+            }
+            const u8* const ptr = source.data();
+            const auto read_fast = [&](u32 v) -> u32 {
+                if (index_size == 2) {
+                    u16 raw;
+                    std::memcpy(&raw, ptr + size_t{v} * 2, 2);
+                    return restart && raw == 0xFFFF ? 0xFFFFFFFFU : u32{raw};
+                }
+                u32 raw;
+                std::memcpy(&raw, ptr + size_t{v} * 4, 4);
+                return raw;
+            };
+            u32 v0 = read_fast(0);
+            u32 v1 = read_fast(1);
+            u32 start = 0;
+            if (restart) {
+                if (v0 == 0xFFFFFFFFU) {
+                    start = 1;
+                }
+                if (v1 == 0xFFFFFFFFU) {
+                    start = 2;
+                }
+            }
+            for (u32 vertex = 2; vertex < count; ++vertex) {
+                const u32 v2 = read_fast(vertex);
+                const bool is_restart = restart && v2 == 0xFFFFFFFFU;
+                if (is_restart) {
+                    start = vertex + 1;
+                }
+                const u32 first_vertex = vertex - 2;
+                if (is_restart || vertex < start + 2) {
+                    out[written++] = 0;
+                    out[written++] = 0;
+                    out[written++] = 0;
+                } else if (((first_vertex - start) & 1U) == 0U) {
+                    out[written++] = v2;
+                    out[written++] = v0;
+                    out[written++] = v1;
+                } else {
+                    out[written++] = v2;
+                    out[written++] = v1;
+                    out[written++] = v0;
+                }
+                v0 = v1;
+                v1 = v2;
+            }
+            return written;
         }
         // Triangle i of a strip is i, i+1, i+2 (even) or i+1, i, i+2 (odd), its last vertex i+2,
         // each at slot i. A restart index begins a new strip; the triangles across it are
@@ -272,6 +414,67 @@ u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 f
         }
         return written;
     case Topology::Quads:
+        if (source.empty()) {
+            const u32 quads = count / 4 * 4;
+            if (provoking_last) {
+                for (u32 q = 0; q < quads; q += 4) {
+                    const u32 b = first + q;
+                    out[written++] = b + 2;
+                    out[written++] = b;
+                    out[written++] = b + 1;
+                    out[written++] = b + 3;
+                    out[written++] = b;
+                    out[written++] = b + 2;
+                }
+            } else {
+                for (u32 q = 0; q < quads; q += 4) {
+                    const u32 b = first + q;
+                    out[written++] = b;
+                    out[written++] = b + 1;
+                    out[written++] = b + 2;
+                    out[written++] = b;
+                    out[written++] = b + 2;
+                    out[written++] = b + 3;
+                }
+            }
+            return written;
+        }
+        if (source.size() >= size_t{count} * index_size && (index_size == 2 || index_size == 4)) {
+            const u32 quads = count / 4 * 4;
+            const u8* const ptr = source.data();
+            const auto rd = [&](u32 v) -> u32 {
+                if (index_size == 2) {
+                    u16 raw;
+                    std::memcpy(&raw, ptr + size_t{v} * 2, 2);
+                    return restart && raw == 0xFFFF ? 0xFFFFFFFFU : u32{raw};
+                }
+                u32 raw;
+                std::memcpy(&raw, ptr + size_t{v} * 4, 4);
+                return raw;
+            };
+            if (provoking_last) {
+                for (u32 q = 0; q < quads; q += 4) {
+                    const u32 v0 = rd(q), v1 = rd(q + 1), v2 = rd(q + 2), v3 = rd(q + 3);
+                    out[written++] = v2;
+                    out[written++] = v0;
+                    out[written++] = v1;
+                    out[written++] = v3;
+                    out[written++] = v0;
+                    out[written++] = v2;
+                }
+            } else {
+                for (u32 q = 0; q < quads; q += 4) {
+                    const u32 v0 = rd(q), v1 = rd(q + 1), v2 = rd(q + 2), v3 = rd(q + 3);
+                    out[written++] = v0;
+                    out[written++] = v1;
+                    out[written++] = v2;
+                    out[written++] = v0;
+                    out[written++] = v2;
+                    out[written++] = v3;
+                }
+            }
+            return written;
+        }
         for (u32 quad = 0; quad + 4 <= count; quad += 4) {
             triangle(quad, quad + 1, quad + 2);
             triangle(quad, quad + 2, quad + 3);
@@ -353,19 +556,41 @@ u32 Convert(Topology topology, std::span<const u8> source, u32 index_size, u32 f
     default:
         break;
     }
-    if (!source.empty() && source.size() >= size_t{count} * index_size && index_size == 1) {
+    if (!source.empty() && source.size() >= size_t{count} * index_size) {
         const u8* ptr = source.data();
-        if (restart) {
-            for (u32 vertex = 0; vertex < count; ++vertex) {
-                const u8 v = ptr[vertex];
-                out[vertex] = v == 0xFF ? 0xFFFFFFFFU : u32{v};
+        if (index_size == 1) {
+            if (restart) {
+                for (u32 vertex = 0; vertex < count; ++vertex) {
+                    const u8 v = ptr[vertex];
+                    out[vertex] = v == 0xFF ? 0xFFFFFFFFU : u32{v};
+                }
+            } else {
+                for (u32 vertex = 0; vertex < count; ++vertex) {
+                    out[vertex] = u32{ptr[vertex]};
+                }
             }
-        } else {
-            for (u32 vertex = 0; vertex < count; ++vertex) {
-                out[vertex] = u32{ptr[vertex]};
-            }
+            return count;
         }
-        return count;
+        if (index_size == 2) {
+            if (restart) {
+                for (u32 vertex = 0; vertex < count; ++vertex) {
+                    u16 v;
+                    std::memcpy(&v, ptr + size_t{vertex} * 2, 2);
+                    out[vertex] = v == 0xFFFF ? 0xFFFFFFFFU : u32{v};
+                }
+            } else {
+                for (u32 vertex = 0; vertex < count; ++vertex) {
+                    u16 v;
+                    std::memcpy(&v, ptr + size_t{vertex} * 2, 2);
+                    out[vertex] = u32{v};
+                }
+            }
+            return count;
+        }
+        if (index_size == 4) {
+            std::memcpy(out.data(), ptr, size_t{count} * sizeof(u32));
+            return count;
+        }
     }
     for (u32 vertex = 0; vertex < count; ++vertex) {
         emit(vertex);

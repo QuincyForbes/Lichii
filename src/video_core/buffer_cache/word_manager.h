@@ -652,6 +652,30 @@ struct WordManager {
         return true;
     }
 
+    /// True when ChangeRegionState(Type::CPU, true, ...) over [offset, offset + size) is a
+    /// complete no-op on both tracker bits and host page protections.
+    [[nodiscard]] bool IsRangeCpuModifiedNoOp(u64 offset, u64 size) const noexcept {
+        if (size == 0) {
+            return true;
+        }
+        const u64 end = offset + size;
+        for (u64 word = offset / BYTES_PER_WORD; word <= (end - 1) / BYTES_PER_WORD; ++word) {
+            const u64 word_begin = word * BYTES_PER_WORD;
+            const u64 begin = (std::max)(offset, word_begin) - word_begin;
+            const u64 stop = (std::min)(end, word_begin + BYTES_PER_WORD) - word_begin;
+            const u64 first_page = begin / BYTES_PER_PAGE;
+            const u64 last_page = (stop - 1) / BYTES_PER_PAGE;
+            const u64 mask = (~u64{0} >> (63 - (last_page - first_page))) << first_page;
+            if ((heap[num_words * size_t(Type::CPU) + word] &
+                 heap[num_words * size_t(Type::Untracked) + word] &
+                 ~heap[num_words * size_t(Type::HotClean) + word] &
+                 ~heap[num_words * size_t(Type::CachedCPU) + word] & mask) != mask) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /// Recounts the clean words: true when clean_words matches the CPU and Untracked words.
     [[nodiscard]] bool CleanWordsHold() const noexcept {
         const std::span<const u64> cpu_words = Span(Type::CPU);

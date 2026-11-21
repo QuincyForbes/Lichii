@@ -329,6 +329,11 @@ public:
 
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
 
+    /// Lock-free fastpath for GetFlushArea when no live GPU-written bytes remain on the read's
+    /// 4 KiB pages (their fence download already landed in guest memory).
+    [[nodiscard]] std::optional<VideoCore::RasterizerDownloadArea> TryFastGetFlushArea(
+        DAddr device_addr, u64 size);
+
     /// EDEN_NX2_GPU_READ_LAND: a guest read of [device_addr, device_addr + size) lands the fence
     /// downloads in flight over it, up to the newest one that holds bytes of the read, and the
     /// finished ones around it. wait: waits for that download's submission (the thread that
@@ -776,6 +781,7 @@ public:
         u64 last_frame_tick{~u64{0}};
         u64 last_skipped_draw_ticket{~u64{0}}; ///< Profiler only: bank_once_per_frame skips
         u32 initialized_mask{};
+        u32 unchanged_streak{};
         std::array<u8, 0x10000> bytes{};
     };
     std::unordered_map<DAddr, NativeUniformBankShadow> native_indirect_uniform_shadow;
@@ -812,6 +818,7 @@ public:
     /// Named uniform_sync_memo here: uniform_bind_memo below is the EXP18 binding memo.
     std::array<std::array<BindMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES> uniform_sync_memo{};
     std::array<std::array<BindMemo, NUM_STORAGE_BUFFERS>, NUM_STAGES> storage_bind_memo{};
+    std::array<BindMemo, NUM_STORAGE_BUFFERS> compute_storage_bind_memo{};
     u64 bind_memo_mismatches = 0;
 
     static constexpr size_t ResolvedStorageAddrCacheSize = 4096;
@@ -1370,7 +1377,14 @@ private:
     u64 nx2_preflush_drops{};   ///< Blocks dropped since start
     u64 nx2_preflush_remarks{}; ///< Reads of dropped blocks that flushed (stalled) and marked them
 
+    void AddGpuModifiedRange(DAddr addr, u64 size);
+    void SubtractGpuModifiedRange(DAddr addr, u64 size);
+    void NoteFastPreflushRead(DAddr begin, DAddr end) noexcept;
+    void DrainFastPreflushReads();
+
     ReadTrapTracker read_trapped_ranges;
+    DevicePageBitmap live_gpu_modified_pages;
+    std::array<std::atomic<u64>, 256> fast_preflush_reads{};
     /// Ranges the guest CPU read after GPU writes. A read that must flush downloads the GPU
     /// writes in all of them, so the reads that usually follow it find nothing left to flush.
     Common::RangeSet<DAddr> cpu_read_ranges;

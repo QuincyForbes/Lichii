@@ -157,6 +157,18 @@ struct StageProgram {
     bool reducing_failed{};
     Object reducing_library;
     Object reducing_function;
+
+    struct FlatBufferSlot {
+        u32 slot_index{};
+        u32 spill{~0U};
+        bool is_push_constant{};
+    };
+    bool flat_slots_built{};
+    u32 max_buffer_spill{};
+    u32 max_sampler_spill{};
+    std::vector<FlatBufferSlot> flat_buffer_slots;
+    std::vector<u32> flat_texture_slots;
+    std::vector<u32> flat_sampler_slots;
 };
 
 /// A compute kernel of the mesh emulation.

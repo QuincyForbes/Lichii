@@ -208,7 +208,7 @@ enum SettingsCatalog {
     static let essentials = [
         "resolution_setup", "oot_graphics_preset", "oot_resolution", "texture_quality", "upscaler", "scaling_filter",
         "fsr_sharpening_slider", "anti_aliasing", "oot_frame_rate", "mkw_frame_rate", "frame_gen", "frame_gen_type", "frame_gen_multiplier", "use_vsync", "frame_pacing_mode",
-        "use_speed_limit", "speed_limit", "use_docked_mode", "gpu_accuracy", "cpu_accuracy",
+        "use_speed_limit", "speed_limit", "use_docked_mode", "gpu_accuracy", "cpu_backend", "cpu_accuracy",
         "use_asynchronous_shaders", "use_disk_shader_cache", "aspect_ratio", "volume", "audio_muted",
     ]
 

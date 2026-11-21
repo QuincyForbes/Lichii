@@ -1939,7 +1939,7 @@ bool NativeMeshEnabled() {
         if (value == nullptr) {
             value = std::getenv("EDEN_NX2_METAL_NATIVE_MESH");
         }
-        return value != nullptr && value[0] == '1';
+        return value == nullptr || value[0] != '0';
     }();
     return enabled;
 }

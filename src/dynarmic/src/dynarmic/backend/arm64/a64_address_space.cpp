@@ -580,6 +580,42 @@ void A64AddressSpace::OnInvalidateBasicBlock(IR::LocationDescriptor descriptor) 
     }
 }
 
+CodePtr A64AddressSpace::TryFastLookup(IR::LocationDescriptor descriptor) const {
+    if (fast_dispatch_table.empty()) {
+        return nullptr;
+    }
+    const u64 desc_val = descriptor.Value();
+    const u32 byte_offset = HashFastDispatch(desc_val) & fast_dispatch_set_mask;
+    const auto* const set = reinterpret_cast<const FastDispatchEntry*>(
+        reinterpret_cast<const std::byte*>(fast_dispatch_table.data()) + byte_offset);
+    for (std::size_t way = 0; way < fast_dispatch_ways; ++way) {
+        if (set[way].location_descriptor == desc_val) {
+            return const_cast<CodePtr>(static_cast<const std::byte*>(set[way].code_ptr));
+        }
+    }
+    return nullptr;
+}
+
+void A64AddressSpace::RecordFastLookup(IR::LocationDescriptor descriptor, CodePtr code_ptr) {
+    if (fast_dispatch_table.empty() || code_ptr == nullptr) {
+        return;
+    }
+    const u64 desc_val = descriptor.Value();
+    const u32 byte_offset = HashFastDispatch(desc_val) & fast_dispatch_set_mask;
+    auto* const set = reinterpret_cast<FastDispatchEntry*>(
+        reinterpret_cast<std::byte*>(fast_dispatch_table.data()) + byte_offset);
+    for (std::size_t way = 0; way < fast_dispatch_ways; ++way) {
+        if (set[way].location_descriptor == desc_val) {
+            set[way].code_ptr = code_ptr;
+            return;
+        }
+    }
+    for (std::size_t way = fast_dispatch_ways - 1; way > 0; --way) {
+        set[way] = set[way - 1];
+    }
+    set[0] = FastDispatchEntry{desc_val, code_ptr};
+}
+
 void A64AddressSpace::EmitPrelude() {
     using namespace oaknut::util;
 
@@ -637,6 +673,20 @@ void A64AddressSpace::EmitPrelude() {
         prelude_info.page_table_lookup_32 = EmitPageTableLookupThunk(code, emit_conf, 32);
         prelude_info.page_table_lookup_64 = EmitPageTableLookupThunk(code, emit_conf, 64);
         prelude_info.page_table_lookup_128 = EmitPageTableLookupThunk(code, emit_conf, 128);
+        if (emit_conf.untrapped_read_bitmap_ptr != 0 && emit_conf.page_table_marked_bit &&
+            *emit_conf.page_table_marked_bit == 0) {
+            prelude_info.page_table_read_lookup_8 = EmitPageTableLookupThunk(code, emit_conf, 8, true);
+            prelude_info.page_table_read_lookup_16 = EmitPageTableLookupThunk(code, emit_conf, 16, true);
+            prelude_info.page_table_read_lookup_32 = EmitPageTableLookupThunk(code, emit_conf, 32, true);
+            prelude_info.page_table_read_lookup_64 = EmitPageTableLookupThunk(code, emit_conf, 64, true);
+            prelude_info.page_table_read_lookup_128 = EmitPageTableLookupThunk(code, emit_conf, 128, true);
+        } else {
+            prelude_info.page_table_read_lookup_8 = prelude_info.page_table_lookup_8;
+            prelude_info.page_table_read_lookup_16 = prelude_info.page_table_lookup_16;
+            prelude_info.page_table_read_lookup_32 = prelude_info.page_table_lookup_32;
+            prelude_info.page_table_read_lookup_64 = prelude_info.page_table_lookup_64;
+            prelude_info.page_table_read_lookup_128 = prelude_info.page_table_lookup_128;
+        }
     }
 
     oaknut::Label return_from_run_code, return_to_dispatcher_label, rsb_miss;
@@ -845,11 +895,15 @@ void A64AddressSpace::EmitPrelude() {
         code.LDR(Wscratch0, SP, offsetof(StackLayout, save_host_fpcr));
         code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
 
+#if defined(__APPLE__) || defined(__ARM_FEATURE_ATOMICS)
+        code.SWPAL(WZR, W0, Xhalt);
+#else
         oaknut::Label exit_hr_loop;
         code.l(exit_hr_loop);
         code.LDAXR(W0, Xhalt);
         code.STLXR(Wscratch0, WZR, Xhalt);
         code.CBNZ(Wscratch0, exit_hr_loop);
+#endif
 
         ABI_PopRegisters(code, ABI_CALLEE_SAVE | (1 << 30), sizeof(StackLayout));
         code.RET();
@@ -893,6 +947,7 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
         .page_table_log2_stride = conf.page_table_log2_stride,
         .page_table_marked_bit = conf.page_table_marked_bit,
         .page_table_sign_extension = conf.page_table_sign_extension,
+        .untrapped_read_bitmap_ptr = conf.untrapped_read_bitmap_ptr,
         .silently_mirror_page_table = conf.silently_mirror_page_table,
         .absolute_offset_page_table = conf.absolute_offset_page_table,
         .detect_misaligned_access_via_page_table = conf.detect_misaligned_access_via_page_table,

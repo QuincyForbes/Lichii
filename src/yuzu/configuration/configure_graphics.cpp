@@ -352,6 +352,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     std::vector<QWidget*> hold_api;
     QCheckBox* flow_scale_auto_checkbox = nullptr;
     QComboBox* oot_preset_combobox = nullptr;
+    QComboBox* oot_aa_combobox = nullptr;
     QComboBox* frame_gen_motion_combobox = nullptr;
 
     for (const auto setting : Settings::values.linkage.by_category[Settings::Category::Renderer]) {
@@ -440,6 +441,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             oot_resolution_combobox = widget->combobox;
         } else if (setting->Id() == Settings::values.oot_graphics_preset.Id()) {
             oot_preset_combobox = widget->combobox;
+        } else if (setting->Id() == Settings::values.oot_anti_aliasing.Id()) {
+            oot_aa_combobox = widget->combobox;
         } else if (setting->Id() == Settings::values.texture_quality.Id()) {
             texture_quality_combobox = widget->combobox;
         }
@@ -680,7 +683,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             }
         };
         QComboBox* const preset_box = oot_preset_combobox;
-        connect(preset_box, &QComboBox::activated, this, [this, pick, preset_box](int index) {
+        QComboBox* const aa_box = oot_aa_combobox;
+        connect(preset_box, &QComboBox::activated, this, [this, pick, preset_box, aa_box](int index) {
             const auto companions = Settings::OotGraphicsPresetCompanions(
                 static_cast<Settings::OotGraphicsPreset>(preset_box->itemData(index).toUInt()));
             if (companions.resolution) {
@@ -688,6 +692,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             }
             if (!Settings::IsConfiguringGlobal() && companions.textures) {
                 pick(texture_quality_combobox, static_cast<u32>(*companions.textures));
+            }
+            if (companions.sharpening) {
+                pick(aa_box, static_cast<u32>(*companions.sharpening));
             }
             UpdateFeatureAvailability();
         });

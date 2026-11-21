@@ -31,6 +31,7 @@
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/render_trace.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 
@@ -2700,9 +2701,13 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
     const VkImage src_image = src.ImageHandle();
     const VkImageSubresourceLayers dst_layers = MakeSubresourceLayers(&dst);
     const VkImageSubresourceLayers src_layers = MakeSubresourceLayers(&src);
+    // A blit inside one image (a mip chain, say) keeps it in GENERAL: moving the whole image to
+    // TRANSFER_DST_OPTIMAL would leave the source levels in another layout than the blit reads.
+    const VkImageLayout dst_layout =
+        src_image == dst_image ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([filter, dst_region, src_region, dst_image, src_image, dst_layers, src_layers,
-                      aspect_mask, is_resolve](vk::CommandBuffer cmdbuf) {
+                      aspect_mask, is_resolve, dst_layout](vk::CommandBuffer cmdbuf) {
         const std::array read_barriers{
             VkImageMemoryBarrier{
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2734,7 +2739,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                                  VK_ACCESS_TRANSFER_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
                 .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-                .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .newLayout = dst_layout,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .image = dst_image,
@@ -2757,7 +2762,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
                              VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .oldLayout = dst_layout,
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -2773,14 +2778,13 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
         cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_TRANSFER_BIT,
                        0, nullptr, nullptr, read_barriers);
         if (is_resolve) {
-            cmdbuf.ResolveImage(src_image, VK_IMAGE_LAYOUT_GENERAL, dst_image,
-                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            cmdbuf.ResolveImage(src_image, VK_IMAGE_LAYOUT_GENERAL, dst_image, dst_layout,
                                 MakeImageResolve(dst_region, src_region, dst_layers, src_layers));
         } else {
             const bool is_linear = filter == Fermi2D::Filter::Bilinear;
             const VkFilter vk_filter = is_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
             cmdbuf.BlitImage(
-                src_image, VK_IMAGE_LAYOUT_GENERAL, dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                src_image, VK_IMAGE_LAYOUT_GENERAL, dst_image, dst_layout,
                 MakeImageBlit(dst_region, src_region, dst_layers, src_layers), vk_filter);
         }
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -3999,6 +4003,54 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
 }
 
 void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImageCopy> copies) {
+    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::BeforePassAdaptive) &&
+        info.num_samples == 1 && !True(flags & ImageFlagBits::Rescaled) && original_image) {
+        const u64 tick = scheduler->CurrentTick();
+        const u64 records = scheduler->WorkRecords();
+        const bool was_initialized = std::exchange(initialized, true);
+        if (!was_initialized ||
+            (initial_upload_tick == tick && initial_upload_records == records)) {
+            auto vk_copies = TransformBufferImageCopies(copies, map.offset, aspect_mask);
+            const VkBuffer src_buffer = map.buffer;
+            const VkImage vk_image = *original_image;
+            const VkImageAspectFlags vk_aspect_mask = aspect_mask;
+            scheduler->RecordUploadOnly(
+                [src_buffer, vk_image, vk_aspect_mask, was_initialized,
+                 vk_copies = std::move(vk_copies)](vk::CommandBuffer upload_cmdbuf) {
+                    if (!was_initialized) {
+                        const VkImageMemoryBarrier init_barrier{
+                            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                            .pNext = nullptr,
+                            .srcAccessMask = VK_ACCESS_NONE,
+                            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT |
+                                             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                            .image = vk_image,
+                            .subresourceRange{
+                                .aspectMask = vk_aspect_mask,
+                                .baseMipLevel = 0,
+                                .levelCount = VK_REMAINING_MIP_LEVELS,
+                                .baseArrayLayer = 0,
+                                .layerCount = VK_REMAINING_ARRAY_LAYERS,
+                            },
+                        };
+                        upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                                      VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                                          vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
+                                                      0, init_barrier);
+                    }
+                    CopyBufferToImage(upload_cmdbuf, src_buffer, vk_image, vk_aspect_mask, true,
+                                      vk_copies);
+                });
+            initial_upload_tick = scheduler->CurrentTick();
+            initial_upload_records = scheduler->WorkRecords();
+            return;
+        }
+        initialized = was_initialized;
+    }
     UploadMemory(map.buffer, map.offset, copies);
 }
 
@@ -4321,6 +4373,14 @@ bool Image::InitSparseLayers() {
         s.tile_width *= block_width;
         s.tile_height *= block_height;
     }
+    if (s.tile_width < block_width || s.tile_height < block_height ||
+        u64{s.tile_width / block_width} * (s.tile_height / block_height) * block_bytes != tile) {
+        LOG_WARNING(Render_Vulkan,
+                    "Sparse layered image {:#x}: driver block {}x{} is not a {} byte page; not "
+                    "using sparse layers",
+                    gpu_addr, granularity.width, granularity.height, tile);
+        return false;
+    }
     const u32 tail_lod = (std::min)(it->imageMipTailFirstLod, s.levels);
     VkDeviceSize bytes = 0;
     for (u32 level = 0; level < tail_lod; ++level) {
@@ -4423,6 +4483,8 @@ bool Image::BindZeroBlock() {
     if (s.zero_block == VK_NULL_HANDLE) {
         return false;
     }
+    s.zero_memory = memory;
+    s.zero_offset = offset;
     s.bound_bytes += tile;
     std::vector<VkSparseImageMemoryBind> image_binds;
     for (u32 level = 0; level < s.tail_level; ++level) {
@@ -4579,7 +4641,98 @@ bool Image::BackTilesWhole() {
     // No block reads the shared one any more.
     s.allocator->FreeSparseMemory(s.zero_block);
     s.zero_block = VK_NULL_HANDLE;
+    s.zero_memory = VK_NULL_HANDLE;
+    s.zero_offset = 0;
     s.bound_bytes -= s.requirements.alignment;
+    ClearTiles();
+    return true;
+}
+
+bool Image::ResetTiles() {
+    SparseLayerMemory& s = sparse_layers;
+    if (s.allocator == nullptr || s.zero_block == VK_NULL_HANDLE) {
+        return false;
+    }
+    const Device& device = runtime->device;
+    const u64 tile = s.requirements.alignment;
+    std::vector<VkSparseImageMemoryBind> image_binds;
+    std::vector<VmaAllocation*> released;
+    for (u32 level = 0; level < s.tail_level; ++level) {
+        const u32 width = (std::max)(s.width >> level, 1U);
+        const u32 height = (std::max)(s.height >> level, 1U);
+        const u32 tiles_x = Common::DivCeil(width, s.tile_width);
+        const size_t tiles = size_t{tiles_x} * Common::DivCeil(height, s.tile_height);
+        auto& level_tiles = s.level_tiles[level];
+        if (level_tiles.size() != tiles) {
+            return false; // the zeroed block is only used for single-layer images
+        }
+        for (size_t index = 0; index < tiles; ++index) {
+            if (level_tiles[index] == VK_NULL_HANDLE) {
+                continue;
+            }
+            const u32 x = static_cast<u32>(index % tiles_x) * s.tile_width;
+            const u32 y = static_cast<u32>(index / tiles_x) * s.tile_height;
+            image_binds.push_back(VkSparseImageMemoryBind{
+                .subresource{
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .mipLevel = level,
+                    .arrayLayer = 0,
+                },
+                .offset{static_cast<s32>(x), static_cast<s32>(y), 0},
+                .extent{(std::min)(s.tile_width, width - x), (std::min)(s.tile_height, height - y),
+                        1},
+                .memory = s.zero_memory,
+                .memoryOffset = s.zero_offset,
+                .flags = 0,
+            });
+            released.push_back(&level_tiles[index]);
+        }
+    }
+    if (!image_binds.empty()) {
+        const VkSparseImageMemoryBindInfo image_bind_info{
+            .image = *original_image,
+            .bindCount = static_cast<u32>(image_binds.size()),
+            .pBinds = image_binds.data(),
+        };
+        const VkBindSparseInfo bind_info{
+            .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
+            .pNext = nullptr,
+            .waitSemaphoreCount = 0,
+            .pWaitSemaphores = nullptr,
+            .bufferBindCount = 0,
+            .pBufferBinds = nullptr,
+            .imageOpaqueBindCount = 0,
+            .pImageOpaqueBinds = nullptr,
+            .imageBindCount = 1,
+            .pImageBinds = &image_bind_info,
+            .signalSemaphoreCount = 0,
+            .pSignalSemaphores = nullptr,
+        };
+        vk::Fence fence = device.GetLogical().CreateFence(VkFenceCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+        });
+        // Earlier work may still read the blocks, and sparse binds aren't ordered against command
+        // buffers on the queue: wait for it before rebinding and freeing them.
+        scheduler->Finish();
+        VkResult result;
+        {
+            std::scoped_lock lock{scheduler->submit_mutex};
+            result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
+        }
+        if (result != VK_SUCCESS) {
+            LOG_ERROR(Render_Vulkan, "Sparse tiled image {:#x}: resetting blocks failed ({})",
+                      gpu_addr, static_cast<int>(result));
+            return false;
+        }
+        fence.Wait();
+        for (VmaAllocation* const allocation : released) {
+            s.allocator->FreeSparseMemory(*allocation);
+            *allocation = VK_NULL_HANDLE;
+            s.bound_bytes -= tile;
+        }
+    }
     ClearTiles();
     return true;
 }
@@ -6113,6 +6266,22 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     pending.tick = scheduler.CurrentTick();
     pending.last_use = ++transcode_use_counter;
     pending_transcodes.push_back(std::move(pending));
+
+    // Throttle in-flight decode scratch memory after recording this decode/encode (waiting before
+    // recording would finish the submission owning `map` and let the staging pool reuse it early).
+    static constexpr u64 MaxInFlightTranscodeBytes = u64{512} << 20;
+    u64 in_flight{};
+    for (const PendingTranscode& t : pending_transcodes) {
+        u64 per_layer{};
+        for (u32 level = 0; level < t.levels; ++level) {
+            per_layer += u64{(std::max)(t.width >> level, 1U)} * (std::max)(t.height >> level, 1U) * 4;
+        }
+        in_flight += per_layer * t.layers;
+    }
+    if (pending_transcodes.size() > 1 && in_flight > MaxInFlightTranscodeBytes) {
+        scheduler.Wait(pending_transcodes.back().tick);
+        RecycleFinishedTranscodes();
+    }
 }
 
 void TextureCacheRuntime::TransitionImageLayout(Image& image) {
@@ -6135,6 +6304,14 @@ void TextureCacheRuntime::TransitionImageLayout(Image& image) {
                 .layerCount = VK_REMAINING_ARRAY_LAYERS,
             },
         };
+        if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::BeforePassAdaptive)) {
+            scheduler.RecordUploadOnly([barrier](vk::CommandBuffer upload_cmdbuf) {
+                upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, barrier);
+            });
+            image.NoteInitialTransition(scheduler.CurrentTick(), scheduler.WorkRecords());
+            return;
+        }
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.Record([barrier](vk::CommandBuffer cmdbuf) {
             cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,

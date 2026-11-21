@@ -88,6 +88,13 @@ public:
     u32 GetActiveCount() const;
 
     /**
+     * Get the number of non-skipped voices populated by the most recent SortInfo() call.
+     */
+    u32 GetSortedCount() const {
+        return sorted_count;
+    }
+
+    /**
      * Set the number of active voices.
      * Can be less than or equal to the maximum number of voices.
      *
@@ -121,6 +128,8 @@ private:
     u32 voice_count{};
     /// Number of active voices
     u32 active_count{};
+    /// Number of non-skipped voices populated by SortInfo()
+    u32 sorted_count{};
 };
 
 } // namespace AudioCore::Renderer

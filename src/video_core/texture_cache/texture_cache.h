@@ -1009,7 +1009,7 @@ void TextureCache<P>::TickFrame() {
                     // The device's budget is not all the room there is: Windows charges device
                     // memory to the system's commit limit (HostCriticalMemory). The usage is the
                     // driver's, which still counts images waiting to be freed.
-                    const std::optional<u64> commit_room = Common::GetSystemCommitRoom();
+                    const std::optional<u64> commit_room = Common::GetProcessCommitRoom();
                     const u64 host_critical =
                         commit_room
                             ? HostCriticalMemory(runtime.GetDeviceMemoryUsage(), *commit_room)
@@ -1494,9 +1494,9 @@ void TextureCache<P>::SweepColdImages() {
     constexpr u64 MaxWatchFrames = 600; // then a watched image that never got BadOverlap leaves
     constexpr ImageFlagBits excluded =
         ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
-        ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::Converted |
-        ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding | ImageFlagBits::Remapped |
-        ImageFlagBits::CostlyLoad;
+        ImageFlagBits::SparseTilesUnmapped | ImageFlagBits::UnwrittenSparse |
+        ImageFlagBits::Unbacked | ImageFlagBits::Converted | ImageFlagBits::AsynchronousDecode |
+        ImageFlagBits::IsDecoding | ImageFlagBits::Remapped | ImageFlagBits::CostlyLoad;
     const auto queued = [](ImageId image_id, const auto& downloads) {
         return std::ranges::any_of(downloads, [image_id](const auto& download) {
             return download.is_swizzle && download.object_id == image_id;
@@ -2184,7 +2184,7 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
     // The cached answer holds only for the same views: the bindings serial changes with the
     // texture pool, not with what a draw samples (a draw sampling the depth target after one that
     // didn't reused "no loop" and got no barrier).
-    u64 views_key = 0xcbf29ce484222325ULL ^ views.size();
+    u64 views_key = (0xcbf29ce484222325ULL ^ bindings_epoch) * 0x100000001b3ULL ^ views.size();
     for (const auto& view : views) {
         views_key = (views_key ^ view.id.index) * 0x100000001b3ULL;
     }
@@ -3548,6 +3548,17 @@ void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {
         Image& image = slot_images[id];
+        if constexpr (requires { &Image::ResetTiles; }) {
+            // A Switch 2 game unmapping one tile of a large sparse texture (title 1's 16384x16384
+            // R8 pair, ~160 times a session) deleted the whole image, and re-creating it (a sparse
+            // image bound block by block to a zeroed block, then waited on) stalled ~0.75 s each on
+            // AMD. The image stays; its tiles are brought up to date before its next use.
+            if (True(image.flags & ImageFlagBits::SparseTiles) &&
+                image.SparseTilesShareZeroBlock()) {
+                image.flags |= ImageFlagBits::SparseTilesUnmapped;
+                continue;
+            }
+        }
         if (True(image.flags & ImageFlagBits::Tracked)) {
             UntrackImage(image, id);
         }
@@ -4723,6 +4734,39 @@ void TextureCache<P>::ForEachWrittenRange(Image& image, ImageId image_id, DAddr 
         return;
     }
     func(begin - image.cpu_addr, end - begin);
+}
+
+template <class P>
+void TextureCache<P>::RefreshUnmappedSparseTiles(Image& image, ImageId image_id) {
+    image.flags &= ~ImageFlagBits::SparseTilesUnmapped;
+    if constexpr (requires { &Image::ResetTiles; }) {
+        // Its views of guest memory are made again from the mappings now, its blocks go back to
+        // the zeroed one, and every tile mapped now is loaded: what a new image would get.
+        const bool tracked = True(image.flags & ImageFlagBits::Tracked);
+        if (tracked) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        total_used_memory -= (std::min)(total_used_memory, ImageMemoryBytes(image));
+        if (!image.ResetTiles()) {
+            LOG_WARNING(HW_GPU, "Sparse tiled image {:#x}: could not reset its blocks",
+                        image.gpu_addr);
+            image.flags |= ImageFlagBits::SparseTilesUnmapped;
+        }
+        RegisterImage(image_id);
+        if (tracked) {
+            TrackImage(image, image_id);
+        }
+        image.dirty_ranges.clear();
+        image.flags |= ImageFlagBits::CpuModified;
+        ++sparse_tiles_refreshed;
+        static u32 logged{};
+        if (logged++ < 16 || (sparse_tiles_refreshed & 63) == 0) {
+            LOG_INFO(HW_GPU,
+                     "Sparse tiled image {:#x}: tiles unmapped, reloaded in place ({} so far)",
+                     image.gpu_addr, sparse_tiles_refreshed);
+        }
+    }
 }
 
 template <class P>
@@ -6792,8 +6836,14 @@ void TextureCache<P>::ForEachSparseSegment(ImageBase& image, Func&& func) {
     constexpr bool RETURNS_BOOL = std::is_same_v<FuncReturn, bool>;
     const auto segments = gpu_memory->GetSubmappedRange(image.gpu_addr, image.guest_size_bytes);
     for (const auto& [gpu_addr, size] : segments) {
-        std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
-        ASSERT(cpu_addr);
+        const std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+        if (!cpu_addr) {
+            LOG_WARNING(HW_GPU,
+                        "Sparse image {:#x} ({:#x} bytes) has segment {:#x}+{:#x} that no longer "
+                        "translates; skipping segment",
+                        image.gpu_addr, image.guest_size_bytes, gpu_addr, size);
+            continue;
+        }
         if constexpr (RETURNS_BOOL) {
             if (func(gpu_addr, *cpu_addr, size)) {
                 break;
@@ -7720,6 +7770,9 @@ template <class P>
 void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate,
                                    bool skip_cross_frame_guard) {
     Image& image = slot_images[image_id];
+    if (True(image.flags & ImageFlagBits::SparseTilesUnmapped)) [[unlikely]] {
+        RefreshUnmappedSparseTiles(image, image_id);
+    }
     CheckCrossFrameUse(image, is_modification, invalidate, skip_cross_frame_guard);
     if (!tombstone_born.empty()) {
         CheckTombstonePrepare(image_id, image, is_modification, invalidate); // EXP43=4

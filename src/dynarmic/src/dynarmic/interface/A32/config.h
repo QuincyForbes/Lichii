@@ -177,6 +177,10 @@ struct UserConfig {
     /// Useful for compacting bits into the page table and should be used as part of `page_table_pointer_mask`.
     std::optional<std::uint8_t> page_table_sign_extension = std::nullopt;
 
+    /// Optional pointer to an atomic uintptr_t state word for page-table reads of marked
+    /// RasterizerCachedMemory entries (see A64::UserConfig::untrapped_read_bitmap_ptr).
+    std::uintptr_t untrapped_read_bitmap_ptr = 0;
+
     /// Select the architecture version to use.
     /// There are minor behavioural differences between versions.
     ArchVersion arch_version = ArchVersion::v8;

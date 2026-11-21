@@ -46,6 +46,9 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
+#ifdef HAS_HYPERVISOR
+#include "core/arm/hypervisor/hv_vm.h"
+#endif
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
@@ -173,6 +176,34 @@ struct Memory::Impl {
 #else
         host_buffer = std::addressof(system.DeviceMemory().buffer);
 #endif
+
+#ifdef HAS_HYPERVISOR
+        if (process.IsApplication()) {
+            hv_vm = nullptr;
+            if (Settings::IsHypervisorEnabled()) {
+                hv_vm = HvVm::Create(system);
+                if (hv_vm != nullptr) {
+                    // Hypervisor translates through its own 4K stage-1 guest tables; skip host
+                    // mach_vm_protect calls on the unused Dynarmic fastmem arena.
+                    current_page_table->fastmem_arena = nullptr;
+                } else {
+                    LOG_WARNING(HW_Memory, "Hypervisor unavailable, falling back to Dynarmic");
+                }
+            }
+            if (hv_vm == nullptr) {
+                HvVm::Deactivate();
+            }
+        }
+#endif
+        RefreshJitReadTrapState();
+    }
+
+    bool HasHypervisor() const noexcept {
+#ifdef HAS_HYPERVISOR
+        return hv_vm != nullptr;
+#else
+        return false;
+#endif
     }
 
     void MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
@@ -188,6 +219,11 @@ struct Memory::Impl {
         if (current_page_table->fastmem_arena) {
             host_buffer->Map(GetInteger(base), GetInteger(target) - DramMemoryMap::Base, size, perms, separate_heap);
         }
+#ifdef HAS_HYPERVISOR
+        if (hv_vm) {
+            hv_vm->Map(GetInteger(base), GetInteger(target) - DramMemoryMap::Base, size, perms);
+        }
+#endif
     }
 
     void UnmapRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
@@ -200,6 +236,11 @@ struct Memory::Impl {
         if (current_page_table->fastmem_arena) {
             host_buffer->Unmap(GetInteger(base), size, separate_heap);
         }
+#ifdef HAS_HYPERVISOR
+        if (hv_vm) {
+            hv_vm->Unmap(GetInteger(base), size);
+        }
+#endif
     }
 
     void ProtectRegion(Common::PageTable& page_table, VAddr vaddr, u64 size,
@@ -208,9 +249,20 @@ struct Memory::Impl {
         ASSERT_MSG((vaddr & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", vaddr);
         static_cast<void>(page_table);
 
-        if (!current_page_table->fastmem_arena) {
+        if (!current_page_table->fastmem_arena && !HasHypervisor()) {
             return;
         }
+
+        const auto protect = [&](u64 begin, u64 bytes) {
+            if (current_page_table->fastmem_arena) {
+                host_buffer->Protect(begin, bytes, perms);
+            }
+#ifdef HAS_HYPERVISOR
+            if (hv_vm) {
+                hv_vm->Protect(begin, bytes, perms);
+            }
+#endif
+        };
 
         u64 protect_bytes = 0;
         u64 protect_begin = 0;
@@ -221,7 +273,7 @@ struct Memory::Impl {
             switch (page_type) {
             case Common::PageType::RasterizerCachedMemory:
                 if (protect_bytes > 0) {
-                    host_buffer->Protect(protect_begin, protect_bytes, perms);
+                    protect(protect_begin, protect_bytes);
                     protect_bytes = 0;
                 }
                 break;
@@ -235,16 +287,24 @@ struct Memory::Impl {
         }
 
         if (protect_bytes > 0) {
-            host_buffer->Protect(protect_begin, protect_bytes, perms);
+            protect(protect_begin, protect_bytes);
         }
     }
+
+    struct u128_le {
+        u64_le lo;
+        u64_le hi;
+        constexpr explicit operator u64() const noexcept {
+            return lo;
+        }
+    };
 
     u8 Read8(const Common::ProcessAddress addr) {
         return Read<u8>(addr);
     }
 
     u16 Read16(const Common::ProcessAddress addr) {
-        if ((addr & 1) == 0) {
+        if ((GetInteger(addr) & YUZU_PAGEMASK) + sizeof(u16) <= YUZU_PAGESIZE) {
             return Read<u16_le>(addr);
         } else {
             const u32 a{Read<u8>(addr)};
@@ -254,7 +314,7 @@ struct Memory::Impl {
     }
 
     u32 Read32(const Common::ProcessAddress addr) {
-        if ((addr & 3) == 0) {
+        if ((GetInteger(addr) & YUZU_PAGEMASK) + sizeof(u32) <= YUZU_PAGESIZE) {
             return Read<u32_le>(addr);
         } else {
             const u32 a{Read16(addr)};
@@ -282,7 +342,7 @@ struct Memory::Impl {
     }
 
     u64 Read64(const Common::ProcessAddress addr) {
-        if ((addr & 7) == 0) {
+        if ((GetInteger(addr) & YUZU_PAGEMASK) + sizeof(u64) <= YUZU_PAGESIZE) {
             return Read<u64_le>(addr);
         } else {
             const u32 a{Read32(addr)};
@@ -291,12 +351,20 @@ struct Memory::Impl {
         }
     }
 
+    u128 Read128(const Common::ProcessAddress addr) {
+        if ((GetInteger(addr) & YUZU_PAGEMASK) + sizeof(u128_le) <= YUZU_PAGESIZE) {
+            const u128_le val = Read<u128_le>(addr);
+            return {val.lo, val.hi};
+        }
+        return {Read64(addr), Read64(addr + sizeof(u64))};
+    }
+
     void Write8(const Common::ProcessAddress addr, const u8 data) {
         Write<u8>(addr, data);
     }
 
     void Write16(const Common::ProcessAddress addr, const u16 data) {
-        if ((addr & 1) == 0) {
+        if ((GetInteger(addr) & YUZU_PAGEMASK) + sizeof(u16) <= YUZU_PAGESIZE) {
             Write<u16_le>(addr, data);
         } else {
             Write<u8>(addr, static_cast<u8>(data));
@@ -305,7 +373,7 @@ struct Memory::Impl {
     }
 
     void Write32(const Common::ProcessAddress addr, const u32 data) {
-        if ((addr & 3) == 0) {
+        if ((GetInteger(addr) & YUZU_PAGEMASK) + sizeof(u32) <= YUZU_PAGESIZE) {
             Write<u32_le>(addr, data);
         } else {
             Write16(addr, static_cast<u16>(data));
@@ -314,11 +382,20 @@ struct Memory::Impl {
     }
 
     void Write64(const Common::ProcessAddress addr, const u64 data) {
-        if ((addr & 7) == 0) {
+        if ((GetInteger(addr) & YUZU_PAGEMASK) + sizeof(u64) <= YUZU_PAGESIZE) {
             Write<u64_le>(addr, data);
         } else {
             Write32(addr, static_cast<u32>(data));
             Write32(addr + sizeof(u32), static_cast<u32>(data >> 32));
+        }
+    }
+
+    void Write128(const Common::ProcessAddress addr, const u128 data) {
+        if ((GetInteger(addr) & YUZU_PAGEMASK) + sizeof(u128_le) <= YUZU_PAGESIZE) {
+            Write<u128_le>(addr, u128_le{data[0], data[1]});
+        } else {
+            Write64(addr, data[0]);
+            Write64(addr + sizeof(u64), data[1]);
         }
     }
 
@@ -738,7 +815,7 @@ struct Memory::Impl {
             stats->Note(vaddr, size, cached);
         }
 
-        if (current_page_table->fastmem_arena) {
+        if (current_page_table->fastmem_arena || HasHypervisor()) {
             Common::MemoryPermission perm{};
             // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
             // them a CPU read of GPU-written memory can see stale data.
@@ -762,7 +839,14 @@ struct Memory::Impl {
             const auto stats_start = stats_enabled || spikes
                                          ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
-            host_buffer->Protect(vaddr, size, perm);
+            if (current_page_table->fastmem_arena) {
+                host_buffer->Protect(vaddr, size, perm);
+            }
+#ifdef HAS_HYPERVISOR
+            if (hv_vm) {
+                hv_vm->ProtectAccess(vaddr, size, perm);
+            }
+#endif
             if (spikes) {
                 VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::ProtectChange,
                                              std::chrono::steady_clock::now() - stats_start,
@@ -872,25 +956,58 @@ struct Memory::Impl {
             const char* value = std::getenv("EDEN_NX2_READ_TRAPS");
             return value != nullptr && value[0] == '0';
         }();
-        return !disabled && current_page_table->fastmem_arena &&
+        return !disabled && (current_page_table->fastmem_arena || HasHypervisor()) &&
                !Settings::values.use_reactive_flushing.GetValue() &&
-               Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
+               Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce &&
+               !Settings::IsCachedInterpreterEnabled();
+    }
+
+    void RefreshJitReadTrapState() noexcept {
+        if (current_page_table == nullptr || !ReadTrapsEnabled()) {
+            jit_read_trap_state.store(0, std::memory_order_release);
+            return;
+        }
+        const auto* const bits = armed_trap_pages.words.load(std::memory_order_acquire);
+        jit_read_trap_state.store(bits != nullptr ? reinterpret_cast<std::uintptr_t>(bits)
+                                                  : std::uintptr_t{1},
+                                  std::memory_order_release);
+    }
+
+    void ProtectReadTrapPages(u64 vaddr, u64 size, Common::MemoryPermission perm) {
+        if (current_page_table->fastmem_arena) {
+            host_buffer->Protect(vaddr, size, perm);
+        }
+#ifdef HAS_HYPERVISOR
+        if (hv_vm) {
+            hv_vm->ProtectAccess(vaddr, size, perm);
+        }
+#endif
     }
 
     void RasterizerArmReadTraps(u64 vaddr, u64 size) {
         read_trap_generation.fetch_add(1, std::memory_order_release);
-        if (vaddr == 0 || size == 0 || !AddressSpaceContains(*current_page_table, vaddr, size) ||
-            !ReadTrapsEnabled()) {
+        if (vaddr == 0 || size == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
+            return;
+        }
+        if (!ReadTrapsEnabled()) {
+            jit_read_trap_state.store(0, std::memory_order_release);
             return;
         }
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
         std::scoped_lock lk{read_trap_mutex};
+        if (armed_trap_pages.words.load(std::memory_order_relaxed) == nullptr) {
+            auto* const bits = armed_trap_pages.Words();
+            jit_read_trap_state.store(reinterpret_cast<std::uintptr_t>(bits),
+                                      std::memory_order_release);
+        } else if (jit_read_trap_state.load(std::memory_order_relaxed) <= 1) {
+            RefreshJitReadTrapState();
+        }
         u64 run_begin = 0;
         u64 run_pages = 0;
         const auto protect_run = [&] {
             if (run_pages > 0) {
                 read_trap_generation.fetch_add(1, std::memory_order_release);
-                host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
+                ProtectReadTrapPages(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
                                      Common::MemoryPermission{});
                 run_pages = 0;
             }
@@ -935,7 +1052,7 @@ struct Memory::Impl {
                 ++run_pages;
             } else {
                 if (run_pages > 0) {
-                    host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
+                    ProtectReadTrapPages(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
                                          Common::MemoryPermission{});
                 }
                 run_begin = *it;
@@ -943,7 +1060,7 @@ struct Memory::Impl {
             }
         }
         if (run_pages > 0) {
-            host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
+            ProtectReadTrapPages(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
                                  Common::MemoryPermission{});
         }
     }
@@ -959,7 +1076,7 @@ struct Memory::Impl {
         auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
         while (it != armed_read_traps.end() && *it < page_end) {
             // Still cached (this read came through the rasterizer path): writes stay trapped.
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
+            ProtectReadTrapPages(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
                                  Common::MemoryPermission::Read);
             armed_trap_pages.Clear(*it);
             it = armed_read_traps.erase(it);
@@ -1234,7 +1351,9 @@ struct Memory::Impl {
     }
 
     void HandleRasterizerWrite(VAddr v_address, size_t size, const u8* known_pointer = nullptr) {
-        VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::CpuWriteSlowPath, {}, size);
+        if (VideoCommon::Nx2Spikes::Counting()) {
+            VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::CpuWriteSlowPath, {}, size);
+        }
         const bool fast = TrapFastpathEnabled();
         const u8* const p = fast && known_pointer != nullptr
                                 ? known_pointer
@@ -1243,18 +1362,14 @@ struct Memory::Impl {
         const std::pair<size_t, bool> slot = WriteSlot();
         const size_t core = slot.first;
         const bool shared = slot.second;
-        if (!gpu_device_memory) [[unlikely]] {
+        if (!gpu_device_memory) {
             gpu_device_memory = &system.Host1x().MemoryManager();
         }
-        if (!gpu_device_memory->IsPhysicalPointer(p)) [[unlikely]] {
-            ReportForeignPointer(v_address, p);
-            return;
-        }
-        if (shared) [[unlikely]] {
+        if (shared) {
             sys_core_guard.lock();
         }
         SCOPE_EXIT {
-            if (shared) [[unlikely]] {
+            if (shared) {
                 sys_core_guard.unlock();
             }
         };
@@ -1274,11 +1389,24 @@ struct Memory::Impl {
             }
             VideoCommon::Nx2Hazard::NoteGuestWrite(address, size);
             gpu_dirty_managers[core].Collect(address, size);
-            // A download writing to guest memory here may have looked at the collected writes
-            // before this one: its bytes would land over the ones stored after this returns.
             VideoCore::DownloadLanding::Await(address, size);
             g_collected_write_pages.Mark(address, size);
         };
+        if (fast) {
+            auto& translation = write_translations[core];
+            const uintptr_t host_address = reinterpret_cast<uintptr_t>(p);
+            const uintptr_t host_page = host_address >> YUZU_PAGEBITS;
+            const u64 mapping_generation = gpu_device_memory->MappingGeneration();
+            if (translation.host_page == host_page && translation.generation == mapping_generation) {
+                on_device_address((DAddr{translation.device_page} << YUZU_PAGEBITS) |
+                                  DAddr{host_address & YUZU_PAGEMASK});
+                return;
+            }
+        }
+        if (!gpu_device_memory->IsPhysicalPointer(p)) {
+            ReportForeignPointer(v_address, p);
+            return;
+        }
         if (!fast) {
             gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], on_device_address);
             return;
@@ -1287,12 +1415,6 @@ struct Memory::Impl {
         const uintptr_t host_address = reinterpret_cast<uintptr_t>(p);
         const uintptr_t host_page = host_address >> YUZU_PAGEBITS;
         const u64 mapping_generation = gpu_device_memory->MappingGeneration();
-        if (translation.host_page == host_page && translation.generation == mapping_generation)
-            [[likely]] {
-            on_device_address((DAddr{translation.device_page} << YUZU_PAGEBITS) |
-                              DAddr{host_address & YUZU_PAGEMASK});
-            return;
-        }
         u32 count = 0;
         DAddr last_address = 0;
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
@@ -1437,6 +1559,9 @@ struct Memory::Impl {
     std::array<ReadAreaCache, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> read_area_generations{};
     std::atomic<u64> read_trap_generation{};
+    std::atomic<u64> fast_read_generation{1};
+    std::atomic<u64> fast_write_generation{1};
+    std::atomic<std::uintptr_t> jit_read_trap_state{0};
     ArmedTrapBitmap armed_trap_pages{};
     std::set<u64> armed_read_traps;
     std::atomic<size_t> armed_read_trap_count{};
@@ -1446,6 +1571,9 @@ struct Memory::Impl {
     std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES + 1> scratch_buffers{};
     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;
     std::mutex sys_core_guard;
+#ifdef HAS_HYPERVISOR
+    HvVm* hv_vm{};
+#endif
 #ifdef __ANDROID__
     std::optional<Common::HeapTracker> heap_tracker;
     Common::HeapTracker* host_buffer{};
@@ -1467,20 +1595,29 @@ Memory::~Memory() = default;
 
 void Memory::Reset() {
     impl = std::make_unique<Impl>(system);
+    fast_read_gen_ptr = &impl->fast_read_generation;
+    fast_write_gen_ptr = &impl->fast_write_generation;
+    jit_read_trap_state_ptr = &impl->jit_read_trap_state;
 }
 
 void Memory::SetCurrentPageTable(Kernel::KProcess& process) {
+    impl->fast_read_generation.fetch_add(1, std::memory_order_release);
+    impl->fast_write_generation.fetch_add(1, std::memory_order_release);
     impl->SetCurrentPageTable(process);
 }
 
 void Memory::MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
                              Common::PhysicalAddress target, Common::MemoryPermission perms,
                              bool separate_heap) {
+    impl->fast_read_generation.fetch_add(1, std::memory_order_release);
+    impl->fast_write_generation.fetch_add(1, std::memory_order_release);
     impl->MapMemoryRegion(page_table, base, size, target, perms, separate_heap);
 }
 
 void Memory::UnmapRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
                          bool separate_heap) {
+    impl->fast_read_generation.fetch_add(1, std::memory_order_release);
+    impl->fast_write_generation.fetch_add(1, std::memory_order_release);
     impl->UnmapRegion(page_table, base, size, separate_heap);
 }
 
@@ -1548,6 +1685,10 @@ u64 Memory::Read64(const Common::ProcessAddress addr) {
     return impl->Read64(addr);
 }
 
+u128 Memory::Read128(const Common::ProcessAddress addr) {
+    return impl->Read128(addr);
+}
+
 void Memory::Write8(Common::ProcessAddress addr, u8 data) {
     impl->Write8(addr, data);
 }
@@ -1562,6 +1703,10 @@ void Memory::Write32(Common::ProcessAddress addr, u32 data) {
 
 void Memory::Write64(Common::ProcessAddress addr, u64 data) {
     impl->Write64(addr, data);
+}
+
+void Memory::Write128(Common::ProcessAddress addr, u128 data) {
+    impl->Write128(addr, data);
 }
 
 bool Memory::WriteExclusive8(Common::ProcessAddress addr, u8 data, u8 expected) {
@@ -1650,15 +1795,140 @@ Result Memory::FlushDataCache(Common::ProcessAddress dest_addr, const std::size_
 }
 
 void Memory::RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, bool cached) {
+    impl->fast_write_generation.fetch_add(1, std::memory_order_release);
+    if (cached && !impl->ReadTrapsEnabled()) {
+        impl->fast_read_generation.fetch_add(1, std::memory_order_release);
+    }
+    impl->RefreshJitReadTrapState();
     impl->RasterizerMarkRegionCached(GetInteger(vaddr), size, cached);
 }
 
 void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
+    impl->fast_read_generation.fetch_add(1, std::memory_order_release);
     impl->RasterizerArmReadTraps(GetInteger(vaddr), size);
 }
 
 void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug) {
+    impl->fast_read_generation.fetch_add(1, std::memory_order_release);
+    impl->fast_write_generation.fetch_add(1, std::memory_order_release);
     impl->MarkRegionDebug(GetInteger(vaddr), size, debug);
+}
+
+bool Memory::TryCollectHotWrite(const std::size_t core_index, const u64 offset,
+                                const std::size_t size, const HotWritePage& hot) noexcept {
+    if (impl->fast_write_generation.load(std::memory_order_acquire) != hot.mem_gen) {
+        return false;
+    }
+    const auto* const dev_mem = impl->gpu_device_memory;
+    if (dev_mem == nullptr || dev_mem->MappingGeneration() != hot.map_gen ||
+        Core::g_write_answer_epoch.load(std::memory_order_relaxed) != hot.answer_epoch) {
+        return false;
+    }
+    const DAddr daddr = hot.daddr_page | offset;
+    VideoCommon::Nx2Hazard::NoteGuestWrite(daddr, size);
+    impl->gpu_dirty_managers[core_index].Collect(daddr, size);
+    VideoCore::DownloadLanding::Await(daddr, size);
+    Core::g_collected_write_pages.Mark(daddr, size);
+    return true;
+}
+
+bool Memory::TryCacheHotWritePage(const std::size_t core_index, const u64 vaddr,
+                                  HotWritePage& out_hot) const noexcept {
+    const Common::PageTable* const table = impl->current_page_table;
+    if (table == nullptr || core_index >= Core::Hardware::NUM_CPU_CORES || !SysSlotEnabled() ||
+        impl->gpu_dirty_managers.size() <= Core::Hardware::NUM_CPU_CORES ||
+        VideoCommon::Nx2Spikes::Counting()) {
+        out_hot.vaddr_page = ~u64{0};
+        return false;
+    }
+    const u64 page_vaddr = (vaddr & 0xffffffffffffULL) & ~u64{YUZU_PAGEMASK};
+    if (!AddressSpaceContains(*table, page_vaddr, YUZU_PAGESIZE)) {
+        out_hot.vaddr_page = ~u64{0};
+        return false;
+    }
+    const u64 gen = impl->fast_write_generation.load(std::memory_order_acquire);
+    const auto raw = table->entries[page_vaddr >> YUZU_PAGEBITS].Raw();
+    if (const uintptr_t ptr = Common::PageTable::PageEntryData::ExtractPointer(raw); ptr != 0) {
+        if (impl->fast_write_generation.load(std::memory_order_acquire) != gen) {
+            out_hot.vaddr_page = ~u64{0};
+            return false;
+        }
+        out_hot = HotWritePage{
+            .vaddr_page = page_vaddr,
+            .host_page = reinterpret_cast<u8*>(ptr + page_vaddr),
+            .daddr_page = 0,
+            .mem_gen = gen,
+            .map_gen = 0,
+            .answer_epoch = 0,
+            .rasterizer_cached = false,
+        };
+        return true;
+    }
+    if (static_cast<Common::PageType>(raw.type) == Common::PageType::RasterizerCachedMemory &&
+        TrapFastpathEnabled() && impl->gpu_device_memory != nullptr) {
+        const uintptr_t ptr = Common::PageTable::PageEntryData::ExtractPointer(raw, true);
+        if (ptr != 0) {
+            u8* const host_page = reinterpret_cast<u8*>(ptr + page_vaddr);
+            const uintptr_t host_page_idx =
+                reinterpret_cast<uintptr_t>(host_page) >> YUZU_PAGEBITS;
+            const u64 map_gen = impl->gpu_device_memory->MappingGeneration();
+            const auto& tr = impl->write_translations[core_index];
+            const auto& area = impl->rasterizer_write_areas[core_index];
+            const u64 epoch = Core::g_write_answer_epoch.load(std::memory_order_relaxed);
+            if (tr.host_page == host_page_idx && tr.generation == map_gen &&
+                area.last_address == tr.device_page && area.epoch == epoch &&
+                impl->fast_write_generation.load(std::memory_order_acquire) == gen) {
+                out_hot = HotWritePage{
+                    .vaddr_page = page_vaddr,
+                    .host_page = host_page,
+                    .daddr_page = DAddr{tr.device_page} << YUZU_PAGEBITS,
+                    .mem_gen = gen,
+                    .map_gen = map_gen,
+                    .answer_epoch = epoch,
+                    .rasterizer_cached = true,
+                };
+                return true;
+            }
+        }
+    }
+    out_hot.vaddr_page = ~u64{0};
+    return false;
+}
+
+bool Memory::TryCacheCleanReadPage(u64 vaddr, const u8*& out_host_page,
+                                   u64& out_generation) const noexcept {
+    const Common::PageTable* const table = impl->current_page_table;
+    if (table == nullptr) {
+        return false;
+    }
+    const u64 page_vaddr = (vaddr & 0xffffffffffffULL) & ~u64{YUZU_PAGEMASK};
+    if (!AddressSpaceContains(*table, page_vaddr, YUZU_PAGESIZE)) {
+        return false;
+    }
+    const u64 gen = impl->fast_read_generation.load(std::memory_order_acquire);
+    const auto raw = table->entries[page_vaddr >> YUZU_PAGEBITS].Raw();
+    if (const uintptr_t ptr = Common::PageTable::PageEntryData::ExtractPointer(raw); ptr != 0) {
+        if (impl->fast_read_generation.load(std::memory_order_acquire) != gen) {
+            return false;
+        }
+        out_host_page = reinterpret_cast<const u8*>(ptr + page_vaddr);
+        out_generation = gen;
+        return true;
+    }
+    if (static_cast<Common::PageType>(raw.type) == Common::PageType::RasterizerCachedMemory &&
+        impl->ReadTrapsEnabled() && !impl->ReadTrapArmed(page_vaddr, YUZU_PAGESIZE)) {
+        const uintptr_t ptr = Common::PageTable::PageEntryData::ExtractPointer(raw, true);
+        if (ptr != 0 && impl->fast_read_generation.load(std::memory_order_acquire) == gen) {
+            out_host_page = reinterpret_cast<const u8*>(ptr + page_vaddr);
+            out_generation = gen;
+            return true;
+        }
+    }
+    return false;
+}
+
+void Memory::DownloadRasterizerRegion(Common::ProcessAddress vaddr, size_t size) {
+    impl->HandleRasterizerDownload(GetInteger(vaddr), size);
 }
 
 bool Memory::InvalidateNCE(Common::ProcessAddress vaddr, size_t size) {

@@ -22,6 +22,7 @@
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_compute_chain.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -146,6 +147,22 @@ public:
         return count;
     }
 
+    [[nodiscard]] std::span<const ComputeAccessRange> ReadRanges() const noexcept {
+        return read_ranges;
+    }
+    [[nodiscard]] std::span<const ComputeAccessRange> WriteRanges() const noexcept {
+        return write_ranges;
+    }
+    [[nodiscard]] std::span<const VkImage> UnbackedReadImages() const noexcept {
+        return unbacked_read_images;
+    }
+    [[nodiscard]] std::span<const VkImage> UnbackedWriteImages() const noexcept {
+        return unbacked_write_images;
+    }
+    [[nodiscard]] bool HasUnboundedAccess() const noexcept {
+        return has_unbounded_access;
+    }
+
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();
@@ -159,7 +176,12 @@ private:
     u32 num_descriptor_entries{};
     bool has_image_resources{false};
     bool has_rescaling_push_constants{false};
+    bool has_unbounded_access{false};
     boost::container::small_vector<VideoCommon::ImageViewId, 8> written_images;
+    boost::container::small_vector<ComputeAccessRange, 32> read_ranges;
+    boost::container::small_vector<ComputeAccessRange, 16> write_ranges;
+    boost::container::small_vector<VkImage, 8> unbacked_read_images;
+    boost::container::small_vector<VkImage, 4> unbacked_write_images;
     std::vector<SampledImage> sampled_images;
     std::vector<VideoCommon::ImageViewInOut> bound_images;
     boost::container::small_vector<u8, 64> texture_is_storage_ptr;
@@ -175,9 +197,14 @@ private:
     std::vector<u32> binding_kinds; ///< EDEN_NX2_BINDMEMO: per texture/image view, in read order
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
     std::vector<u8> last_descriptor_bytes;
+    VkDeviceSize last_bound_descriptor_offset{~VkDeviceSize{0}};
+    u32 last_bound_descriptor_chunk{~u32{0}};
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};
+    u64 last_descriptor_set_serial{};
+    std::array<u32, 6> last_rescaling_words{};
+    bool has_last_rescaling_words{};
     bool has_last_descriptor_buffer{};
     DescriptorAllocator descriptor_allocator;
     VkPipelineLayout pipeline_layout{}; ///< Owned by the PipelineLayoutCache

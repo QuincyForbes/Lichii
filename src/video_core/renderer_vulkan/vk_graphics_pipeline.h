@@ -114,6 +114,7 @@ struct GraphicsPipelineLibraryParams {
     GraphicsPipelineLibraryCache* library_cache{};
     std::array<u128, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> spirv_hashes{};
     bool libraries_only{};
+    bool use_stage_sets{};
 };
 
 class GraphicsPipeline {
@@ -466,10 +467,13 @@ private:
     DescriptorBufferLayout descriptor_buffer_layout;
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
     std::vector<u8> last_descriptor_bytes;
+    VkDeviceSize last_bound_descriptor_offset{~VkDeviceSize{0}};
+    u32 last_bound_descriptor_chunk{~u32{0}};
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};
     u64 last_descriptor_set_serial{};
+    u64 last_configure_recording_epoch{~u64{0}};
     std::vector<u32> binding_kinds; ///< EDEN_NX2_BINDMEMO: per texture/image view, in read order
 
     Common::ThreadWorker* const worker_thread;

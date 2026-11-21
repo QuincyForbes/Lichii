@@ -72,6 +72,37 @@ TEST_CASE("A64: ADD{V,P}", "[a64]") {
     REQUIRE(jit.GetVector(6) == Vector{0x0000000004040404, 0x0000000000000000});
 }
 
+TEST_CASE("A64: scalar result forwarding preserves lane widths", "[a64]") {
+    A64TestEnv env;
+    A64::UserConfig conf{};
+    conf.callbacks = &env;
+    A64::Jit jit{conf};
+    oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
+    code.FCSEL(S0, S1, S2, EQ);
+    code.FCSEL(S3, S0, S2, EQ);
+    code.FCSEL(D4, D1, D2, NE);
+    code.FCSEL(D5, D1, D4, NE);
+    code.UMOV(W0, V4.S()[1]);
+    code.UMOV(X1, V3.D()[1]);
+    code.UMOV(W2, V4.S()[0]);
+    oaknut::Label end;
+    code.l(end);
+    code.B(end);
+
+    jit.SetPstate(1u << 30);
+    jit.SetVector(1, {0x89abcdef7f812345, ~u64{0}});
+    jit.SetVector(2, {0xfedcba9880000000, ~u64{0}});
+    env.ticks_left = env.code_mem.size();
+    CheckedRun([&] { jit.Run(); });
+    REQUIRE(jit.GetVector(3) == Vector{0x7f812345, 0});
+    REQUIRE(jit.GetVector(4) == Vector{0xfedcba9880000000, 0});
+    REQUIRE(jit.GetVector(5) == Vector{0xfedcba9880000000, 0});
+    REQUIRE(jit.GetRegister(0) == 0xfedcba98);
+    REQUIRE(jit.GetRegister(1) == 0);
+    REQUIRE(jit.GetRegister(2) == 0x80000000);
+    REQUIRE(jit.GetFpsr() == 0);
+}
+
 TEST_CASE("A64: CLZ", "[a64]") {
     A64TestEnv env;
     A64::UserConfig jit_user_config{};

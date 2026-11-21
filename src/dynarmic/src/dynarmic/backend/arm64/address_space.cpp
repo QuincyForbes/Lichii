@@ -43,13 +43,17 @@ namespace Dynarmic::Backend::Arm64 {
 namespace {
 // Blocks are assumed to be smaller than this (as the full-flush check always did).
 constexpr std::size_t kBlockHeadroom = 1024 * 1024;
+// Architectural AArch64 unconditional B / BL range is +/- 128 MiB.
+constexpr std::size_t kMaxArm64CodeCacheSize = 128 * 1024 * 1024;
 
 // Fastmem markers every guest core sees (FastmemManager::Configure).
 struct SharedFastmemMarkers {
     std::shared_mutex mutex;
     ::Common::unordered_set<DoNotFastmemMarker, DoNotFastmemMarkerHash> markers;
     ::Common::unordered_set<IR::LocationDescriptor> blocks;
+    ::Common::unordered_set<IR::LocationDescriptor> load_blocks;
     ::Common::unordered_map<IR::LocationDescriptor, unsigned> faults_per_block;
+    ::Common::unordered_map<IR::LocationDescriptor, unsigned> load_faults_per_block;
     ::Common::unordered_map<DoNotFastmemMarker, unsigned, DoNotFastmemMarkerHash> load_faults;
 };
 
@@ -73,6 +77,14 @@ bool PackedListsOn() {
     return on;
 }
 
+bool EntryCacheOn() {
+    static const bool on = [] {
+        const char* const value = std::getenv("EDEN_NX2_JIT_ENTRY_CACHE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+
 // With shared markers a core kept its own copy of every marker it set, and counted a block's
 // faults by itself (six cores: up to six times the translations before the block gives up
 // fastmem). EDEN_NX2_JIT_FAULT_LOCAL=1 restores that.
@@ -82,45 +94,52 @@ bool LocalFaultMarkersOn() {
 }
 }  // namespace
 
-bool FastmemManager::ShouldFastmem(DoNotFastmemMarker marker) const {
+bool FastmemManager::ShouldFastmem(DoNotFastmemMarker marker, bool is_load) const {
     const IR::LocationDescriptor block = std::get<0>(marker);
-    if (do_not_fastmem.count(marker) != 0 || do_not_fastmem_blocks.count(block) != 0) {
+    const auto& local_blocks = is_load ? do_not_fastmem_load_blocks : do_not_fastmem_blocks;
+    if (do_not_fastmem.count(marker) != 0 || local_blocks.count(block) != 0) {
         return false;
     }
     if (shared_markers) {
         SharedFastmemMarkers& shared = SharedMarkers();
         std::shared_lock lock{shared.mutex};
-        return shared.markers.count(marker) == 0 && shared.blocks.count(block) == 0;
+        const auto& target_blocks = is_load ? shared.load_blocks : shared.blocks;
+        return shared.markers.count(marker) == 0 && target_blocks.count(block) == 0;
     }
     return true;
 }
 
-void FastmemManager::MarkDoNotFastmem(DoNotFastmemMarker marker) {
+void FastmemManager::MarkDoNotFastmem(DoNotFastmemMarker marker, bool is_load) {
     const IR::LocationDescriptor block = std::get<0>(marker);
     if (shared_markers && !LocalFaultMarkersOn()) {
         SharedFastmemMarkers& shared = SharedMarkers();
         std::unique_lock lock{shared.mutex};
+        auto& counts = is_load ? shared.load_faults_per_block : shared.faults_per_block;
+        auto& target_blocks = is_load ? shared.load_blocks : shared.blocks;
         // A marker another core set meanwhile is the same fault, not a second one.
         if (shared.markers.insert(marker).second && faults_per_block_limit != 0 &&
-            ++shared.faults_per_block[block] >= faults_per_block_limit) {
-            shared.blocks.insert(block);
-            shared.faults_per_block.erase(block);
+            ++counts[block] >= faults_per_block_limit) {
+            target_blocks.insert(block);
+            counts.erase(block);
         }
-        ::Common::PerfReport::NoteJitMarkers(shared.markers.size(), shared.blocks.size());
+        ::Common::PerfReport::NoteJitMarkers(shared.markers.size(),
+                                             shared.blocks.size() + shared.load_blocks.size());
         return;
     }
     do_not_fastmem.insert(marker);
-    const bool whole_block = faults_per_block_limit != 0 && ++faults_per_block[block] >= faults_per_block_limit;
+    auto& local_counts = is_load ? load_faults_per_block : faults_per_block;
+    auto& local_blocks = is_load ? do_not_fastmem_load_blocks : do_not_fastmem_blocks;
+    const bool whole_block = faults_per_block_limit != 0 && ++local_counts[block] >= faults_per_block_limit;
     if (whole_block) {
-        do_not_fastmem_blocks.insert(block);
-        faults_per_block.erase(block);
+        local_blocks.insert(block);
+        local_counts.erase(block);
     }
     if (shared_markers) {
         SharedFastmemMarkers& shared = SharedMarkers();
         std::unique_lock lock{shared.mutex};
         shared.markers.insert(marker);
         if (whole_block) {
-            shared.blocks.insert(block);
+            (is_load ? shared.load_blocks : shared.blocks).insert(block);
         }
     }
 }
@@ -145,10 +164,15 @@ bool FastmemManager::LoadFaultRecompiles(DoNotFastmemMarker marker) {
     return true;
 }
 
-AddressSpace::AddressSpace(std::size_t code_cache_size, std::size_t evict_slice, std::size_t processor_id)
+AddressSpace::AddressSpace(std::size_t requested_code_cache_size, std::size_t requested_evict_slice, std::size_t processor_id)
     : ir_block{IR::LocationDescriptor{0}}
-    , code_cache_size(code_cache_size)
-    , evict_slice(evict_slice != 0 && evict_slice + 2 * kBlockHeadroom < code_cache_size ? std::max(evict_slice, kBlockHeadroom) : 0)
+    , code_cache_size((std::min)(requested_code_cache_size, kMaxArm64CodeCacheSize))
+    , evict_slice([&]() -> std::size_t {
+        const std::size_t slice = (requested_code_cache_size > kMaxArm64CodeCacheSize && requested_evict_slice == 0)
+                                      ? code_cache_size / 8
+                                      : requested_evict_slice;
+        return slice != 0 && slice + 2 * kBlockHeadroom < code_cache_size ? (std::max)(slice, kBlockHeadroom) : 0;
+    }())
     , processor_id(processor_id)
     , free_end(code_cache_size)
     , mem(code_cache_size)
@@ -157,7 +181,7 @@ AddressSpace::AddressSpace(std::size_t code_cache_size, std::size_t evict_slice,
     , compact_ranges(!EnvIs("EDEN_NX2_JIT_RANGE_COMPACT", '0'))
     , fastmem_manager(exception_handler)
 {
-    ASSERT(code_cache_size <= 128 * 1024 * 1024 && "code_cache_size > 128 MiB not currently supported");
+    ASSERT(code_cache_size <= kMaxArm64CodeCacheSize && "code_cache_size > 128 MiB not currently supported");
 
     exception_handler.Register(mem, code_cache_size);
     exception_handler.SetFastmemCallback([this](u64 host_pc) {
@@ -213,7 +237,24 @@ bool AddressSpace::BlockReferences::Empty() const {
 }
 
 CodePtr AddressSpace::Get(IR::LocationDescriptor descriptor) {
+    if (EntryCacheOn()) {
+        if (mru_generation == cache_generation && mru_descriptor == descriptor) {
+            return mru_code_ptr;
+        }
+        if (CodePtr fast = TryFastLookup(descriptor)) {
+            mru_descriptor = descriptor;
+            mru_generation = cache_generation;
+            mru_code_ptr = fast;
+            return fast;
+        }
+    }
     if (const auto iter = block_entries.find(descriptor); iter != block_entries.end()) {
+        if (EntryCacheOn()) {
+            mru_descriptor = descriptor;
+            mru_generation = cache_generation;
+            mru_code_ptr = iter->second;
+            RecordFastLookup(descriptor, iter->second);
+        }
         return iter->second;
     }
     return nullptr;
@@ -321,6 +362,8 @@ void AddressSpace::ClearCache() {
     block_infos.clear();
     list_bytes = 0;
     block_references.clear();
+    mru_generation = ~u64{0};
+    mru_code_ptr = nullptr;
     code.set_offset(prelude_info.end_of_prelude);
     free_end = code_cache_size;
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -463,6 +506,10 @@ CodePtr AddressSpace::Emit(IR::Block block) {
     const CodePtr entry_point = block_info.entry_point;
 
     ASSERT(block_entries.insert({block.Location(), entry_point}).second);
+    mru_descriptor = block.Location();
+    mru_generation = cache_generation;
+    mru_code_ptr = entry_point;
+    RecordFastLookup(block.Location(), entry_point);
     ASSERT(reverse_block_entries.empty() || reverse_block_entries.back().first < entry_point);
     reverse_block_entries.emplace_back(entry_point, block.Location());
     Link(block_info);
@@ -674,6 +721,21 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
         case LinkTarget::PageTableLookup128:
             c.BL(prelude_info.page_table_lookup_128);
             break;
+        case LinkTarget::PageTableReadLookup8:
+            c.BL(prelude_info.page_table_read_lookup_8);
+            break;
+        case LinkTarget::PageTableReadLookup16:
+            c.BL(prelude_info.page_table_read_lookup_16);
+            break;
+        case LinkTarget::PageTableReadLookup32:
+            c.BL(prelude_info.page_table_read_lookup_32);
+            break;
+        case LinkTarget::PageTableReadLookup64:
+            c.BL(prelude_info.page_table_read_lookup_64);
+            break;
+        case LinkTarget::PageTableReadLookup128:
+            c.BL(prelude_info.page_table_read_lookup_128);
+            break;
         default:
             UNREACHABLE();
         }
@@ -877,7 +939,7 @@ FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
         }
 
         if (patch->recompile && (!patch->load || fastmem_manager.LoadFaultRecompiles(patch->marker))) {
-            fastmem_manager.MarkDoNotFastmem(patch->marker);
+            fastmem_manager.MarkDoNotFastmem(patch->marker, patch->load);
             InvalidateBasicBlocks({std::get<0>(patch->marker)});
         }
 

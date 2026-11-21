@@ -140,23 +140,24 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
         device_address = device->GetLogical().GetBufferDeviceAddress(*buffer);
     }
     if (device->IsMoltenVK()) {
-        scheduler->RequestOutsideRenderPassOperationContext();
-        scheduler->Record([handle = *buffer, offset = SizeBytes()](vk::CommandBuffer cmdbuf) {
-            static constexpr VkMemoryBarrier ZERO_FILL_BARRIER{
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT,
-            };
-            cmdbuf.FillBuffer(handle, offset, MOLTENVK_BUFFER_TAIL, 0);
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, ZERO_FILL_BARRIER);
-        });
+        scheduler->RecordUploadOnly(
+            [handle = *buffer, offset = SizeBytes()](vk::CommandBuffer upload_cmdbuf) {
+                static constexpr VkMemoryBarrier ZERO_FILL_BARRIER{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                };
+                upload_cmdbuf.FillBuffer(handle, offset, MOLTENVK_BUFFER_TAIL, 0);
+                upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                              ZERO_FILL_BARRIER);
+            });
     }
 }
 
 bool Buffer::IsRegionUsed(u64 offset, u64 size) const noexcept {
-    if (scheduler->CurrentTick() != last_usage_tick) {
+    if (scheduler->CurrentTick() != last_tracked_tick) {
         return false;
     }
     return tracker.IsUsed(offset, size);
@@ -164,11 +165,15 @@ bool Buffer::IsRegionUsed(u64 offset, u64 size) const noexcept {
 
 void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
     const u64 current_tick = scheduler->CurrentTick();
-    if (last_usage_tick != current_tick) {
+    last_usage_tick = current_tick;
+    if (std::exchange(expect_creation_mark, false)) {
+        return;
+    }
+    if (last_tracked_tick != current_tick) {
         tracker.Reset();
+        last_tracked_tick = current_tick;
     }
     tracker.Track(offset, size);
-    last_usage_tick = current_tick;
     if (const u64 serial = scheduler->BeforePassSerial(); serial != last_use_before_pass_serial) {
         pass_tracker.Reset();
         last_use_before_pass_serial = serial;
@@ -518,13 +523,8 @@ u64 BufferCacheRuntime::GetMaxStorageBufferRange() const {
     return device.GetMaxStorageBufferRange();
 }
 
-void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept {
+void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>&) noexcept {
     multi_range_buffers.TickFrame(scheduler);
-    for (auto it = slot_buffers.begin(); it != slot_buffers.end(); it++) {
-        if (scheduler.IsFree(it->LastUsageTick())) {
-            it->ResetUsageTracking();
-        }
-    }
 }
 
 bool BufferCacheRuntime::IsFree(u64 tick) {
@@ -613,7 +613,7 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick, u64 writer) {
         split.Active() && !VideoCommon::GpuSplit::OnBackThread()) {
         split.Publish();
     }
-    if (ListWaitTrace* const trace = ListWaitTrace::Get()) [[unlikely]] {
+    if (ListWaitTrace* const trace = ListWaitTrace::Get()) {
         master.Refresh();
         const u64 known = master.KnownGpuTick();
         const bool unsubmitted = !scheduler.IsSubmitted(tick);
@@ -705,12 +705,13 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
         return false;
     }
     upload_before_pass = false;
+    upload_fits_before_pass = false;
     if (WrittenInTick(buffer.Handle())) {
         // An in-order copy into this buffer is already recorded in this submission: the upload
         // must land after it, not at the submission's start (stale bytes would win).
         return false;
     }
-    if (buffer.LastUsageTick() != scheduler.CurrentTick()) {
+    if (buffer.LastTrackedTick() != scheduler.CurrentTick()) {
         buffer.ResetUsageTracking();
         return true;
     }
@@ -720,12 +721,14 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
         });
     // Used earlier in this submission, but not since the open render pass began: the copy can
     // run between those uses and the pass instead of ending and reopening it.
-    upload_before_pass =
-        !can_use_upload_cmdbuf && scheduler.CanRecordBeforePass() &&
+    upload_fits_before_pass =
+        !can_use_upload_cmdbuf && scheduler.IsRenderPassActive() &&
+        !scheduler.HasDeferredWaitForIdle() &&
         std::ranges::none_of(copies, [&](const VideoCommon::BufferCopy& copy) {
             return buffer.IsRegionUsedSince(scheduler.BeforePassSerial(), copy.dst_offset,
                                             copy.size);
         });
+    upload_before_pass = upload_fits_before_pass && scheduler.CanRecordBeforePass();
     if (!can_use_upload_cmdbuf && UploadInOrderGuardEnabled()) {
         // These copies run in order. Mark every one of them used: a copy of the batch whose own
         // region was unused would otherwise let a later upload of the same bytes be reordered
@@ -762,18 +765,20 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
     boost::container::small_vector<VkBufferCopy, 8> vk_copies(copies.size());
     std::ranges::transform(copies, vk_copies.begin(), MakeBufferCopy);
     if (src_buffer == staging_pool.StreamBuf() && can_reorder_upload) {
-        scheduler.RecordWithUploadBuffer([src_buffer, dst_buffer, vk_copies](
-                                             vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
-            upload_cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
-        });
+        scheduler.RecordUploadOnly(
+            [src_buffer, dst_buffer, vk_copies](vk::CommandBuffer upload_cmdbuf) {
+                upload_cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
+            });
         return;
     }
     if (can_reorder_upload) {
         // Reorderable, but its staging isn't the stream buffer: it runs in order, unmarked.
         NoteTickWrite(dst_buffer);
     }
-    if (std::exchange(upload_before_pass, false) && !can_reorder_upload &&
+    const bool fits_before_pass = std::exchange(upload_fits_before_pass, false);
+    if ((std::exchange(upload_before_pass, false) || can_reorder_upload) &&
         scheduler.CanRecordBeforePass() && !WrittenInOrder(dst_buffer)) {
+        NoteTickWrite(dst_buffer);
         scheduler.RecordBeforePass([src_buffer, dst_buffer, vk_copies, barrier](vk::CommandBuffer cmdbuf) {
             if (barrier) {
                 cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
@@ -785,9 +790,14 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
         });
         return;
     }
+    if ((fits_before_pass || can_reorder_upload) && scheduler.IsRenderPassActive() &&
+        !scheduler.HasDeferredWaitForIdle() && !WrittenInOrder(dst_buffer)) {
+        scheduler.WantSplitBeforeCurrentPass();
+    }
 
     scheduler.RequestOutsideRenderPassKeepClear();
     NoteInOrderWrite(dst_buffer);
+    NoteTickWrite(dst_buffer);
     if (barrier && VideoCore::Nx2Debug::Experiment(62) != 0 &&
         src_buffer == staging_pool.StreamBuf() && !vk_copies.empty()) {
         scheduler.RecordUpload(src_buffer, dst_buffer,
@@ -899,6 +909,7 @@ void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t si
 
     scheduler.RequestOutsideRenderPassKeepClear();
     NoteInOrderWrite(dest_buffer);
+    NoteTickWrite(dest_buffer);
     scheduler.Record([dest_buffer, offset, size, value](vk::CommandBuffer cmdbuf) {
         cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                0, READ_BARRIER);
@@ -906,6 +917,60 @@ void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t si
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
                                0, WRITE_BARRIER);
     });
+}
+
+void BufferCacheRuntime::ClearBuffer(Buffer& dest_buffer, u32 offset, size_t size, u32 value) {
+    const VkBuffer handle = dest_buffer.Handle();
+    if (handle == VK_NULL_HANDLE) {
+        return;
+    }
+    if (!Settings::values.disable_buffer_reorder && offset == 0 &&
+        size == dest_buffer.SizeBytes() && value == 0 &&
+        dest_buffer.LastTrackedTick() != scheduler.CurrentTick() && !WrittenInTick(handle)) {
+        dest_buffer.ExpectCreationMark();
+        scheduler.RecordUploadOnly([handle, size](vk::CommandBuffer upload_cmdbuf) {
+            static constexpr VkMemoryBarrier UPLOAD_FILL_BARRIER{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            };
+            upload_cmdbuf.FillBuffer(handle, 0, size, 0);
+            upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, UPLOAD_FILL_BARRIER);
+        });
+        return;
+    }
+    if (!Settings::values.disable_buffer_reorder && scheduler.IsRenderPassActive() &&
+        !scheduler.HasDeferredWaitForIdle() && !WrittenInOrder(handle) &&
+        !dest_buffer.IsRegionUsedSince(scheduler.BeforePassSerial(), offset, size)) {
+        if (scheduler.CanRecordBeforePass()) {
+            NoteTickWrite(handle);
+            scheduler.RecordBeforePass([handle, offset, size, value](vk::CommandBuffer cmdbuf) {
+                static constexpr VkMemoryBarrier READ_BARRIER{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                };
+                static constexpr VkMemoryBarrier WRITE_BARRIER{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                };
+                cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
+                cmdbuf.FillBuffer(handle, offset, size, value);
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0,
+                                       WRITE_BARRIER);
+            });
+            return;
+        }
+        scheduler.WantSplitBeforeCurrentPass();
+    }
+    ClearBuffer(handle, offset, size, value);
 }
 
 bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {
@@ -1160,6 +1225,22 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
     if (all_same) {
         return;
     }
+    if (binding_count == 1) {
+        const VkBuffer handle = buffer_handles[0];
+        const VkDeviceSize offset = bindings.offsets[0];
+        if (device.IsExtExtendedDynamicStateSupported()) {
+            const VkDeviceSize size = bindings.sizes[0];
+            const VkDeviceSize stride = bindings.strides[0];
+            scheduler.Record([min_binding, handle, offset, size, stride](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers2EXT(min_binding, 1, &handle, &offset, &size, &stride);
+            });
+        } else {
+            scheduler.Record([min_binding, handle, offset](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers(min_binding, 1, &handle, &offset);
+            });
+        }
+        return;
+    }
     static constexpr u32 COMPACT_BINDINGS = 8;
     if (binding_count <= COMPACT_BINDINGS) {
         struct CompactBindings {
@@ -1299,19 +1380,16 @@ vk::Buffer BufferCacheRuntime::CreateNullBuffer() {
         ret.SetObjectNameEXT("Null buffer");
     }
 
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([buffer = *ret](vk::CommandBuffer cmdbuf) {
+    scheduler.RecordUploadOnly([buffer = *ret](vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier ZERO_FILL_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
-                             VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT |
-                             VK_ACCESS_SHADER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
         };
-        cmdbuf.FillBuffer(buffer, 0, VK_WHOLE_SIZE, 0);
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
-                               0, ZERO_FILL_BARRIER);
+        upload_cmdbuf.FillBuffer(buffer, 0, VK_WHOLE_SIZE, 0);
+        upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, ZERO_FILL_BARRIER);
     });
 
     return ret;

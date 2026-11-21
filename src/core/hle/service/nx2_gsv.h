@@ -1676,6 +1676,7 @@ struct Nx2NativeObjects {
     std::map<u32, Memory> memories;
     std::map<u32, Image> images;
     std::optional<VideoTrace> last_video_write;
+    std::atomic<u32> active_video_streams{};
     u32 next_memory{1};
     u32 next_image{1};
 };
@@ -1959,11 +1960,22 @@ private:
             frames_ahead = 0;
         } else if (frames_ahead == -1 && app_program_id == OcarinaOfTimeProgramId &&
                    VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FramesAhead)) {
-            frames_ahead = 1;
+            // Keep 2D menus, loading screens and active video playback on the current frame's
+            // fence: lightweight UI frames finish on the guest CPU in ~1 ms and wrap their ring
+            // buffers before the GPU thread reads this frame's pass inputs (flashing the unblurred
+            // background on Continue / New Game). 3D gameplay frames advance the fence by > 4.
+            const bool video_playing =
+                m_objects && m_objects->active_video_streams.load(std::memory_order_relaxed) != 0;
+            const bool light_ui_frame =
+                m_previous_fence_id != ~w[22] || (w[24] - m_previous_fence_value) <= 4;
+            frames_ahead = (video_playing || light_ui_frame) ? 0 : 1;
         }
         const auto entered = std::chrono::steady_clock::now();
         m_host_while_suspended = frames_ahead != 0;
-        if (frames_ahead == 1 || (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
+        if (frames_ahead == 1 && m_ahead_cooldown != 0) {
+            --m_ahead_cooldown;
+            WaitForFrame(~w[22], w[24]);
+        } else if (frames_ahead == 1 || (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
                       m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,
                       ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
@@ -1980,6 +1992,7 @@ private:
             WaitForFrame(m_previous_fence_id, m_previous_fence_value);
             if (gpu_behind) {
                 WaitForFrame(~w[22], w[24]);
+                m_ahead_cooldown = 2;
             }
         } else if (frames_ahead == 0) {
             static const bool back_wait_start = [] {
@@ -2353,6 +2366,7 @@ private:
     VideoCommon::Nx2Timeline::FrameStats m_timeline;
     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
     u32 m_previous_fence_value{};
+    u32 m_ahead_cooldown{};
     u32 m_frame_fence_relearn_logs{}; // the first 8 frame-fence learn lines
 
     // The console flips one frame per 60 Hz vblank and keeps the rest queued, so a game can't
@@ -3424,6 +3438,10 @@ public:
 
     ~INx2VideoSession() override {
         m_ready->SetRunning(system.Kernel(), false);
+        {
+            std::scoped_lock lk{m_mutex};
+            SetStreamActiveLocked(false);
+        }
         if (m_worker.joinable()) {
             {
                 std::scoped_lock lk{m_mutex};
@@ -3569,10 +3587,28 @@ private:
         TipcReplyWords(ctx, {});
     }
 
+    void SetStreamActiveLocked(bool active) {
+        if (m_active_stream_counted == active) {
+            return;
+        }
+        m_active_stream_counted = active;
+        if (m_objects) {
+            if (active) {
+                m_objects->active_video_streams.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                m_objects->active_video_streams.fetch_sub(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
     void Start(HLERequestContext& ctx) {
         Log(ctx, "start");
         if (Nx2VideoTraceEnabled()) {
             LOG_INFO(Service, "nx2:vdec trace start syncpoint={}", m_syncpoint);
+        }
+        {
+            std::scoped_lock lk{m_mutex};
+            SetStreamActiveLocked(true);
         }
         m_ready->SetRunning(system.Kernel(), true);
         EnsureReadyTimerScheduled();
@@ -3778,6 +3814,7 @@ private:
             }
             m_stream_ended = false;
             m_end_queued |= end;
+            SetStreamActiveLocked(true);
             m_ready->room.store(!m_end_queued && m_inputs.BelowReadyWatermark(),
                                 std::memory_order_relaxed);
             if (Nx2VideoTraceEnabled()) {
@@ -3824,6 +3861,7 @@ private:
             // Only Stop: Bananza flushes (8) after its movies end and treats every completed
             // fence as a frame to acquire.
             if (ctx.GetCommand() == 207) {
+                SetStreamActiveLocked(false);
                 CompleteHandedFences();
                 m_release_idle_buffers = true;
             }
@@ -3838,6 +3876,7 @@ private:
         PauseReadyTimer();
         {
             std::scoped_lock lk{m_mutex};
+            SetStreamActiveLocked(false);
             if (Nx2VideoTraceEnabled()) {
                 LOG_INFO(Service,
                          "nx2:vdec trace finalize syncpoint={} inputs={} decoded={} outputs={} "
@@ -4220,6 +4259,9 @@ private:
                     m_stream_ended = true;
                     m_end_queued = false;
                     m_ready->room.store(false, std::memory_order_relaxed);
+                    if (m_inputs.Empty() && m_decoded.empty()) {
+                        SetStreamActiveLocked(false);
+                    }
                 }
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
                 m_last_output = m_outputs.back();
@@ -4689,6 +4731,7 @@ private:
     std::set<u32> m_registered;        ///< Output images the client has registered
     bool m_stream_ended{};             ///< End-of-stream frame handed out, nothing submitted since
     bool m_end_queued{};
+    bool m_active_stream_counted{};
     bool m_flush{};
     bool m_quit{};
     std::thread m_worker;

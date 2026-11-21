@@ -334,19 +334,23 @@
     <string-array name="cpuBackendArm64Names">
         <item>@string/cpu_backend_dynarmic</item>
         <item>@string/cpu_backend_nce</item>
+        <item>@string/cpu_backend_cached</item>
     </string-array>
 
     <integer-array name="cpuBackendArm64Values">
         <item>0</item>
         <item>1</item>
+        <item>2</item>
     </integer-array>
 
     <string-array name="cpuBackendX86Names">
         <item>@string/cpu_backend_dynarmic</item>
+        <item>@string/cpu_backend_cached</item>
     </string-array>
 
     <integer-array name="cpuBackendX86Values">
         <item>0</item>
+        <item>2</item>
     </integer-array>
 
     <string-array name="cpuAccuracyNames">

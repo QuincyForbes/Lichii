@@ -9,6 +9,7 @@ Log line: `Ocarina graphics preset <name>: N values in the game's parameter file
 
 | Preset | Game files | Resolution / textures |
 |---|---|---|
+| Ultra Low | Same `gsys` / `agl` edits as Phone Low, plus foliage level 2 (33 % grass density, half plant distances, no moss, no second undergrowth layer, no grass shadows) and no sharpening network | 40 %, Quarter, No sharpening |
 | Phone Low | `gsys/ModelSceneConfigParam/Main`: `CubeMapMaxTexNum=1`, `CubeMapMaxTexWidth=64`, `CreateXluZPrePass=false`, `DepthShadowCascadeNum0=1`, `DepthShadowTexWidth/Height=512`, `StaticSdwWidth=1024`; `agl/BloomParam/MainField` and `agl/DepthOfFieldParam/MainField`: `Enable=false`; foliage level 1 (half grass density and plant distances) | 50 %, Quarter |
 | Phone Medium | `CubeMapMaxTexNum=1`, `CubeMapMaxTexWidth=64`, `CreateXluZPrePass=false`, `DepthShadowCascadeNum0=2`, `DepthShadowTexWidth/Height=512`, `StaticSdwWidth=2048`; `agl/DepthOfFieldParam/MainField`: `Enable=false` | 56 %, Half |
 | Console | none (the game as shipped) | unchanged |
@@ -18,7 +19,7 @@ Default: Phone Low on iPhones (device profile), Console elsewhere.
 
 ## Testing switches
 
-- `EDEN_NX2_OOT_GRAPHICS_PRESET=0..3` (Phone Low, Phone Medium, Console, High) overrides the setting.
+- `EDEN_NX2_OOT_GRAPHICS_PRESET=0..4` (Phone Low, Phone Medium, Console, High, Ultra Low) overrides the setting.
 - `EDEN_NX2_OOT_GFX="<file>:<Key.Sub>=<value>,...;<file2>:..."` adds or replaces single edits.
   `<file>` is a RomFS path prefix (`gsys/ModelSceneConfigParam/Main`) or `<pack>!<member>` for a
   file inside a pack (`Pack/Bootup!System/GameGraphics/ModelLodParam/Default`). Values are written

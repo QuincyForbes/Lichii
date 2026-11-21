@@ -20,6 +20,8 @@
 
 namespace Common {
 
+inline constexpr std::size_t DefaultLargeStackSize = std::size_t{32} << 20;
+
 /// RAII joinable thread started with an explicit stack size on POSIX (falling back to std::thread
 /// on Windows). Supports both `void()` and `void(std::stop_token)` callables like `std::jthread`.
 class LargeStackThread {
@@ -167,7 +169,7 @@ template <typename Fn>
 /// due to excessive recursion"). An exception `func` throws is rethrown here. Falls back to
 /// calling `func` directly when the thread can't be made.
 template <typename Func>
-void RunOnLargeStack(Func&& func, std::size_t stack_size = std::size_t{16} << 20) {
+void RunOnLargeStack(Func&& func, std::size_t stack_size = DefaultLargeStackSize) {
 #if defined(_WIN32)
     static_cast<void>(stack_size);
     std::forward<Func>(func)();

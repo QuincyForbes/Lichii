@@ -43,6 +43,7 @@
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/object_pool.h"
 #include "common/settings.h"
+#include "video_core/host_budget.h"
 #include "common/settings_enums.h"
 #include "shader_recompiler/shader_info.h"
 #include "device_msl_smoke_frag_spv.h"
@@ -5822,6 +5823,7 @@ int RunFenceBatch() {
     const uint64_t first = scheduler.FenceTick();
     const bool first_pending = !scheduler.IsSubmitted(first) && scheduler.HasPendingWork();
     scene.Draw(scheduler, 0, 1, Size / 2);
+    const bool list_deferred = scheduler.DeferFlush();
     const uint64_t second = scheduler.FenceTick();
     const bool may_wait = scheduler.DeferredFlushMayWait();
     const bool idle_committed = scheduler.FlushDeferredFromIdle(false);
@@ -5831,8 +5833,8 @@ int RunFenceBatch() {
     scheduler.WaitSubmitted(second);
     const auto counts = scheduler.TakeCounts();
     const auto [deferred, idle_commits] = scheduler.TakeDeferredFences();
-    const bool passed = first == second && first_pending && may_wait && idle_committed &&
-                        submitted && nothing_left && scheduler.IsFree(second) &&
+    const bool passed = first == second && first_pending && list_deferred && may_wait &&
+                        idle_committed && submitted && nothing_left && scheduler.IsFree(second) &&
                         counts[1] == 1 && deferred == 2 && idle_commits == 1;
     std::printf("metal-smoke: fence batch: ticks %llu/%llu, pending %d, may wait %d, idle commit "
                 "%d, %llu command buffers, %llu fences left pending, %llu idle commits: %s\n",
@@ -5844,7 +5846,246 @@ int RunFenceBatch() {
     return passed ? 0 : 1;
 }
 
-/// Staging buffers bounded (EDEN_NX2_METAL_STAGING_BOUND): a command buffer that took its mark's
+/// Inline constant deduplication (BindBytes, including invalidation across in-pass clears) and
+/// per-encoder UseBuffer / UseTexture residency memos.
+int RunInlineAndResidencyMemo() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr const char* Source = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct Out {
+    float4 position [[position]];
+};
+vertex Out memo_vertex(uint id [[vertex_id]]) {
+    const float2 pos[3] = {float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0)};
+    Out out;
+    out.position = float4(pos[id], 0.0, 1.0);
+    return out;
+}
+struct Spilled {
+    ulong buf_addr;
+};
+fragment float4 memo_fragment(constant float4& tint [[buffer(0)]],
+                              constant Spilled& spilled [[buffer(1)]]) {
+    device const float4* scale = reinterpret_cast<device const float4*>(spilled.buf_addr);
+    return tint * (*scale);
+}
+)";
+    std::string error;
+    const Metal::Object library = Metal::CreateLibrary(device, Source, error);
+    const Metal::Object vertex =
+        library ? Metal::CreateFunction(library.Get(), "memo_vertex") : Metal::Object{};
+    const Metal::Object fragment =
+        library ? Metal::CreateFunction(library.Get(), "memo_fragment") : Metal::Object{};
+    const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    auto desc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    desc.vertex_function = vertex.Get();
+    desc.fragment_function = fragment.Get();
+    desc.color_formats[0] = rgba8;
+    desc.blend[0].write_mask = 0xF;
+    desc.samples = 1;
+    desc.topology_class = 2;
+    desc.rasterize = 1;
+    const Metal::Object pipeline =
+        vertex && fragment ? Metal::CreateRenderPipelineState(device, desc, error)
+                           : Metal::Object{};
+    uint8_t* scale_ptr = nullptr;
+    const Metal::Object scale_buf = Metal::CreateBuffer(device, 64, true, &scale_ptr);
+    uint8_t* readback_ptr = nullptr;
+    const Metal::Object readback_buf = Metal::CreateBuffer(device, 16, true, &readback_ptr);
+    const Metal::Object target = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D, .format = rgba8, .width = 4, .height = 4, .render_target = true});
+    const Metal::Object extra_tex = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D, .format = rgba8, .width = 4, .height = 4});
+    if (!pipeline || !scale_buf || !readback_buf || !target || !extra_tex || scale_ptr == nullptr ||
+        readback_ptr == nullptr) {
+        std::printf("metal-smoke: FAIL inline/residency memo setup: %s\n", error.c_str());
+        return 1;
+    }
+    const std::array<float, 4> scales{0.5f, 1.0f, 0.25f, 1.0f};
+    const std::array<float, 4> scales2{1.0f, 0.5f, 1.0f, 1.0f};
+    std::memcpy(scale_ptr, scales.data(), sizeof(scales));
+    std::memcpy(scale_ptr + 16, scales2.data(), sizeof(scales2));
+
+    Metal::RenderTargetSet targets{};
+    targets.color[0] = {.texture = target.Get()};
+    targets.width = 4;
+    targets.height = 4;
+    scheduler.BeginRendering(targets);
+    scheduler.SetDrawState({.pipeline = pipeline.Get(),
+                            .viewport = {0.0f, 0.0f, 4.0f, 4.0f, 0.0f, 1.0f},
+                            .scissor = {0, 0, 4, 4}});
+    (void)scheduler.TakeCounts();
+    const std::array<float, 4> tint{1.0f, 0.0f, 0.0f, 1.0f};
+    const uint64_t addr0 = scheduler.UseBuffer(Metal::ShaderStage::Fragment, scale_buf.Get(), 0, false);
+    const uint64_t addr0_repeat =
+        scheduler.UseBuffer(Metal::ShaderStage::Fragment, scale_buf.Get(), 0, false);
+    const uint64_t addr16 =
+        scheduler.UseBuffer(Metal::ShaderStage::Fragment, scale_buf.Get(), 16, false);
+    const uint64_t tex_id0 =
+        scheduler.UseTexture(Metal::ShaderStage::Fragment, extra_tex.Get(), false, false);
+    const uint64_t tex_id1 =
+        scheduler.UseTexture(Metal::ShaderStage::Fragment, extra_tex.Get(), false, false);
+
+    scheduler.BindBytes(Metal::ShaderStage::Fragment, 0, tint.data(), sizeof(tint));
+    scheduler.BindBytes(Metal::ShaderStage::Fragment, 0, tint.data(), sizeof(tint)); // skipped
+    scheduler.BindBytes(Metal::ShaderStage::Fragment, 1, &addr0, sizeof(addr0));
+    scheduler.BindBytes(Metal::ShaderStage::Fragment, 1, &addr0, sizeof(addr0)); // skipped
+    const auto memo_counts = scheduler.TakeCounts();
+    scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 3, 1, 0);
+
+    // Mid-pass clear clobbers slot 0 on the open render encoder: re-binding the same `tint` must
+    // re-issue setFragmentBytes instead of treating slot 0 as still holding `tint`.
+    Metal::ClearPass clear{};
+    clear.color[0] = {.texture = target.Get()};
+    clear.clear_color[0] = true;
+    clear.color_value[0] = {0.0, 0.0, 1.0, 1.0};
+    clear.width = 4;
+    clear.height = 4;
+    scheduler.Clear(clear);
+    scheduler.SetDrawState({.pipeline = pipeline.Get(),
+                            .viewport = {0.0f, 0.0f, 4.0f, 4.0f, 0.0f, 1.0f},
+                            .scissor = {0, 0, 4, 4}});
+    scheduler.BindBytes(Metal::ShaderStage::Fragment, 0, tint.data(), sizeof(tint));
+    scheduler.BindBytes(Metal::ShaderStage::Fragment, 1, &addr16, sizeof(addr16));
+    scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 3, 1, 0);
+    scheduler.EndRendering();
+    scheduler.CopyTextureToBuffer(target.Get(), 0, 0, {}, {1, 1, 1}, readback_buf.Get(), 0, 4, 0);
+    scheduler.Finish();
+
+    Texel pixel{};
+    std::memcpy(&pixel, readback_ptr, sizeof(pixel));
+    const bool caching = SwitchOn("EDEN_NX2_METAL_STATE_CACHE");
+    const bool counts_ok = caching ? (memo_counts[5] == 2 && memo_counts[6] == 2)
+                                   : (memo_counts[5] == 4 && memo_counts[6] == 0);
+    const bool addrs_ok = addr0 != 0 && addr0 == addr0_repeat && addr16 == addr0 + 16 &&
+                          tex_id0 != 0 && tex_id0 == tex_id1;
+    const bool pixel_ok = Near(pixel, {255, 0, 0, 255});
+    const bool passed = counts_ok && addrs_ok && pixel_ok;
+    std::printf("metal-smoke: inline & residency memo: sets %llu skips %llu, addrs %d, pixel "
+                "%u,%u,%u: %s\n",
+                static_cast<unsigned long long>(memo_counts[5]),
+                static_cast<unsigned long long>(memo_counts[6]), addrs_ok ? 1 : 0, pixel.r, pixel.g,
+                pixel.b, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// Exercises NEON u16 strip-restart detection, effective-extent clear folding & in-pass clears
+/// under oversized surface_clip dimensions, PrepareCompute + FillBufferPattern + CopyByCompute
+/// keeping a single compute encoder open, and range-tracked ahead buffer copies preserving an
+/// open render pass after an earlier in-order copy on another range of the same buffer.
+int RunEncoderAndIndexOpt() {
+    // 1. HasU16RestartIndex across NEON 32-lane, 8-lane and scalar tail boundaries.
+    std::vector<uint16_t> strip_indices(75, 42);
+    const auto span_of = [](const std::vector<uint16_t>& v) {
+        return std::span<const uint8_t>{reinterpret_cast<const uint8_t*>(v.data()),
+                                        v.size() * sizeof(uint16_t)};
+    };
+    bool scan_ok = !Metal::IndexConvert::HasU16RestartIndex(span_of(strip_indices), 75) &&
+                   Metal::IndexConvert::IsPrefixInvariant(1) &&
+                   Metal::IndexConvert::IsPrefixInvariant(6) &&
+                   !Metal::IndexConvert::IsPrefixInvariant(9);
+    for (size_t pos : {size_t{0}, size_t{7}, size_t{31}, size_t{32}, size_t{63}, size_t{74}}) {
+        strip_indices[pos] = 0xFFFFU;
+        scan_ok = scan_ok && Metal::IndexConvert::HasU16RestartIndex(span_of(strip_indices), 75);
+        strip_indices[pos] = 42;
+    }
+
+    // 2. Oversized surface_clip (16384x16384) vs mip-sized clear (Size x Size): both load-action
+    //    folding and mid-pass TryDrawInPassClear stay inside 1 render pass, and a range-tracked
+    //    ahead upload after an earlier in-order copy on the same buffer keeps that pass open.
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const QuadScene scene(device);
+    uint8_t* compute_ptr = nullptr;
+    const Metal::Object compute_buf = Metal::CreateBuffer(device, 128, true, &compute_ptr);
+    std::string error;
+    const Metal::Object mark_lib = Metal::CreateLibrary(device, GroupMarkSource, error);
+    const Metal::Object mark_fn =
+        mark_lib ? Metal::CreateFunction(mark_lib.Get(), "mark_groups") : Metal::Object{};
+    const Metal::Object mark_pipe =
+        mark_fn ? Metal::CreateComputePipelineState(device, mark_fn.Get(), error) : Metal::Object{};
+    if (!scene.valid || !compute_buf || compute_ptr == nullptr || !mark_pipe) {
+        std::printf("metal-smoke: FAIL encoder & index opt setup: %s %s\n", scene.error.c_str(),
+                    error.c_str());
+        return 1;
+    }
+
+    (void)scheduler.TakeCounts();
+    // In-order range-tracked copy to [0, QuadBytes) before any render pass opens.
+    std::memcpy(scene.staged, QuadScene::Left.data(), QuadScene::QuadBytes);
+    scheduler.CopyBuffer(scene.staging.Get(), 0, scene.vertex_buffer.Get(), 0,
+                         QuadScene::QuadBytes, false, true);
+    const bool untracked_clean = !scheduler.UsedUntrackedInOrder(scene.vertex_buffer.Get());
+
+    // Clear at mip size (Size x Size), then BeginRendering with surface_clip 16384x16384 -> folds.
+    scene.Clear(scheduler, 0, {1.0, 0.0, 0.0, 1.0});
+    Metal::RenderTargetSet big_clip = scene.Targets(0);
+    big_clip.width = 16384;
+    big_clip.height = 16384;
+    scheduler.BeginRendering(big_clip);
+    Metal::DrawState dstate{};
+    dstate.pipeline = scene.pipeline.Get();
+    dstate.depth_stencil = scene.depth_stencil.Get();
+    dstate.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+    dstate.scissor = {0, 0, Size, Size};
+    scheduler.SetDrawState(dstate);
+    scheduler.BindVertexBuffer(Metal::VertexBufferSlot(0), scene.vertex_buffer.Get(), 0);
+    scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 6, 1, 0);
+
+    // Mid-pass clear at mip size (Size x Size) while pass is open at 16384x16384 -> in-pass clear!
+    scene.Clear(scheduler, 0, {0.0, 0.0, 1.0, 1.0});
+    const bool still_open_after_clear = scheduler.IsRenderingTo(big_clip);
+
+    // Disjoint ahead copy into [QuadBytes, 2 * QuadBytes) of vertex_buffer -> stays open!
+    std::memcpy(scene.staged, QuadScene::Right.data(), QuadScene::QuadBytes);
+    scheduler.CopyBuffer(scene.staging.Get(), 0, scene.vertex_buffer.Get(), QuadScene::QuadBytes,
+                         QuadScene::QuadBytes, true, true);
+    const bool still_open_after_upload = scheduler.IsRenderingTo(big_clip);
+
+    scheduler.SetDrawState(dstate);
+    scheduler.BindVertexBuffer(Metal::VertexBufferSlot(0), scene.vertex_buffer.Get(),
+                               QuadScene::QuadBytes);
+    scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 6, 1, 0);
+    scheduler.EndRendering();
+    const auto pass_counts = scheduler.TakeCounts();
+
+    // 3. PrepareCompute + FillBufferPattern + CopyBuffer + Dispatch all share 1 compute encoder.
+    scheduler.PrepareCompute();
+    scheduler.FillBufferPattern(compute_buf.Get(), 0, 64, 0x11223344U, false, true);
+    scheduler.CopyBuffer(scene.staging.Get(), 0, compute_buf.Get(), 64, 16, false, true);
+    scheduler.BeginCompute(mark_pipe.Get(), false);
+    const std::array<uint64_t, 128> big_inline{}; // 1024 B (> old 512 B inline cache limit)
+    scheduler.BindBytes(Metal::ShaderStage::Compute, 1, big_inline.data(), sizeof(big_inline));
+    scheduler.BindBytes(Metal::ShaderStage::Compute, 1, big_inline.data(), sizeof(big_inline));
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, compute_buf.Get(), 80);
+    scheduler.Dispatch({4, 1, 1}, {1, 1, 1});
+    const auto comp_counts = scheduler.TakeCounts();
+    scene.Read(scheduler, 0);
+    scheduler.Finish();
+
+    uint32_t pattern_word = 0;
+    uint32_t mark_word = 0;
+    std::memcpy(&pattern_word, compute_ptr + 12, sizeof(uint32_t));
+    std::memcpy(&mark_word, compute_ptr + 80, sizeof(uint32_t));
+    const uint32_t mid = Size / 2;
+    const bool pixels_ok = Near(scene.At(0, 4, mid), {0, 0, 255, 255}) &&
+                           Near(scene.At(0, Size - 4, mid), {0, 255, 0, 255});
+    const bool pass_ok = untracked_clean && still_open_after_clear && still_open_after_upload &&
+                         pass_counts[3] == 1 && pass_counts[4] == 1 && pass_counts[8] == 1;
+    const bool comp_ok = comp_counts[0] == 1 && comp_counts[6] >= 1 &&
+                         pattern_word == 0x11223344U && mark_word == 1U;
+    const bool passed = scan_ok && pixels_ok && pass_ok && comp_ok;
+    std::printf("metal-smoke: encoder & index opt: scan %d, pass (%llu passes, %llu folded, %llu "
+                "ahead) %d, compute (%llu enc, pattern %08x, mark %u) %d, pixels %d: %s\n",
+                scan_ok ? 1 : 0, static_cast<unsigned long long>(pass_counts[3]),
+                static_cast<unsigned long long>(pass_counts[4]),
+                static_cast<unsigned long long>(pass_counts[8]), pass_ok ? 1 : 0,
+                static_cast<unsigned long long>(comp_counts[0]), pattern_word, mark_word,
+                comp_ok ? 1 : 0, pixels_ok ? 1 : 0, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
 /// worth asks to be committed, over the cap the buffers the GPU is done with go, a slot freed is
 /// used again, and a deferred buffer stays through all of it.
 int RunStagingBound() {
@@ -5900,9 +6141,11 @@ int RunStagingBound() {
     const Metal::StagingBufferRef in_ring = small_ring.Stream(Chunk, 16);
     const Metal::StagingBufferRef own = small_ring.Stream(Chunk + 16, 16);
     constexpr size_t NotPooled = (std::numeric_limits<size_t>::max)();
+    const uint64_t expected_default_stream =
+        VideoCommon::HostBudget::Active() ? 32 * MiB : 128 * MiB;
     const bool stream_sized = small_ring.StreamSize() == 8 * MiB &&
-                              default_ring.StreamSize() == 32 * MiB && in_ring.index == NotPooled &&
-                              own.index != NotPooled;
+                              default_ring.StreamSize() == expected_default_stream &&
+                              in_ring.index == NotPooled && own.index != NotPooled;
     finish();
 
     const bool bound_passed =
@@ -7168,7 +7411,7 @@ int main(int argc, char** argv) {
                                  RunPipelineCheck, RunDeviceMsl, RunNativeMesh, RunBlockCopy,
                                  RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,
-                                 RunStagingBound, RunPipelineFiles, RunOcarinaTemporal,
+                                 RunInlineAndResidencyMemo, RunEncoderAndIndexOpt, RunStagingBound, RunPipelineFiles, RunOcarinaTemporal,
                                  RunProvokingVertex, RunCondition, RunIndirectArguments, RunPipelineJobs,
                                  RunOcarinaActorEffects, RunOcarinaDepthJitter, RunCameraMotionUpscale,
                                  RunTemporalStandIn, RunForceLod0,

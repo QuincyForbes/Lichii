@@ -93,4 +93,22 @@ void ApplyBiquadFilterFloat2(std::span<s32> output, std::span<const s32> input,
                              std::array<f32, 3>& b, std::array<f32, 2>& a,
                              VoiceState::BiquadFilterState& state, const u32 sample_count);
 
+/**
+ * Fused 2-tap cascaded biquad filter (fixed-point Q14 coefficients converted to double).
+ */
+void ApplyDoubleBiquadFilterFloat(
+    std::span<s32> output, std::span<const s32> input,
+    const std::array<VoiceInfo::BiquadFilterParameter, MaxBiquadFilters>& biquads,
+    VoiceState::BiquadFilterState& state0, VoiceState::BiquadFilterState& state1,
+    u32 sample_count);
+
+/**
+ * Fused 2-tap cascaded biquad filter (native float coefficients, SDK REV15+).
+ */
+void ApplyDoubleBiquadFilterFloat2(
+    std::span<s32> output, std::span<const s32> input,
+    const std::array<VoiceInfo::BiquadFilterParameter2, MaxBiquadFilters>& biquads,
+    VoiceState::BiquadFilterState& state0, VoiceState::BiquadFilterState& state1,
+    u32 sample_count);
+
 } // namespace AudioCore::Renderer

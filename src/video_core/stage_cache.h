@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -117,9 +118,12 @@ public:
     [[nodiscard]] std::shared_ptr<const Translation> Find(const std::vector<u8>& signature,
                                                           Shader::Environment& env);
 
-    /// The emitted stage of `translation` for `runtime_key`, or null.
+    /// The emitted stage of `translation` for `runtime_key`, or null. When `allow_spirv_rebase`
+    /// is true, an existing SPIR-V module with matching runtime state and rescaling indices is
+    /// rebased to the requested descriptor set and unified binding offset in place.
     [[nodiscard]] std::shared_ptr<const Emitted> FindEmitted(const Translation& translation,
-                                                             const std::vector<u8>& runtime_key);
+                                                             const std::vector<u8>& runtime_key,
+                                                             bool allow_spirv_rebase = false);
 
     /// Makes a translation (from a Recorder) findable, with its first emitted stage.
     void Insert(std::shared_ptr<Translation> translation, std::shared_ptr<const Emitted> emitted);
@@ -128,7 +132,17 @@ public:
     void AddEmitted(const Translation& translation, std::shared_ptr<const Emitted> emitted);
 
     [[nodiscard]] static std::vector<u8> RuntimeKey(const Shader::RuntimeInfo& info,
-                                                    const Shader::Backend::Bindings& bindings);
+                                                    const Shader::Backend::Bindings& bindings,
+                                                    bool support_descriptor_aliasing = true);
+
+    /// Checks whether a valid persistent stage cache file exists for `expected_variant`.
+    [[nodiscard]] static bool HasValidFile(const std::filesystem::path& path, u64 expected_variant);
+
+    /// Loads zstd-compressed persistent translations and emitted SPIR-V modules from `path`.
+    bool LoadFromDisk(const std::filesystem::path& path, u64 expected_variant);
+
+    /// Saves persistent translations and emitted SPIR-V modules to `path` if modified.
+    bool SaveToDisk(const std::filesystem::path& path, u64 variant);
 
     /// Program metadata without its IR.
     [[nodiscard]] static Shader::IR::Program Summary(const Shader::IR::Program& program);
@@ -152,6 +166,7 @@ private:
     std::mutex mutex;
     std::unordered_map<u64, std::vector<std::shared_ptr<const Translation>>> translations;
     size_t bytes{};
+    std::atomic<bool> dirty{false};
 
     std::atomic<u64> reused_emitted{};
     std::atomic<u64> reused_translation{};

@@ -10,6 +10,10 @@
 add_library(core STATIC
     arm/arm_interface.cpp
     arm/arm_interface.h
+    arm/cached_interpreter/arm_cached_interpreter.cpp
+    arm/cached_interpreter/arm_cached_interpreter.h
+    arm/cached_interpreter/cached_block_engine.cpp
+    arm/cached_interpreter/cached_block_engine.h
     arm/debug.cpp
     arm/debug.h
     arm/exclusive_monitor.cpp
@@ -1314,6 +1318,15 @@ if (HAS_NCE)
         arm/nce/patcher.h
         arm/nce/visitor_base.h)
     target_link_libraries(core PRIVATE merry::oaknut)
+endif()
+
+if (HAS_HYPERVISOR)
+    target_sources(core PRIVATE
+        arm/hypervisor/arm_hypervisor.cpp
+        arm/hypervisor/arm_hypervisor.h
+        arm/hypervisor/hv_vm.cpp
+        arm/hypervisor/hv_vm.h)
+    target_link_libraries(core PRIVATE "-framework Hypervisor")
 endif()
 
 if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64)

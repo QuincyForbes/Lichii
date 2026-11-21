@@ -89,6 +89,7 @@ final class AppController: ObservableObject {
     /// The JIT pool is prepared while the library is open, so a launch does not wait for it. The
     /// automatic request waits until onboarding has explained it.
     func requestJitIfNeeded(automatic: Bool) {
+        guard QuickSettings.canonical("cpu_backend") != "CachedInterpreter" else { return }
         let provider = JitProvider.current
         guard Bridge.jitState == .waiting, provider.installed else { return }
         // A bench run asks for the JIT itself, or a debugger on the host provides it.

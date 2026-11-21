@@ -2223,10 +2223,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 word && (insn.Bits(78, 2) == 2 || (insn.Bits(78, 2) == 3 && !insn.Bits(80, 1)));
             if ((!half && !small && !short_trunc && !byte && !word) ||
                 (signed_half && (insn.Bits(24, 8) || (insn.words[3] & 0xc00001ffU))) ||
+                ((byte || small || short_trunc || extended_word || opcode == 0xb05) &&
+                 (insn.Bits(24, 8) || (insn.words[3] & 0xc00001ffU))) ||
                 ((byte || small || short_trunc || extended_word) &&
-                 (insn.Bits(24, 8) || (insn.words[3] & 0xc00001ffU) ||
-                  (opcode == 0xb05 && small && insn.Bits(59, 3)) ||
-                  insn.Bits(91, 1) != static_cast<u32>(opcode == 0xd05))) ||
+                 insn.Bits(91, 1) != static_cast<u32>(opcode == 0xd05)) ||
+                (opcode == 0xb05 && insn.Bits(59, 3)) ||
                 (opcode != 0xb05 && (insn.words[1] & ~(half ? 0x100000ffU :
                     0xffU | (absolute ? 0x40000000U : 0U) | (negate ? 0x80000000U : 0U)))) ||
                 (opcode == 0xd05 && uniform_register(insn.Bits(32, 8)) == ~0U)) {

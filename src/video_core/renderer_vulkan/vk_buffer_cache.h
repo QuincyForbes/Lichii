@@ -77,6 +77,14 @@ public:
         return last_usage_tick;
     }
 
+    [[nodiscard]] u64 LastTrackedTick() const noexcept {
+        return last_tracked_tick;
+    }
+
+    void ExpectCreationMark() noexcept {
+        expect_creation_mark = true;
+    }
+
     /// Whether a range was used since Scheduler::BeforePassSerial took this value.
     [[nodiscard]] bool IsRegionUsedSince(u64 serial, u64 offset, u64 size) const noexcept {
         return last_use_before_pass_serial == serial && pass_tracker.IsUsed(offset, size);
@@ -107,7 +115,9 @@ private:
     VideoCommon::UsageTracker pass_tracker;
     VkDeviceAddress device_address{};
     u64 last_usage_tick{};
+    u64 last_tracked_tick{};
     u64 last_use_before_pass_serial{};
+    bool expect_creation_mark{};
     bool is_null{};
     bool sparse_compatible{};
 };
@@ -196,6 +206,7 @@ public:
     void HoldStagingSubmits(bool hold) noexcept;
 
     void ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t size, u32 value);
+    void ClearBuffer(Buffer& dest_buffer, u32 offset, size_t size, u32 value);
 
     /// Switch 2: mesh task indirect commands {count, 1, 1} for the counts GPU-written command
     /// lists feed (BufferCache::Nx2MeshCountSlot). Created on first use.
@@ -428,6 +439,7 @@ private:
     GuestDescriptorQueue& guest_descriptor_queue;
     /// Set by CanReorderUpload for the CopyBuffer that follows it.
     bool upload_before_pass{};
+    bool upload_fits_before_pass{};
     /// Buffers in-order copies and clears wrote since Scheduler::BeforePassSerial last changed:
     /// a copy into one of them can't go before the render pass, ahead of that write.
     boost::container::small_vector<VkBuffer, 16> written_in_order;

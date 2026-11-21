@@ -182,7 +182,8 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
     } else {
         // Use page table
         ASSERT(conf.page_table);
-        const auto src_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr);
+        UntrappedCachedReadX64 cached;
+        const auto src_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr, &cached);
         EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered_mov);
 
         ColdEmits(code, ctx).emplace_back([=, this, &ctx] {
@@ -190,6 +191,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
             code.call(wrapped_fn);
             EmitCheckMemoryAbort(ctx, inst, end);
             code.jmp(*end, code.T_NEAR);
+            EmitUntrappedCachedReadCheckX64(code, ctx, vaddr, cached, *abort);
         });
     }
     code.L(*end);

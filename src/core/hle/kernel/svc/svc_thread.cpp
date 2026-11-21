@@ -16,6 +16,10 @@
 #include <optional>
 #include <thread>
 
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
 #include "common/nx2_poll.h"
 #include "common/perf_report.h"
 #include "common/perf_sched.h"
@@ -24,12 +28,15 @@
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/debugger/trace_hooks.h"
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/physical_core.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/svc/svc_thread_yield.h"
 #include "core/hle/kernel/thread_startup_policy.h"
 
 namespace Kernel::Svc {
@@ -40,15 +47,109 @@ constexpr bool IsValidVirtualCoreId(int32_t core_id) {
 }
 
 // Switch 2 hardware has eight cores. Six are emulated (the most an application is given), so
-// fold any id past them back onto the low cores, both in core ids and in affinity masks.
+// fold any id past them onto the high emulated cores (e.g. 6 -> 5, 7 -> 4) rather than Core 0
+// where the application's main render thread lives (Djihads80/Eglantine#910).
 constexpr int32_t FoldExtraCoreId(int32_t core_id) {
     constexpr auto num_cores = static_cast<int32_t>(Core::Hardware::NUM_CPU_CORES);
-    return core_id >= num_cores && core_id < 2 * num_cores ? core_id - num_cores : core_id;
+    return core_id >= num_cores && core_id < 2 * num_cores
+               ? (num_cores - 1) - (core_id - num_cores)
+               : core_id;
 }
 
 constexpr u64 FoldExtraCoreMask(u64 mask) {
-    constexpr u64 low = (1ULL << Core::Hardware::NUM_CPU_CORES) - 1;
-    return (mask & low) | ((mask >> Core::Hardware::NUM_CPU_CORES) & low);
+    constexpr auto num_cores = static_cast<int32_t>(Core::Hardware::NUM_CPU_CORES);
+    constexpr u64 low = (1ULL << num_cores) - 1;
+    u64 folded = mask & low;
+    for (int32_t c = num_cores; c < 2 * num_cores; ++c) {
+        if ((mask & (1ULL << c)) != 0) {
+            folded |= 1ULL << FoldExtraCoreId(c);
+        }
+    }
+    return folded;
+}
+
+void FutileYieldPauseOnce() {
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+    _mm_pause();
+#elif defined(__APPLE__) && defined(__aarch64__)
+    __builtin_arm_isb(0xF);
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
+}
+
+void FutileYieldRelax(u16 streak) {
+    const u32 pauses = streak < 2 ? 0U : streak < 4 ? 1U : streak < 8 ? 4U : streak < 32 ? 8U : 16U;
+    for (u32 i = 0; i < pauses; ++i) {
+        FutileYieldPauseOnce();
+    }
+}
+
+u64 SteadyNowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+bool StarvedYieldHandoffEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_YIELD_HANDOFF");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+bool FastFutileYieldEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_FAST_FUTILE_YIELD");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool SvcTraceConfigured() {
+    static const bool configured = [] {
+        const char* value = std::getenv("EDEN_NX2_SVC_TRACE");
+        return value != nullptr && value[0] != '\0';
+    }();
+    return configured;
+}
+
+/// True when another runnable thread is queued behind the current thread on `current_core`, or
+/// when all emulated cores are busy while at least one core has a runnable waiter queued behind
+/// its running thread (letting UpdateHighestPriorityThreadsImpl migrate a multi-core waiter).
+bool AnyCoreHasStarvedRunnable(KernelCore& kernel, s32 current_core) {
+    if (!kernel.IsMulticore() || !StarvedYieldHandoffEnabled()) {
+        return false;
+    }
+    if (current_core >= 0 && KScheduler::GetCoreScheduledCount(kernel, current_core) > 1) {
+        return true;
+    }
+    u32 total_extra = 0;
+    for (s32 c = 0; c < static_cast<s32>(Core::Hardware::NUM_CPU_CORES); ++c) {
+        const u32 count = KScheduler::GetCoreScheduledCount(kernel, c);
+        if (count == 0) {
+            return false;
+        }
+        total_extra += count - 1;
+    }
+    return total_extra > 0;
+}
+
+u64 ComputeThreadSpinStateHash(KernelCore& kernel) {
+    KProcess& process = GetCurrentProcess(kernel);
+    Svc::ThreadContext context;
+    u64 regs = 0;
+    if (auto* arm = process.GetArmInterface(kernel.CurrentPhysicalCoreIndex())) {
+        arm->GetContext(context);
+        regs = HashYieldSpinWord(regs, context.pc);
+        regs = HashYieldSpinWord(regs, context.sp);
+        for (size_t i = 19; i <= 28; ++i) {
+            regs = HashYieldSpinWord(regs, context.r[i]);
+        }
+        regs = HashYieldSpinWord(regs, context.fp);
+    }
+    return regs;
 }
 
 struct YieldBackoff {
@@ -62,15 +163,15 @@ struct YieldBackoff {
 
 /// EDEN_NX2_YIELD_BACKOFF: 0 off, 1 on, or <gate us>:<cap us>; unset follows guest_wait_backoff.
 /// EDEN_NX2_YIELD_BACKOFF_GAP_US=<n>: the pause between two yields that still counts as the same
-/// run (100). A host thread that lost its CPU between two yields exceeds it, so a loaded host
-/// needs a larger one for the backoff to ever sleep.
+/// run (500). A host thread that lost its CPU between two yields exceeds a narrow gap, so a
+/// loaded host needs headroom for the backoff to accumulate across OS preemptions.
 /// EDEN_NX2_YIELD_BACKOFF_REGS=0: changed callee-saved registers no longer start a new run.
 /// Ocarina of Time changes them at every one of its ~100,000 yields to nobody per second (its
 /// job workers do work between yields), so the backoff never sleeps there; forced to (REGS=0 and
 /// a 100 us gate), Kokiri Forest fell from ~105 to ~38 fps on the PC.
 const YieldBackoff& YieldBackoffSetting() {
     static const YieldBackoff setting = [] {
-        YieldBackoff result{std::nullopt, 2'000'000, 10'000, 200'000, 100'000, true};
+        YieldBackoff result{std::nullopt, 2'000'000, 10'000, 200'000, 500'000, true};
         if (const char* regs = std::getenv("EDEN_NX2_YIELD_BACKOFF_REGS"); regs != nullptr) {
             result.same_regs = regs[0] != '0';
         }
@@ -96,6 +197,103 @@ const YieldBackoff& YieldBackoffSetting() {
     return setting;
 }
 
+void SleepThreadForNs(KernelCore& kernel, KThread& thread, u64 sleep_ns) {
+    s64 timeout = kernel.HardwareTimer().GetTick() + static_cast<s64>(sleep_ns) + 2;
+    if (timeout <= 0) {
+        timeout = (std::numeric_limits<s64>::max)();
+    }
+    static_cast<void>(thread.Sleep(kernel, timeout));
+}
+
+/// Processes a confirmed futile yield. When `allow_sleep` is false (the in-JIT fast path), returns
+/// false without mutating `thread` if either starved-runnable handoff or `YieldBackoff` wants to
+/// sleep the thread, so the caller halts the JIT cleanly into `SleepThread`.
+bool HandleFutileYield(KernelCore& kernel, KThread& thread, u64 spin_hash, bool allow_sleep) {
+    constexpr u16 kStarvedHandoffStreak = 8;
+    constexpr u64 kStarvedHandoffGapNs = 500'000;
+    constexpr u64 kStarvedHandoffSleepNs = 15'000;
+
+    const u64 now = SteadyNowNs();
+    const u16 next_streak = thread.m_nx2_futile_yield_streak < 0xFFFFU
+                                ? static_cast<u16>(thread.m_nx2_futile_yield_streak + 1U)
+                                : u16{0xFFFFU};
+    const bool same_spin_site = thread.m_nx2_yield_last != 0 &&
+                                spin_hash == thread.m_nx2_yield_regs &&
+                                (now - thread.m_nx2_yield_last) <= kStarvedHandoffGapNs;
+    const bool handoff_sleep = next_streak >= kStarvedHandoffStreak && same_spin_site &&
+                               AnyCoreHasStarvedRunnable(kernel, thread.GetActiveCore());
+
+    const bool backoff_on = YieldBackoffEnabled();
+    const YieldBackoff& setting = YieldBackoffSetting();
+    const bool regs_changed = setting.same_regs && spin_hash != thread.m_nx2_yield_regs;
+    const bool run_restarts = thread.m_nx2_yield_run_start == 0 ||
+                              (now - thread.m_nx2_yield_last) > setting.gap_ns || regs_changed;
+    const bool backoff_sleep =
+        backoff_on && !run_restarts && (now - thread.m_nx2_yield_run_start) >= setting.gate_ns;
+
+    if (!allow_sleep && (handoff_sleep || backoff_sleep)) {
+        return false;
+    }
+
+    thread.m_nx2_last_yield_futile = true;
+    Common::PerfReport::Add(Common::PerfReport::GuestFutileYields);
+    thread.m_nx2_futile_yield_streak = next_streak;
+
+    if (!backoff_on) {
+        Common::PerfSched::g_yield_backoff.store(0, std::memory_order_relaxed);
+        thread.m_nx2_yield_last = now;
+        thread.m_nx2_yield_regs = spin_hash;
+        if (handoff_sleep) {
+            thread.m_nx2_futile_yield_streak = 0;
+            SleepThreadForNs(kernel, thread, kStarvedHandoffSleepNs);
+            thread.m_nx2_yield_last = SteadyNowNs();
+            return true;
+        }
+        FutileYieldRelax(next_streak);
+        return true;
+    }
+
+    Common::PerfSched::g_yield_backoff.store(1, std::memory_order_relaxed);
+    if (run_restarts) {
+        Common::PerfSched::Add(thread.m_nx2_yield_run_start == 0
+                                   ? Common::PerfSched::YieldRunStarts
+                                   : regs_changed
+                                         ? Common::PerfSched::YieldRegResets
+                                         : Common::PerfSched::YieldGapResets);
+        thread.m_nx2_yield_run_start = now;
+        thread.m_nx2_yield_last = now;
+        thread.m_nx2_yield_regs = spin_hash;
+        FutileYieldRelax(next_streak);
+        return true;
+    }
+
+    thread.m_nx2_yield_last = now;
+    const u64 run = now - thread.m_nx2_yield_run_start;
+    if (!backoff_sleep) {
+        Common::PerfSched::Add(Common::PerfSched::YieldUnderGate);
+        if (handoff_sleep) {
+            thread.m_nx2_futile_yield_streak = 0;
+            SleepThreadForNs(kernel, thread, kStarvedHandoffSleepNs);
+            const u64 after = SteadyNowNs();
+            thread.m_nx2_yield_last = after;
+            Common::PerfReport::Add(Common::PerfReport::GuestYieldSleeps);
+            Common::PerfReport::Add(Common::PerfReport::GuestYieldSleepNs, after - now);
+            return true;
+        }
+        FutileYieldRelax(next_streak);
+        return true;
+    }
+
+    thread.m_nx2_futile_yield_streak = 0;
+    const u64 sleep_ns = std::clamp(run / 8, setting.min_ns, setting.cap_ns);
+    SleepThreadForNs(kernel, thread, sleep_ns);
+    const u64 after = SteadyNowNs();
+    thread.m_nx2_yield_last = after;
+    Common::PerfReport::Add(Common::PerfReport::GuestYieldSleeps);
+    Common::PerfReport::Add(Common::PerfReport::GuestYieldSleepNs, after - now);
+    return true;
+}
+
 /// On the Switch a yield with nothing else to run costs nothing, so guest code waits for other
 /// threads by yielding in a loop. Here each pass is a host round trip that keeps a host core busy
 /// (on a phone, one of its two performance cores). A thread that has yielded to nobody for the
@@ -105,63 +303,14 @@ const YieldBackoff& YieldBackoffSetting() {
 void YieldBackoffAfterYield(Core::System& system) {
     auto& kernel = system.Kernel();
     KThread& thread = GetCurrentThread(kernel);
-    KProcess& process = GetCurrentProcess(kernel);
-    if (thread.GetYieldScheduleCount() != process.GetScheduledCount()) {
+    if (!thread.m_nx2_last_yield_futile) {
         // Another thread runs next: a real yield.
         thread.m_nx2_yield_run_start = 0;
+        thread.m_nx2_futile_yield_streak = 0;
         Common::PerfSched::Add(Common::PerfSched::YieldRealYields);
         return;
     }
-    Common::PerfReport::Add(Common::PerfReport::GuestFutileYields);
-    if (!YieldBackoffEnabled()) {
-        Common::PerfSched::g_yield_backoff.store(0, std::memory_order_relaxed);
-        return;
-    }
-    Common::PerfSched::g_yield_backoff.store(1, std::memory_order_relaxed);
-    const YieldBackoff& setting = YieldBackoffSetting();
-    const auto steady_ns = [] {
-        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now().time_since_epoch())
-                                    .count());
-    };
-    const u64 now = steady_ns();
-    Svc::ThreadContext context{};
-    if (auto* arm = process.GetArmInterface(kernel.CurrentPhysicalCoreIndex())) {
-        arm->GetContext(context);
-    }
-    u64 regs = 0;
-    for (size_t i = 19; i <= 28; ++i) {
-        regs = (regs ^ context.r[i]) * 0x100000001B3ULL;
-    }
-    const bool regs_changed = setting.same_regs && regs != thread.m_nx2_yield_regs;
-    if (thread.m_nx2_yield_run_start == 0 || now - thread.m_nx2_yield_last > setting.gap_ns ||
-        regs_changed) {
-        Common::PerfSched::Add(thread.m_nx2_yield_run_start == 0
-                                   ? Common::PerfSched::YieldRunStarts
-                                   : regs_changed
-                                         ? Common::PerfSched::YieldRegResets
-                                         : Common::PerfSched::YieldGapResets);
-        thread.m_nx2_yield_run_start = now;
-        thread.m_nx2_yield_last = now;
-        thread.m_nx2_yield_regs = regs;
-        return;
-    }
-    thread.m_nx2_yield_last = now;
-    const u64 run = now - thread.m_nx2_yield_run_start;
-    if (run < setting.gate_ns) {
-        Common::PerfSched::Add(Common::PerfSched::YieldUnderGate);
-        return;
-    }
-    const u64 sleep_ns = std::clamp(run / 8, setting.min_ns, setting.cap_ns);
-    s64 timeout = kernel.HardwareTimer().GetTick() + static_cast<s64>(sleep_ns) + 2;
-    if (timeout <= 0) {
-        timeout = (std::numeric_limits<s64>::max)();
-    }
-    static_cast<void>(thread.Sleep(kernel, timeout));
-    const u64 after = steady_ns();
-    thread.m_nx2_yield_last = after;
-    Common::PerfReport::Add(Common::PerfReport::GuestYieldSleeps);
-    Common::PerfReport::Add(Common::PerfReport::GuestYieldSleepNs, after - now);
+    static_cast<void>(HandleFutileYield(kernel, thread, ComputeThreadSpinStateHash(kernel), true));
 }
 
 // Ocarina of Time's two main threads (priorities 55 and 47) may only run on two of cores 3-5,
@@ -190,6 +339,46 @@ OotAffinity OotAffinityMode(const KProcess& process, u64 affinity_mask) {
 bool YieldBackoffEnabled() {
     const YieldBackoff& setting = YieldBackoffSetting();
     return setting.forced ? *setting.forced : Settings::values.guest_wait_backoff.GetValue();
+}
+
+bool TryFastFutileYield64(Core::System& system, s64 ns, u64 spin_state_hash) {
+    if (!FastFutileYieldEnabled()) {
+        return false;
+    }
+    const auto yield_type = static_cast<Svc::YieldType>(ns);
+    if (yield_type != Svc::YieldType::WithoutCoreMigration &&
+        yield_type != Svc::YieldType::WithCoreMigration &&
+        yield_type != Svc::YieldType::ToAnyThread) {
+        return false;
+    }
+    auto& kernel = system.Kernel();
+    if (!kernel.IsMulticore() ||
+        Core::Trace::g_svc_hook.load(std::memory_order_relaxed) != nullptr ||
+        SvcTraceConfigured()) {
+        return false;
+    }
+    KProcess* const process = GetCurrentProcessPointer(kernel);
+    KThread* const thread = GetCurrentThreadPointer(kernel);
+    if (process == nullptr || thread == nullptr || !process->Is64Bit() ||
+        !thread->HasEnteredKernel() || thread->HasDpc() ||
+        thread->GetStepState() != StepState::NotStepping ||
+        thread->GetDisableDispatchCount() != 0 ||
+        thread->GetRawState() != ThreadState::Runnable ||
+        kernel.CurrentPhysicalCore().IsInterrupted()) {
+        return false;
+    }
+    const s32 core_id = thread->GetActiveCore();
+    if (core_id < 0) {
+        return false;
+    }
+    const bool schedule_unchanged =
+        thread->GetYieldScheduleCount() == process->GetScheduledCount();
+    const bool alone_on_core = yield_type == Svc::YieldType::WithoutCoreMigration &&
+                               KScheduler::GetCoreScheduledCount(kernel, core_id) <= 1;
+    if (!schedule_unchanged && !alone_on_core) {
+        return false;
+    }
+    return HandleFutileYield(kernel, *thread, spin_state_hash, false);
 }
 
 /// Creates a new thread
@@ -338,6 +527,7 @@ void SleepThread(Core::System& system, s64 ns) {
 
         // Sleep.
         // NOTE: Nintendo does not check the result of this sleep.
+        GetCurrentThread(kernel).m_nx2_futile_yield_streak = 0;
         static_cast<void>(GetCurrentThread(kernel).Sleep(kernel, timeout));
     } else if (yield_type == Svc::YieldType::WithoutCoreMigration) {
         KScheduler::YieldWithoutCoreMigration(kernel);
@@ -474,9 +664,11 @@ Result SetThreadCoreMask(Core::System& system, Handle thread_handle, s32 core_id
         R_UNLESS(affinity_mask != 0, ResultInvalidCombination);
 
         // Validated against the real mask above; fold to the emulated cores from here on.
+        const u64 raw_affinity_mask = affinity_mask;
         affinity_mask = FoldExtraCoreMask(affinity_mask);
         core_id = FoldExtraCoreId(core_id);
-        const OotAffinity mode = OotAffinityMode(GetCurrentProcess(system.Kernel()), affinity_mask);
+        const OotAffinity mode =
+            OotAffinityMode(GetCurrentProcess(system.Kernel()), raw_affinity_mask);
         if (mode == OotAffinity::Wide) {
             affinity_mask = FoldExtraCoreMask(process_core_mask);
         } else if (mode == OotAffinity::Ideal && IsValidVirtualCoreId(core_id) &&

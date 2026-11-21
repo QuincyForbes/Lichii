@@ -80,6 +80,7 @@ protected:
 
 private:
     Scheduler& scheduler;
+    bool in_nonblocking_release_wait{};
 };
 
 } // namespace Metal

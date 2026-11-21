@@ -21,11 +21,8 @@
 #include "common/perf_report.h"
 #include "core/arm/arm_interface.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "core/memory.h"
 #include "dynarmic/interface/A64/config.h"
-
-namespace Core::Memory {
-class Memory;
-}
 
 namespace Core::WindowTrace {
 class Session;
@@ -71,6 +68,8 @@ public:
     void ReturnException(u64 pc, Dynarmic::HaltReason hr);
     u64 ReadValue(u64 vaddr, size_t size);
     Dynarmic::A64::Vector Read128Value(u64 vaddr);
+    void WriteValue(u64 vaddr, u64 value, std::size_t size);
+    void Write128Value(u64 vaddr, Dynarmic::A64::Vector value);
     template <typename T>
     bool WriteExclusive(u64 vaddr, T value, T expected);
     Common::PerfReport::SlowAccess ClassifySlowAccess(u64 vaddr, size_t size) const;
@@ -82,6 +81,10 @@ public:
     u64 last_code_addr = u64(-1);
     u32 cached_code_generation = 0;
     std::atomic<u32> code_generation{0};
+    u64 m_hot_read_page{~u64{0}};
+    const u8* m_hot_read_ptr{};
+    u64 m_hot_read_gen{};
+    Core::Memory::Memory::HotWritePage m_hot_write{};
     ArmDynarmic64& m_parent;
     Core::Memory::Memory& m_memory;
     u64 m_tpidrro_el0{};

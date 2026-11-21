@@ -18,11 +18,15 @@
 
 namespace Vulkan {
 
-UpdateDescriptorQueue::UpdateDescriptorQueue([[maybe_unused]] const Device& device_,
-                                             size_t frame_payload_size_,
+UpdateDescriptorQueue::UpdateDescriptorQueue(size_t frame_payload_size_,
                                              bool supports_descriptor_buffer_)
     : maximum_frame_payload_size{frame_payload_size_ * 4},
       supports_descriptor_buffer{supports_descriptor_buffer_} {}
+
+UpdateDescriptorQueue::UpdateDescriptorQueue([[maybe_unused]] const Device& device_,
+                                             size_t frame_payload_size_,
+                                             bool supports_descriptor_buffer_)
+    : UpdateDescriptorQueue{frame_payload_size_, supports_descriptor_buffer_} {}
 
 UpdateDescriptorQueue::~UpdateDescriptorQueue() = default;
 
@@ -65,14 +69,26 @@ void UpdateDescriptorQueue::Acquire(Scheduler& scheduler, size_t required_entrie
     static constexpr size_t DEFAULT_REQUIRED_ENTRIES = 0x400;
     const size_t reserve = required_entries > 0 ? required_entries : DEFAULT_REQUIRED_ENTRIES;
     if (payload_cursor != nullptr &&
-        static_cast<size_t>(payload_end - payload_cursor) >= reserve) [[likely]] {
+        static_cast<size_t>(payload_end - payload_cursor) >= reserve) {
         upload_start = payload_cursor;
         return;
     }
-    AcquireSlow(scheduler, reserve);
+    AcquireSlow(&scheduler, reserve);
 }
 
-void UpdateDescriptorQueue::AcquireSlow(Scheduler& scheduler, size_t reserve) {
+void UpdateDescriptorQueue::AcquireScratch(size_t required_entries, bool use_descriptor_buffer_) {
+    use_descriptor_buffer = supports_descriptor_buffer && use_descriptor_buffer_;
+    static constexpr size_t DEFAULT_REQUIRED_ENTRIES = 0x400;
+    const size_t reserve = required_entries > 0 ? required_entries : DEFAULT_REQUIRED_ENTRIES;
+    if (payload_cursor != nullptr &&
+        static_cast<size_t>(payload_end - payload_cursor) >= reserve) {
+        upload_start = payload_cursor;
+        return;
+    }
+    AcquireSlow(nullptr, reserve);
+}
+
+void UpdateDescriptorQueue::AcquireSlow(Scheduler* scheduler, size_t reserve) {
     if (reserve > maximum_frame_payload_size) {
         throw std::length_error("Descriptor reservation exceeds the bounded staging capacity");
     }
@@ -120,7 +136,9 @@ void UpdateDescriptorQueue::AcquireSlow(Scheduler& scheduler, size_t reserve) {
                     arena.total_entries, frame_index);
         fallback_reported = true;
     }
-    scheduler.WaitWorker();
+    if (scheduler != nullptr) {
+        scheduler->WaitWorker();
+    }
     arena.total_entries = 0;
     for (size_t i = 0; i < arena.chunks.size(); ++i) {
         if (arena.chunks[i].capacity >= reserve) {

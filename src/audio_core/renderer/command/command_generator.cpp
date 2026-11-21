@@ -276,7 +276,7 @@ void CommandGenerator::GenerateVoiceCommand(VoiceInfo& voice_info) {
 }
 
 void CommandGenerator::GenerateVoiceCommands() {
-    const auto voice_count{voice_context.GetCount()};
+    const auto voice_count{voice_context.GetSortedCount()};
 
     for (u32 i = 0; i < voice_count; i++) {
         auto sorted_info{voice_context.GetSortedInfo(i)};

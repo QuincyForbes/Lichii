@@ -867,8 +867,12 @@ static std::optional<SDL_AppResult> IosAppIterate(SdlState* state) {
     }
     if (state->pending_launch) {
         const State jit = Common::IosJit::GetState();
-        if (jit == State::Ready) {
-            LOG_INFO(Frontend, "iOS: JIT pool ready, booting {}", state->pending_launch->filepath);
+        const bool jit_free =
+            Settings::IsCachedInterpreterEnabled() || VideoCommon::ShaderWarm::BuildOnlyRequested();
+        if (jit == State::Ready || jit_free) {
+            LOG_INFO(Frontend, "iOS: {} booting {}",
+                     jit == State::Ready ? "JIT pool ready," : "JIT-free mode,",
+                     state->pending_launch->filepath);
             IosFrontend::EndJitBackgroundTask();
             IosFrontend::SetState(LICHII_EMU_BOOTING);
             Core::LaunchParams lp = std::move(*state->pending_launch);
@@ -1898,7 +1902,7 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     if (state->pending_launch) {
         using Common::IosJit::State;
         const State jit = Common::IosJit::GetState();
-        if (jit == State::Ready) {
+        if (jit == State::Ready || Settings::IsCachedInterpreterEnabled()) {
             LOG_INFO(Frontend, "iOS: JIT pool ready after {} ms", SDL_GetTicks() - state->jit_wait_start);
             IOS_MARK("JIT pool ready");
             IosSupport::EndBackgroundTask(state->jit_bg_task);

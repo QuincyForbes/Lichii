@@ -4,7 +4,16 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "core/arm/exclusive_monitor.h"
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
+#include "common/spin_deadline.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_condition_variable.h"
 #include "core/hle/kernel/k_process.h"
@@ -13,6 +22,7 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_thread_queue.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/physical_core.h"
 #include "core/hle/kernel/svc_common.h"
 #include "core/hle/kernel/svc_results.h"
 #include "core/memory.h"
@@ -33,34 +43,41 @@ bool WriteToUser(KernelCore& kernel, KProcessAddress address, u32 val) {
 
 bool UpdateLockAtomic(KernelCore& kernel, u32* out, KProcessAddress address, u32 if_zero,
                       u32 new_orr_mask) {
-    auto& monitor = GetCurrentProcess(kernel).GetExclusiveMonitor();
-    const auto current_core = kernel.CurrentPhysicalCoreIndex();
+    auto& memory = GetCurrentMemory(kernel);
+    const u64 raw_addr = GetInteger(address);
 
-    u32 expected{};
-
+    u32 expected = memory.Read32(raw_addr);
     while (true) {
-        // Load the value from the address.
-        expected = monitor.ExclusiveRead32(current_core, GetInteger(address));
-
-        // Orr in the new mask.
-        u32 value = expected | new_orr_mask;
-
-        // If the value is zero, use the if_zero value, otherwise use the newly orr'd value.
-        if (!expected) {
-            value = if_zero;
-        }
-
-        // Try to store.
-        if (monitor.ExclusiveWrite32(current_core, GetInteger(address), value)) {
+        const u32 value = expected != 0 ? (expected | new_orr_mask) : if_zero;
+        if (memory.WriteExclusive32(raw_addr, value, expected)) {
             break;
         }
-
-        // If we failed to store, try again.
+        expected = memory.Read32(raw_addr);
     }
 
-    // We're done.
     *out = expected;
     return true;
+}
+
+void LockSpinPause() {
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+    _mm_pause();
+#elif defined(__APPLE__) && defined(__aarch64__)
+    __builtin_arm_isb(0xF);
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
+}
+
+s64 LockSpinMicroseconds() {
+    static const s64 microseconds = [] {
+        const char* value = std::getenv("EDEN_NX2_LOCK_SPIN");
+        if (value == nullptr || value[0] == '\0') {
+            return s64{4};
+        }
+        return (std::max)(s64{0}, static_cast<s64>(std::strtoll(value, nullptr, 10)));
+    }();
+    return microseconds;
 }
 
 class ThreadQueueImplForKConditionVariableWaitForAddress final : public KThreadQueue {
@@ -156,6 +173,67 @@ Result KConditionVariable::SignalToAddress(KernelCore& kernel, KProcessAddress a
 Result KConditionVariable::WaitForAddress(KernelCore& kernel, Handle handle, KProcessAddress addr, u32 value) {
     KThread* cur_thread = GetCurrentThreadPointer(kernel);
     ThreadQueueImplForKConditionVariableWaitForAddress wait_queue(kernel);
+    const u32 expected_tag = handle | Svc::HandleWaitMask;
+
+    // Resolve handle and optionally watch the lock word briefly outside KScopedSchedulerLock
+    // when the lock owner is actively running on another physical core (so priority inheritance
+    // is never delayed for a preempted owner).
+    KScopedAutoObject<KThread> pre_owner{kernel};
+    if (!cur_thread->IsTerminationRequested() && (GetInteger(addr) & 3) == 0) {
+        if (u8* const pointer = GetCurrentMemory(kernel).GetPointerSilent(GetInteger(addr));
+            pointer != nullptr) {
+            const auto load_tag = [pointer] {
+                return std::atomic_ref<u32>{*reinterpret_cast<u32*>(pointer)}.load(
+                    std::memory_order_acquire);
+            };
+            if (load_tag() != expected_tag) {
+                R_SUCCEED();
+            }
+            pre_owner = GetCurrentProcess(kernel)
+                            .GetHandleTable()
+                            .GetObjectWithoutPseudoHandle<KThread>(kernel, handle);
+            const s64 spin_us = LockSpinMicroseconds();
+            const s32 current_core = GetCurrentCoreId(kernel);
+            if (spin_us > 0 && pre_owner.IsNotNull() && kernel.IsMulticore() && current_core >= 0 &&
+                KScheduler::GetCoreScheduledCount(kernel, current_core) <= 1) {
+                const s32 owner_core = pre_owner->GetCurrentCore();
+                if (owner_core >= 0 && owner_core != current_core &&
+                    kernel.Scheduler(owner_core).GetSchedulerCurrentThread() ==
+                        pre_owner.GetPointerUnsafe()) {
+                    u8& credit = cur_thread->m_nx2_lock_spin_credit;
+                    if (credit > 0 || (++cur_thread->m_nx2_lock_spin_probe & 15) == 0) {
+                        const PhysicalCore& core = kernel.CurrentPhysicalCore();
+                        const Common::SpinDeadline::Deadline deadline{
+                            std::chrono::microseconds{spin_us}};
+                        bool released = false;
+                        for (u32 spin = 1;; ++spin) {
+                            LockSpinPause();
+                            if (load_tag() != expected_tag) {
+                                credit = static_cast<u8>((std::min)(credit + 2, 16));
+                                released = true;
+                                break;
+                            }
+                            if ((spin & 31) == 0) {
+                                if (core.IsInterrupted() ||
+                                    KScheduler::GetCoreScheduledCount(kernel, current_core) > 1 ||
+                                    kernel.Scheduler(owner_core).GetSchedulerCurrentThread() !=
+                                        pre_owner.GetPointerUnsafe() ||
+                                    deadline.Expired()) {
+                                    break;
+                                }
+                            }
+                        }
+                        if (released && !cur_thread->IsTerminationRequested()) {
+                            R_SUCCEED();
+                        }
+                        if (!released && credit > 0) {
+                            --credit;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Wait for the address.
     KThread* owner_thread{};
@@ -170,13 +248,15 @@ Result KConditionVariable::WaitForAddress(KernelCore& kernel, Handle handle, KPr
         R_UNLESS(ReadFromUser(kernel, std::addressof(test_tag), addr), ResultInvalidCurrentMemory);
 
         // If the tag isn't the handle (with wait mask), we're done.
-        R_SUCCEED_IF(test_tag != (handle | Svc::HandleWaitMask));
+        R_SUCCEED_IF(test_tag != expected_tag);
 
         // Get the lock owner thread.
-        owner_thread = GetCurrentProcess(kernel)
-            .GetHandleTable()
-            .GetObjectWithoutPseudoHandle<KThread>(kernel, handle)
-            .ReleasePointerUnsafe();
+        owner_thread = pre_owner.IsNotNull()
+                           ? pre_owner.ReleasePointerUnsafe()
+                           : GetCurrentProcess(kernel)
+                                 .GetHandleTable()
+                                 .GetObjectWithoutPseudoHandle<KThread>(kernel, handle)
+                                 .ReleasePointerUnsafe();
         R_UNLESS(owner_thread != nullptr, ResultInvalidHandle);
 
         // Update the lock.
@@ -248,7 +328,7 @@ void KConditionVariable::Signal(u64 cv_key, s32 count) {
     {
         KScopedSchedulerLock sl(m_system.Kernel());
 
-        auto it = m_tree.nfind_key({cv_key, -1});
+        auto it = m_tree.empty() ? m_tree.end() : m_tree.nfind_key({cv_key, -1});
         while ((it != m_tree.end()) && (count <= 0 || num_waiters < count) && (it->GetConditionVariableKey() == cv_key)) {
             KThread* target_thread = std::addressof(*it);
 

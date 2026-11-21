@@ -10,6 +10,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <bitset>
 #include <concepts>
@@ -152,6 +153,12 @@ public:
         constexpr Member* GetFront(s32 core) const {
             return m_root[core].GetNext();
         }
+
+        constexpr bool IsSingleton(s32 core, const Member* member) const {
+            const Entry& member_entry = member->GetPriorityQueueEntry(core);
+            return member_entry.GetPrev() == nullptr && member_entry.GetNext() == nullptr &&
+                   m_root[core].GetNext() == member;
+        }
     };
 
     class KPriorityQueueImpl {
@@ -169,6 +176,8 @@ public:
             if (m_queues[priority].PushBack(core, member)) {
                 m_available_priorities[core].set(std::size_t(priority));
             }
+            AddCount(core, 1);
+            BumpVersion(core);
         }
 
         constexpr void PushFront(s32 priority, s32 core, Member* member) {
@@ -182,6 +191,8 @@ public:
             if (m_queues[priority].PushFront(core, member)) {
                 m_available_priorities[core].set(std::size_t(priority));
             }
+            AddCount(core, 1);
+            BumpVersion(core);
         }
 
         constexpr void Remove(s32 priority, s32 core, Member* member) {
@@ -195,6 +206,8 @@ public:
             if (m_queues[priority].Remove(core, member)) {
                 m_available_priorities[core].reset(std::size_t(priority));
             }
+            AddCount(core, -1);
+            BumpVersion(core);
         }
 
         constexpr Member* GetFront(s32 core) const {
@@ -253,9 +266,10 @@ public:
             ASSERT(IsValidCore(core));
             ASSERT(IsValidPriority(priority));
 
-            if (priority <= LowestPriority) {
+            if (priority <= LowestPriority && m_queues[priority].GetFront(core) != member) {
                 m_queues[priority].Remove(core, member);
                 m_queues[priority].PushFront(core, member);
+                BumpVersion(core);
             }
         }
 
@@ -264,17 +278,56 @@ public:
             ASSERT(IsValidPriority(priority));
 
             if (priority <= LowestPriority) {
+                if (m_queues[priority].IsSingleton(core, member)) {
+                    return member;
+                }
                 m_queues[priority].Remove(core, member);
                 m_queues[priority].PushBack(core, member);
+                BumpVersion(core);
                 return m_queues[priority].GetFront(core);
             } else {
                 return nullptr;
             }
         }
 
+        constexpr u64 GetVersion(s32 core) const {
+            ASSERT(IsValidCore(core));
+            if (std::is_constant_evaluated()) {
+                return m_versions[core];
+            }
+            return std::atomic_ref<u64>{m_versions[core]}.load(std::memory_order_acquire);
+        }
+
+        constexpr u32 GetCount(s32 core) const {
+            ASSERT(IsValidCore(core));
+            if (std::is_constant_evaluated()) {
+                return m_counts[core];
+            }
+            return std::atomic_ref<u32>{m_counts[core]}.load(std::memory_order_relaxed);
+        }
+
     private:
+        constexpr void BumpVersion(s32 core) {
+            if (std::is_constant_evaluated()) {
+                ++m_versions[core];
+            } else {
+                std::atomic_ref<u64>{m_versions[core]}.fetch_add(1, std::memory_order_release);
+            }
+        }
+
+        constexpr void AddCount(s32 core, s32 delta) {
+            if (std::is_constant_evaluated()) {
+                m_counts[core] = static_cast<u32>(static_cast<s32>(m_counts[core]) + delta);
+            } else {
+                std::atomic_ref<u32>{m_counts[core]}.fetch_add(static_cast<u32>(delta),
+                                                               std::memory_order_relaxed);
+            }
+        }
+
         std::array<KPerCoreQueue, NumPriority> m_queues{};
         std::array<std::bitset<NumPriority>, NumCores> m_available_priorities{};
+        alignas(8) mutable std::array<u64, NumCores> m_versions{};
+        alignas(4) mutable std::array<u32, NumCores> m_counts{};
     };
 
 private:
@@ -373,6 +426,14 @@ public:
         return member->GetPriorityQueueEntry(core).GetNext();
     }
 
+    constexpr u64 GetScheduledQueueVersion(s32 core) const {
+        return m_scheduled_queue.GetVersion(core);
+    }
+
+    constexpr u32 GetScheduledCount(s32 core) const {
+        return m_scheduled_queue.GetCount(core);
+    }
+
     // Mutators.
     constexpr void PushBack(Member* member) {
         // This is for host (dummy) threads that we do not want to enter the priority queue.
@@ -444,24 +505,24 @@ public:
         const s32 new_core = member->GetActiveCore();
 
         // Remove the member from all queues it was in before.
-        for (s32 core = 0; core < static_cast<s32>(NumCores); core++) {
-            if (prev_affinity.GetAffinity(core)) {
-                if (core == prev_core) {
-                    m_scheduled_queue.Remove(priority, core, member);
-                } else {
-                    m_suggested_queue.Remove(priority, core, member);
-                }
+        u64 prev_mask = prev_affinity.GetAffinityMask();
+        while (prev_mask) {
+            const s32 core = GetNextCore(prev_mask);
+            if (core == prev_core) {
+                m_scheduled_queue.Remove(priority, core, member);
+            } else {
+                m_suggested_queue.Remove(priority, core, member);
             }
         }
 
         // And add the member to all queues it should be in now.
-        for (s32 core = 0; core < static_cast<s32>(NumCores); core++) {
-            if (new_affinity.GetAffinity(core)) {
-                if (core == new_core) {
-                    m_scheduled_queue.PushBack(priority, core, member);
-                } else {
-                    m_suggested_queue.PushBack(priority, core, member);
-                }
+        u64 new_mask = new_affinity.GetAffinityMask();
+        while (new_mask) {
+            const s32 core = GetNextCore(new_mask);
+            if (core == new_core) {
+                m_scheduled_queue.PushBack(priority, core, member);
+            } else {
+                m_suggested_queue.PushBack(priority, core, member);
             }
         }
     }

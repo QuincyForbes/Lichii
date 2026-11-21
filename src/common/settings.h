@@ -278,11 +278,7 @@ struct Values {
                                                     CpuBackend::Dynarmic,
 #endif
                                                     CpuBackend::Dynarmic,
-#ifdef HAS_NCE
-                                                    CpuBackend::Nce,
-#else
-                                                    CpuBackend::Dynarmic,
-#endif
+                                                    CpuBackend::Hypervisor,
                                                     "cpu_backend",
                                                     Category::Cpu};
     SwitchableSetting<CpuAccuracy, true> cpu_accuracy{linkage, CpuAccuracy::Auto,
@@ -1236,6 +1232,8 @@ bool IsGPUFenceBehaviorAccurate();
 bool IsFastmemEnabled();
 void SetNceEnabled(bool is_64bit);
 bool IsNceEnabled();
+bool IsCachedInterpreterEnabled();
+bool IsHypervisorEnabled();
 
 void SetCurrentProgramID(u64 program_id);
 u64 GetCurrentProgramID();
@@ -1283,6 +1281,7 @@ OotResolution OcarinaUpscaledResolution(OotResolution resolution, Upscaler upsca
 struct OotPresetCompanions {
     std::optional<OotResolution> resolution;
     std::optional<TextureQuality> textures;
+    std::optional<OotAntiAliasing> sharpening;
 };
 OotPresetCompanions OotGraphicsPresetCompanions(OotGraphicsPreset preset);
 void ApplyOotGraphicsPreset(OotGraphicsPreset preset);

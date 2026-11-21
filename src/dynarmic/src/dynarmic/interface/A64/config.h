@@ -195,6 +195,14 @@ struct UserConfig {
     /// Useful for compacting bits into the page table and should be used as part of `page_table_pointer_mask`.
     std::optional<std::uint8_t> page_table_sign_extension = std::nullopt;
 
+    /// Optional pointer to an atomic uintptr_t state word for page-table reads of marked
+    /// RasterizerCachedMemory entries (low 3 bits == 0b111 when page_table_marked_bit == 0):
+    ///   0: disabled (always call memory read callbacks)
+    ///   1: enabled with no read traps armed anywhere (read directly from masked page pointer)
+    ///  >1: pointer to a u64 bitmap indexed by 4 KiB page (0 .. 2^27 - 1); bit == 0 reads
+    ///      directly, bit == 1 calls the memory read callbacks.
+    std::uintptr_t untrapped_read_bitmap_ptr = 0;
+
     /// Counter-timer frequency register. The value of the register is not interpreted by
     /// dynarmic.
     std::uint32_t cntfrq_el0 = 600000000;

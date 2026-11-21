@@ -35,6 +35,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_compute_chain.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
@@ -245,6 +246,9 @@ private:
 
     /// EDEN_NX2_WRITER_DEPS (diagnostic): what a command-list-writing dispatch samples.
     void NoteWriterDeps(const ComputePipeline& pipeline);
+    [[nodiscard]] bool ShouldSkipDispatchBarrier(
+        const ComputePipeline& pipeline, bool may_chain,
+        std::optional<ComputeAccessRange> indirect_range = std::nullopt);
     /// The split back's idle hook: submits pending list copies and deferred work.
     bool FlushSplitIdle(bool requested);
 
@@ -336,7 +340,7 @@ private:
         boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
         boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;
     };
-    using VertexInputKey = std::array<u32, 32 + 32 * 3 + 1>;
+    using VertexInputKey = std::array<u32, 32 + 32 * 2 + 2>;
     struct VertexInputKeyHash {
         size_t operator()(const VertexInputKey& key) const noexcept;
     };
@@ -490,6 +494,7 @@ private:
     u64 last_blend_epoch{~0ULL};
     u64 nx2_dispatch_serial = 0;
     u64 nx2_wfi_dispatch_serial = 0;
+    ComputeDispatchChain dispatch_chain;
     VideoCommon::OotNetwork::BypassState oot_network_bypass;
 
     /// A depth buffer drawn with a perspective camera since the last evaluation of
@@ -611,10 +616,15 @@ private:
     };
     DynamicStateCache dyn_cache;
     Tegra::Engines::Maxwell3D::DirtyState::Flags dyn_state_mask{};
+    Tegra::Engines::Maxwell3D::DirtyState::Flags vertex_input_keep_mask{};
     bool dyn_state_mask_built{};
+    bool vertex_input_keep_mask_built{};
 
-    std::unordered_map<VertexInputKey, std::unique_ptr<VertexInputLayout>, VertexInputKeyHash>
-        vertex_input_layouts;
+    using VertexInputMap =
+        std::unordered_map<VertexInputKey, std::unique_ptr<VertexInputLayout>, VertexInputKeyHash>;
+    VertexInputMap vertex_input_layouts;
+    static constexpr size_t VertexInputFastSlots = 256;
+    std::array<const VertexInputMap::value_type*, VertexInputFastSlots> vertex_input_fast_cache{};
     VertexInputKey last_vertex_input_key{};
     const VertexInputLayout* last_vertex_input_layout{};
     std::array<u32, 64> repack_key{};

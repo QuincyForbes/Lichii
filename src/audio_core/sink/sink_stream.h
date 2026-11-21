@@ -99,8 +99,16 @@ public:
         return false;
     }
 
+    virtual bool DiscardsSamples() const noexcept {
+        return !IsReady();
+    }
+
     void MarkFaulted() {
-        failed = true;
+        {
+            std::scoped_lock lk{release_mutex};
+            failed = true;
+        }
+        release_cv.notify_all();
     }
 
     virtual bool TryAppendOutputBlock(SinkBuffer& buffer, std::span<s16> samples);
@@ -279,13 +287,15 @@ public:
     /**
      * Waits for free space in the sample ring buffer
      */
-    void WaitFreeSpace(std::stop_token stop_token);
+    virtual void WaitFreeSpace(std::stop_token stop_token);
 
 protected:
     /**
      * Unblocks the ADSP if the stream is paused.
      */
     void SignalPause();
+
+    void AdvancePlayedSampleCount(u64 num_frames);
 
 protected:
     /// Core system

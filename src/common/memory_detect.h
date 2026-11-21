@@ -23,8 +23,8 @@ struct MemoryInfo {
 /// Page faults of this process so far, soft and hard (0 where unknown).
 [[nodiscard]] u64 GetProcessPageFaults();
 
-/// Commit the system can still hand out, in bytes: its commit limit (RAM plus the page files)
-/// minus what is committed. No value where the host reports no such limit (anything but Windows).
-[[nodiscard]] std::optional<u64> GetSystemCommitRoom();
+/// Commit this process can still take, in bytes: the system's remaining commit, or less under
+/// a job object's commit limit. No value if the query fails or the host is not Windows.
+[[nodiscard]] std::optional<u64> GetProcessCommitRoom();
 
 } // namespace Common

@@ -30,6 +30,13 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
     if (type == StreamType::In)
         return;
 
+    if (!IsReady()) {
+        if (type == StreamType::Render || type == StreamType::Out) {
+            AdvancePlayedSampleCount(buffer.frames != 0 ? buffer.frames : TargetSampleCount);
+        }
+        return;
+    }
+
     constexpr s32 min = (std::numeric_limits<s16>::min)();
     constexpr s32 max = (std::numeric_limits<s16>::max)();
 
@@ -67,28 +74,34 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
     } else if (system_channels < device_channels) {
         if (device_samples <= 2048) {
             std::array<s16, 2048> stack_samples{};
-            for (u32 r_offs = 0, w_offs = 0; r_offs < samples.size();
-                 r_offs += system_channels, w_offs += device_channels) {
-                for (u32 channel = 0; channel < system_channels; ++channel) {
-                    stack_samples[w_offs + channel] =
-                        s16(std::clamp(s32(f32(samples[r_offs + channel]) * volume), min, max));
+            if (volume != 0.0f) {
+                for (u32 r_offs = 0, w_offs = 0; r_offs < samples.size();
+                     r_offs += system_channels, w_offs += device_channels) {
+                    for (u32 channel = 0; channel < system_channels; ++channel) {
+                        stack_samples[w_offs + channel] =
+                            s16(std::clamp(s32(f32(samples[r_offs + channel]) * volume), min, max));
+                    }
                 }
             }
             pushed = samples_buffer.Push(std::span<const s16>{stack_samples.data(), device_samples});
         } else {
             std::vector<s16> new_samples(device_samples);
-            for (u32 r_offs = 0, w_offs = 0; r_offs < samples.size();
-                 r_offs += system_channels, w_offs += device_channels) {
-                for (u32 channel = 0; channel < system_channels; ++channel) {
-                    new_samples[w_offs + channel] =
-                        s16(std::clamp(s32(f32(samples[r_offs + channel]) * volume), min, max));
+            if (volume != 0.0f) {
+                for (u32 r_offs = 0, w_offs = 0; r_offs < samples.size();
+                     r_offs += system_channels, w_offs += device_channels) {
+                    for (u32 channel = 0; channel < system_channels; ++channel) {
+                        new_samples[w_offs + channel] =
+                            s16(std::clamp(s32(f32(samples[r_offs + channel]) * volume), min, max));
+                    }
                 }
             }
             pushed = samples_buffer.Push(new_samples);
         }
     } else {
-        if (volume != 1.0f) {
-            for (u32 i = 0; i < samples.size(); ++i)
+        if (volume == 0.0f) {
+            std::memset(samples.data(), 0, samples.size_bytes());
+        } else if (volume != 1.0f) {
+            for (size_t i = 0; i < samples.size(); ++i)
                 samples[i] = s16(std::clamp(s32(f32(samples[i]) * volume), min, max));
         }
 
@@ -433,7 +446,7 @@ void SinkStream::WaitFreeSpace(std::stop_token stop_token) {
     std::unique_lock lk{release_mutex};
 
     auto can_continue = [this]() {
-        return paused || queued_buffers < max_queue_size;
+        return paused || !IsReady() || queued_buffers < max_queue_size;
     };
 
     release_cv.wait_for(lk, std::chrono::milliseconds(7), can_continue);
@@ -449,6 +462,13 @@ void SinkStream::SignalPause() {
         paused = true;
     }
     release_cv.notify_one();
+}
+
+void SinkStream::AdvancePlayedSampleCount(u64 num_frames) {
+    UpdateSampleCount(static_cast<std::size_t>(num_frames));
+    if (RenderOutputClockEnabled() && type == StreamType::Render && name == "ADSP_RenderStream-0") {
+        GetRenderOutputClock().played.fetch_add(num_frames, std::memory_order_relaxed);
+    }
 }
 
 } // namespace AudioCore::Sink

@@ -40,6 +40,7 @@
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/svc/svc_thread_yield.h"
 #include "dynarmic/interface/A64/config.h"
 #include "dynarmic/interface/jit_stats.h"
 #include "video_core/nx2_spikes.h"
@@ -55,13 +56,17 @@ bool Nx2EnvOn(const char* name) {
     return value == nullptr || value[0] != '0';
 }
 
-#if defined(ARCHITECTURE_x86_64)
-// Fast dispatch table size: unset = 2^16 entries, 4-way set associative (1 MiB per core instead of
-// 16 MiB); "0" = the old direct-mapped 2^20 table; a number 8-24 = that many bits, 4-way.
+#if defined(ARCHITECTURE_x86_64) || defined(ARCHITECTURE_arm64)
+// Fast dispatch table size: unset = 2^18 entries on desktop (2^15 on iOS), 4-way set associative;
+// "0" = off / fallback; a number 8-24 = that many bits, 4-way.
 u32 Nx2DispatchBits() {
     const char* value = std::getenv("EDEN_NX2_JIT_DISPATCH");
     if (value == nullptr || value[0] == '\0' || (value[0] == '1' && value[1] == '\0')) {
-        return 16;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        return 15;
+#else
+        return 18;
+#endif
     }
     const long bits = std::strtol(value, nullptr, 10);
     return bits >= 8 && bits <= 24 ? u32(bits) : 0;
@@ -83,7 +88,7 @@ u32 DefaultCodeCacheBytes() {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
     // Carved out of the debugger-prepared JIT pool (common/ios_jit.h).
     return u32(Common::IosJit::CodeCacheBytes());
-#elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+#elif defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
     return u32(128_MiB);
 #else
     return u32(512_MiB);
@@ -343,13 +348,15 @@ u32 JitEvictSliceBytes() {
 
 JitFaultPolicy GetJitFaultPolicy() {
     static const JitFaultPolicy policy = [] {
+        constexpr u32 DefaultLoadFaultLimit = 0;
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         JitFaultPolicy result{Common::IosJit::FaultSharedMarkers(),
-                              u8((std::min)(Common::IosJit::FaultBlockAfter(), 255U)), 0};
+                              u8((std::min)(Common::IosJit::FaultBlockAfter(), 255U)),
+                              DefaultLoadFaultLimit};
 #elif defined(__APPLE__) && defined(ARCHITECTURE_arm64)
-        JitFaultPolicy result{true, 2, 0};
+        JitFaultPolicy result{true, 2, DefaultLoadFaultLimit};
 #else
-        JitFaultPolicy result{false, 0, 0};
+        JitFaultPolicy result{false, 0, DefaultLoadFaultLimit};
 #endif
         if (const char* const value = std::getenv("EDEN_NX2_JIT_LOAD_FAULTS"); value && value[0] != '\0') {
             result.load_fault_limit = u32(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 1U << 20));
@@ -419,7 +426,7 @@ auto DynarmicCallbacks64::SlowAccessCall(Common::PerfReport::SlowAccess reason, 
 
 u64 DynarmicCallbacks64::MemoryRead(u64 vaddr, size_t size) {
     ++m_slow_reads;
-    if (m_slow_breakdown) [[unlikely]] {
+    if (m_slow_breakdown) {
         return SlowAccessCall(ClassifySlowAccess(vaddr, size), false, vaddr,
                               [&] { return ReadValue(vaddr, size); });
     }
@@ -428,7 +435,7 @@ u64 DynarmicCallbacks64::MemoryRead(u64 vaddr, size_t size) {
 
 u64 DynarmicCallbacks64::MemoryReadExclusive(u64 vaddr, size_t size) {
     ++m_slow_reads;
-    if (m_slow_breakdown) [[unlikely]] {
+    if (m_slow_breakdown) {
         return SlowAccessCall(Common::PerfReport::SlowAccess::Exclusive, false, vaddr,
                               [&] { return ReadValue(vaddr, size); });
     }
@@ -436,7 +443,19 @@ u64 DynarmicCallbacks64::MemoryReadExclusive(u64 vaddr, size_t size) {
 }
 
 u64 DynarmicCallbacks64::ReadValue(u64 vaddr, size_t size) {
-    CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Read);
+    if (!m_check_memory_access) {
+        const u64 masked = vaddr & 0xffffffffffffULL;
+        const u64 page = masked & ~u64{Core::Memory::YUZU_PAGEMASK};
+        const u64 offset = masked & u64{Core::Memory::YUZU_PAGEMASK};
+        if (page == m_hot_read_page && offset + size <= Core::Memory::YUZU_PAGESIZE &&
+            m_memory.FastReadGeneration() == m_hot_read_gen) {
+            u64 value{};
+            std::memcpy(&value, m_hot_read_ptr + offset, size);
+            return value;
+        }
+    } else {
+        CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Read);
+    }
     u64 value{};
     switch (size) {
     case sizeof(u64): value = m_memory.Read64(vaddr); break;
@@ -445,25 +464,53 @@ u64 DynarmicCallbacks64::ReadValue(u64 vaddr, size_t size) {
     case sizeof(u8): value = m_memory.Read8(vaddr); break;
     default: UNREACHABLE();
     }
-    // With memory aborts ignored the guest keeps running on zeros: say where it read from.
-    if (auto& unmapped = Core::Memory::UnmappedReadFlag(); unmapped != 0) {
-        unmapped = 0;
-        static std::atomic<u32> logged{};
-        const u32 count = logged.fetch_add(1);
-        if (count < 32) {
-            LOG_ERROR(Core_ARM, "Unmapped read {:#x} ({} bytes) at pc {:#x} lr {:#x} sp {:#x}", vaddr, size,
-                      m_parent.m_jit->GetPC(), m_parent.m_jit->GetRegister(30), m_parent.m_jit->GetSP());
-        }
-        if (count < 2) {
-            LogUnmappedReadContext(m_memory, *m_parent.m_jit, vaddr);
+    // Unmapped Read<T> always returns 0; avoid the cross-TU thread_local lookup on non-zero reads.
+    if (value == 0) {
+        if (auto& unmapped = Core::Memory::UnmappedReadFlag(); unmapped != 0) {
             unmapped = 0;
+            static std::atomic<u32> logged{};
+            const u32 count = logged.fetch_add(1);
+            if (count < 32) {
+                LOG_ERROR(Core_ARM, "Unmapped read {:#x} ({} bytes) at pc {:#x} lr {:#x} sp {:#x}", vaddr, size,
+                          m_parent.m_jit->GetPC(), m_parent.m_jit->GetRegister(30), m_parent.m_jit->GetSP());
+            }
+            if (count < 2) {
+                LogUnmappedReadContext(m_memory, *m_parent.m_jit, vaddr);
+                unmapped = 0;
+            }
+            return value;
+        }
+    }
+    if (!m_check_memory_access &&
+        ((vaddr & u64{Core::Memory::YUZU_PAGEMASK}) + size <= Core::Memory::YUZU_PAGESIZE)) {
+        if (m_memory.TryCacheCleanReadPage(vaddr, m_hot_read_ptr, m_hot_read_gen)) {
+            m_hot_read_page = (vaddr & 0xffffffffffffULL) & ~u64{Core::Memory::YUZU_PAGEMASK};
         }
     }
     return value;
 }
 Dynarmic::A64::Vector DynarmicCallbacks64::Read128Value(u64 vaddr) {
-    CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Read);
-    return {m_memory.Read64(vaddr), m_memory.Read64(vaddr + 8)};
+    if (!m_check_memory_access) {
+        const u64 masked = vaddr & 0xffffffffffffULL;
+        const u64 page = masked & ~u64{Core::Memory::YUZU_PAGEMASK};
+        const u64 offset = masked & u64{Core::Memory::YUZU_PAGEMASK};
+        if (page == m_hot_read_page && offset + 16 <= Core::Memory::YUZU_PAGESIZE &&
+            m_memory.FastReadGeneration() == m_hot_read_gen) {
+            Dynarmic::A64::Vector out{};
+            std::memcpy(&out, m_hot_read_ptr + offset, sizeof(out));
+            return out;
+        }
+    } else {
+        CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Read);
+    }
+    const Dynarmic::A64::Vector out = m_memory.Read128(vaddr);
+    if (!m_check_memory_access &&
+        ((vaddr & u64{Core::Memory::YUZU_PAGEMASK}) + 16 <= Core::Memory::YUZU_PAGESIZE)) {
+        if (m_memory.TryCacheCleanReadPage(vaddr, m_hot_read_ptr, m_hot_read_gen)) {
+            m_hot_read_page = (vaddr & 0xffffffffffffULL) & ~u64{Core::Memory::YUZU_PAGEMASK};
+        }
+    }
+    return out;
 }
 
 Dynarmic::A64::Vector DynarmicCallbacks64::MemoryRead128(u64 vaddr) {
@@ -506,40 +553,80 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     return instruction;
 }
 
-void DynarmicCallbacks64::MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std::size_t size) {
-    ++m_slow_writes;
-    const auto write = [&] {
-        if (CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Write)) {
-            switch (size) {
-            case sizeof(u64): m_memory.Write64(vaddr, u64(value)); break;
-            case sizeof(u32): m_memory.Write32(vaddr, u32(value)); break;
-            case sizeof(u16): m_memory.Write16(vaddr, u16(value)); break;
-            case sizeof(u8): m_memory.Write8(vaddr, u8(value)); break;
-            default: UNREACHABLE();
+void DynarmicCallbacks64::WriteValue(u64 vaddr, u64 value, std::size_t size) {
+    if (!m_check_memory_access) {
+        const u64 masked = vaddr & 0xffffffffffffULL;
+        const u64 page = masked & ~u64{Core::Memory::YUZU_PAGEMASK};
+        const u64 offset = masked & u64{Core::Memory::YUZU_PAGEMASK};
+        if (page == m_hot_write.vaddr_page && offset + size <= Core::Memory::YUZU_PAGESIZE &&
+            m_memory.FastWriteGeneration() == m_hot_write.mem_gen) {
+            if (!m_hot_write.rasterizer_cached ||
+                m_memory.TryCollectHotWrite(m_parent.m_core_index, offset, size, m_hot_write)) {
+                std::memcpy(m_hot_write.host_page + offset, &value, size);
+                return;
             }
         }
-        return true;
-    };
-    if (m_slow_breakdown) [[unlikely]] {
-        SlowAccessCall(ClassifySlowAccess(vaddr, size), true, vaddr, write);
+    } else if (!CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Write)) {
         return;
     }
-    write();
+    switch (size) {
+    case sizeof(u64): m_memory.Write64(vaddr, u64(value)); break;
+    case sizeof(u32): m_memory.Write32(vaddr, u32(value)); break;
+    case sizeof(u16): m_memory.Write16(vaddr, u16(value)); break;
+    case sizeof(u8): m_memory.Write8(vaddr, u8(value)); break;
+    default: UNREACHABLE();
+    }
+    if (!m_check_memory_access &&
+        ((vaddr & u64{Core::Memory::YUZU_PAGEMASK}) + size <= Core::Memory::YUZU_PAGESIZE)) {
+        static_cast<void>(m_memory.TryCacheHotWritePage(m_parent.m_core_index, vaddr, m_hot_write));
+    }
 }
+
+void DynarmicCallbacks64::Write128Value(u64 vaddr, Dynarmic::A64::Vector value) {
+    if (!m_check_memory_access) {
+        const u64 masked = vaddr & 0xffffffffffffULL;
+        const u64 page = masked & ~u64{Core::Memory::YUZU_PAGEMASK};
+        const u64 offset = masked & u64{Core::Memory::YUZU_PAGEMASK};
+        if (page == m_hot_write.vaddr_page && offset + 16 <= Core::Memory::YUZU_PAGESIZE &&
+            m_memory.FastWriteGeneration() == m_hot_write.mem_gen) {
+            if (!m_hot_write.rasterizer_cached ||
+                m_memory.TryCollectHotWrite(m_parent.m_core_index, offset, 16, m_hot_write)) {
+                std::memcpy(m_hot_write.host_page + offset, &value, sizeof(value));
+                return;
+            }
+        }
+    } else if (!CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Write)) {
+        return;
+    }
+    m_memory.Write128(vaddr, value);
+    if (!m_check_memory_access &&
+        ((vaddr & u64{Core::Memory::YUZU_PAGEMASK}) + 16 <= Core::Memory::YUZU_PAGESIZE)) {
+        static_cast<void>(m_memory.TryCacheHotWritePage(m_parent.m_core_index, vaddr, m_hot_write));
+    }
+}
+
+void DynarmicCallbacks64::MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std::size_t size) {
+    ++m_slow_writes;
+    if (m_slow_breakdown) {
+        SlowAccessCall(ClassifySlowAccess(vaddr, size), true, vaddr, [&] {
+            WriteValue(vaddr, value, size);
+            return true;
+        });
+        return;
+    }
+    WriteValue(vaddr, value, size);
+}
+
 void DynarmicCallbacks64::MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value) {
     ++m_slow_writes;
-    const auto write = [&] {
-        if (CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Write)) {
-            m_memory.Write64(vaddr, value[0]);
-            m_memory.Write64(vaddr + 8, value[1]);
-        }
-        return true;
-    };
-    if (m_slow_breakdown) [[unlikely]] {
-        SlowAccessCall(ClassifySlowAccess(vaddr, 16), true, vaddr, write);
+    if (m_slow_breakdown) {
+        SlowAccessCall(ClassifySlowAccess(vaddr, 16), true, vaddr, [&] {
+            Write128Value(vaddr, value);
+            return true;
+        });
         return;
     }
-    write();
+    Write128Value(vaddr, value);
 }
 
 // false is reserved for "memory did not hold `expected`", which the caller retries. An access that
@@ -703,6 +790,24 @@ void DynarmicCallbacks64::CallSVC(u32 svc) {
     ++m_svcs;
     ++m_svc_counts[svc & 0xFF];
     ++m_svcs_pending;
+    if (svc == 0x0BU && !m_debugger_enabled) {
+        auto& jit = *m_parent.m_jit;
+        u64 spin_hash = 0;
+        spin_hash = Kernel::Svc::HashYieldSpinWord(spin_hash, jit.GetPC());
+        spin_hash = Kernel::Svc::HashYieldSpinWord(spin_hash, jit.GetSP());
+        for (size_t i = 19; i <= 29; ++i) {
+            spin_hash = Kernel::Svc::HashYieldSpinWord(spin_hash, jit.GetRegister(i));
+        }
+        if (Kernel::Svc::TryFastFutileYield64(
+                m_parent.m_system, static_cast<s64>(jit.GetRegister(0)), spin_hash)) {
+            jit.ClearExclusiveState();
+            m_parent.m_exclusive_monitor.ClearExclusive(m_parent.m_core_index);
+            if (m_svcs_pending >= 1024) {
+                m_parent.FlushGuestEvents();
+            }
+            return;
+        }
+    }
     m_parent.m_svc = svc;
     m_parent.m_jit->HaltExecution(SupervisorCall);
 }
@@ -1000,7 +1105,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         if (!Common::g_cpu_caps.fma) {
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
         }
-#else
+#elif !defined(ARCHITECTURE_arm64)
         config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
 #endif
         config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
@@ -1041,7 +1146,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     if (const char* bits = std::getenv("EDEN_NX2_FASTMEM_BITS"); bits && config.fastmem_pointer) {
         const auto value = static_cast<std::uint32_t>(std::strtoul(bits, nullptr, 10));
         if (value >= 32 && value < address_space_bits) {
-            config.fastmem_address_space_bits = value;
+            config.fastmem_address_space_bits = (std::min)(config.fastmem_address_space_bits, value);
         }
     }
     // cpuopt_compact_jit_code (EDEN_NX2_JIT_PT_FALLBACK=1/0 overrides): accesses past the fastmem
@@ -1066,9 +1171,26 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // page table walk instead of emitting it inline (65 bytes per access, against 29 with
     // fastmem, over the PC run's Kokiri blocks translated for arm64 offline).
     static const char* const pt_calls = std::getenv("EDEN_NX2_JIT_PT_CALLS");
+#if defined(__APPLE__) && TARGET_OS_IPHONE
     config.page_table_lookup_calls = pt_calls != nullptr
                                          ? pt_calls[0] != '0'
                                          : Settings::values.cpuopt_compact_jit_code.GetValue();
+#else
+    // Desktop ARM64 has a 512 MiB code cache, so inline the 4-instruction page-table walk rather
+    // than paying a shared BLR call + register save/restore on every post-fault access.
+    config.page_table_lookup_calls = pt_calls != nullptr && pt_calls[0] != '0';
+#endif
+#if defined(ARCHITECTURE_arm64)
+    if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
+        static const bool backedge_halt = Nx2EnvOn("EDEN_NX2_JIT_BACKEDGE_HALT");
+        config.halt_check_on_back_edges = backedge_halt && !config.enable_cycle_counting;
+        static const u32 dispatch_bits = Nx2DispatchBits();
+        config.fast_dispatch_table_bits = dispatch_bits;
+        static const bool native_atomics = Nx2EnvOn("EDEN_NX2_JIT_ATOMICS");
+        config.native_lse_atomics = native_atomics && config.fastmem_exclusive_access &&
+            config.HasOptimization(Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor);
+    }
+#endif
 #if defined(ARCHITECTURE_x86_64)
     // x86-64 is TSO: LDAPR/LDAR/LDAXR need no locked RMW (STLR keeps XCHG), and DMB xxLD/xxST
     // order nothing TSO does not already order. Ocarina of Time has ~68k LDAPRB sites (static
@@ -1161,6 +1283,12 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Debugging &&
         Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
         config.optimizations |= Dynarmic::OptimizationFlag::DisableVerification;
+    }
+    if (!m_cb->m_check_memory_access && config.page_table != nullptr &&
+        Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid &&
+        Nx2EnvOn("EDEN_NX2_JIT_PT_CACHED_READ")) {
+        config.untrapped_read_bitmap_ptr =
+            reinterpret_cast<std::uintptr_t>(m_cb->m_memory.JitReadTrapStatePtr());
     }
     // EDEN_NX2_PERF_MEMCB=0 keeps the perf report but drops the callback breakdown.
     static const bool slow_breakdown = Nx2EnvOn("EDEN_NX2_PERF_MEMCB");

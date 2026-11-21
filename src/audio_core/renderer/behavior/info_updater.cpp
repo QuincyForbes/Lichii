@@ -82,12 +82,15 @@ Result InfoUpdater::UpdateVoices(VoiceContext& voice_context,
     const u32 in_stride = use_v2 ? 0x188u : static_cast<u32>(sizeof(VoiceInfo::InParameter));
 
     for (u32 i = 0; i < voice_count; i++) {
-        VoiceInfo::InParameter local_in{};
-        std::array<VoiceInfo::BiquadFilterParameter2, MaxBiquadFilters> float_biquads{};
+        VoiceInfo::InParameter local_in;
+        std::array<VoiceInfo::BiquadFilterParameter2, MaxBiquadFilters> float_biquads;
 
         if (!use_v2) {
             const auto* in_param_ptr = reinterpret_cast<const VoiceInfo::InParameter*>(
                 input + i * sizeof(VoiceInfo::InParameter));
+            if (!in_param_ptr->in_use) {
+                continue;
+            }
             local_in = *in_param_ptr;
         } else {
             struct VoiceInParameterV2 {
@@ -135,11 +138,16 @@ Result InfoUpdater::UpdateVoices(VoiceContext& voice_context,
             static_assert(sizeof(VoiceInParameterV2) == 0x188);
             static_assert(offsetof(VoiceInParameterV2, crossfade_curve) == 0x177);
             const auto* vin = reinterpret_cast<const VoiceInParameterV2*>(input + i * in_stride);
-            if (behaviour.GetUserRevisionNum() >= 16 && vin->in_use && vin->crossfade_curve != 0) {
+            if (!vin->in_use) {
+                continue;
+            }
+            if (behaviour.GetUserRevisionNum() >= 16 && vin->crossfade_curve != 0) {
                 LOG_ERROR(Service_Audio, "Unsupported voice biquad crossfade curve {}",
                           vin->crossfade_curve);
                 return Service::Audio::ResultInvalidUpdateInfo;
             }
+            local_in = {};
+            float_biquads = {};
             local_in.id = vin->id;
             local_in.node_id = vin->node_id;
             local_in.is_new = vin->is_new;
@@ -185,10 +193,6 @@ Result InfoUpdater::UpdateVoices(VoiceContext& voice_context,
         }
         const auto& in_param = local_in;
         std::array<VoiceState*, MaxChannels> voice_states{};
-
-        if (!in_param.in_use) {
-            continue;
-        }
 
         auto& voice_info{voice_context.GetInfo(in_param.id)};
 

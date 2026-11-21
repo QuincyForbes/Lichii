@@ -151,6 +151,11 @@ u64 BeforePassMinPixels() {
     return pixels;
 }
 
+bool ExplicitBeforePassPixels() {
+    static const bool explicit_env = std::getenv("EDEN_NX2_BEFORE_PASS") != nullptr;
+    return explicit_env;
+}
+
 bool KeepDeferredClear() {
     static const bool keep = [] {
         const char* const value = std::getenv("EDEN_NX2_KEEP_DEFERRED_CLEAR");
@@ -328,7 +333,8 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
 
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
-    worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
+    worker_thread = Common::StartThreadWithStack(
+        std::size_t{32} << 20, [this](std::stop_token token) { WorkerThread(token); });
 }
 
 Scheduler::~Scheduler() {
@@ -434,7 +440,7 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (Common::PerfReport::Enabled()) {
         NoteSubmitPerf();
     }
-    if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+    if (VideoCommon::GpuSplit::check_owner) {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
     }
     VideoCommon::Nx2Profile::AddFlush();
@@ -469,16 +475,28 @@ namespace {
 // kept the Vulkan worker busy submitting. Batched within 500 us: ~10-15% more fps there.
 // Command list copies after dispatches were ~9,000 more a second, of which the front waited
 // for about 5%.
+bool ExplicitFenceFlushWindow() {
+    static const bool explicit_window = [] {
+        return std::getenv("EDEN_NX2_FENCE_FLUSH_US") != nullptr ||
+               VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush);
+    }();
+    return explicit_window;
+}
+
 s64 DeferFlushIntervalUs() {
     static const s64 interval_us = [] {
         const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
         if (value != nullptr) {
             return static_cast<s64>(std::atoll(value));
         }
-        // 0 by default (EvilOOT's flash fix): Ocarina of Time flashed white with the 500 us batch
-        // (sword boulder with preflush: 31 whole-screen flashes in 30 s, 0 without), and ran
-        // faster without it (Lake Hylia 52.3 -> 55.4 fps). EDEN_NX2_FENCE_FLUSH_US=500 restores it.
-        return VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush) ? s64{5000} : s64{0};
+        if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush)) {
+            return s64{5000};
+        }
+        // Bounded 250 us coalescing gated by GpuBehind() (>= 1 tick already in flight on the host
+        // GPU) or an active render pass, matching Metal's FenceTick after buffer_cache's
+        // preflush-read fix (2ac4f336).
+        return VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::VkFenceBatch) ? s64{250}
+                                                                                 : s64{0};
     }();
     return interval_us;
 }
@@ -490,18 +508,53 @@ bool Scheduler::DeferredFlushMayWait() const {
 }
 
 bool Scheduler::GpuBehind() {
+    return GpuBehindFor(master_semaphore->CurrentTick());
+}
+
+bool Scheduler::GpuBehindFor(u64 tick) const {
+    if (master_semaphore->KnownGpuTick() + 1 >= tick) {
+        return false;
+    }
     master_semaphore->Refresh();
-    return master_semaphore->KnownGpuTick() + 1 < master_semaphore->CurrentTick();
+    return master_semaphore->KnownGpuTick() + 1 < tick;
+}
+
+bool Scheduler::GpuDeepBehind() {
+    return GpuDeepBehindFor(master_semaphore->CurrentTick());
+}
+
+bool Scheduler::GpuDeepBehindFor(u64 tick) const {
+    if (master_semaphore->KnownGpuTick() + 2 >= tick) {
+        return false;
+    }
+    master_semaphore->Refresh();
+    return master_semaphore->KnownGpuTick() + 2 < tick;
 }
 
 bool Scheduler::DeferFlush(std::source_location location) {
     const s64 interval_us = DeferFlushIntervalUs();
-    if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread() ||
-        std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
+    if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread()) {
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const bool in_pass = state.renderpass != VK_NULL_HANDLE && pass_draws < 256U;
+    const auto window = std::chrono::microseconds{interval_us};
+    if (!ExplicitFenceFlushWindow()) {
+        const bool gpu_busy = GpuBehind();
+        if (!gpu_busy && !in_pass) {
+            return false;
+        }
+        const auto active_window =
+            gpu_busy ? window : std::chrono::microseconds{(std::min)(interval_us, s64{250})};
+        if ((now - last_flush >= window && !in_pass) ||
+            (flush_pending && now - flush_pending_since >= active_window)) {
+            return false;
+        }
+    } else if (now - last_flush >= window) {
         return false;
     }
     if (!flush_pending) {
-        flush_pending_since = std::chrono::steady_clock::now();
+        flush_pending_since = now;
         CountPerfSite(SiteDefer, location.file_name(), location.line());
     }
     flush_pending = true;
@@ -510,6 +563,22 @@ bool Scheduler::DeferFlush(std::source_location location) {
 
 void Scheduler::FlushDeferred(std::source_location location) {
     if (flush_pending) {
+        Flush({}, {}, location);
+    }
+}
+
+void Scheduler::FlushExpiredDeferred(std::source_location location) {
+    if (!flush_pending) {
+        return;
+    }
+    const s64 interval_us = DeferFlushIntervalUs();
+    const auto elapsed = std::chrono::steady_clock::now() - flush_pending_since;
+    const bool in_pass = state.renderpass != VK_NULL_HANDLE;
+    const bool gpu_busy = ExplicitFenceFlushWindow() || GpuBehind();
+    const auto limit = in_pass ? (gpu_busy ? std::chrono::microseconds{interval_us * 2}
+                                           : std::chrono::microseconds{(std::min)(interval_us, s64{250})})
+                               : std::chrono::microseconds{interval_us};
+    if (interval_us <= 0 || elapsed >= limit || (!in_pass && !gpu_busy)) {
         Flush({}, {}, location);
     }
 }
@@ -526,6 +595,36 @@ bool Scheduler::FlushDeferredFromIdle(bool requested) {
         FlushDeferred();
     }
     return true;
+}
+
+bool Scheduler::WaitFenceSubmitted(u64 tick, std::chrono::steady_clock::time_point queued,
+                                   std::source_location location) {
+    if (IsSubmitted(tick)) {
+        return true;
+    }
+    const s64 interval_us = DeferFlushIntervalUs();
+    auto& split = VideoCommon::GpuSplit::Get();
+    const bool gpu_busy = GpuBehindFor(tick);
+    const bool pass_open = in_render_pass.load(std::memory_order_relaxed);
+    if (interval_us > 0 && queued != std::chrono::steady_clock::time_point{} &&
+        split.BackRunning() && (gpu_busy || pass_open)) {
+        const s64 grace_us = gpu_busy ? interval_us : (std::min)(interval_us, s64{250});
+        const auto deadline = queued + std::chrono::microseconds{grace_us};
+        if (std::chrono::steady_clock::now() < deadline) {
+            submitted_ticks.Wait(
+                tick + 1, std::chrono::microseconds{20}, deadline,
+                [&] {
+                    return IsSubmitted(tick) || !split.BackRunning() ||
+                           (!GpuBehindFor(tick) &&
+                            !in_render_pass.load(std::memory_order_relaxed));
+                },
+                std::chrono::microseconds{100});
+            if (IsSubmitted(tick)) {
+                return true;
+            }
+        }
+    }
+    return WaitSubmitted(tick, location);
 }
 
 bool Scheduler::WaitSubmitted(u64 tick, std::source_location location) {
@@ -573,7 +672,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (state.renderpass) {
         NotePassEnd(location);
     }
-    if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+    if (VideoCommon::GpuSplit::check_owner) {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
     }
     if (Common::PerfReport::Enabled()) {
@@ -1106,7 +1205,7 @@ void Scheduler::ReportPassTimes() {
 }
 
 void Scheduler::DispatchWork(bool lazy) {
-    if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+    if (VideoCommon::GpuSplit::check_owner) {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
     }
     if (uploads_pending) {
@@ -1191,7 +1290,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
         // This pass loads back what the last one stored: on a tiler that is the whole target, twice.
         Common::PerfReport::Add(Common::PerfReport::RenderPassReopens);
         CountReopen(last_pass_end_file, last_pass_end_line, render_area);
-        if (pass_time_host_sampling) [[unlikely]] {
+        if (pass_time_host_sampling) {
             auto it = std::ranges::find_if(pass_time_reopens, [&](const PassReopen& reopen) {
                 return reopen.file == last_pass_end_file && reopen.line == last_pass_end_line &&
                        reopen.width == render_area.width && reopen.height == render_area.height;
@@ -1294,8 +1393,10 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
         }
     }
     state.renderpass = renderpass;
+    in_render_pass.store(true, std::memory_order_relaxed);
     state.clear_variant = false;
     state.framebuffer = framebuffer_handle;
+    state.target_key = pending_target_key;
     state.render_area = render_area;
     const std::span<const VkImageView> views = framebuffer->AttachmentViews();
     state.num_views = static_cast<u32>((std::min)(views.size(), state.views.size()));
@@ -1315,6 +1416,9 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
         values[i] = clear_values[i];
     }
     before_pass_open = std::exchange(before_pass_split, false);
+    if (!before_pass_open) {
+        ++before_pass_serial;
+    }
     const bool after_compute = std::exchange(compute_writes_pending, false);
     // A pass that begins with a clear (or discard) writes its attachments before any draw.
     render_pass_depth_written = clear_value_count != 0 || depth_clear || depth_discard ||
@@ -1472,7 +1576,7 @@ void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location lo
         NotePassEnd(location);
     }
     EndRenderPass();
-    if (pass_time_host_sampling) [[unlikely]] {
+    if (pass_time_host_sampling) {
         // "Perf passes:" names the GPU time up to the next timestamp after the caller.
         Record([this, file = location.file_name(), line = location.line()](vk::CommandBuffer cmdbuf) {
             PassTimeLabel(cmdbuf, file, line);
@@ -1496,7 +1600,7 @@ void Scheduler::RequestOutsideRenderPassKeepClear(std::span<const VkImage> touch
         });
         if (!touched) {
             Common::PerfReport::Add(Common::PerfReport::DeferredClearsKept);
-            if (pass_time_host_sampling) [[unlikely]] {
+            if (pass_time_host_sampling) {
                 Record([this, file = location.file_name(),
                         line = location.line()](vk::CommandBuffer cmdbuf) {
                     PassTimeLabel(cmdbuf, file, line);
@@ -1913,6 +2017,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             before_pass_cmdbuf.End();
             before_pass_cmdbuf = {};
         }
+        before_pass_slot = ~size_t{0};
 
         if (on_submit) {
             on_submit();
@@ -1920,7 +2025,11 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
 
         boost::container::small_vector<VkCommandBuffer, 16> cmdbufs;
         cmdbufs.push_back(*upload_cmdbuf);
-        cmdbufs.insert(cmdbufs.end(), segment_cmdbufs.begin(), segment_cmdbufs.end());
+        for (const VkCommandBuffer seg : segment_cmdbufs) {
+            if (seg != VK_NULL_HANDLE) {
+                cmdbufs.push_back(seg);
+            }
+        }
         cmdbufs.push_back(*cmdbuf);
         segment_cmdbufs.clear();
         VkResult result;
@@ -1973,6 +2082,7 @@ void Scheduler::AllocateNewContext() {
 void Scheduler::InvalidateState() {
     ++recording_epoch;
     state.graphics_pipeline = nullptr;
+    last_guest_compute_pipeline = nullptr;
     state.rescaling_defined = false;
     state.descriptor_buffer_bound = false;
     ++state.descriptor_buffer_bind_serial;
@@ -1996,7 +2106,11 @@ void Scheduler::EndRenderPass()
         }
         ++recording_epoch;
         fragment_barrier.Reset();
-        render_pass_has_stores = false;
+        const VkPipelineStageFlags wfi_stages = std::exchange(deferred_wfi_stages, 0U);
+        const bool had_stores = std::exchange(render_pass_has_stores, false);
+        if (wfi_stages != 0 || had_stores) {
+            NoteStorageWritesOrdered();
+        }
         render_pass_depth_written = false;
         last_pass_framebuffer = state.framebuffer;
         last_pass_num_views = state.num_views;
@@ -2024,6 +2138,8 @@ void Scheduler::EndRenderPass()
                        images = renderpass_images,
                        ranges = renderpass_image_ranges,
                        use_xfb_barrier,
+                       had_stores,
+                       wfi_stages,
                        time_pass = static_cast<bool>(pass_time_pool), draws = pass_draws](
                           vk::CommandBuffer cmdbuf) {
             std::array<VkImageMemoryBarrier, 9> barriers;
@@ -2065,9 +2181,34 @@ void Scheduler::EndRenderPass()
             if (time_pass) {
                 PassTimestamp(cmdbuf, false, nullptr, draws);
             }
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
-                                   0, nullptr, nullptr, vk::Span(barriers.data(), num_images));
+            static constexpr VkMemoryBarrier STORE_BARRIER{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                                 VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
+                                 VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                                 VK_ACCESS_TRANSFER_WRITE_BIT,
+            };
+            VkPipelineStageFlags src_stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                              VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            VkPipelineStageFlags dst_stages = vk::PIPELINE_STAGE_GRAPHICS_COMPUTE;
+            if (had_stores) {
+                src_stages |= VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+                dst_stages |= VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                              VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                              VK_PIPELINE_STAGE_TRANSFER_BIT;
+                if (device.IsExtMeshShaderSupported()) {
+                    src_stages |= VK_PIPELINE_STAGE_TASK_SHADER_BIT_EXT |
+                                  VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT;
+                }
+            }
+            const vk::Span<VkMemoryBarrier> mem_span =
+                had_stores ? vk::Span<VkMemoryBarrier>{STORE_BARRIER}
+                           : vk::Span<VkMemoryBarrier>{};
+            cmdbuf.PipelineBarrier(src_stages, dst_stages, 0, mem_span, nullptr,
+                                   vk::Span(barriers.data(), num_images));
             if (use_xfb_barrier) {
                 static constexpr VkMemoryBarrier XFB_OUTPUT_BARRIER{
                     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -2079,30 +2220,56 @@ void Scheduler::EndRenderPass()
                                        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                                        0, XFB_OUTPUT_BARRIER);
             }
+            if (wfi_stages != 0) {
+                static constexpr VkMemoryBarrier WFI_BARRIER{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                };
+                cmdbuf.PipelineBarrier(wfi_stages, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                                       WFI_BARRIER);
+            }
         });
 
         state.renderpass = VkRenderPass{};
+        in_render_pass.store(false, std::memory_order_relaxed);
         state.clear_variant = false;
         before_pass_open = false;
         num_renderpass_images = 0;
     }
 
-void Scheduler::WantSplitBefore(VkFramebuffer framebuffer) {
-    if (std::ranges::find(split_wanted, framebuffer) != split_wanted.end()) {
-        return;
-    }
-    split_wanted[split_wanted_next] = framebuffer;
-    split_wanted_next = (split_wanted_next + 1) % split_wanted.size();
+VkFramebuffer Scheduler::DeferredClearFramebufferHandle() const noexcept {
+    return deferred_clear.framebuffer != nullptr ? deferred_clear.framebuffer->Handle()
+                                                 : VK_NULL_HANDLE;
 }
 
-bool Scheduler::SplitBeforeNextPass(u64 pixels, VkFramebuffer framebuffer) {
+void Scheduler::WantSplitBefore(VkFramebuffer framebuffer, u64 target_key) {
+    if (framebuffer != VK_NULL_HANDLE) {
+        split_wanted.Insert((u64)framebuffer);
+    }
+    if (target_key != 0) {
+        split_wanted_targets.Insert(target_key);
+    }
+}
+
+void Scheduler::WantSplitBeforeCurrentPass() {
+    if (state.renderpass != VK_NULL_HANDLE) {
+        WantSplitBefore(state.framebuffer, state.target_key);
+    }
+}
+
+bool Scheduler::SplitBeforeNextPass(u64 pixels, VkFramebuffer framebuffer, u64 target_key) {
     if (state.renderpass || before_pass_split) {
         return false;
     }
     const u64 min_pixels = BeforePassMinPixels();
-    const bool wanted = framebuffer != VK_NULL_HANDLE &&
-                        std::ranges::find(split_wanted, framebuffer) != split_wanted.end();
-    if (min_pixels == 0 || (pixels < min_pixels && !wanted)) {
+    const bool wanted = (framebuffer != VK_NULL_HANDLE && split_wanted.Contains((u64)framebuffer)) ||
+                        (target_key != 0 && split_wanted_targets.Contains(target_key));
+    const bool allow_by_size =
+        ExplicitBeforePassPixels() ||
+        !VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::BeforePassAdaptive);
+    if (min_pixels == 0 || (!wanted && (!allow_by_size || pixels < min_pixels))) {
         return false;
     }
     ++before_pass_serial;
@@ -2120,35 +2287,72 @@ bool Scheduler::SplitBeforeTargetSwitch(const Framebuffer* framebuffer,
         return false;
     }
     const VkExtent2D area = framebuffer->RenderArea();
+    const u64 pixels = u64{area.width} * area.height;
     const u64 min_pixels = BeforePassMinPixels();
-    const bool wanted =
-        std::ranges::find(split_wanted, framebuffer->Handle()) != split_wanted.end();
-    if (min_pixels == 0 || (u64{area.width} * area.height < min_pixels && !wanted)) {
+    const bool wanted = split_wanted.Contains((u64)framebuffer->Handle()) ||
+                        (pending_target_key != 0 &&
+                         split_wanted_targets.Contains(pending_target_key));
+    const bool allow_by_size =
+        ExplicitBeforePassPixels() ||
+        !VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::BeforePassAdaptive);
+    if (min_pixels == 0 || (!wanted && (!allow_by_size || pixels < min_pixels))) {
         return false;
     }
     NotePassEnd(location);
     EndRenderPass();
-    return SplitBeforeNextPass(u64{area.width} * area.height, framebuffer->Handle());
+    return SplitBeforeNextPass(pixels, framebuffer->Handle(), pending_target_key);
 }
 
 void Scheduler::SplitBeforePass() {
     if (*before_pass_cmdbuf != VK_NULL_HANDLE) {
         before_pass_cmdbuf.End();
+        before_pass_cmdbuf = {};
     }
     current_cmdbuf.End();
     segment_cmdbufs.push_back(*current_cmdbuf);
+    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::BeforePassAdaptive)) {
+        before_pass_slot = segment_cmdbufs.size();
+        segment_cmdbufs.push_back(VK_NULL_HANDLE);
+    } else {
+        static constexpr VkCommandBufferBeginInfo begin_info{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = nullptr,
+        };
+        before_pass_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
+        before_pass_cmdbuf.Begin(begin_info);
+        before_pass_slot = segment_cmdbufs.size();
+        segment_cmdbufs.push_back(*before_pass_cmdbuf);
+    }
     static constexpr VkCommandBufferBeginInfo begin_info{
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .pNext = nullptr,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         .pInheritanceInfo = nullptr,
     };
-    before_pass_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
-    before_pass_cmdbuf.Begin(begin_info);
-    segment_cmdbufs.push_back(*before_pass_cmdbuf);
     current_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
     current_cmdbuf.Begin(begin_info);
     index_buffer_bound = false;
+}
+
+vk::CommandBuffer Scheduler::EnsureBeforePassCmdbuf() {
+    if (*before_pass_cmdbuf == VK_NULL_HANDLE) {
+        static constexpr VkCommandBufferBeginInfo begin_info{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = nullptr,
+        };
+        before_pass_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
+        before_pass_cmdbuf.Begin(begin_info);
+        if (before_pass_slot < segment_cmdbufs.size()) {
+            segment_cmdbufs[before_pass_slot] = *before_pass_cmdbuf;
+        } else {
+            segment_cmdbufs.push_back(*before_pass_cmdbuf);
+        }
+    }
+    return before_pass_cmdbuf;
 }
 
 

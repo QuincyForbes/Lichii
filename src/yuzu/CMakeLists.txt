@@ -433,12 +433,17 @@ if (APPLE)
         MACOSX_PACKAGE_LOCATION Frameworks
         XCODE_FILE_ATTRIBUTES "CodeSignOnCopy")
     target_sources(yuzu PRIVATE ${MOLTENVK_LIBRARY})
-    if (MOLTENVK_MESH_LIBRARY)
+        if (MOLTENVK_MESH_LIBRARY)
         # The second driver (Settings moltenvk_driver, externals/CMakeLists.txt).
         set_source_files_properties(${MOLTENVK_MESH_LIBRARY} PROPERTIES
             MACOSX_PACKAGE_LOCATION Frameworks
             XCODE_FILE_ATTRIBUTES "CodeSignOnCopy")
         target_sources(yuzu PRIVATE ${MOLTENVK_MESH_LIBRARY})
+    endif()
+    if (HAS_HYPERVISOR AND NOT CMAKE_GENERATOR MATCHES "Xcode")
+        add_custom_command(TARGET yuzu POST_BUILD
+            COMMAND codesign --force --deep --sign - --entitlements
+                    "${CMAKE_SOURCE_DIR}/dist/eglantine.entitlements" "$<TARGET_BUNDLE_DIR:yuzu>")
     endif()
 elseif(WIN32)
     # compile as a win32 gui application instead of a console application

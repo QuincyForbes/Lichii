@@ -124,6 +124,8 @@ protected:
     virtual EmitConfig GetEmitConfig() = 0;
     virtual void RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) = 0;
     virtual void OnInvalidateBasicBlock(IR::LocationDescriptor) {}
+    virtual CodePtr TryFastLookup(IR::LocationDescriptor) const { return nullptr; }
+    virtual void RecordFastLookup(IR::LocationDescriptor, CodePtr) {}
 
     void ProtectCodeMemory() {
 #if defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT) || defined(__APPLE__) || defined(__OpenBSD__)
@@ -165,6 +167,9 @@ protected:
     const std::size_t evict_slice;
     const std::size_t processor_id;
     u64 cache_generation = 0;
+    IR::LocationDescriptor mru_descriptor{~u64{0}};
+    u64 mru_generation = ~u64{0};
+    CodePtr mru_code_ptr = nullptr;
     std::size_t dropped_writable_offset = 0;
     /// Ring mode: [code.offset(), free_end) may be written; blocks of the previous lap start at
     /// free_end and above.
@@ -256,6 +261,11 @@ protected:
         void* page_table_lookup_32 = nullptr;
         void* page_table_lookup_64 = nullptr;
         void* page_table_lookup_128 = nullptr;
+        void* page_table_read_lookup_8 = nullptr;
+        void* page_table_read_lookup_16 = nullptr;
+        void* page_table_read_lookup_32 = nullptr;
+        void* page_table_read_lookup_64 = nullptr;
+        void* page_table_read_lookup_128 = nullptr;
     } prelude_info;
 };
 

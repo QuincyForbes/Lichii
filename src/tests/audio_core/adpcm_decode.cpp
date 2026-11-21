@@ -209,3 +209,5 @@ TEST_CASE("ADPCM wave buffers decode to the reference decoder's samples", "[audi
         REQUIRE(FirstDifference(render(static_cast<u32>(expected.size())), expected) == "none");
     }
 }
+
+#include "tests/audio_core/dsp_renderer_tests.h"

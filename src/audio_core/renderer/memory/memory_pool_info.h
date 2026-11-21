@@ -72,87 +72,53 @@ public:
     MemoryPoolInfo() = default;
     MemoryPoolInfo(Location location_) : location{location_} {}
 
-    /**
-     * Get the CPU address for this pool.
-     *
-     * @return The CPU address of this pool.
-     */
-    CpuAddr GetCpuAddress() const;
+    CpuAddr GetCpuAddress() const noexcept {
+        return cpu_address;
+    }
 
-    /**
-     * Get the DSP address for this pool.
-     *
-     * @return The DSP address of this pool.
-     */
-    CpuAddr GetDspAddress() const;
+    CpuAddr GetDspAddress() const noexcept {
+        return dsp_address;
+    }
 
-    /**
-     * Get the size of this pool.
-     *
-     * @return The size of this pool.
-     */
-    u64 GetSize() const;
+    u64 GetSize() const noexcept {
+        return size;
+    }
 
-    /**
-     * Get the location of this pool.
-     *
-     * @return The location for the pool (see MemoryPoolInfo::Location).
-     */
-    Location GetLocation() const;
+    Location GetLocation() const noexcept {
+        return location;
+    }
 
-    /**
-     * Set the CPU address for this pool.
-     *
-     * @param address - The new CPU address for this pool.
-     * @param size    - The new size for this pool.
-     */
-    void SetCpuAddress(CpuAddr address, u64 size);
+    void SetCpuAddress(const CpuAddr address, const u64 size_) noexcept {
+        cpu_address = address;
+        size = size_;
+    }
 
-    /**
-     * Set the DSP address for this pool.
-     *
-     * @param address - The new DSP address for this pool.
-     */
-    void SetDspAddress(CpuAddr address);
+    void SetDspAddress(const CpuAddr address) noexcept {
+        dsp_address = address;
+    }
 
-    /**
-     * Check whether the pool contains a given range.
-     *
-     * @param address - The buffer address to look for.
-     * @param size    - The size of the given buffer.
-     * @return True if the range is within this pool, otherwise false.
-     */
-    bool Contains(CpuAddr address, u64 size) const;
+    bool Contains(const CpuAddr address_, const u64 size_) const noexcept {
+        return cpu_address <= address_ && (address_ + size_) <= (cpu_address + size);
+    }
 
-    /**
-     * Check whether this pool is mapped, which is when the dsp address is set.
-     *
-     * @return True if the pool is mapped, otherwise false.
-     */
-    bool IsMapped() const;
+    bool IsMapped() const noexcept {
+        return dsp_address != 0;
+    }
 
-    /**
-     * Translates a given CPU range into a relative offset for the DSP.
-     *
-     * @param address - The buffer address to look for.
-     * @param size    - The size of the given buffer.
-     * @return Pointer to the DSP-mapped memory.
-     */
-    CpuAddr Translate(CpuAddr address, u64 size) const;
+    CpuAddr Translate(const CpuAddr address, const u64 size_) const noexcept {
+        if (!IsMapped() || !Contains(address, size_)) {
+            return 0;
+        }
+        return dsp_address + (address - cpu_address);
+    }
 
-    /**
-     * Set or unset whether this memory pool is in use.
-     *
-     * @param used - Use state for this pool.
-     */
-    void SetUsed(bool used);
+    void SetUsed(const bool used) noexcept {
+        in_use = used;
+    }
 
-    /**
-     * Get whether this pool is in use.
-     *
-     * @return True if in use, otherwise false.
-     */
-    bool IsUsed() const;
+    bool IsUsed() const noexcept {
+        return in_use;
+    }
 
 private:
     /// Base address for the CPU-side memory

@@ -28,6 +28,7 @@
 #include "common/alignment.h"
 #include "common/common_types.h"
 #include "common/dkb_frame_trace.h"
+#include "common/large_stack.h"
 #include "common/logging.h"
 #include "common/nx2_poll.h"
 #include "common/polyfill_thread.h"
@@ -39,6 +40,7 @@
 #include "video_core/gpu_wait_site.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/pushed_constants.h"
+#include "video_core/renderer_vulkan/vk_compute_chain.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -50,6 +52,7 @@ class QueryCacheBase;
 namespace Vulkan {
 
 class CommandPool;
+class ComputePipeline;
 class Device;
 class Framebuffer;
 class GraphicsPipeline;
@@ -80,6 +83,8 @@ public:
     bool DeferFlush(std::source_location location = std::source_location::current());
     /// Submits deferred work (the split's back).
     void FlushDeferred(std::source_location location = std::source_location::current());
+    /// Submits deferred work once its coalescing window has elapsed or the GPU caught up.
+    void FlushExpiredDeferred(std::source_location location = std::source_location::current());
     /// The split's idle hook: before the back waits for work, or between entries when another
     /// thread asked (`requested`). Returns whether it submitted.
     bool FlushDeferredFromIdle(bool requested);
@@ -88,10 +93,16 @@ public:
     [[nodiscard]] bool DeferredFlushMayWait() const;
     /// The split's back: whether the GPU has not finished everything submitted so far.
     [[nodiscard]] bool GpuBehind();
+    /// Whether the GPU still has at least two submitted ticks in flight.
+    [[nodiscard]] bool GpuDeepBehind();
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
     /// is not running, so nothing will submit it: the caller then submits it itself.
     bool WaitSubmitted(u64 tick, std::source_location location = std::source_location::current());
+    /// Fencing thread: lets a bounded deferred fence batch coalesce while >= 2 earlier ticks are
+    /// still in flight on the GPU, then falls back to WaitSubmitted.
+    bool WaitFenceSubmitted(u64 tick, std::chrono::steady_clock::time_point queued,
+                            std::source_location location = std::source_location::current());
     /// Whether everything up to tick has been handed to the worker for submission.
     [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept {
         return tick < master_semaphore->CurrentTick();
@@ -143,7 +154,7 @@ public:
     template <typename Func>
     void TraceGpuWork(vk::CommandBuffer cmdbuf, u64 hash, u64 fragment_hash,
                       std::array<u32, 3> size, Func&& work) {
-        if (pass_time_sampling && !pass_time_in_pass) [[unlikely]] {
+        if (pass_time_sampling && !pass_time_in_pass) {
             // A guest dispatch of a frame "Perf passes:" times.
             const u32 record = PassTimeWorkBegin(cmdbuf, hash, size);
             TraceGpuWorkImpl(cmdbuf, hash, fragment_hash, size, work);
@@ -198,14 +209,22 @@ public:
     [[nodiscard]] static bool KeepsDeferredClear();
 
     /// Before a draw records anything, outside a render pass: when its render targets have at
-    /// least EDEN_NX2_BEFORE_PASS pixels (default 256x256, 0 = off), what follows goes to a new
-    /// command buffer after one that the next render pass can take copies into (RecordBeforePass).
-    /// True when it split now.
-    bool SplitBeforeNextPass(u64 pixels, VkFramebuffer framebuffer = VK_NULL_HANDLE);
+    /// least EDEN_NX2_BEFORE_PASS pixels (or were requested via WantSplitBefore), what follows
+    /// goes to a new command buffer after one that the next render pass can take copies into
+    /// (RecordBeforePass). True when it split now.
+    bool SplitBeforeNextPass(u64 pixels, VkFramebuffer framebuffer = VK_NULL_HANDLE,
+                             u64 target_key = 0);
+
+    /// Records the guest target identity of the draw being configured for adaptive splitting.
+    void NoteTargetKey(u64 target_key) noexcept {
+        pending_target_key = target_key;
+    }
 
     /// Passes on that framebuffer split as SplitBeforeNextPass whatever their size (an emulated
-    /// mesh draw ended one for its compute). The last few framebuffers asked for are kept.
-    void WantSplitBefore(VkFramebuffer framebuffer);
+    /// mesh draw or mid-pass buffer copy ended one). Kept in a set-associative cache.
+    void WantSplitBefore(VkFramebuffer framebuffer, u64 target_key = 0);
+    void WantSplitBeforeCurrentPass();
+    [[nodiscard]] VkFramebuffer DeferredClearFramebufferHandle() const noexcept;
 
     /// A draw that will leave the open render pass for another framebuffer, after it bound its
     /// buffers: ends the pass and splits as SplitBeforeNextPass. True when it split; the draw's
@@ -218,13 +237,17 @@ public:
     /// it. Valid only for work whose inputs were final before the pass began and whose outputs
     /// nothing in the pass used so far (see BeforePassSerial).
     [[nodiscard]] bool CanRecordBeforePass() const noexcept {
-        return before_pass_open;
+        return before_pass_open && !HasDeferredWaitForIdle();
     }
 
-    /// Changes at every render pass that can take work before it: a buffer marked with an older
-    /// serial was not used since that pass began.
+    /// Changes at every render pass: a buffer marked with an older serial was not used since
+    /// that pass began.
     [[nodiscard]] u64 BeforePassSerial() const noexcept {
         return before_pass_serial;
+    }
+
+    [[nodiscard]] u64 WorkRecords() const noexcept {
+        return work_records;
     }
 
     template <typename T>
@@ -232,10 +255,14 @@ public:
     void RecordBeforePass(T&& c, Common::PerfReport::Counter counter =
                                      Common::PerfReport::BeforePassCommands) {
         Common::PerfReport::Add(counter);
-        this->RecordWithUploadBuffer(
-            [this, command = std::move(c)](vk::CommandBuffer, vk::CommandBuffer) {
-                command(before_pass_cmdbuf);
-            });
+        const bool keep = !uploads_pending;
+        const u64 main_records = cmdbuf_records;
+        this->Record([this, command = std::move(c)](vk::CommandBuffer) {
+            command(EnsureBeforePassCmdbuf());
+        });
+        if (keep) {
+            cmdbuf_records = main_records;
+        }
     }
 
     void DeferFragmentBarrier() {
@@ -244,6 +271,14 @@ public:
 
     bool HasFragmentBarrier() const {
         return fragment_barrier.Pending();
+    }
+
+    void DeferWaitForIdle(VkPipelineStageFlags stages) noexcept {
+        deferred_wfi_stages |= stages;
+    }
+
+    bool HasDeferredWaitForIdle() const noexcept {
+        return deferred_wfi_stages != 0;
     }
 
     void NoteRenderPassStores() {
@@ -295,7 +330,7 @@ public:
 
     /// Update the pipeline to the current execution context.
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
-        if (state.graphics_pipeline == pipeline && !state.needs_state_enable_refresh) [[likely]] {
+        if (state.graphics_pipeline == pipeline && !state.needs_state_enable_refresh) {
             return false;
         }
         return UpdateGraphicsPipelineImpl(pipeline);
@@ -315,8 +350,7 @@ public:
 
     /// Returns true when the descriptor buffer chunk has to be bound into the command buffer.
     bool UpdateDescriptorBufferChunk(u32 descriptor_chunk) {
-        if (state.descriptor_buffer_bound && descriptor_chunk == state.descriptor_buffer_chunk)
-            [[likely]] {
+        if (state.descriptor_buffer_bound && descriptor_chunk == state.descriptor_buffer_chunk) {
             return false;
         }
         state.descriptor_buffer_bound = true;
@@ -334,6 +368,7 @@ public:
     void InvalidateDescriptorBuffer() {
         state.descriptor_buffer_bound = false;
         state.rescaling_defined = false;
+        ++state.descriptor_buffer_bind_serial;
     }
 
     /// Draws of pipelines with the plain graphics layout (one push constant range, the same for
@@ -377,28 +412,56 @@ public:
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
     void RecordWithUploadBuffer(T&& command) {
-        if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+        if (VideoCommon::GpuSplit::check_owner) {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }
         if (uploads_pending) {
             FlushUploads();
         }
         ++work_records;
+        ++cmdbuf_records;
         has_pending_commands = true;
-        if (chunk->Record(command)) {
+        if (chunk->Record<CommandMode::Both>(std::forward<T>(command))) {
             return;
         }
         DispatchWork(true);
-        (void)chunk->Record(command);
+        (void)chunk->Record<CommandMode::Both>(std::forward<T>(command));
+    }
+
+    /// Records work exclusively into the submission's upload command buffer, leaving
+    /// current_cmdbuf and FollowsDispatch untouched.
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer>
+    void RecordUploadOnly(T&& command) {
+        if (VideoCommon::GpuSplit::check_owner) {
+            VideoCommon::GpuSplit::CheckOwner("Scheduler::RecordUploadOnly");
+        }
+        ++work_records;
+        has_pending_commands = true;
+        if (chunk->Record<CommandMode::UploadOnly>(std::forward<T>(command))) {
+            return;
+        }
+        DispatchWork(true);
+        (void)chunk->Record<CommandMode::UploadOnly>(std::forward<T>(command));
     }
 
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer>
     void Record(T&& c) {
-        this->RecordWithUploadBuffer(
-            [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
-                command(cmdbuf);
-            });
+        if (VideoCommon::GpuSplit::check_owner) {
+            VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
+        }
+        if (uploads_pending) {
+            FlushUploads();
+        }
+        ++work_records;
+        ++cmdbuf_records;
+        has_pending_commands = true;
+        if (chunk->Record<CommandMode::MainOnly>(std::forward<T>(c))) {
+            return;
+        }
+        DispatchWork(true);
+        (void)chunk->Record<CommandMode::MainOnly>(std::forward<T>(c));
     }
 
     /// As Record, for commands that only bind state (pipelines, descriptors, push constants) or
@@ -409,23 +472,30 @@ public:
         // Batched uploads are recorded first, as copies.
         const bool keep = !uploads_pending;
         const u64 records = work_records;
+        const u64 main_records = cmdbuf_records;
         Record(std::forward<T>(c));
         if (keep) {
             work_records = records;
+            cmdbuf_records = main_records;
         }
     }
 
-    /// Guest dispatches: whether only RecordState commands were recorded since the last
-    /// NoteDispatchRecorded, in the same command buffer and outside a render pass. MoltenVK then
-    /// encodes both dispatches into one serial Metal compute encoder (a barrier would end it).
+    /// Guest dispatches: whether only RecordState or upload-only commands were recorded since the
+    /// last NoteDispatchRecorded, in the same command buffer and outside a render pass. MoltenVK
+    /// then encodes both dispatches into one serial Metal compute encoder (a barrier would end it).
     [[nodiscard]] bool FollowsDispatch() const noexcept {
-        return last_dispatch_record == work_records && last_dispatch_tick == CurrentTick() &&
+        return last_dispatch_record == cmdbuf_records && last_dispatch_tick == CurrentTick() &&
                state.renderpass == VK_NULL_HANDLE && !uploads_pending;
     }
 
-    void NoteDispatchRecorded() noexcept {
-        last_dispatch_record = work_records;
+    [[nodiscard]] const ComputePipeline* LastGuestComputePipeline() const noexcept {
+        return last_guest_compute_pipeline;
+    }
+
+    void NoteDispatchRecorded(const ComputePipeline* pipeline = nullptr) noexcept {
+        last_dispatch_record = cmdbuf_records;
         last_dispatch_tick = CurrentTick();
+        last_guest_compute_pipeline = pipeline;
     }
 
     [[nodiscard]] bool HasPendingCommands() const noexcept {
@@ -583,18 +653,30 @@ private:
         Command* next = nullptr;
     };
 
-    template <typename T>
+    enum class CommandMode : u8 {
+        Both,
+        MainOnly,
+        UploadOnly,
+    };
+
+    template <typename T, CommandMode Mode>
     class TypedCommand final : public Command {
     public:
-        explicit TypedCommand(T&& command_) : command{std::move(command_)} {}
+        template <typename U>
+        explicit TypedCommand(U&& command_) : command{std::forward<U>(command_)} {}
         ~TypedCommand() override = default;
 
         TypedCommand(TypedCommand&&) = delete;
         TypedCommand& operator=(TypedCommand&&) = delete;
 
         void Execute(vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) const override {
-
-            command(cmdbuf, upload_cmdbuf);
+            if constexpr (Mode == CommandMode::MainOnly) {
+                command(cmdbuf);
+            } else if constexpr (Mode == CommandMode::UploadOnly) {
+                command(upload_cmdbuf);
+            } else {
+                command(cmdbuf, upload_cmdbuf);
+            }
         }
 
     private:
@@ -615,10 +697,11 @@ private:
         /// By reference: a command may start a new command buffer (SplitBeforePass).
         void ExecuteAll(const vk::CommandBuffer& cmdbuf, const vk::CommandBuffer& upload_cmdbuf);
 
-        template <typename T>
-        bool Record(T& command) {
-            using FuncType = TypedCommand<T>;
-            static_assert(std::is_nothrow_destructible_v<std::decay_t<T>>);
+        template <CommandMode Mode = CommandMode::Both, typename T>
+        bool Record(T&& command) {
+            using Decayed = std::decay_t<T>;
+            using FuncType = TypedCommand<Decayed, Mode>;
+            static_assert(std::is_nothrow_destructible_v<Decayed>);
             static_assert(sizeof(FuncType) < sizeof(data), "Lambda is too large");
 
             command_offset = Common::AlignUp(command_offset, alignof(FuncType));
@@ -626,7 +709,7 @@ private:
                 return false;
             }
             Command* const current_last = last;
-            last = new (data.data() + command_offset) FuncType(std::move(command));
+            last = new (data.data() + command_offset) FuncType(std::forward<T>(command));
 
             if (current_last) {
                 current_last->SetNext(last);
@@ -661,6 +744,7 @@ private:
     struct State {
         VkRenderPass renderpass{};
         VkFramebuffer framebuffer{};
+        u64 target_key{};
         VkExtent2D render_area = {0, 0};
         /// The pass is a deferred clear's variant of the framebuffer's render pass that differs
         /// from it only in load ops, so later draws on that framebuffer can stay in it.
@@ -879,23 +963,31 @@ private:
     vk::CommandBuffer current_cmdbuf;
     vk::CommandBuffer current_upload_cmdbuf;
     /// Worker thread: runs before the last render pass that began on a command buffer of its
-    /// own (RecordBeforePass); null when there is none in this submission.
+    /// own (RecordBeforePass); allocated lazily on first RecordBeforePass.
     vk::CommandBuffer before_pass_cmdbuf{};
+    size_t before_pass_slot{~size_t{0}};
     /// Worker thread: finished command buffers of this submission, in order, between the upload
     /// command buffer and current_cmdbuf (before_pass_cmdbuf among them, still open).
     std::vector<VkCommandBuffer> segment_cmdbufs;
-    /// Worker thread: closes current_cmdbuf and starts before_pass_cmdbuf and a new
+    /// Worker thread: closes current_cmdbuf, reserves a before_pass slot, and starts a new
     /// current_cmdbuf for the render pass that begins next.
     void SplitBeforePass();
+    vk::CommandBuffer EnsureBeforePassCmdbuf();
+    [[nodiscard]] bool GpuBehindFor(u64 tick) const;
+    [[nodiscard]] bool GpuDeepBehindFor(u64 tick) const;
     // Recording thread:
     u64 before_pass_serial = 0;
+    u64 pending_target_key = 0;
     bool before_pass_split = false; ///< SplitBeforeNextPass ran, no render pass began since
     bool before_pass_open = false;  ///< The open render pass began after a SplitBeforePass
-    std::array<VkFramebuffer, 8> split_wanted{};
-    size_t split_wanted_next = 0;
-    u64 work_records = 0;           ///< Commands recorded, RecordState ones excepted
+    SplitWantedCache<64, 4> split_wanted;
+    SplitWantedCache<64, 4> split_wanted_targets;
+    u64 work_records = 0;   ///< Commands recorded (including upload-only), RecordState ones excepted
+    u64 cmdbuf_records = 0; ///< Commands recorded into current_cmdbuf, RecordState ones excepted
     u64 last_dispatch_record = ~0ULL;
     u64 last_dispatch_tick = 0;
+    const ComputePipeline* last_guest_compute_pipeline = nullptr;
+    std::atomic<bool> in_render_pass{false};
 
     DeferredClear deferred_clear;
 
@@ -924,7 +1016,8 @@ private:
     bool waiter_waiting{}; ///< WaitWorker is waiting for work_queue to drain (guarded by queue_mutex)
     bool lazy_queued{};    ///< A lazily queued chunk may wait for a sleeping worker (recording thread)
     bool has_pending_commands{};
-    std::jthread worker_thread;
+    VkPipelineStageFlags deferred_wfi_stages{};
+    Common::LargeStackThread worker_thread;
 
     std::chrono::steady_clock::duration frame_interval{};
     std::chrono::steady_clock::time_point start_time{};

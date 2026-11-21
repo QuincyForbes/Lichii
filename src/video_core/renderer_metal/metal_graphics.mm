@@ -615,14 +615,13 @@ Object CreateMeshRenderPipelineState(const Device& device, const RenderPipelineD
                 hit, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                           std::chrono::steady_clock::now() - start)
                                           .count()));
-            if (!hit && !archive->IsReadOnly() && descriptor.fragmentFunction != nil &&
-                descriptor.rasterizationEnabled) {
+            if (!hit && !archive->IsReadOnly() && descriptor.meshFunction != nil &&
+                descriptor.fragmentFunction != nil && descriptor.rasterizationEnabled) {
                 if (@available(iOS 18.0, macOS 15.0, *)) {
-                    MTLMeshRenderPipelineDescriptor* const copy = [descriptor copy];
-                    archive->DeferAdd([copy](void* bin_ptr) {
+                    archive->DeferAdd([descriptor](void* bin_ptr) {
                         const id<MTLBinaryArchive> binary = (__bridge id<MTLBinaryArchive>)bin_ptr;
                         return binary != nil &&
-                               [binary addMeshRenderPipelineFunctionsWithDescriptor:copy
+                               [binary addMeshRenderPipelineFunctionsWithDescriptor:descriptor
                                                                               error:nil] == YES;
                     });
                 }

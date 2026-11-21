@@ -287,7 +287,7 @@ private:
     /// same geometry are skipped too for up to two frames or until that pipeline is built, so
     /// shadows and prepasses don't show without their material pass.
     void RecordSkippedGeometry(const GraphicsPipeline* pipeline) const noexcept;
-    [[nodiscard]] bool ShouldSkipDepthOnlyGeometry() const noexcept;
+    [[nodiscard]] bool ShouldSkipDepthOnlyGeometry(const GraphicsPipeline& pipeline) const noexcept;
     void ClearSkippedGeometryIfDrawn() const noexcept;
     static constexpr size_t SkippedGeometryTableSize = 256;
     struct SkippedGeometryEntry {
@@ -505,6 +505,7 @@ private:
     } build_report;
 
     std::filesystem::path vulkan_pipeline_cache_filename;
+    std::filesystem::path stage_cache_filename;
     vk::PipelineCache vulkan_pipeline_cache;
     size_t pipelines_since_flush{};
     std::chrono::steady_clock::time_point last_flush{};

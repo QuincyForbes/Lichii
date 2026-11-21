@@ -6,6 +6,10 @@
 
 #include <bit>
 
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/fiber.h"
@@ -29,6 +33,23 @@ static void IncrementScheduledCount(Kernel::KThread* thread) {
     if (auto process = thread->GetOwnerProcess(); process) {
         process->IncrementScheduledCount();
     }
+}
+
+static void SpinPause() {
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+    _mm_pause();
+#elif defined(__APPLE__) && defined(__aarch64__)
+    __builtin_arm_isb(0xF);
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
+}
+
+u32 KScheduler::GetCoreScheduledCount(KernelCore& kernel, s32 core_id) {
+    if (core_id < 0 || core_id >= static_cast<s32>(Core::Hardware::NUM_CPU_CORES)) {
+        return 0;
+    }
+    return GetPriorityQueue(kernel).GetScheduledCount(core_id);
 }
 
 KScheduler::KScheduler(KernelCore& kernel) {
@@ -247,9 +268,11 @@ u64 KScheduler::UpdateHighestPriorityThreadsImpl(KernelCore& kernel) {
         cores_needing_scheduling |= kernel.Scheduler(core_id).UpdateHighestPriorityThread(kernel, top_threads[core_id]);
     }
 
-    // Idle cores are bad. We're going to try to migrate threads to each idle core in turn.
+    // Idle cores are bad. We're going to try to migrate threads to each idle core in turn,
+    // preferring higher core IDs first so multi-core background workers stay off Core 0 when
+    // higher cores are also idle (Djihads80/Eglantine#910).
     while (idle_cores != 0) {
-        const s32 core_id = static_cast<s32>(std::countr_zero(idle_cores));
+        const s32 core_id = static_cast<s32>(Common::BitSize<u64>() - 1 - std::countl_zero(idle_cores));
 
         if (KThread* suggested = priority_queue.GetSuggestedFront(core_id); suggested != nullptr) {
             s32 migration_candidates[Core::Hardware::NUM_CPU_CORES];
@@ -453,10 +476,11 @@ void KScheduler::ScheduleImplFiber(KernelCore& kernel) {
         while (!highest_priority_thread->m_context_guard.try_lock()) {
             // The highest priority thread's context is already locked.
             // Check if we need scheduling. If we don't, we can retry directly.
-            if (m_state.needs_scheduling.load(std::memory_order_seq_cst)) {
+            if (m_state.needs_scheduling.load(std::memory_order_acquire)) {
                 // If we do, another core is interfering, and we must start again.
                 goto retry;
             }
+            SpinPause();
         }
 
         // It's time to switch the thread.
@@ -554,8 +578,10 @@ void KScheduler::ClearPreviousThread(KernelCore& kernel, KThread* thread) {
         auto& prev_thread{kernel.Scheduler(i).m_state.prev_thread};
 
         // Atomically clear the previous thread if it's our target.
-        KThread* compare = thread;
-        prev_thread.compare_exchange_strong(compare, nullptr, std::memory_order_seq_cst);
+        if (prev_thread.load(std::memory_order_relaxed) == thread) {
+            KThread* compare = thread;
+            prev_thread.compare_exchange_strong(compare, nullptr, std::memory_order_seq_cst);
+        }
     }
 }
 
@@ -729,11 +755,22 @@ void KScheduler::YieldWithoutCoreMigration(KernelCore& kernel) {
 
     // If the thread's yield count matches, there's nothing for us to do.
     if (cur_thread.GetYieldScheduleCount() == cur_process.GetScheduledCount()) {
+        cur_thread.m_nx2_last_yield_futile = true;
         return;
     }
 
     // Get a reference to the priority queue.
     auto& priority_queue = GetPriorityQueue(kernel);
+
+    // YieldWithoutCoreMigration only rotates this core's scheduled queue: activity on other
+    // cores cannot make another thread runnable here unless this core's scheduled queue changed.
+    if (const s32 fast_core = cur_thread.GetActiveCore();
+        fast_core >= 0 && cur_thread.GetRawState() == ThreadState::Runnable &&
+        cur_thread.GetYieldCoreId() == fast_core &&
+        cur_thread.GetYieldCoreSeq() == priority_queue.GetScheduledQueueVersion(fast_core)) {
+        cur_thread.m_nx2_last_yield_futile = true;
+        return;
+    }
 
     // Perform the yield.
     {
@@ -743,16 +780,25 @@ void KScheduler::YieldWithoutCoreMigration(KernelCore& kernel) {
         if (cur_state == ThreadState::Runnable) {
             // Put the current thread at the back of the queue.
             KThread* next_thread = priority_queue.MoveToScheduledBack(std::addressof(cur_thread));
-            IncrementScheduledCount(std::addressof(cur_thread));
 
             // If the next thread is different, we have an update to perform.
             if (next_thread != std::addressof(cur_thread)) {
+                IncrementScheduledCount(std::addressof(cur_thread));
                 SetSchedulerUpdateNeeded(kernel);
+                cur_thread.m_nx2_last_yield_futile = false;
             } else {
-                // Otherwise, set the thread's yield count so that we won't waste work until the
-                // process is scheduled again.
+                // Otherwise, record both process and per-core counts without bumping the
+                // process-wide count (which would invalidate other cores' yield fast paths).
+                const s32 active_core = cur_thread.GetActiveCore();
                 cur_thread.SetYieldScheduleCount(cur_process.GetScheduledCount());
+                if (active_core >= 0) {
+                    cur_thread.SetYieldCoreSeq(active_core,
+                                               priority_queue.GetScheduledQueueVersion(active_core));
+                }
+                cur_thread.m_nx2_last_yield_futile = true;
             }
+        } else {
+            cur_thread.m_nx2_last_yield_futile = false;
         }
     }
 }
@@ -768,6 +814,7 @@ void KScheduler::YieldWithCoreMigration(KernelCore& kernel) {
 
     // If the thread's yield count matches, there's nothing for us to do.
     if (cur_thread.GetYieldScheduleCount() == cur_process.GetScheduledCount()) {
+        cur_thread.m_nx2_last_yield_futile = true;
         return;
     }
 
@@ -785,7 +832,6 @@ void KScheduler::YieldWithCoreMigration(KernelCore& kernel) {
 
             // Put the current thread at the back of the queue.
             KThread* next_thread = priority_queue.MoveToScheduledBack(std::addressof(cur_thread));
-            IncrementScheduledCount(std::addressof(cur_thread));
 
             // While we have a suggested thread, try to migrate it!
             bool recheck = false;
@@ -835,12 +881,19 @@ void KScheduler::YieldWithCoreMigration(KernelCore& kernel) {
             // If we still have a suggestion or the next thread is different, we have an update to
             // perform.
             if (suggested != nullptr || next_thread != std::addressof(cur_thread)) {
+                IncrementScheduledCount(std::addressof(cur_thread));
                 SetSchedulerUpdateNeeded(kernel);
-            } else if (!recheck) {
-                // Otherwise if we don't need to re-check, set the thread's yield count so that we
-                // won't waste work until the process is scheduled again.
-                cur_thread.SetYieldScheduleCount(cur_process.GetScheduledCount());
+                cur_thread.m_nx2_last_yield_futile = false;
+            } else {
+                if (!recheck) {
+                    // Otherwise if we don't need to re-check, set the thread's yield count so that
+                    // we won't waste work until the process is scheduled again.
+                    cur_thread.SetYieldScheduleCount(cur_process.GetScheduledCount());
+                }
+                cur_thread.m_nx2_last_yield_futile = true;
             }
+        } else {
+            cur_thread.m_nx2_last_yield_futile = false;
         }
     }
 }
@@ -856,6 +909,7 @@ void KScheduler::YieldToAnyThread(KernelCore& kernel) {
 
     // If the thread's yield count matches, there's nothing for us to do.
     if (cur_thread.GetYieldScheduleCount() == cur_process.GetScheduledCount()) {
+        cur_thread.m_nx2_last_yield_futile = true;
         return;
     }
 
@@ -870,6 +924,31 @@ void KScheduler::YieldToAnyThread(KernelCore& kernel) {
         if (cur_state == ThreadState::Runnable) {
             // Get the current active core.
             const s32 core_id = cur_thread.GetActiveCore();
+
+            // Fast check: if cur_thread is alone on core_id and no non-running suggested thread
+            // with priority <= cur_thread's exists on core_id, detaching to -1 would only walk
+            // down to cur_thread and re-attach it right back to core_id.
+            if (core_id >= 0 &&
+                priority_queue.GetScheduledFront(core_id) == std::addressof(cur_thread) &&
+                priority_queue.GetScheduledNext(core_id, std::addressof(cur_thread)) == nullptr) {
+                bool has_candidate = false;
+                for (KThread* probe = priority_queue.GetSuggestedFront(core_id);
+                     probe != nullptr && probe->GetPriority() <= cur_thread.GetPriority();
+                     probe = priority_queue.GetSuggestedNext(core_id, probe)) {
+                    const s32 probe_core = probe->GetActiveCore();
+                    KThread* const top_on_probe =
+                        (probe_core >= 0) ? priority_queue.GetScheduledFront(probe_core) : nullptr;
+                    if (top_on_probe != probe) {
+                        has_candidate = true;
+                        break;
+                    }
+                }
+                if (!has_candidate) {
+                    cur_thread.SetYieldScheduleCount(cur_process.GetScheduledCount());
+                    cur_thread.m_nx2_last_yield_futile = true;
+                    return;
+                }
+            }
 
             // Migrate the current thread to core -1.
             cur_thread.SetActiveCore(-1);
@@ -908,15 +987,20 @@ void KScheduler::YieldToAnyThread(KernelCore& kernel) {
                 // update.
                 if (suggested != std::addressof(cur_thread)) {
                     SetSchedulerUpdateNeeded(kernel);
+                    cur_thread.m_nx2_last_yield_futile = false;
                 } else {
                     // Otherwise, set the thread's yield count so that we won't waste work until the
                     // process is scheduled again.
                     cur_thread.SetYieldScheduleCount(cur_process.GetScheduledCount());
+                    cur_thread.m_nx2_last_yield_futile = true;
                 }
             } else {
                 // Otherwise, we have an update to perform.
                 SetSchedulerUpdateNeeded(kernel);
+                cur_thread.m_nx2_last_yield_futile = false;
             }
+        } else {
+            cur_thread.m_nx2_last_yield_futile = false;
         }
     }
 }

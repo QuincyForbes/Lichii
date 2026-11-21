@@ -34,6 +34,12 @@ using Topology = Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology;
 /// are (the rewritten ones carry no restart).
 [[nodiscard]] bool RestartsStrips(Topology topology) noexcept;
 
+/// Whether `count` 16-bit indices in `source` contain 0xFFFF (Metal's strip restart value).
+[[nodiscard]] bool HasU16RestartIndex(std::span<const u8> source, u32 count) noexcept;
+
+/// Whether a non-indexed `first = 0` conversion in `mode` produces a prefix of any larger count.
+[[nodiscard]] bool IsPrefixInvariant(u32 mode) noexcept;
+
 /// What the rewritten list is drawn as: Triangles for quads, quad strips, fans, polygons and
 /// triangle adjacency (and strips with `provoking_last`), LineStrip for line loops and line
 /// strips with adjacency, Lines for lines with adjacency, the topology itself otherwise.

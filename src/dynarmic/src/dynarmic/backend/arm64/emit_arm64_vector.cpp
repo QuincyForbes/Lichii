@@ -275,39 +275,62 @@ static void EmitReduce(oaknut::CodeGenerator&, EmitContext& ctx, IR::Inst* inst,
     }
 }
 
-template<std::size_t size, typename EmitFn>
-static void EmitGetElement(oaknut::CodeGenerator&, EmitContext& ctx, IR::Inst* inst, EmitFn emit) {
+template<std::size_t size, typename EmitGprFn, typename EmitFprFn>
+static void EmitGetElement(oaknut::CodeGenerator&, EmitContext& ctx, IR::Inst* inst, EmitGprFn emit_gpr, EmitFprFn emit_fpr) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ASSERT(args[1].IsImmediate());
     const u8 index = args[1].GetImmediateU8();
+
+    if (!args[0].IsImmediate() && ctx.ebi.FindScalarGetQ(args[0].GetInst()) != nullptr) {
+        ctx.reg_alloc.DefineAsExisting(inst, args[0]);
+        return;
+    }
+
+    if (FprScalarForwardingOn()) {
+        auto Vresult = ctx.reg_alloc.WriteVec<size>(inst);
+        auto Qvalue = ctx.reg_alloc.ReadQ(args[0]);
+        RegAlloc::Realize(Vresult, Qvalue);
+        emit_fpr(Vresult, Qvalue, index);
+        return;
+    }
 
     auto Rresult = ctx.reg_alloc.WriteReg<std::max<std::size_t>(32, size)>(inst);
     auto Qvalue = ctx.reg_alloc.ReadQ(args[0]);
     RegAlloc::Realize(Rresult, Qvalue);
 
-    // TODO: fpr destination
-
-    emit(Rresult, Qvalue, index);
+    emit_gpr(Rresult, Qvalue, index);
 }
 
 template<>
 void EmitIR<IR::Opcode::VectorGetElement8>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    EmitGetElement<8>(code, ctx, inst, [&](auto& Wresult, auto& Qvalue, u8 index) { code.UMOV(Wresult, Qvalue->Belem()[index]); });
+    EmitGetElement<8>(
+        code, ctx, inst,
+        [&](auto& Wresult, auto& Qvalue, u8 index) { code.UMOV(Wresult, Qvalue->Belem()[index]); },
+        [&](auto& Bresult, auto& Qvalue, u8 index) { code.DUP(Bresult, Qvalue->Belem()[index]); });
 }
 
 template<>
 void EmitIR<IR::Opcode::VectorGetElement16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    EmitGetElement<16>(code, ctx, inst, [&](auto& Wresult, auto& Qvalue, u8 index) { code.UMOV(Wresult, Qvalue->Helem()[index]); });
+    EmitGetElement<16>(
+        code, ctx, inst,
+        [&](auto& Wresult, auto& Qvalue, u8 index) { code.UMOV(Wresult, Qvalue->Helem()[index]); },
+        [&](auto& Hresult, auto& Qvalue, u8 index) { code.DUP(Hresult, Qvalue->Helem()[index]); });
 }
 
 template<>
 void EmitIR<IR::Opcode::VectorGetElement32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    EmitGetElement<32>(code, ctx, inst, [&](auto& Wresult, auto& Qvalue, u8 index) { code.UMOV(Wresult, Qvalue->Selem()[index]); });
+    EmitGetElement<32>(
+        code, ctx, inst,
+        [&](auto& Wresult, auto& Qvalue, u8 index) { code.UMOV(Wresult, Qvalue->Selem()[index]); },
+        [&](auto& Sresult, auto& Qvalue, u8 index) { code.DUP(Sresult, Qvalue->Selem()[index]); });
 }
 
 template<>
 void EmitIR<IR::Opcode::VectorGetElement64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    EmitGetElement<64>(code, ctx, inst, [&](auto& Xresult, auto& Qvalue, u8 index) { code.UMOV(Xresult, Qvalue->Delem()[index]); });
+    EmitGetElement<64>(
+        code, ctx, inst,
+        [&](auto& Xresult, auto& Qvalue, u8 index) { code.UMOV(Xresult, Qvalue->Delem()[index]); },
+        [&](auto& Dresult, auto& Qvalue, u8 index) { code.DUP(Dresult, Qvalue->Delem()[index]); });
 }
 
 template<std::size_t size, typename EmitFn>

@@ -11,6 +11,7 @@
 
 #include <iterator>
 #include <shared_mutex>
+#include <span>
 #include "common/container/unordered_map.h"
 #include <boost/icl/separate_interval_set.hpp>
 #include <windows.h>
@@ -427,11 +428,13 @@ public:
         ASSERT(placeholders.find({virtual_offset, virtual_offset + length}) == placeholders.end());
         TrackPlaceholder(virtual_offset, host_offset, length);
 
-        MapView(virtual_offset, host_offset, length);
+        if (!MapView(virtual_offset, host_offset, length)) {
+            LOG_CRITICAL(HW_Memory, "Failed to map placeholder, error {}", GetLastError());
+        }
     }
 
     void Unmap(size_t virtual_offset, size_t length) {
-        std::scoped_lock lock{placeholder_mutex};
+        std::unique_lock lock{placeholder_mutex};
 
         // Unmap until there are no more placeholders
         while (UnmapOnePlaceholder(virtual_offset, length)) {
@@ -450,6 +453,14 @@ public:
             UNIMPLEMENTED_MSG("Protection flag combination read={} write={}", read, write);
         }
         const size_t virtual_end = virtual_offset + length;
+
+        DWORD fast_old_flags{};
+        {
+            std::shared_lock protect_lock{protect_mutex};
+            if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &fast_old_flags)) {
+                return;
+            }
+        }
 
         const auto protect = [&](auto it, auto end) {
             while (it != end) {
@@ -600,26 +611,40 @@ private:
         const bool split_left = unmap_begin > placeholder_begin;
         const bool split_right = unmap_end < placeholder_end;
 
+        // Keep Protect from changing a retained page between the snapshot and its restore.
+        std::unique_lock protect_lock{protect_mutex, std::defer_lock};
+        kept_protections.clear();
+        size_t left_runs = 0;
+        if (split_left || split_right) {
+            protect_lock.lock();
+            if (split_left) {
+                FindProtectionRuns(placeholder_begin, unmap_begin);
+                left_runs = kept_protections.size();
+            }
+            if (split_right) {
+                FindProtectionRuns(unmap_end, placeholder_end);
+            }
+        }
+        const std::span<const ProtectionRun> runs{kept_protections};
+
         if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder_begin,
                                   MEM_PRESERVE_PLACEHOLDER)) {
             LOG_CRITICAL(HW_Memory, "Failed to unmap placeholder");
         }
-        // If we have to remap memory regions due to partial unmaps, we are in a data race as
-        // Windows doesn't support remapping memory without unmapping first. Avoid adding any extra
-        // logic within the panic region described below.
-
-        // Panic region, we are in a data race right now
+        // Guest accesses can still race the remap, including the brief interval between mapping
+        // a kept view read-write and restoring its protections.
         if (split_left || split_right) {
             Split(unmap_begin, unmap_end - unmap_begin);
+            if (split_left) {
+                MapKeptPiece(placeholder_begin, host_offset, unmap_begin - placeholder_begin,
+                             runs.first(left_runs));
+            }
+            if (split_right) {
+                MapKeptPiece(unmap_end, host_offset + unmap_end - placeholder_begin,
+                             placeholder_end - unmap_end, runs.subspan(left_runs));
+            }
+            protect_lock.unlock();
         }
-        if (split_left) {
-            MapView(placeholder_begin, host_offset, unmap_begin - placeholder_begin);
-        }
-        if (split_right) {
-            MapView(unmap_end, host_offset + unmap_end - placeholder_begin,
-                    placeholder_end - unmap_end);
-        }
-        // End panic region
 
         size_t coalesce_begin = unmap_begin;
         if (!split_left) {
@@ -650,11 +675,54 @@ private:
         return true;
     }
 
-    void MapView(size_t virtual_offset, size_t host_offset, size_t length) {
-        if (!pfn_MapViewOfFile3(backing_handle, process, virtual_base + virtual_offset, host_offset,
-                                length, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) {
-            LOG_CRITICAL(HW_Memory, "Failed to map placeholder");
+    struct ProtectionRun {
+        size_t offset;
+        size_t length;
+        DWORD flags;
+    };
+
+    void FindProtectionRuns(size_t offset, size_t end) {
+        while (offset < end) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(virtual_base + offset, &info, sizeof(info)) != sizeof(info)) {
+                UNREACHABLE_MSG("Failed to query protection at {:#x}, error {}", offset,
+                                GetLastError());
+            }
+            if (info.State != MEM_COMMIT || info.Protect == 0) {
+                UNREACHABLE_MSG("Expected committed pages at {:#x}, got state {:#x}, protection {:#x}",
+                                offset, info.State, info.Protect);
+            }
+            const size_t region_end =
+                static_cast<size_t>(static_cast<u8*>(info.BaseAddress) - virtual_base) +
+                info.RegionSize;
+            const size_t run_end = (std::min)(region_end, end);
+            if (info.Protect != PAGE_READWRITE) {
+                kept_protections.push_back({offset, run_end - offset, info.Protect});
+            }
+            offset = run_end;
         }
+    }
+
+    void MapKeptPiece(size_t virtual_offset, size_t host_offset, size_t length,
+                      std::span<const ProtectionRun> runs) {
+        // Map read-write so a later Protect can make the pages writable again.
+        if (!MapView(virtual_offset, host_offset, length)) {
+            UNREACHABLE_MSG("Failed to remap kept view at {:#x}, error {}", virtual_offset,
+                            GetLastError());
+        }
+        for (const auto& run : runs) {
+            DWORD old_flags{};
+            if (!VirtualProtect(virtual_base + run.offset, run.length, run.flags, &old_flags)) {
+                UNREACHABLE_MSG("Failed to restore protection {:#x} for {:#x} bytes at {:#x}, error {}",
+                                run.flags, run.length, run.offset, GetLastError());
+            }
+        }
+    }
+
+    bool MapView(size_t virtual_offset, size_t host_offset, size_t length) {
+        return pfn_MapViewOfFile3(backing_handle, process, virtual_base + virtual_offset, host_offset,
+                                  length, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr,
+                                  0) != nullptr;
     }
 
     void Split(size_t virtual_offset, size_t length) {
@@ -703,6 +771,8 @@ private:
     PFN_UnmapViewOfFile2 pfn_UnmapViewOfFile2{};
 
     std::shared_mutex placeholder_mutex;                          ///< Mutex for placeholders
+    std::shared_mutex protect_mutex;
+    std::vector<ProtectionRun> kept_protections;
     boost::icl::separate_interval_set<size_t> placeholders;       ///< Mapped placeholders
     ::Common::unordered_map<size_t, size_t> placeholder_host_pointers; ///< Placeholder backing offset
 };
@@ -989,8 +1059,9 @@ public:
             vm_address_t virtual_address = 0;
             size_t guest_space = virtual_size - HugePageSize;
             while (true) {
-                kr = vm_allocate(mach_task_self(), &virtual_address, guest_space + HugePageSize,
-                                 VM_FLAGS_ANYWHERE);
+                kr = vm_map(mach_task_self(), &virtual_address, guest_space + HugePageSize, 0,
+                            VM_FLAGS_ANYWHERE, MACH_PORT_NULL, 0, FALSE, VM_PROT_NONE,
+                            VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
                 if (kr == KERN_SUCCESS) {
                     break;
                 }
@@ -998,7 +1069,7 @@ public:
                          guest_space >> 30, mach_error_string(kr));
                 if (guest_space / 2 < MinGuestSpace) {
                     LOG_CRITICAL(HW_Memory,
-                                 "vm_allocate of the guest address space failed down to {} GiB (is "
+                                 "vm_map of the guest address space failed down to {} GiB (is "
                                  "the extended-virtual-addressing entitlement present?)",
                                  guest_space >> 30);
                     return false;
@@ -1006,7 +1077,6 @@ public:
                 guest_space /= 2;
             }
             virtual_size = guest_space + HugePageSize;
-            vm_protect(mach_task_self(), virtual_address, virtual_size, FALSE, VM_PROT_NONE);
             virtual_base = virtual_map_base = reinterpret_cast<u8*>(virtual_address);
             if (ledger_tagged && !chunked && !file && !shm_fallback) {
                 free_zero = EnvSwitch("EDEN_NX2_FREE_ZERO", FreeZeroPagesDefault);
@@ -2818,9 +2888,11 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages(
     const auto end_slice = [&] {
         std::sort(trim.begin(), trim.end());
         trim.erase(std::unique(trim.begin(), trim.end()), trim.end());
+        constexpr size_t MaxUnlockPages = (size_t{1} << 20) / PageAlignment;
         for (size_t i = 0; i < trim.size();) {
             size_t j = i + 1;
-            while (j < trim.size() && trim[j] == trim[j - 1] + PageAlignment) {
+            while (j < trim.size() && j - i < MaxUnlockPages &&
+                   trim[j] == trim[j - 1] + PageAlignment) {
                 ++j;
             }
             unlock(trim[i], trim[j - 1] + PageAlignment);

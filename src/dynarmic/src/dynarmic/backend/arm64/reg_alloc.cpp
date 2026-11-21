@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <iterator>
 
 #include "common/assert.h"
@@ -29,6 +30,27 @@ using namespace oaknut::util;
 
 constexpr std::size_t spill_offset = offsetof(StackLayout, spill);
 constexpr std::size_t spill_slot_size = sizeof(decltype(StackLayout::spill)::value_type);
+constexpr u32 callee_saved_allocatable_gprs = 0x00F8'0000U; // X19..X23
+
+static bool MoveEliminationOn() noexcept {
+    static const bool on = [] {
+        const char* const value = std::getenv("EDEN_NX2_JIT_MOV_ELIM");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+
+static bool SpillToFreeGprOn() noexcept {
+    static const bool on = [] {
+        const char* const value = std::getenv("EDEN_NX2_JIT_SPILL_GPR");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+
+static bool IsNarrowScalarType(IR::Type type) noexcept {
+    return type == IR::Type::U8 || type == IR::Type::U16 || type == IR::Type::U32;
+}
 
 static bool IsValuelessType(IR::Type type) {
     switch (type) {
@@ -112,6 +134,7 @@ void HostLocInfo::SetupScratchLocation() {
 void HostLocInfo::SetupLocation(const IR::Inst* value) {
     ASSERT(IsCompletelyEmpty());
     values.clear();
+    fastmem_base = nullptr;
     values.push_back(value);
     realized = true;
     uses_this_inst = 0;
@@ -120,7 +143,7 @@ void HostLocInfo::SetupLocation(const IR::Inst* value) {
 }
 
 bool HostLocInfo::IsCompletelyEmpty() const {
-    return values.empty() && !locked && !realized && !accumulated_uses && !expected_uses && !uses_this_inst;
+    return values.empty() && fastmem_base == nullptr && !locked && !realized && !accumulated_uses && !expected_uses && !uses_this_inst;
 }
 
 bool HostLocInfo::MaybeAllocatable() const {
@@ -137,8 +160,24 @@ void HostLocInfo::UpdateUses() {
 
     if (accumulated_uses == expected_uses) {
         values.clear();
+        fastmem_base = nullptr;
         accumulated_uses = 0;
         expected_uses = 0;
+    }
+}
+
+RAFastmemBase::~RAFastmemBase() {
+    if (!base_inst) {
+        return;
+    }
+    const auto loc = reg_alloc.FastmemBaseLocation(base_inst);
+    ASSERT(loc);
+    auto& info = reg_alloc.ValueInfo(*loc);
+    ASSERT(info.locked > 0);
+    info.locked--;
+    info.realized = false;
+    if (info.IsCompletelyEmpty()) {
+        reg_alloc.ClearActive(*loc);
     }
 }
 
@@ -448,7 +487,11 @@ int RegAlloc::RealizeReadImpl(const IR::Value& value) {
 
         switch (current_location->kind) {
         case HostLoc::Kind::Gpr:
-            code.FMOV(oaknut::DReg{new_location_index}, oaknut::XReg{current_location->index});
+            if (IsNarrowScalarType(value.GetType())) {
+                code.FMOV(oaknut::SReg{new_location_index}, oaknut::WReg{current_location->index});
+            } else {
+                code.FMOV(oaknut::DReg{new_location_index}, oaknut::XReg{current_location->index});
+            }
             break;
         case HostLoc::Kind::Fpr:
             UNREACHABLE(); //logic error
@@ -500,9 +543,33 @@ int RegAlloc::RealizeWriteImpl(const IR::Inst* value) {
 }
 
 template<HostLoc::Kind kind>
-int RegAlloc::RealizeReadWriteImpl(const IR::Value& read_value, const IR::Inst* write_value) {
-    // TODO: Move elimination
+std::optional<int> RegAlloc::TryRealizeReadWriteInPlace(const IR::Value& read_value, const IR::Inst* write_value) {
+    if constexpr (kind != HostLoc::Kind::Gpr && kind != HostLoc::Kind::Fpr) {
+        return std::nullopt;
+    }
+    if (!MoveEliminationOn() || read_value.IsImmediate()) {
+        return std::nullopt;
+    }
+    const auto current_location = ValueLocation(read_value.GetInst());
+    ASSERT(current_location);
+    if (current_location->kind != kind) {
+        return std::nullopt;
+    }
+    auto& info = ValueInfo(*current_location);
+    if (info.locked != 1 || info.realized || !info.IsOneRemainingUse()) {
+        return std::nullopt;
+    }
+    RecordDefined(write_value);
+    DEBUG_ASSERT(!ValueLocation(write_value));
+    info.locked = 0;
+    info = {};
+    info.SetupLocation(write_value);
+    MarkActive(*current_location);
+    return current_location->index;
+}
 
+template<HostLoc::Kind kind>
+int RegAlloc::RealizeReadWriteImpl(const IR::Value& read_value, const IR::Inst* write_value) {
     const int write_loc = RealizeWriteImpl<kind>(write_value);
 
     if constexpr (kind == HostLoc::Kind::Gpr) {
@@ -525,6 +592,9 @@ template int RegAlloc::RealizeReadImpl<HostLoc::Kind::Flags>(const IR::Value& va
 template int RegAlloc::RealizeWriteImpl<HostLoc::Kind::Gpr>(const IR::Inst* value);
 template int RegAlloc::RealizeWriteImpl<HostLoc::Kind::Fpr>(const IR::Inst* value);
 template int RegAlloc::RealizeWriteImpl<HostLoc::Kind::Flags>(const IR::Inst* value);
+template std::optional<int> RegAlloc::TryRealizeReadWriteInPlace<HostLoc::Kind::Gpr>(const IR::Value&, const IR::Inst*);
+template std::optional<int> RegAlloc::TryRealizeReadWriteInPlace<HostLoc::Kind::Fpr>(const IR::Value&, const IR::Inst*);
+template std::optional<int> RegAlloc::TryRealizeReadWriteInPlace<HostLoc::Kind::Flags>(const IR::Value&, const IR::Inst*);
 template int RegAlloc::RealizeReadWriteImpl<HostLoc::Kind::Gpr>(const IR::Value&, const IR::Inst*);
 template int RegAlloc::RealizeReadWriteImpl<HostLoc::Kind::Fpr>(const IR::Value&, const IR::Inst*);
 template int RegAlloc::RealizeReadWriteImpl<HostLoc::Kind::Flags>(const IR::Value&, const IR::Inst*);
@@ -554,14 +624,92 @@ int RegAlloc::AllocateRegister(const std::array<HostLocInfo, 32>& regs, std::spa
 
 void RegAlloc::SpillGpr(int index) {
     ASSERT(!gprs[index].locked && !gprs[index].realized);
-    if (gprs[index].values.empty()) {
+    if (!gprs[index].HasLiveValue()) {
         return;
+    }
+    if (SpillToFreeGprOn() && ((callee_saved_allocatable_gprs >> index) & 1U) == 0) {
+        const u32 free_callee = (~static_cast<u32>(active_gprs)) & callee_saved_allocatable_gprs;
+        if (free_callee != 0) {
+            const int dst = std::countr_zero(free_callee);
+            DEBUG_ASSERT(gprs[dst].IsCompletelyEmpty());
+            Code().MOV(oaknut::XReg{dst}, oaknut::XReg{index});
+            gprs[dst] = std::exchange(gprs[index], {});
+            active_gprs = (active_gprs & ~(u64{1} << index)) | (u64{1} << dst);
+            return;
+        }
     }
     const int new_location_index = FindFreeSpill();
     Code().STR(oaknut::XReg{index}, SP, spill_offset + new_location_index * spill_slot_size);
     spills[new_location_index] = std::exchange(gprs[index], {});
     active_gprs &= ~(u64{1} << index);
     active_spills |= u64{1} << new_location_index;
+}
+
+bool RegAlloc::HasFastmemBase(const IR::Inst* base_inst) const {
+    return FastmemBaseLocation(base_inst).has_value();
+}
+
+std::optional<HostLoc> RegAlloc::FastmemBaseLocation(const IR::Inst* base_inst) const {
+    for (u64 mask = active_gprs; mask != 0; mask &= mask - 1) {
+        const int i = std::countr_zero(mask);
+        if (gprs[i].fastmem_base == base_inst) {
+            return HostLoc{HostLoc::Kind::Gpr, i};
+        }
+    }
+    for (u64 mask = active_spills; mask != 0; mask &= mask - 1) {
+        const int i = std::countr_zero(mask);
+        if (spills[i].fastmem_base == base_inst) {
+            return HostLoc{HostLoc::Kind::Spill, i};
+        }
+    }
+    return std::nullopt;
+}
+
+RAFastmemBase RegAlloc::AcquireExistingFastmemBase(const IR::Inst* base_inst) {
+    const auto loc = FastmemBaseLocation(base_inst);
+    ASSERT(loc);
+    auto& info = ValueInfo(*loc);
+    info.uses_this_inst++;
+    info.locked++;
+    return RAFastmemBase{*this, base_inst};
+}
+
+oaknut::XReg RegAlloc::RealizeExistingFastmemBase(RAFastmemBase& handle) {
+    const auto loc = FastmemBaseLocation(handle.base_inst);
+    ASSERT(loc);
+    if (loc->kind == HostLoc::Kind::Gpr) {
+        gprs[loc->index].realized = true;
+        handle.reg = oaknut::XReg{loc->index};
+        return *handle.reg;
+    }
+    ASSERT(loc->kind == HostLoc::Kind::Spill);
+    const int new_idx = AllocateRegister(gprs, gpr_order, gpr_order_masks, active_gprs);
+    SpillGpr(new_idx);
+    Code().LDR(oaknut::XReg{new_idx}, SP, spill_offset + loc->index * spill_slot_size);
+    gprs[new_idx] = std::exchange(ValueInfo(*loc), {});
+    gprs[new_idx].realized = true;
+    ClearActive(*loc);
+    active_gprs |= u64{1} << new_idx;
+    handle.reg = oaknut::XReg{new_idx};
+    return *handle.reg;
+}
+
+RAFastmemBase RegAlloc::CreateFastmemBase(const IR::Inst* base_inst, std::size_t total_uses, oaknut::XReg Xfastmem_reg, oaknut::XReg Xbase_reg) {
+    ASSERT(total_uses >= 2);
+    DEBUG_ASSERT(!FastmemBaseLocation(base_inst));
+    const int host_idx = AllocateRegister(gprs, gpr_order, gpr_order_masks, active_gprs);
+    SpillGpr(host_idx);
+    auto& info = gprs[host_idx];
+    ASSERT(info.IsCompletelyEmpty());
+    info.fastmem_base = base_inst;
+    info.locked = 1;
+    info.realized = true;
+    info.uses_this_inst = 1;
+    info.accumulated_uses = 0;
+    info.expected_uses = total_uses;
+    active_gprs |= u64{1} << host_idx;
+    Code().ADD(oaknut::XReg{host_idx}, Xfastmem_reg, Xbase_reg);
+    return RAFastmemBase{*this, base_inst, oaknut::XReg{host_idx}};
 }
 
 void RegAlloc::SpillFpr(int index) {
@@ -669,7 +817,11 @@ void RegAlloc::LoadCopyInto(const IR::Value& value, oaknut::QReg reg) {
     ASSERT(current_location);
     switch (current_location->kind) {
     case HostLoc::Kind::Gpr:
-        code.FMOV(reg.toD(), oaknut::XReg{current_location->index});
+        if (IsNarrowScalarType(value.GetType())) {
+            code.FMOV(reg.toS(), oaknut::WReg{current_location->index});
+        } else {
+            code.FMOV(reg.toD(), oaknut::XReg{current_location->index});
+        }
         break;
     case HostLoc::Kind::Fpr:
         code.MOV(reg.B16(), oaknut::QReg{current_location->index}.B16());

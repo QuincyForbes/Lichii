@@ -196,7 +196,11 @@ u64 BufferCacheRuntime::GetDeviceLocalMemory() const {
 }
 
 StagingBufferRef BufferCacheRuntime::UploadStagingBuffer(size_t size) {
-    if (shared_buffers) {
+    static const bool use_scratch = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_UPLOAD_SCRATCH");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (use_scratch && shared_buffers) {
         const size_t alloc_size = (std::max<size_t>)(size, 1);
         if (upload_scratch.size() < alloc_size) {
             upload_scratch.resize(alloc_size);
@@ -241,7 +245,8 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick, u64) {
 
 bool BufferCacheRuntime::CanReorderUpload(
     const Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies) const noexcept {
-    return scheduler.CanCopyBufferAhead() && !scheduler.UsedInOrder(buffer.Handle()) &&
+    return scheduler.CanCopyBufferAhead() &&
+           !scheduler.UsedUntrackedInOrder(buffer.Handle()) &&
            std::ranges::none_of(copies, [&](const VideoCommon::BufferCopy& copy) {
                return buffer.IsRegionUsed(copy.dst_offset, copy.size);
            });
@@ -249,7 +254,7 @@ bool BufferCacheRuntime::CanReorderUpload(
 
 void BufferCacheRuntime::CopyBuffer(BufferHandle dst_buffer, BufferHandle src_buffer,
                                     std::span<const VideoCommon::BufferCopy> copies, bool,
-                                    bool can_reorder_upload) {
+                                    bool can_reorder_upload, bool range_tracked) {
     if (src_buffer == &upload_scratch_tag) {
         if (upload_scratch_size == 0 || copies.empty()) {
             return;
@@ -261,7 +266,7 @@ void BufferCacheRuntime::CopyBuffer(BufferHandle dst_buffer, BufferHandle src_bu
                 write_hook(write_hook_user, dst_buffer, copy.dst_offset, copy.size);
             }
             scheduler.CopyBuffer(staged.buffer, staged.offset + copy.src_offset, dst_buffer,
-                                 copy.dst_offset, copy.size, can_reorder_upload);
+                                 copy.dst_offset, copy.size, can_reorder_upload, range_tracked);
         }
         return;
     }
@@ -272,7 +277,7 @@ void BufferCacheRuntime::CopyBuffer(BufferHandle dst_buffer, BufferHandle src_bu
             write_hook(write_hook_user, dst_buffer, copy.dst_offset, copy.size);
         }
         scheduler.CopyBuffer(src_buffer, copy.src_offset, dst_buffer, copy.dst_offset, copy.size,
-                             can_reorder_upload);
+                             can_reorder_upload, range_tracked);
     }
 }
 
@@ -311,7 +316,7 @@ void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, BufferHandle src_buffer,
                 write_hook(write_hook_user, dst_buffer.Handle(), copy.dst_offset, copy.size);
             }
             scheduler.CopyBuffer(staged.buffer, staged.offset + copy.src_offset,
-                                 dst_buffer.Handle(), copy.dst_offset, copy.size, ahead);
+                                 dst_buffer.Handle(), copy.dst_offset, copy.size, ahead, true);
         }
         return;
     }
@@ -322,7 +327,7 @@ void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, BufferHandle src_buffer,
             dst_buffer.MarkUsage(copy.dst_offset, copy.size);
         }
     }
-    CopyBuffer(dst_buffer.Handle(), src_buffer, copies, barrier, ahead);
+    CopyBuffer(dst_buffer.Handle(), src_buffer, copies, barrier, ahead, true);
 }
 
 void BufferCacheRuntime::CopyBuffer(BufferHandle dst_buffer, Buffer& src_buffer,
@@ -335,7 +340,7 @@ void BufferCacheRuntime::CopyBuffer(BufferHandle dst_buffer, Buffer& src_buffer,
             src_buffer.MarkUsage(copy.src_offset, copy.size);
         }
     }
-    CopyBuffer(dst_buffer, src_buffer.Handle(), copies, barrier, ahead);
+    CopyBuffer(dst_buffer, src_buffer.Handle(), copies, barrier, ahead, false);
 }
 
 void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, Buffer& src_buffer,
@@ -350,7 +355,7 @@ void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, Buffer& src_buffer,
             dst_buffer.MarkUsage(copy.dst_offset, copy.size);
         }
     }
-    CopyBuffer(dst_buffer.Handle(), src_buffer.Handle(), copies, barrier, ahead);
+    CopyBuffer(dst_buffer.Handle(), src_buffer.Handle(), copies, barrier, ahead, true);
 }
 
 void BufferCacheRuntime::ClearBuffer(Buffer& dest_buffer, u32 offset, size_t size, u32 value) {
@@ -379,26 +384,25 @@ void BufferCacheRuntime::ClearBuffer(Buffer& dest_buffer, u32 offset, size_t siz
         }
         return;
     }
+    const bool ahead = scheduler.CanCopyBufferAhead() &&
+                       !scheduler.UsedUntrackedInOrder(dest_buffer.Handle()) &&
+                       !dest_buffer.IsRegionUsed(offset, size);
     dest_buffer.NoteUsed();
-    ClearBuffer(dest_buffer.Handle(), offset, size, value);
+    if (!ahead) {
+        dest_buffer.MarkUsage(offset, size);
+    }
+    if (write_hook != nullptr && size != 0) {
+        write_hook(write_hook_user, dest_buffer.Handle(), offset, size);
+    }
+    scheduler.FillBufferPattern(dest_buffer.Handle(), offset, size, value, ahead, true);
 }
 
 void BufferCacheRuntime::ClearBuffer(BufferHandle dest_buffer, u32 offset, size_t size,
                                      u32 value) {
-    if (write_hook != nullptr) {
+    if (write_hook != nullptr && size != 0) {
         write_hook(write_hook_user, dest_buffer, offset, size);
     }
-    const u8 byte = static_cast<u8>(value);
-    if (value == u32{byte} * 0x01010101U) {
-        scheduler.FillBuffer(dest_buffer, offset, size, byte);
-        return;
-    }
-    // fillBuffer takes one byte: other patterns are copied from a staging buffer.
-    const StagingBufferRef pattern = staging_pool.RequestUpload(size, 16);
-    for (size_t at = 0; at + sizeof(u32) <= size; at += sizeof(u32)) {
-        std::memcpy(pattern.mapped_span.data() + at, &value, sizeof(u32));
-    }
-    scheduler.CopyBuffer(pattern.buffer, pattern.offset, dest_buffer, offset, size);
+    scheduler.FillBufferPattern(dest_buffer, offset, size, value, false, false);
 }
 
 BufferHandle BufferCacheRuntime::Nx2MeshMirror() {

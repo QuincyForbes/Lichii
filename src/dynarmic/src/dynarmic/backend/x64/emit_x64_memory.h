@@ -83,11 +83,77 @@ void EmitDetectMisalignedVAddr(BlockOfCode& code, EmitContext& ctx, size_t bitsi
     }
 }
 
+struct UntrappedCachedReadX64 {
+    SharedLabel check_cached{};
+    SharedLabel resume_unmarked{};
+    Xbyak::Reg64 page{};
+    Xbyak::Reg64 tmp{};
+    Xbyak::Reg64 tmp2{};
+};
+
 template<typename EmitContext>
-Xbyak::RegExp EmitVAddrLookup(BlockOfCode& code, EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr);
+void EmitUntrappedCachedReadCheckX64(BlockOfCode&, EmitContext&, Xbyak::Reg64, const UntrappedCachedReadX64&, Xbyak::Label&) {}
 
 template<>
-[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A32EmitContext>(BlockOfCode& code, A32EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr) {
+[[maybe_unused]] void EmitUntrappedCachedReadCheckX64<A64EmitContext>(
+    BlockOfCode& code, A64EmitContext& ctx, Xbyak::Reg64 vaddr,
+    const UntrappedCachedReadX64& cached, Xbyak::Label& abort) {
+    if (!cached.check_cached) {
+        return;
+    }
+    const size_t valid_page_index_bits = ctx.conf.page_table_address_space_bits - page_table_const_bits;
+    const size_t unused_top_bits = 64 - ctx.conf.page_table_address_space_bits;
+
+    code.L(*cached.check_cached);
+    code.mov(cached.tmp.cvt32(), cached.page.cvt32());
+    code.and_(cached.tmp.cvt32(), 7);
+    code.cmp(cached.tmp.cvt32(), 7);
+    code.jne(abort, code.T_NEAR);
+
+    code.mov(cached.tmp, ctx.conf.untrapped_read_bitmap_ptr);
+    code.mov(cached.tmp, qword[cached.tmp]);
+    code.test(cached.tmp, cached.tmp);
+    code.jz(abort, code.T_NEAR);
+    code.cmp(cached.tmp, 1);
+    code.je(*cached.resume_unmarked, code.T_NEAR);
+
+    code.mov(cached.tmp2, vaddr);
+    if (unused_top_bits == 0) {
+        code.shr(cached.tmp2, int(page_table_const_bits));
+    } else if (ctx.conf.silently_mirror_page_table) {
+        code.shl(cached.tmp2, int(unused_top_bits));
+        code.shr(cached.tmp2, int(unused_top_bits + page_table_const_bits));
+    } else {
+        code.shr(cached.tmp2, int(page_table_const_bits));
+    }
+
+    if (valid_page_index_bits > 27) {
+        code.shr(cached.tmp2, 27);
+        code.jnz(*cached.resume_unmarked, code.T_NEAR);
+        code.mov(cached.tmp2, vaddr);
+        if (ctx.conf.silently_mirror_page_table && unused_top_bits != 0) {
+            code.shl(cached.tmp2, int(unused_top_bits));
+            code.shr(cached.tmp2, int(unused_top_bits + page_table_const_bits + 6));
+        } else {
+            code.shr(cached.tmp2, int(page_table_const_bits + 6));
+        }
+    } else {
+        code.shr(cached.tmp2, 6);
+    }
+
+    code.mov(cached.tmp, qword[cached.tmp + cached.tmp2 * 8]);
+    code.mov(cached.tmp2, vaddr);
+    code.shr(cached.tmp2, int(page_table_const_bits));
+    code.bt(cached.tmp, cached.tmp2);
+    code.jc(abort, code.T_NEAR);
+    code.jmp(*cached.resume_unmarked, code.T_NEAR);
+}
+
+template<typename EmitContext>
+Xbyak::RegExp EmitVAddrLookup(BlockOfCode& code, EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr, UntrappedCachedReadX64* out_cached = nullptr);
+
+template<>
+[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A32EmitContext>(BlockOfCode& code, A32EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr, UntrappedCachedReadX64*) {
     const Xbyak::Reg64 page = ctx.reg_alloc.ScratchGpr(code);
     const Xbyak::Reg64 tmp = ctx.conf.absolute_offset_page_table && ctx.conf.page_table_pointer_mask == 0 ? page : ctx.reg_alloc.ScratchGpr(code);
 
@@ -135,12 +201,20 @@ template<>
 }
 
 template<>
-[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr) {
+[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr, UntrappedCachedReadX64* out_cached) {
     const size_t valid_page_index_bits = ctx.conf.page_table_address_space_bits - page_table_const_bits;
     const size_t unused_top_bits = 64 - ctx.conf.page_table_address_space_bits;
+    const bool use_cached_read = out_cached != nullptr && ctx.conf.untrapped_read_bitmap_ptr != 0 &&
+                                 ctx.conf.page_table_marked_bit && *ctx.conf.page_table_marked_bit == 0;
 
     const Xbyak::Reg64 page = ctx.reg_alloc.ScratchGpr(code);
-    const Xbyak::Reg64 tmp = ctx.conf.absolute_offset_page_table && ctx.conf.page_table_pointer_mask == 0 ? page : ctx.reg_alloc.ScratchGpr(code);
+    const Xbyak::Reg64 tmp = (ctx.conf.absolute_offset_page_table && ctx.conf.page_table_pointer_mask == 0 && !use_cached_read)
+                                 ? page
+                                 : ctx.reg_alloc.ScratchGpr(code);
+    std::optional<Xbyak::Reg64> tmp2;
+    if (use_cached_read) {
+        tmp2 = ctx.reg_alloc.ScratchGpr(code);
+    }
 
     EmitDetectMisalignedVAddr(code, ctx, bitsize, abort, vaddr, tmp);
 
@@ -182,8 +256,22 @@ template<>
 
     // check for marked bit, use as unmapped if marked
     if (ctx.conf.page_table_marked_bit) {
-        code.bt(page, *ctx.conf.page_table_marked_bit);
-        code.jc(abort, code.T_NEAR);
+        if (use_cached_read) {
+            out_cached->check_cached = ctx.GenSharedLabel();
+            out_cached->resume_unmarked = ctx.GenSharedLabel();
+            out_cached->page = page;
+            out_cached->tmp = tmp;
+            out_cached->tmp2 = *tmp2;
+            code.bt(page, *ctx.conf.page_table_marked_bit);
+            code.jc(*out_cached->check_cached, code.T_NEAR);
+            code.L(*out_cached->resume_unmarked);
+        } else {
+            code.bt(page, *ctx.conf.page_table_marked_bit);
+            code.jc(abort, code.T_NEAR);
+        }
+    }
+    if (tmp2) {
+        ctx.reg_alloc.Release(*tmp2);
     }
     // mask away attributes
     if (ctx.conf.page_table_pointer_mask == 0) {

@@ -13,6 +13,7 @@ struct InGameMenuView: View {
     @ObservedObject private var external = ExternalDisplay.shared
     @State private var confirmQuit = false
     @State private var showControllers = false
+    @State private var ootPreset = QuickSettings.string("oot_graphics_preset")
     @State private var resolution = QuickSettings.string(InGameMenuView.resolutionKey)
     @State private var frameGen = QuickSettings.bool("frame_gen")
     @State private var frameGenMultiplier = max(2, QuickSettings.int("frame_gen_multiplier"))
@@ -33,6 +34,13 @@ struct InGameMenuView: View {
             ?? "resolution_setup"
     }
     private let resolutions = QuickSettings.choices(InGameMenuView.resolutionKey)
+    private let ootPresets: [QuickSettings.Choice] = {
+        guard let id = ControlsCenter.shared.currentGame?.programId,
+              "oot_graphics_preset".withCString({ lichii_settings_applies($0, id) }) else {
+            return []
+        }
+        return QuickSettings.choices("oot_graphics_preset")
+    }()
     /// Built into this app and the chip can run it (SettingsCatalog.availability).
     private let frameGenAvailable = SettingsCatalog.all.first { $0.key == "frame_gen" }
         .map { SettingsCatalog.availability(of: $0) == .available } ?? false
@@ -150,6 +158,16 @@ struct InGameMenuView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Quick Settings")
                 .font(.subheadline.weight(.semibold))
+
+            if !ootPresets.isEmpty {
+                Picker(SettingLabels.title(for: "oot_graphics_preset"), selection: $ootPreset) {
+                    ForEach(ootPresets) { Text($0.name).tag($0.value) }
+                }
+                .onChange(of: ootPreset) { value in
+                    change("oot_graphics_preset", value)
+                    resolution = QuickSettings.string(InGameMenuView.resolutionKey)
+                }
+            }
 
             if !resolutions.isEmpty {
                 Picker(SettingLabels.title(for: "resolution_setup"), selection: $resolution) {

@@ -233,6 +233,28 @@ bool IsNceEnabled() {
     return is_nce_enabled;
 }
 
+bool IsCachedInterpreterEnabled() {
+    if (const char* env = std::getenv("EDEN_NX2_CPU_BACKEND")) {
+        if (std::string_view{env} == "cached" || std::string_view{env} == "interpreter") {
+            return true;
+        }
+    }
+    return values.cpu_backend.GetValue() == CpuBackend::CachedInterpreter;
+}
+
+bool IsHypervisorEnabled() {
+#ifdef HAS_HYPERVISOR
+    if (const char* env = std::getenv("EDEN_NX2_CPU_BACKEND")) {
+        if (std::string_view{env} == "hypervisor" || std::string_view{env} == "hv") {
+            return true;
+        }
+    }
+    return values.cpu_backend.GetValue() == CpuBackend::Hypervisor;
+#else
+    return false;
+#endif
+}
+
 static u64 current_program_id = 0;
 
 void SetCurrentProgramID(u64 program_id) {
@@ -527,7 +549,7 @@ u16 FrameRateLimit() {
     case FramePacingMode::Target_120:
         return 120;
     case FramePacingMode::Unlocked:
-        return 240;
+        return 1000;
     case FramePacingMode::Target_Auto:
         break;
     }
@@ -593,10 +615,12 @@ OotResolution OcarinaUpscaledResolution(OotResolution resolution, Upscaler upsca
 
 OotPresetCompanions OotGraphicsPresetCompanions(OotGraphicsPreset preset) {
     switch (preset) {
+    case OotGraphicsPreset::UltraLow:
+        return {OotResolution::Percent40, TextureQuality::Quarter, OotAntiAliasing::NoSharpening};
     case OotGraphicsPreset::PhoneLow:
-        return {OotResolution::Percent50, TextureQuality::Quarter};
+        return {OotResolution::Percent50, TextureQuality::Quarter, std::nullopt};
     case OotGraphicsPreset::PhoneMedium:
-        return {OotResolution::Percent56, TextureQuality::Half};
+        return {OotResolution::Percent56, TextureQuality::Half, std::nullopt};
     default:
         return {};
     }
@@ -626,6 +650,9 @@ void ApplyOotGraphicsPreset(OotGraphicsPreset preset) {
     }
     if (!global && companions.textures) {
         set(values.texture_quality, *companions.textures);
+    }
+    if (companions.sharpening) {
+        set(values.oot_anti_aliasing, *companions.sharpening);
     }
 }
 

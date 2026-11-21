@@ -135,7 +135,7 @@ void Resolve(Cache& cache, bool compute, bool blacklist, std::span<const u32> ki
         }
     } release{lists};
     std::vector<Memo*>& memos = lists.memos;
-    memos.assign(views.size(), nullptr);
+    memos.resize(views.size());
     std::vector<Miss>& misses = lists.misses;
     misses.clear();
     bool aliased_hit = false;
@@ -146,7 +146,7 @@ void Resolve(Cache& cache, bool compute, bool blacklist, std::span<const u32> ki
     std::vector<typename Cache::BindingProbe>& probes = lists.probes;
     probes.clear();
     std::vector<u32>& tsc_indices = lists.tsc_indices;
-    tsc_indices.assign(views.size(), 0U);
+    tsc_indices.resize(views.size());
     u32 sampler_index = 0;
     for (size_t index = 0; index < views.size(); ++index) {
         const bool is_texture = (kinds[index] & Kind::ClassMask) == Kind::Texture;
@@ -200,8 +200,9 @@ void Resolve(Cache& cache, bool compute, bool blacklist, std::span<const u32> ki
         const char* const value = VulkanSwitch("EDEN_NX2_BINDMEMO_PARTIAL");
         return value == nullptr || value[0] != '0';
     }();
+    const bool had_hits = misses.size() != views.size();
     bool resolved = false;
-    if (misses.size() != views.size() && partial) {
+    if (had_hits && partial) {
         for (const Miss& miss : misses) {
             if (miss.sampler != ~0U) {
                 samplers[miss.sampler] = cache.GetSamplerId(sampler_handles[miss.sampler], compute);
@@ -220,25 +221,31 @@ void Resolve(Cache& cache, bool compute, bool blacklist, std::span<const u32> ki
         if (cache.BindingClock() == lookup.clock && !aliased_hit) {
             resolved = true;
         } else {
+            size_t total_resolved = misses.size();
             std::vector<Miss>& stale_hits = lists.stale_hits;
-            stale_hits.clear();
-            u32 hit_sampler_index = 0;
-            for (size_t index = 0; index < views.size(); ++index) {
-                const bool is_texture = (kinds[index] & Kind::ClassMask) == Kind::Texture;
-                if (Memo* const memo = memos[index]) {
-                    if (!IsMemoStillValid(cache, *memo)) {
-                        memos[index] = nullptr;
-                        stale_hits.push_back(
-                            {static_cast<u32>(index), is_texture ? hit_sampler_index : ~0U});
+            for (u32 pass = 0; pass < 3; ++pass) {
+                stale_hits.clear();
+                u32 hit_sampler_index = 0;
+                for (size_t index = 0; index < views.size(); ++index) {
+                    const bool is_texture = (kinds[index] & Kind::ClassMask) == Kind::Texture;
+                    if (Memo* const memo = memos[index]) {
+                        if (!IsMemoStillValid(cache, *memo)) {
+                            memos[index] = nullptr;
+                            stale_hits.push_back(
+                                {static_cast<u32>(index), is_texture ? hit_sampler_index : ~0U});
+                        }
+                    }
+                    if (is_texture) {
+                        ++hit_sampler_index;
                     }
                 }
-                if (is_texture) {
-                    ++hit_sampler_index;
+                if (stale_hits.empty()) {
+                    resolved = true;
+                    break;
                 }
-            }
-            if (stale_hits.empty()) {
-                resolved = true;
-            } else if (stale_hits.size() + misses.size() < views.size()) {
+                if (total_resolved + stale_hits.size() > views.size()) {
+                    break;
+                }
                 const u64 retry_clock = cache.BindingClock();
                 for (const Miss& stale : stale_hits) {
                     if (stale.sampler != ~0U) {
@@ -255,16 +262,11 @@ void Resolve(Cache& cache, bool compute, bool blacklist, std::span<const u32> ki
                 for (size_t index = 0; index < stale_hits.size(); ++index) {
                     views[stale_hits[index].view].id = subset[index].id;
                 }
-                bool all_remaining_valid = true;
-                if (cache.BindingClock() != retry_clock || aliased_hit) {
-                    for (size_t index = 0; index < views.size(); ++index) {
-                        if (memos[index] != nullptr && !IsMemoStillValid(cache, *memos[index])) {
-                            all_remaining_valid = false;
-                            break;
-                        }
-                    }
+                total_resolved += stale_hits.size();
+                if (cache.BindingClock() == retry_clock && !aliased_hit) {
+                    resolved = true;
+                    break;
                 }
-                resolved = all_remaining_valid;
             }
         }
     }
@@ -274,7 +276,9 @@ void Resolve(Cache& cache, bool compute, bool blacklist, std::span<const u32> ki
         }
         cache.FillImageViews(views, compute, blacklist);
         std::fill(memos.begin(), memos.end(), nullptr);
-        ++counts.full_resolves;
+        if (had_hits) {
+            ++counts.full_resolves;
+        }
     }
     // What was resolved is remembered (the texture cache refuses what changed since the lookup).
     sampler_index = 0;

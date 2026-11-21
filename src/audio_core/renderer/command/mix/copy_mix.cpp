@@ -13,6 +13,9 @@ void CopyMixBufferCommand::Dump(
 }
 
 void CopyMixBufferCommand::Process(const AudioRenderer::CommandListProcessor& processor) {
+    if (input_index == output_index) {
+        return;
+    }
     auto output{processor.mix_buffers.subspan(output_index * processor.sample_count,
                                               processor.sample_count)};
     auto input{processor.mix_buffers.subspan(input_index * processor.sample_count,

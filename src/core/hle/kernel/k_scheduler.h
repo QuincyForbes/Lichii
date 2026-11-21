@@ -114,6 +114,7 @@ public:
     static void YieldWithoutCoreMigration(KernelCore& kernel);
     static void YieldWithCoreMigration(KernelCore& kernel);
     static void YieldToAnyThread(KernelCore& kernel);
+    static u32 GetCoreScheduledCount(KernelCore& kernel, s32 core_id);
 
 private:
     // Static private API.

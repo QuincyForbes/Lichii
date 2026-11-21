@@ -18,6 +18,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/dlss_contract.h"
+#include "video_core/host_budget.h"
 #include "video_core/nx2.h"
 #include "video_core/ocarina_upscale.h"
 #include "video_core/render_probe.h"
@@ -1434,20 +1435,42 @@ void TextureCacheRuntime::ZeroTexture(TextureHandle tex, const TextureDesc& tex_
     if (slice_bytes == 0 || slice_bytes > (u64{64} << 20)) {
         return;
     }
-    StagingBufferRef zero_staging = UploadStagingBuffer(static_cast<size_t>(slice_bytes));
-    if (zero_staging.mapped_span.size() < slice_bytes) {
-        return;
+    const u64 max_shared_zeros =
+        VideoCommon::HostBudget::Active() ? (u64{4} << 20) : (u64{16} << 20);
+    BufferHandle zero_buf = nullptr;
+    u64 zero_offset = 0;
+    if (slice_bytes <= max_shared_zeros) {
+        if (!pool_zero_buffer || pool_zero_size < slice_bytes) {
+            const u64 alloc = (std::min)(
+                std::bit_ceil((std::max)(slice_bytes, u64{65536})), max_shared_zeros);
+            Object grown = CreateBuffer(device, alloc, false, nullptr);
+            if (grown) {
+                pool_zero_buffer = std::move(grown);
+                pool_zero_size = alloc;
+            }
+        }
+        if (pool_zero_buffer && pool_zero_size >= slice_bytes) {
+            zero_buf = pool_zero_buffer.Get();
+        }
     }
-    std::memset(zero_staging.mapped_span.data(), 0, static_cast<size_t>(slice_bytes));
+    if (zero_buf == nullptr) {
+        StagingBufferRef zero_staging = UploadStagingBuffer(static_cast<size_t>(slice_bytes));
+        if (zero_staging.mapped_span.size() < slice_bytes) {
+            return;
+        }
+        std::memset(zero_staging.mapped_span.data(), 0, static_cast<size_t>(slice_bytes));
+        zero_buf = zero_staging.buffer;
+        zero_offset = zero_staging.offset;
+    }
+    const bool ahead = scheduler.CanUploadTextureAhead(tex);
     for (u32 level = 0; level < tex_desc.levels; ++level) {
         const u32 lw = (std::max)(tex_desc.width >> level, 1U);
         const u32 lh = (std::max)(tex_desc.height >> level, 1U);
         const u32 row_bytes = Common::DivCeil(lw, block_w) * block_bytes;
         const u32 img_bytes = Common::DivCeil(lh, block_h) * row_bytes;
         for (u32 layer = 0; layer < tex_desc.layers; ++layer) {
-            scheduler.CopyBufferToTexture(zero_staging.buffer, zero_staging.offset, row_bytes,
-                                          img_bytes, tex, level, layer, Offset3D{},
-                                          Extent3D{lw, lh, 1});
+            scheduler.CopyBufferToTexture(zero_buf, zero_offset, row_bytes, img_bytes, tex, level,
+                                          layer, Offset3D{}, Extent3D{lw, lh, 1}, ahead);
         }
     }
 }

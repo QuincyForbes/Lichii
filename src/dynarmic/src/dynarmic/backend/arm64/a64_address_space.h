@@ -53,12 +53,14 @@ protected:
     EmitConfig GetEmitConfig() override;
     void RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) override;
     void OnInvalidateBasicBlock(IR::LocationDescriptor descriptor) override;
+    CodePtr TryFastLookup(IR::LocationDescriptor descriptor) const override;
+    void RecordFastLookup(IR::LocationDescriptor descriptor, CodePtr code_ptr) override;
 
     const A64::UserConfig conf;
     BlockRangeInformation<u64> block_ranges;
     AtomicCallbackCtx atomic_ctx{};
     A64JitState* jit_state = nullptr;
-    std::vector<FastDispatchEntry> fast_dispatch_table;
+    mutable std::vector<FastDispatchEntry> fast_dispatch_table;
     u32 fast_dispatch_set_mask = 0;
 };
 

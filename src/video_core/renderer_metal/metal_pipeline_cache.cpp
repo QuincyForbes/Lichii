@@ -29,6 +29,7 @@
 #include "common/cityhash.h"
 #include "common/fs/file.h"
 #include "common/fs/path_util.h"
+#include "common/large_stack.h"
 #include "common/logging.h"
 #include "common/platform_events.h"
 #include "common/scope_exit.h"
@@ -1184,7 +1185,7 @@ struct WarmGraphicsResult {
     bool read_error{};
 };
 
-/// POSIX pthread wrapper with a 16 MiB stack so `Common::RunOnLargeStack` inside `SpirvToMsl`
+/// POSIX pthread wrapper with a large stack so `Common::RunOnLargeStack` inside `SpirvToMsl`
 /// executes inline on warm worker threads with zero per-shader `pthread_create` calls.
 class LargeStackThread {
 public:
@@ -1196,7 +1197,7 @@ public:
         auto heap_fn = std::make_unique<std::function<void()>>(std::forward<Fn>(fn));
         pthread_attr_t attr;
         pthread_attr_init(&attr);
-        pthread_attr_setstacksize(&attr, 16 * 1024 * 1024);
+        pthread_attr_setstacksize(&attr, Common::DefaultLargeStackSize);
         const int rc = pthread_create(
             &handle, &attr,
             +[](void* arg) -> void* {

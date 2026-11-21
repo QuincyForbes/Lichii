@@ -1,17 +1,22 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
-#include <vector>
+#include <cstring>
+#include <limits>
 
+#include "audio_core/common/dsp_simd.h"
 #include "audio_core/renderer/command/data_source/decode.h"
 #include "audio_core/renderer/command/resample/resample.h"
 #include "common/fixed_point.h"
 #include "common/logging.h"
-#include "common/scratch_buffer.h"
 #include "core/guest_memory.h"
 #include "core/memory.h"
 
@@ -19,14 +24,9 @@ namespace AudioCore::Renderer {
 
 constexpr u32 TempBufferSize = 0x3F00;
 
-/// @brief Decode PCM data. Only s16 or f32 is supported.
-/// @tparam T         - Type to decode. Only s16 and f32 are supported.
-/// @param memory     - Core memory for reading samples.
-/// @param out_buffer - Output mix buffer to receive the samples.
-/// @param req        - Information for how to decode.
-/// @return Number of samples decoded.
 template <typename T>
-static u32 DecodePcm(Core::Memory::Memory& memory, std::span<s16> out_buffer, const DecodeArg& req) {
+static u32 DecodePcm(Core::Memory::Memory& memory, std::span<s16> out_buffer,
+                     const DecodeArg& req) {
     constexpr s32 min{(std::numeric_limits<s16>::min)()};
     constexpr s32 max{(std::numeric_limits<s16>::max)()};
 
@@ -40,7 +40,8 @@ static u32 DecodePcm(Core::Memory::Memory& memory, std::span<s16> out_buffer, co
 
     auto samples_to_decode{
         (std::min)(req.samples_to_read, req.end_offset - req.start_offset - req.offset)};
-    u32 channel_count{static_cast<u32>(req.channel_count)};
+    const u32 channel_count{static_cast<u32>(req.channel_count)};
+    s16* __restrict dst = out_buffer.data();
 
     switch (req.channel_count) {
     default: {
@@ -50,20 +51,21 @@ static u32 DecodePcm(Core::Memory::Memory& memory, std::span<s16> out_buffer, co
 
         Core::Memory::CpuGuestMemory<T, Core::Memory::GuestMemoryFlags::UnsafeRead> samples(
             memory, source, size);
+        const T* __restrict src = samples.data() + req.target_channel;
         if constexpr (std::is_floating_point_v<T>) {
             for (u32 i = 0; i < samples_to_decode; i++) {
-                auto sample{static_cast<s32>(samples[i * channel_count + req.target_channel] *
-                                             (std::numeric_limits<s16>::max)())};
-                out_buffer[i] = static_cast<s16>(std::clamp(sample, min, max));
+                const auto sample{static_cast<s32>(src[i * channel_count] *
+                                                   static_cast<f32>((std::numeric_limits<s16>::max)()))};
+                dst[i] = static_cast<s16>(std::clamp(sample, min, max));
             }
         } else {
             for (u32 i = 0; i < samples_to_decode; i++) {
-                out_buffer[i] = samples[i * channel_count + req.target_channel];
+                dst[i] = src[i * channel_count];
             }
         }
     } break;
 
-    case 1:
+    case 1: {
         if (req.target_channel != 0) {
             LOG_ERROR(Service_Audio, "Invalid target channel, expected 0, got {}",
                       req.target_channel);
@@ -73,28 +75,62 @@ static u32 DecodePcm(Core::Memory::Memory& memory, std::span<s16> out_buffer, co
         const VAddr source{req.buffer + ((req.start_offset + req.offset) * sizeof(T))};
         Core::Memory::CpuGuestMemory<T, Core::Memory::GuestMemoryFlags::UnsafeRead> samples(
             memory, source, samples_to_decode);
+        const T* __restrict src = samples.data();
 
         if constexpr (std::is_floating_point_v<T>) {
-            for (u32 i = 0; i < samples_to_decode; i++) {
-                auto sample{static_cast<s32>(samples[i * channel_count + req.target_channel] *
-                                             (std::numeric_limits<s16>::max)())};
-                out_buffer[i] = static_cast<s16>(std::clamp(sample, min, max));
+            u32 i = 0;
+#if defined(ARCHITECTURE_arm64)
+            const float32x4_t vscale = vdupq_n_f32(32767.0f);
+            const float32x4_t vmin = vdupq_n_f32(-32768.0f);
+            const float32x4_t vmax = vdupq_n_f32(32767.0f);
+            for (; i + 8 <= samples_to_decode; i += 8) {
+                const float32x4_t f0 =
+                    vminq_f32(vmaxq_f32(vmulq_f32(vld1q_f32(src + i), vscale), vmin), vmax);
+                const float32x4_t f1 =
+                    vminq_f32(vmaxq_f32(vmulq_f32(vld1q_f32(src + i + 4), vscale), vmin), vmax);
+                const int16x4_t s0 = vqmovn_s32(vcvtq_s32_f32(f0));
+                const int16x8_t s01 = vqmovn_high_s32(s0, vcvtq_s32_f32(f1));
+                vst1q_s16(dst + i, s01);
+            }
+#elif defined(ARCHITECTURE_x86_64)
+            const __m128 vscale = _mm_set1_ps(32767.0f);
+            const __m128 vmin = _mm_set1_ps(-32768.0f);
+            const __m128 vmax = _mm_set1_ps(32767.0f);
+            for (; i + 8 <= samples_to_decode; i += 8) {
+                const __m128 p0 = _mm_mul_ps(_mm_loadu_ps(src + i), vscale);
+                const __m128 p1 = _mm_mul_ps(_mm_loadu_ps(src + i + 4), vscale);
+                // NaN checks: keep scalar static_cast<s32> behavior if non-finite values appear.
+                if (_mm_movemask_ps(_mm_cmpord_ps(p0, p1)) == 0xF) {
+                    const __m128 c0 = _mm_min_ps(_mm_max_ps(p0, vmin), vmax);
+                    const __m128 c1 = _mm_min_ps(_mm_max_ps(p1, vmin), vmax);
+                    const __m128i i0 = _mm_cvttps_epi32(c0);
+                    const __m128i i1 = _mm_cvttps_epi32(c1);
+                    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), _mm_packs_epi32(i0, i1));
+                } else {
+                    for (u32 k = 0; k < 8; ++k) {
+                        const auto sample = static_cast<s32>(
+                            src[i + k] * static_cast<f32>((std::numeric_limits<s16>::max)()));
+                        dst[i + k] = static_cast<s16>(std::clamp(sample, min, max));
+                    }
+                }
+            }
+#endif
+            for (; i < samples_to_decode; i++) {
+                const auto sample{
+                    static_cast<s32>(src[i] * static_cast<f32>((std::numeric_limits<s16>::max)()))};
+                dst[i] = static_cast<s16>(std::clamp(sample, min, max));
             }
         } else {
-            std::memcpy(out_buffer.data(), samples.data(), samples_to_decode * sizeof(s16));
+            std::memcpy(dst, src, samples_to_decode * sizeof(s16));
         }
-        break;
+    } break;
     }
 
     return samples_to_decode;
 }
 
-/// @brief Decode ADPCM data.
-/// @param memory     - Core memory for reading samples.
-/// @param out_buffer - Output mix buffer to receive the samples.
-/// @param req        - Information for how to decode.
-/// @return Number of samples decoded.
-static u32 DecodeAdpcm(Core::Memory::Memory& memory, std::span<s16> out_buffer, const DecodeArg& req) {
+static u32 DecodeAdpcm(Core::Memory::Memory& memory, std::span<s16> out_buffer,
+                       const DecodeArg& req) {
     constexpr u32 SamplesPerFrame{14};
     constexpr u32 NibblesPerFrame{16};
 
@@ -106,7 +142,8 @@ static u32 DecodeAdpcm(Core::Memory::Memory& memory, std::span<s16> out_buffer, 
         return 0;
     }
 
-    auto end{(req.end_offset % SamplesPerFrame) + NibblesPerFrame * (req.end_offset / SamplesPerFrame)};
+    auto end{(req.end_offset % SamplesPerFrame) +
+             NibblesPerFrame * (req.end_offset / SamplesPerFrame)};
     if (req.end_offset % SamplesPerFrame) {
         end += 3;
     } else {
@@ -125,60 +162,61 @@ static u32 DecodeAdpcm(Core::Memory::Memory& memory, std::span<s16> out_buffer, 
 
     auto samples_to_read = samples_to_process;
     auto samples_remaining_in_frame = start_pos % SamplesPerFrame;
-    auto position_in_frame = (start_pos / SamplesPerFrame) * NibblesPerFrame + samples_remaining_in_frame;
+    auto position_in_frame =
+        (start_pos / SamplesPerFrame) * NibblesPerFrame + samples_remaining_in_frame;
     if (samples_remaining_in_frame) {
         position_in_frame += 2;
     }
 
     const auto size{(std::max)((samples_to_process / 8U) * SamplesPerFrame, 8U)};
-    Core::Memory::CpuGuestMemory<u8, Core::Memory::GuestMemoryFlags::UnsafeRead> wavebuffer(memory, req.buffer + position_in_frame / 2, size);
+    Core::Memory::CpuGuestMemory<u8, Core::Memory::GuestMemoryFlags::UnsafeRead> wavebuffer(
+        memory, req.buffer + position_in_frame / 2, size);
+    const u8* __restrict wave_ptr = wavebuffer.data();
+    s16* __restrict out_ptr = out_buffer.data();
+    const u32 out_limit = static_cast<u32>(out_buffer.size());
 
     auto context = req.adpcm_context;
     auto header = context->header;
-    u8 scale = u8(header & 0xfU);
-    u8 coeff_index = u8((header >> 4U) & 0x7u);
+    u32 scale_shift = (header & 0xFU) + 11U;
+    u8 coeff_index = static_cast<u8>((header >> 4U) & 0x7U);
     s32 coeff0 = req.coefficients[coeff_index * 2 + 0];
     s32 coeff1 = req.coefficients[coeff_index * 2 + 1];
 
-    auto yn0 = context->yn0;
-    auto yn1 = context->yn1;
-    auto const get_step = [](u32 index) {
-        // Emulates the following table
-        // 0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1,
-        // (bit set in steps_sign = negative half)
-        constexpr u64 steps_table = 0x1234567876543210ull;
-        constexpr u64 steps_sign = 0b1111111100000000ull;
-        auto const r = s32((steps_table >> (index * 4)) & 0xf);
-        return ((steps_sign >> index) & 1) == 0 ? r : -r;
+    s32 yn0 = context->yn0;
+    s32 yn1 = context->yn1;
+
+    // 4-bit signed nibble sign extension: 0..7 -> 0..7, 8..15 -> -8..-1.
+    const auto high_nibble = [](const u8 byte) noexcept -> s32 {
+        return static_cast<s32>(static_cast<s8>(byte)) >> 4;
     };
-    auto const decode_sample = [&](const s32 code) -> s16 {
-        const auto xn = code * (1 << scale);
-        const auto prediction = coeff0 * yn0 + coeff1 * yn1;
-        const auto sample = ((xn << 11) + 0x400 + prediction) >> 11;
-        const auto saturated = std::clamp<s32>(sample, -0x8000, 0x7FFF);
+    const auto low_nibble = [](const u8 byte) noexcept -> s32 {
+        return static_cast<s32>(static_cast<s8>(static_cast<u8>(byte << 4))) >> 4;
+    };
+    const auto decode_sample = [&](const s32 code) noexcept -> s16 {
+        const s32 xn_shifted = static_cast<s32>(static_cast<u32>(code) << scale_shift);
+        const s32 prediction = coeff0 * yn0 + coeff1 * yn1;
+        const s32 sample = (xn_shifted + 0x400 + prediction) >> 11;
+        const s32 saturated = std::clamp<s32>(sample, -0x8000, 0x7FFF);
         yn1 = yn0;
-        return yn0 = s16(saturated);
+        yn0 = saturated;
+        return static_cast<s16>(saturated);
     };
 
     u32 read_index = 0;
-    for (u32 write_index = 0; samples_to_read > 0 && write_index < out_buffer.size(); ) {
-        // Are we at a new frame?
+    for (u32 write_index = 0; samples_to_read > 0 && write_index < out_limit;) {
         if ((position_in_frame % NibblesPerFrame) == 0) {
-            header = wavebuffer[read_index++];
-            scale = header & 0xFu;
-            coeff_index = (header >> 4) & 0x7u;
+            header = wave_ptr[read_index++];
+            scale_shift = (header & 0xFU) + 11U;
+            coeff_index = static_cast<u8>((header >> 4U) & 0x7U);
             coeff0 = req.coefficients[coeff_index * 2 + 0];
             coeff1 = req.coefficients[coeff_index * 2 + 1];
             position_in_frame += 2;
 
-            // Can we consume all of this frame's samples?
-            if (samples_to_read >= SamplesPerFrame) {
-                // Can grab all samples until the next header
+            if (samples_to_read >= SamplesPerFrame && write_index + SamplesPerFrame <= out_limit) {
                 for (u32 i = 0; i < SamplesPerFrame / 2; i++) {
-                    auto code0 = get_step((wavebuffer[read_index + i] >> 4) & 0xF);
-                    auto code1 = get_step(wavebuffer[read_index + i] & 0xF);
-                    out_buffer[write_index++] = decode_sample(code0);
-                    out_buffer[write_index++] = decode_sample(code1);
+                    const u8 byte = wave_ptr[read_index + i];
+                    out_ptr[write_index++] = decode_sample(high_nibble(byte));
+                    out_ptr[write_index++] = decode_sample(low_nibble(byte));
                 }
                 read_index += SamplesPerFrame / 2;
                 position_in_frame += SamplesPerFrame;
@@ -187,33 +225,29 @@ static u32 DecodeAdpcm(Core::Memory::Memory& memory, std::span<s16> out_buffer, 
             }
         }
 
-        // Decode a single sample
-        auto code = wavebuffer[read_index];
+        const u8 byte = wave_ptr[read_index];
+        s32 step{};
         if (position_in_frame & 1) {
-            code &= 0xF;
+            step = low_nibble(byte);
             read_index++;
         } else {
-            code >>= 4;
+            step = high_nibble(byte);
         }
-        out_buffer[write_index++] = decode_sample(get_step(code));
+        out_ptr[write_index++] = decode_sample(step);
 
         position_in_frame++;
         samples_to_read--;
     }
 
     context->header = header;
-    context->yn0 = yn0;
-    context->yn1 = yn1;
+    context->yn0 = static_cast<s16>(yn0);
+    context->yn1 = static_cast<s16>(yn1);
     return samples_to_process;
 }
 
-/// @brief Decode implementation.
-/// Decode wavebuffers according to the given args.
-///
-/// @param memory - Core memory to read data from.
-/// @param args   - The wavebuffer data, and information for how to decode it.
 void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuffersArgs& args) {
-    constexpr auto EndWaveBuffer = [](auto& voice_state, auto& wavebuffer, auto& index, auto& played_samples, auto& consumed) -> void {
+    constexpr auto EndWaveBuffer = [](auto& voice_state, auto& wavebuffer, auto& index,
+                                      auto& played_samples, auto& consumed) -> void {
         voice_state.wave_buffer_valid[index] = false;
         voice_state.loop_count = 0;
         if (wavebuffer.stream_ended) {
@@ -227,7 +261,8 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
     auto fraction{voice_state.fraction};
 
     const auto sample_rate_ratio{Common::FixedPoint<49, 15>(
-        (f32)args.source_sample_rate / (f32)args.target_sample_rate * (f32)args.pitch)};
+        static_cast<f32>(args.source_sample_rate) / static_cast<f32>(args.target_sample_rate) *
+        args.pitch)};
     const auto size_required{fraction + remaining_sample_count * sample_rate_ratio};
 
     if (size_required < 0) {
@@ -235,7 +270,7 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
     }
 
     // 0 -> 4, 1 -> 8, 2 -> 4
-    auto pitch = u32((0x040804ul >> (u32(args.src_quality) * 8)) & 0xfful);
+    const auto pitch = u32((0x040804ul >> (u32(args.src_quality) * 8)) & 0xfful);
     if (u32(pitch + size_required.to_int_floor()) > TempBufferSize) {
         return;
     }
@@ -252,8 +287,16 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
     bool is_buffer_starved{false};
     u32 offset{voice_state.offset};
 
+    std::array<s16, 16> adpcm_coeffs{};
+    if (args.sample_format == SampleFormat::Adpcm && args.data_address != 0 && args.data_size > 0) {
+        memory.ReadBlockUnsafe(args.data_address, adpcm_coeffs.data(),
+                               (std::min<u64>)(args.data_size, sizeof(adpcm_coeffs)));
+    }
+
     auto output_buffer = args.output;
-    std::array<s16, TempBufferSize> temp_buffer{};
+    // Uninitialized scratch buffer: only `[0 .. pitch + samples_to_read)` is read, avoiding a
+    // 32 KiB memset on every voice channel per 5 ms frame.
+    std::array<s16, TempBufferSize> temp_buffer;
 
     while (remaining_sample_count > 0) {
         const auto samples_to_write{(std::min)(remaining_sample_count, max_remaining_sample_count)};
@@ -263,9 +306,7 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
         u32 temp_buffer_pos{0};
 
         if (!args.IsVoicePitchAndSrcSkippedSupported) {
-            for (u32 i = 0; i < pitch; i++) {
-                temp_buffer[i] = voice_state.sample_history[i];
-            }
+            std::memcpy(temp_buffer.data(), voice_state.sample_history.data(), pitch * sizeof(s16));
             temp_buffer_pos = pitch;
         }
 
@@ -284,8 +325,10 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
             }
 
             auto& wavebuffer = args.wave_buffers[wavebuffer_index];
-            if (offset == 0 && args.sample_format == SampleFormat::Adpcm && wavebuffer.context != 0) {
-                memory.ReadBlockUnsafe(wavebuffer.context, &voice_state.adpcm_context, wavebuffer.context_size);
+            if (offset == 0 && args.sample_format == SampleFormat::Adpcm &&
+                wavebuffer.context != 0) {
+                memory.ReadBlockUnsafe(wavebuffer.context, &voice_state.adpcm_context,
+                                       wavebuffer.context_size);
             }
 
             auto start_offset{wavebuffer.start_offset};
@@ -303,14 +346,14 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
                 .start_offset{start_offset},
                 .end_offset{end_offset},
                 .channel_count{args.channel_count},
-                .coefficients{},
+                .coefficients{adpcm_coeffs},
                 .adpcm_context{nullptr},
                 .target_channel{args.channel},
                 .offset{offset},
                 .samples_to_read{samples_to_read - samples_read},
             };
 
-            s32 samples_decoded{0};
+            u32 samples_decoded{0};
 
             switch (args.sample_format) {
             case SampleFormat::PcmInt16:
@@ -325,11 +368,12 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
                     decode_arg);
                 break;
 
-            case SampleFormat::Adpcm: {
+            case SampleFormat::Adpcm:
                 decode_arg.adpcm_context = &voice_state.adpcm_context;
-                memory.ReadBlockUnsafe(args.data_address, &decode_arg.coefficients, args.data_size);
-                samples_decoded = DecodeAdpcm( memory, {&temp_buffer[temp_buffer_pos], TempBufferSize - temp_buffer_pos}, decode_arg);
-            } break;
+                samples_decoded = DecodeAdpcm(
+                    memory, {&temp_buffer[temp_buffer_pos], TempBufferSize - temp_buffer_pos},
+                    decode_arg);
+                break;
 
             default:
                 LOG_ERROR(Service_Audio, "Invalid sample format to decode {}",
@@ -371,15 +415,21 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
         }
 
         if (args.IsVoicePitchAndSrcSkippedSupported) {
+            const u32 to_copy =
+                (std::min)(samples_read, static_cast<u32>(output_buffer.size()));
             if (samples_read > output_buffer.size()) {
                 LOG_ERROR(Service_Audio, "Attempting to write past the end of output buffer!");
             }
-            for (u32 i = 0; i < samples_read; i++) {
-                output_buffer[i] = temp_buffer[i];
+            s32* __restrict dst = output_buffer.data();
+            const s16* __restrict src = temp_buffer.data();
+            for (u32 i = 0; i < to_copy; i++) {
+                dst[i] = src[i];
             }
         } else {
-            std::memset(&temp_buffer[temp_buffer_pos], 0,
-                        (samples_to_read - samples_read) * sizeof(s16));
+            if (samples_to_read > samples_read) {
+                std::memset(&temp_buffer[temp_buffer_pos], 0,
+                            (samples_to_read - samples_read) * sizeof(s16));
+            }
 
             Resample(output_buffer, temp_buffer, sample_rate_ratio, fraction, samples_to_write,
                      args.src_quality);

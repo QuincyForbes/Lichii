@@ -19,14 +19,10 @@ namespace VideoCommon::HotPages {
 /// list, for games that fill pages shared by two lists of a frame between the two.
 /// Between two epochs a write to a hot page is not seen: the buffer cache tells its write memos
 /// at each epoch instead (BufferCache::AdvanceHotPages).
-#ifdef __APPLE__
 inline constexpr int DefaultMode = 2;
-#else
-inline constexpr int DefaultMode = 0;
-#endif
 
 /// Hot pages cool down together after this many frames and have to trap twice again.
-inline constexpr u32 WindowFrames = 128;
+inline constexpr u32 WindowFrames = 512;
 
 [[nodiscard]] inline int ReadMode() noexcept {
     const char* const value = std::getenv("EDEN_NX2_HOT_PAGES");

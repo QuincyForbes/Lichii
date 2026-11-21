@@ -60,7 +60,8 @@ public:
 
         void Write(const Common::FixedPoint<50, 14> value) {
             buffer[buffer_pos] = value;
-            buffer_pos = static_cast<u32>((buffer_pos + 1) % buffer.size());
+            const u32 next = buffer_pos + 1;
+            buffer_pos = next >= static_cast<u32>(buffer.size()) ? 0U : next;
         }
 
         s32 sample_count_max{};

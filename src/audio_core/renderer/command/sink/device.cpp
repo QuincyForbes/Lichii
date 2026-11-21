@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -5,8 +8,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 
 #include "audio_core/adsp/apps/audio_renderer/command_list_processor.h"
+#include "audio_core/common/dsp_simd.h"
 #include "audio_core/renderer/command/sink/device.h"
 #include "audio_core/sink/sink.h"
 
@@ -36,13 +41,30 @@ void DeviceSinkCommand::Process(const AudioRenderer::CommandListProcessor& proce
         .consumed{false},
     };
 
-    std::array<s16, TargetSampleCount * MaxChannels> samples{};
-    for (u32 channel = 0; channel < input_count; channel++) {
-        const auto offset{inputs[channel] * out_buffer.frames};
+    if (stream->DiscardsSamples()) {
+        stream->AppendBuffer(out_buffer, {});
+        if (stream->IsPaused()) {
+            stream->Start();
+        }
+        return;
+    }
 
-        for (u32 index = 0; index < out_buffer.frames; index++) {
-            samples[index * input_count + channel] =
-                static_cast<s16>(std::clamp(sample_buffer[offset + index], min, max));
+    std::array<s16, TargetSampleCount * MaxChannels> samples;
+    const u32 frames = static_cast<u32>(out_buffer.frames);
+    if (input_count == 2) {
+        const s32* left = &sample_buffer[inputs[0] * frames];
+        const s32* right = &sample_buffer[inputs[1] * frames];
+        DspSimd::SaturateInterleaveStereoS32ToS16(samples.data(), left, right, frames);
+    } else if (input_count == 1) {
+        DspSimd::SaturateS32ToS16(samples.data(), &sample_buffer[inputs[0] * frames], frames);
+    } else {
+        for (u32 channel = 0; channel < input_count; channel++) {
+            const auto offset{inputs[channel] * frames};
+            const s32* __restrict src = &sample_buffer[offset];
+            for (u32 index = 0; index < frames; index++) {
+                samples[index * input_count + channel] =
+                    static_cast<s16>(std::clamp(src[index], min, max));
+            }
         }
     }
 

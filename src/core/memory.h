@@ -216,6 +216,8 @@ public:
      */
     u64 Read64(Common::ProcessAddress addr);
 
+    u128 Read128(Common::ProcessAddress addr);
+
     /**
      * Writes an 8-bit unsigned integer to the given virtual address in
      * the current process' address space.
@@ -259,6 +261,8 @@ public:
      * @post The memory range [addr, sizeof(data)) contains the given data value.
      */
     void Write64(Common::ProcessAddress addr, u64 data);
+
+    void Write128(Common::ProcessAddress addr, u128 data);
 
     /**
      * Writes a 8-bit unsigned integer to the given virtual address in
@@ -514,13 +518,55 @@ public:
 
     bool InvalidateNCE(Common::ProcessAddress vaddr, size_t size);
 
+    /// Makes GPU-modified data in a rasterizer-cached region visible to the CPU before it reads.
+    void DownloadRasterizerRegion(Common::ProcessAddress vaddr, size_t size);
+
     bool InvalidateSeparateHeap(void* fault_address);
+
+    struct HotWritePage {
+        u64 vaddr_page{~u64{0}};
+        u8* host_page{};
+        u64 daddr_page{};
+        u64 mem_gen{};
+        u64 map_gen{};
+        u64 answer_epoch{};
+        bool rasterizer_cached{};
+    };
+
+    [[nodiscard]] u64 FastReadGeneration() const noexcept {
+        return fast_read_gen_ptr != nullptr ? fast_read_gen_ptr->load(std::memory_order_acquire)
+                                            : 0;
+    }
+
+    [[nodiscard]] u64 FastWriteGeneration() const noexcept {
+        return fast_write_gen_ptr != nullptr ? fast_write_gen_ptr->load(std::memory_order_acquire)
+                                             : 0;
+    }
+
+    [[nodiscard]] const std::atomic<std::uintptr_t>* JitReadTrapStatePtr() const noexcept {
+        return jit_read_trap_state_ptr;
+    }
+
+    /// Resolves a clean 4 KiB guest page (`Memory`, or `RasterizerCachedMemory` with read traps
+    /// enabled and none armed on the page) to its host base pointer for fast consecutive callback
+    /// reads until `FastReadGeneration()` advances.
+    [[nodiscard]] bool TryCacheCleanReadPage(u64 vaddr, const u8*& out_host_page,
+                                             u64& out_generation) const noexcept;
+
+    [[nodiscard]] bool TryCollectHotWrite(std::size_t core_index, u64 offset, std::size_t size,
+                                          const HotWritePage& hot) noexcept;
+
+    [[nodiscard]] bool TryCacheHotWritePage(std::size_t core_index, u64 vaddr,
+                                            HotWritePage& out_hot) const noexcept;
 
 private:
     Core::System& system;
 
     struct Impl;
     std::unique_ptr<Impl> impl;
+    const std::atomic<u64>* fast_read_gen_ptr{};
+    const std::atomic<u64>* fast_write_gen_ptr{};
+    const std::atomic<std::uintptr_t>* jit_read_trap_state_ptr{};
 };
 
 template <typename T, GuestMemoryFlags FLAGS>

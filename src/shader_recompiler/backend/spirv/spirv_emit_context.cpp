@@ -465,15 +465,19 @@ Id DescType(EmitContext& ctx, Id sampled_type, Id pointer_type, u32 count) {
     }
 }
 
-// EDEN_NX2_LEAN_SSBO=0 turns it off: the global memory helpers are kept as calls and route
-// with one switch. Inlined at each of their calls, a program with ~30 candidate buffers took
-// NVIDIA's compiler 2.4 s (Ocarina's foliage compute programs; 0.6 s this way, same accesses).
-bool LeanGlobalMemory() {
-    static const bool enabled = [] {
+// EDEN_NX2_LEAN_SSBO=0 turns it off; =1 forces it on in every stage. By default, global memory
+// helpers are kept as DontInline calls outside Task/Mesh stages (saving 4x compile time on foliage
+// compute shaders), while Task/Mesh stages allow inlining so NVIDIA's task compiler does not
+// miscompile back-to-back global loads.
+bool LeanGlobalMemory(Stage stage) {
+    static const int mode = [] {
         const char* value = std::getenv("EDEN_NX2_LEAN_SSBO");
-        return value == nullptr || value[0] != '0';
+        return value == nullptr ? -1 : (value[0] != '0' ? 1 : 0);
     }();
-    return enabled;
+    if (mode >= 0) {
+        return mode != 0;
+    }
+    return stage != Stage::Task && stage != Stage::Mesh;
 }
 } // Anonymous namespace
 
@@ -1050,13 +1054,13 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     std::vector<u32> candidates;
     GlobalMemoryFunctions* functions{};
     using DefPtr = Id StorageDefinitions::*;
-    static const spv::FunctionControlMask function_control = [] {
+    static const bool force_no_inline = [] {
         const char* value = std::getenv("EDEN_NX2_SPIRV_INLINE_GLOBALS");
-        return value != nullptr && value[0] == '0'
-                   ? spv::FunctionControlMask::DontInline
-                   : (LeanGlobalMemory() ? spv::FunctionControlMask::DontInline
-                                         : spv::FunctionControlMask::MaskNone);
+        return value != nullptr && value[0] == '0';
     }();
+    const spv::FunctionControlMask function_control =
+        (force_no_inline || LeanGlobalMemory(stage)) ? spv::FunctionControlMask::DontInline
+                                                     : spv::FunctionControlMask::MaskNone;
     const Id zero{u32_zero_value};
     const bool inline_mesh_loads{profile.has_broken_mesh_global_memory_calls &&
                                  runtime_info.mesh_as_compute &&
@@ -1193,6 +1197,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             Id ssbo_id{ssbos[candidates[0]].*ssbo_member};
             if (candidates.size() > 1) {
                 AddCapability(spv::Capability::VariablePointersStorageBuffer);
+                AddCapability(spv::Capability::VariablePointers);
                 for (size_t i = 1; i < candidates.size(); ++i) {
                     const Id routed{OpIEqual(U1, route, Const(candidates[i]))};
                     ssbo_id = OpSelect(type_def.array, routed, ssbos[candidates[i]].*ssbo_member,

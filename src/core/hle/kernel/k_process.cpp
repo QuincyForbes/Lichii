@@ -21,10 +21,15 @@
 #include "core/hle/kernel/k_thread_queue.h"
 #include "core/hle/kernel/k_worker_task_manager.h"
 
+#include "core/arm/cached_interpreter/arm_cached_interpreter.h"
 #include "core/arm/dynarmic/arm_dynarmic_32.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #ifdef HAS_NCE
 #include "core/arm/nce/arm_nce.h"
+#endif
+#ifdef HAS_HYPERVISOR
+#include "core/arm/hypervisor/arm_hypervisor.h"
+#include "core/arm/hypervisor/hv_vm.h"
 #endif
 
 namespace Kernel {
@@ -1337,7 +1342,31 @@ void KProcess::InitializeInterfaces(KernelCore& kernel) {
         }
     } else
 #endif
-        if (this->Is64Bit()) {
+#ifdef HAS_HYPERVISOR
+    if (this->IsApplication() && !this->Is64Bit() && Core::HvVm::Get() != nullptr) {
+        Core::HvVm::Deactivate();
+        m_memory.SetCurrentPageTable(*this);
+    }
+    if (auto* vm = Core::HvVm::Get(); vm && this->IsApplication() && this->Is64Bit()) {
+        LOG_INFO(Core_ARM, "Initializing Apple Silicon Hypervisor.framework backend for process {}",
+                 this->GetName());
+        for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
+            if ((active_core_mask & (1ULL << i)) != 0) {
+                m_arm_interfaces[i] = std::make_unique<Core::ArmHypervisor>(kernel.System(), *vm, i);
+            }
+        }
+    } else
+#endif
+        if (this->Is64Bit() && Settings::IsCachedInterpreterEnabled()) {
+        LOG_INFO(Core_ARM, "Initializing portable cached AArch64 interpreter for process {}",
+                 this->GetName());
+        for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
+            if ((active_core_mask & (1ULL << i)) != 0) {
+                m_arm_interfaces[i] = std::make_unique<Core::ArmCachedInterpreter>(
+                    kernel.System(), kernel.IsMulticore(), this, m_exclusive_monitor.get(), i);
+            }
+        }
+    } else if (this->Is64Bit()) {
         for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
             if ((active_core_mask & (1ULL << i)) != 0) {
                 m_arm_interfaces[i] = std::make_unique<Core::ArmDynarmic64>(

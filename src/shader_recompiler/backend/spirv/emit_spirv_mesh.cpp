@@ -911,6 +911,12 @@ std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile) {
     const Id function_u32{module.TypePointer(spv::StorageClass::Function, u32_type)};
     const Id total_var{module.AddLocalVariable(function_u32, spv::StorageClass::Function)};
     const Id task_var{module.AddLocalVariable(function_u32, spv::StorageClass::Function)};
+    const Id base_var{module.AddLocalVariable(function_u32, spv::StorageClass::Function)};
+    const Id max_u32{constant(~u32{0})};
+    const auto saturated_add = [&](Id a, Id b) {
+        const Id remaining{module.OpISub(u32_type, max_u32, a)};
+        return module.OpIAdd(u32_type, a, module.OpUMin(u32_type, b, remaining));
+    };
     const auto push = [&](u32 member) {
         return module.OpLoad(u32_type, module.OpAccessChain(constant_u32, constants,
                                                             constant(member)));
@@ -945,7 +951,7 @@ std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile) {
                                                   module.OpIMul(u32_type, task, payload_words),
                                                   constant(1))))};
         module.OpStore(word(offsets, task), total);
-        module.OpStore(total_var, module.OpIAdd(u32_type, total, requested));
+        module.OpStore(total_var, saturated_add(total, requested));
     }
     module.OpBranch(continue_label);
     module.AddLabel(continue_label);
@@ -953,13 +959,30 @@ std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile) {
     module.OpBranch(header);
     module.AddLabel(merge);
 
-    // The draw's blocks are allocated from the arena every draw of the submission shares. The
-    // passes of consecutive draws are ordered by barriers, so a plain read and write allocate.
-    // The counter keeps growing past the end, so the host sees how much the submission needed.
+    // Saturate demand beyond 32 bits; wrapping would hand a later draw live arena slots.
     const Id total{module.OpLoad(u32_type, total_var)};
-    const Id base{module.OpLoad(u32_type, word(counter, constant(0)))};
-    module.OpStore(word(counter, constant(0)),
-                   module.OpIAdd(u32_type, base, module.OpIMul(u32_type, total, block_words)));
+    const Id max_blocks{module.OpUDiv(u32_type, max_u32, block_words)};
+    const Id alloc_words{module.OpSelect(u32_type, module.OpUGreaterThan(bool_type, total, max_blocks),
+                                         max_u32, module.OpIMul(u32_type, total, block_words))};
+    const Id counter_ptr{word(counter, constant(0))};
+    const Id scope{constant(static_cast<u32>(spv::Scope::Device))};
+    const Id relaxed{constant(static_cast<u32>(spv::MemorySemanticsMask::MaskNone))};
+    module.OpStore(base_var, module.OpAtomicLoad(u32_type, counter_ptr, scope, relaxed));
+    const Id reserve{module.OpLabel()};
+    const Id retry{module.OpLabel()};
+    const Id reserved{module.OpLabel()};
+    module.OpBranch(reserve);
+    module.AddLabel(reserve);
+    const Id base{module.OpLoad(u32_type, base_var)};
+    const Id observed{module.OpAtomicCompareExchange(u32_type, counter_ptr, scope, relaxed, relaxed,
+                                                     saturated_add(base, alloc_words), base)};
+    const Id success{module.OpIEqual(bool_type, observed, base)};
+    module.OpLoopMerge(reserved, retry, spv::LoopControlMask::MaskNone);
+    module.OpBranchConditional(success, reserved, retry);
+    module.AddLabel(retry);
+    module.OpStore(base_var, observed);
+    module.OpBranch(reserve);
+    module.AddLabel(reserved);
     const Id room{module.OpSelect(u32_type, module.OpULessThan(bool_type, base, capacity_words),
                                   module.OpISub(u32_type, capacity_words, base), constant(0))};
     const Id dispatched{module.OpUMin(

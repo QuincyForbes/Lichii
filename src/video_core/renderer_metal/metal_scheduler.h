@@ -296,10 +296,11 @@ public:
     /// thread, EDEN_NX2_METAL_ASYNC_FENCES). A tick not committed yet must be one the owner
     /// commits on its own: a fence's (FenceTick) or one marked with RequestCommit. The split's
     /// back is asked to run its idle hook, which commits such work between entries.
-    void WaitCompleted(u64 tick);
+    void WaitCompleted(u64 tick, bool allow_batch_grace = false);
 
     /// Wait on the thread that owns the scheduler (GpuSplit::OwnsScheduler), else WaitCompleted.
-    void WaitAnyThread(u64 tick, CommitReason reason = CommitReason::Wait);
+    void WaitAnyThread(u64 tick, CommitReason reason = CommitReason::Wait,
+                       bool allow_batch_grace = false);
 
     /// Owner: another thread will wait for the tick being recorded (WaitCompleted). It is left
     /// pending as a fence's work (FenceTick): the next commit, FlushDeferred or the back's idle
@@ -337,6 +338,10 @@ public:
     /// a wait or the next list end once the GPU caught up commits it.
     bool DeferListEnd();
 
+    /// Coalesces non-urgent flushes (such as speculative command-list copies) on GPUBack within
+    /// EDEN_NX2_FENCE_FLUSH_US while the GPU already has work in flight.
+    bool DeferFlush();
+
     /// The tick a guest fence queued now waits for. Pending work is committed for it; with none
     /// it is the last tick committed, and no command buffer is made (EDEN_NX2_METAL_FENCE_IDLE).
     /// On the split's back within EDEN_NX2_FENCE_FLUSH_US of the last commit the work stays
@@ -361,9 +366,10 @@ public:
     [[nodiscard]] std::array<u64, 2> TakeDeferredFences() noexcept;
 
     /// ahead: recorded before everything else of the segment (see CanUploadAhead), leaving the
-    /// open encoder as it is.
+    /// open encoder as it is. `range_tracked`: the caller tracks exact byte ranges in
+    /// Buffer::tracker so whole-buffer untracked serialization is not needed.
     void CopyBuffer(BufferHandle src, u64 src_offset, BufferHandle dst, u64 dst_offset, u64 size,
-                    bool ahead = false);
+                    bool ahead = false, bool range_tracked = false);
 
     /// EDEN_NX2_METAL_AHEAD: a segment is what one command buffer of a tick records in order.
     /// Uploads and kernels that do not depend on it go into one command buffer of their own in
@@ -387,6 +393,9 @@ public:
     /// Whether a copy, fill or texture copy of the segment reads or writes `buffer` in order.
     [[nodiscard]] bool UsedInOrder(BufferHandle buffer) const noexcept;
 
+    /// Whether an in-order operation without per-range Buffer::tracker coverage touched `buffer`.
+    [[nodiscard]] bool UsedUntrackedInOrder(BufferHandle buffer) const noexcept;
+
     /// Whether a kernel of a draw into `targets` may go ahead of the segment: nothing but the
     /// render pass on them was recorded in it, so the kernel sees what it would see in order.
     /// EDEN_NX2_METAL_AHEAD_ANY: also after other work; each buffer the kernel then binds is
@@ -406,7 +415,10 @@ public:
     /// start of a segment, commits what was recorded (same tick) and starts the next segment.
     void SplitBefore(const RenderTargetSet& targets);
 
-    void FillBuffer(BufferHandle dst, u64 offset, u64 size, u8 value);
+    void FillBuffer(BufferHandle dst, u64 offset, u64 size, u8 value, bool ahead = false,
+                    bool range_tracked = false);
+    void FillBufferPattern(BufferHandle dst, u64 offset, u64 size, u32 pattern, bool ahead = false,
+                           bool range_tracked = false);
 
     void CopyBufferToTexture(BufferHandle src, u64 offset, u32 bytes_per_row, u32 bytes_per_image,
                              TextureHandle dst, u32 level, u32 slice, Offset3D origin,
@@ -572,6 +584,10 @@ public:
     /// `index_offset`.
     void DrawIndexedIndirect(u32 primitive, u32 index_size, BufferHandle index_buffer,
                              u64 index_offset, BufferHandle buffer, u64 offset);
+
+    /// Opens the in-order compute encoder ahead of a dispatch's buffer uploads when compute-copy
+    /// is enabled so those uploads stay on one compute encoder instead of opening a blit encoder.
+    void PrepareCompute();
 
     /// Opens a compute encoder (or keeps the open one) running pipeline
     /// (an id<MTLComputePipelineState>). ahead: the encoder of the kernels recorded ahead of

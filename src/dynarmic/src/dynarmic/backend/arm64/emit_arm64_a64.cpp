@@ -123,8 +123,36 @@ void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::If
 
 void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::CheckBit terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
     oaknut::Label fail;
-    code.LDRB(Wscratch0, SP, offsetof(StackLayout, check_bit));
-    code.CBZ(Wscratch0, fail);
+    switch (ctx.ebi.check_bit_kind) {
+    case CheckBitKind::ConstTrue:
+        ctx.ebi.check_bit_kind = CheckBitKind::Stack;
+        EmitA64LeafTerminal(code, ctx, terminal.then_, initial_location, is_single_step);
+        return;
+    case CheckBitKind::ConstFalse:
+        ctx.ebi.check_bit_kind = CheckBitKind::Stack;
+        EmitA64LeafTerminal(code, ctx, terminal.else_, initial_location, is_single_step);
+        return;
+    case CheckBitKind::RegZero32:
+        ctx.ebi.check_bit_kind = CheckBitKind::Stack;
+        code.CBNZ(Wscratch2, fail);
+        break;
+    case CheckBitKind::RegZero64:
+        ctx.ebi.check_bit_kind = CheckBitKind::Stack;
+        code.CBNZ(Xscratch2, fail);
+        break;
+    case CheckBitKind::TestBit:
+        ctx.ebi.check_bit_kind = CheckBitKind::Stack;
+        code.TBZ(Xscratch2, ctx.ebi.check_bit_num, fail);
+        break;
+    case CheckBitKind::RegBit:
+        ctx.ebi.check_bit_kind = CheckBitKind::Stack;
+        code.CBZ(Wscratch2, fail);
+        break;
+    case CheckBitKind::Stack:
+        code.LDRB(Wscratch0, SP, offsetof(StackLayout, check_bit));
+        code.CBZ(Wscratch0, fail);
+        break;
+    }
     EmitA64LeafTerminal(code, ctx, terminal.then_, initial_location, is_single_step);
     code.l(fail);
     EmitA64LeafTerminal(code, ctx, terminal.else_, initial_location, is_single_step);
@@ -193,6 +221,49 @@ void EmitA64CheckMemoryAbort(oaknut::CodeGenerator& code, EmitContext& ctx, IR::
 template<>
 void EmitIR<IR::Opcode::A64SetCheckBit>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
+
+    if (inst == ctx.ebi.terminal_set_check_bit) {
+        if (args[0].IsImmediate()) {
+            ctx.ebi.check_bit_kind = args[0].GetImmediateU1() ? CheckBitKind::ConstTrue : CheckBitKind::ConstFalse;
+        } else if (ctx.ebi.fused_check_bit_src != nullptr) {
+            switch (ctx.ebi.fused_check_bit_src->GetOpcode()) {
+            case IR::Opcode::IsZero32: {
+                auto Wop = ctx.reg_alloc.ReadW(args[0]);
+                RegAlloc::Realize(Wop);
+                code.MOV(Wscratch2, Wop);
+                ctx.ebi.check_bit_kind = CheckBitKind::RegZero32;
+                break;
+            }
+            case IR::Opcode::IsZero64: {
+                auto Xop = ctx.reg_alloc.ReadX(args[0]);
+                RegAlloc::Realize(Xop);
+                code.MOV(Xscratch2, Xop);
+                ctx.ebi.check_bit_kind = CheckBitKind::RegZero64;
+                break;
+            }
+            case IR::Opcode::TestBit: {
+                auto Xop = ctx.reg_alloc.ReadX(args[0]);
+                RegAlloc::Realize(Xop);
+                code.MOV(Xscratch2, Xop);
+                ctx.ebi.check_bit_kind = CheckBitKind::TestBit;
+                ctx.ebi.check_bit_num = ctx.ebi.fused_check_bit_src->GetArg(1).GetU8();
+                break;
+            }
+            default:
+                UNREACHABLE();
+            }
+        } else {
+            auto Wbit = ctx.reg_alloc.ReadW(args[0]);
+            RegAlloc::Realize(Wbit);
+            code.MOV(Wscratch2, Wbit);
+            ctx.ebi.check_bit_kind = CheckBitKind::RegBit;
+        }
+        if (flags_live) {
+            ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+        }
+        return;
+    }
 
     if (args[0].IsImmediate()) {
         if (args[0].GetImmediateU1()) {
@@ -205,6 +276,9 @@ void EmitIR<IR::Opcode::A64SetCheckBit>(oaknut::CodeGenerator& code, EmitContext
         auto Wbit = ctx.reg_alloc.ReadW(args[0]);
         RegAlloc::Realize(Wbit);
         code.STRB(Wbit, SP, offsetof(StackLayout, check_bit));
+    }
+    if (flags_live) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
     }
 }
 
@@ -280,10 +354,21 @@ void EmitA64SetGpr(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst
             code.STR(Xscratch0, Xstate, reg_off);
         }
     } else if constexpr (bitsize == 32) {
-        auto Wvalue = ctx.reg_alloc.ReadW(args[1]);
-        RegAlloc::Realize(Wvalue);
-        code.MOV(*Wvalue, Wvalue);
-        code.STR(Wvalue->toX(), Xstate, reg_off);
+        if (args[1].IsInFpr(ctx.reg_alloc)) {
+            auto Svalue = ctx.reg_alloc.ReadS(args[1]);
+            RegAlloc::Realize(Svalue);
+            code.STR(Svalue, Xstate, reg_off);
+            code.STR(WZR, Xstate, reg_off + 4);
+        } else {
+            auto Wvalue = ctx.reg_alloc.ReadW(args[1]);
+            RegAlloc::Realize(Wvalue);
+            if (ElideRedundantZextOn() && IsZeroExtendedU32Producer(args[1].GetInst())) {
+                code.STR(Wvalue->toX(), Xstate, reg_off);
+            } else {
+                code.MOV(Wscratch0, Wvalue);
+                code.STR(Xscratch0, Xstate, reg_off);
+            }
+        }
     } else if (args[1].IsInFpr(ctx.reg_alloc)) {
         auto Dvalue = ctx.reg_alloc.ReadD(args[1]);
         RegAlloc::Realize(Dvalue);
@@ -367,34 +452,86 @@ void EmitIR<IR::Opcode::A64GetX>(oaknut::CodeGenerator& code, EmitContext& ctx, 
 
 template<>
 void EmitIR<IR::Opcode::A64GetS>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
     const A64::Vec vec = inst->GetArg(0).GetA64VecRef();
     auto Sresult = ctx.reg_alloc.WriteS(inst);
     RegAlloc::Realize(Sresult);
     code.LDR(Sresult, Xstate, offsetof(A64JitState, vec) + sizeof(u64) * 2 * static_cast<size_t>(vec));
+    if (flags_live) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
 }
 
 template<>
 void EmitIR<IR::Opcode::A64GetD>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
     const A64::Vec vec = inst->GetArg(0).GetA64VecRef();
     auto Dresult = ctx.reg_alloc.WriteD(inst);
     RegAlloc::Realize(Dresult);
     code.LDR(Dresult, Xstate, offsetof(A64JitState, vec) + sizeof(u64) * 2 * static_cast<size_t>(vec));
+    if (flags_live) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
 }
 
 template<>
 void EmitIR<IR::Opcode::A64GetQ>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
     const A64::Vec vec = inst->GetArg(0).GetA64VecRef();
+    const std::size_t vec_base = offsetof(A64JitState, vec) + sizeof(u64) * 2 * static_cast<size_t>(vec);
+    if (const auto* scalar = ctx.ebi.FindScalarGetQ(inst)) {
+        const std::size_t elem_off = vec_base + (static_cast<std::size_t>(scalar->elem_bits) / 8) * scalar->lane;
+        switch (scalar->elem_bits) {
+        case 8: {
+            auto Bresult = ctx.reg_alloc.WriteB(inst);
+            RegAlloc::Realize(Bresult);
+            code.LDR(Bresult, Xstate, static_cast<int>(elem_off));
+            break;
+        }
+        case 16: {
+            auto Hresult = ctx.reg_alloc.WriteH(inst);
+            RegAlloc::Realize(Hresult);
+            code.LDR(Hresult, Xstate, static_cast<int>(elem_off));
+            break;
+        }
+        case 32: {
+            auto Sresult = ctx.reg_alloc.WriteS(inst);
+            RegAlloc::Realize(Sresult);
+            code.LDR(Sresult, Xstate, static_cast<int>(elem_off));
+            break;
+        }
+        case 64: {
+            auto Dresult = ctx.reg_alloc.WriteD(inst);
+            RegAlloc::Realize(Dresult);
+            code.LDR(Dresult, Xstate, static_cast<int>(elem_off));
+            break;
+        }
+        default:
+            UNREACHABLE();
+        }
+        if (flags_live) {
+            ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+        }
+        return;
+    }
     auto Qresult = ctx.reg_alloc.WriteQ(inst);
     RegAlloc::Realize(Qresult);
-    code.LDR(Qresult, Xstate, offsetof(A64JitState, vec) + sizeof(u64) * 2 * static_cast<size_t>(vec));
+    code.LDR(Qresult, Xstate, vec_base);
+    if (flags_live) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
 }
 
 template<>
 void EmitIR<IR::Opcode::A64GetSP>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
     auto Xresult = ctx.reg_alloc.WriteX(inst);
     RegAlloc::Realize(Xresult);
 
     code.LDR(Xresult, Xstate, offsetof(A64JitState, sp));
+    if (flags_live) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
 }
 
 template<>
@@ -435,19 +572,27 @@ void EmitIR<IR::Opcode::A64SetD>(oaknut::CodeGenerator& code, EmitContext& ctx, 
 
 template<>
 void EmitIR<IR::Opcode::A64SetQ>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const A64::Vec vec = inst->GetArg(0).GetA64VecRef();
     auto Qvalue = ctx.reg_alloc.ReadQ(args[1]);
     RegAlloc::Realize(Qvalue);
     code.STR(Qvalue, Xstate, offsetof(A64JitState, vec) + sizeof(u64) * 2 * static_cast<size_t>(vec));
+    if (flags_live) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
 }
 
 template<>
 void EmitIR<IR::Opcode::A64SetSP>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     auto Xvalue = ctx.reg_alloc.ReadX(args[0]);
     RegAlloc::Realize(Xvalue);
     code.STR(Xvalue, Xstate, offsetof(A64JitState, sp));
+    if (flags_live) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
 }
 
 template<>
@@ -470,10 +615,14 @@ void EmitIR<IR::Opcode::A64SetFPSR>(oaknut::CodeGenerator& code, EmitContext& ct
 
 template<>
 void EmitIR<IR::Opcode::A64SetPC>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     auto Xvalue = ctx.reg_alloc.ReadX(args[0]);
     RegAlloc::Realize(Xvalue);
     code.STR(Xvalue, Xstate, offsetof(A64JitState, pc));
+    if (flags_live) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
 }
 
 template<>
@@ -484,6 +633,7 @@ void EmitIR<IR::Opcode::A64CallSupervisor>(oaknut::CodeGenerator& code, EmitCont
     EmitFlushCycles(code, ctx);
     code.MOV(W1, args[0].GetImmediateU32());
     EmitRelocation(code, ctx, LinkTarget::CallSVC);
+    code.STRB(WZR, Xstate, ctx.conf.state_exclusive_state_offset);
     EmitReloadCycles(code, ctx);
 }
 

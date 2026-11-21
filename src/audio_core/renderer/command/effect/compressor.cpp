@@ -46,36 +46,50 @@ static void ApplyCompressorEffect(const CompressorInfo::ParameterVersion2& param
                                   CompressorInfo::State& state, bool enabled,
                                   std::span<std::span<const s32>> input_buffers,
                                   std::span<std::span<s32>> output_buffers, u32 sample_count) {
-    if (enabled) {
+    if (enabled && params.channel_count > 0) {
         auto state_00{state.unk_00};
         auto state_04{state.unk_04};
         auto state_08{state.unk_08};
         auto state_18{state.unk_18};
+        const f32 state_00_initial = state.unk_00;
+        const f32 state_10 = state.unk_10;
+        const f32 state_14 = state.unk_14;
+        const f32 neg_state_0c = -state.unk_0C;
+        const f32 state_20 = state.unk_20;
+        const f32 slope = (1.0f / params.compressor_ratio) - 1.0f;
+        const f32 inv_channels = 1.0f / static_cast<f32>(params.channel_count);
+
+        std::array<const s32*, MaxChannels> in_ptrs{};
+        std::array<s32*, MaxChannels> out_ptrs{};
+        const s16 ch_count = params.channel_count;
+        for (s16 c = 0; c < ch_count; ++c) {
+            in_ptrs[c] = input_buffers[c].data();
+            out_ptrs[c] = output_buffers[c].data();
+        }
 
         for (u32 i = 0; i < sample_count; i++) {
-            auto a{0.0f};
-            for (s16 channel = 0; channel < params.channel_count; channel++) {
-                const auto input_sample{Common::FixedPoint<49, 15>(input_buffers[channel][i])};
-                a += (input_sample * input_sample).to_float();
+            f32 a = 0.0f;
+            for (s16 channel = 0; channel < ch_count; channel++) {
+                const s64 s = in_ptrs[channel][i];
+                a += static_cast<f32>(s * s);
             }
 
-            state_00 += params.unk_24 * ((a / params.channel_count) - state.unk_00);
+            state_00 += params.unk_24 * ((a * inv_channels) - state_00_initial);
 
             auto b{-100.0f};
             auto c{0.0f};
-            if (state_00 >= 1.0e-10) {
+            if (state_00 >= 1.0e-10f) {
                 b = std::log10(state_00) * 10.0f;
                 c = 1.0f;
             }
 
-            if (b >= state.unk_10) {
-                const auto d{b >= state.unk_14
-                                 ? ((1.0f / params.compressor_ratio) - 1.0f) *
-                                       (b - params.threshold)
-                                 : (b - state.unk_10) * (b - state.unk_10) * -state.unk_0C};
-                const auto e{d / 20.0f * 3.3219f};
+            if (b >= state_10) {
+                const f32 diff10 = b - state_10;
+                const auto d{b >= state_14 ? slope * (b - params.threshold)
+                                           : diff10 * diff10 * neg_state_0c};
+                const auto e{d * (3.3219f / 20.0f)};
                 const auto f{(e - std::trunc(e)) * 0.69315f};
-                c = std::pow(2.0f, f);
+                c = std::exp2f(f);
             }
 
             state_18 = params.unk_28;
@@ -89,10 +103,11 @@ static void ApplyCompressorEffect(const CompressorInfo::ParameterVersion2& param
 
             state_04 = tmp;
             state_08 += (c - state_08) * state_18;
+            const f32 out_scale = state_08 * state_20;
 
-            for (s16 channel = 0; channel < params.channel_count; channel++) {
-                output_buffers[channel][i] = static_cast<s32>(
-                    static_cast<f32>(input_buffers[channel][i]) * state_08 * state.unk_20);
+            for (s16 channel = 0; channel < ch_count; channel++) {
+                out_ptrs[channel][i] =
+                    static_cast<s32>(static_cast<f32>(in_ptrs[channel][i]) * out_scale);
             }
         }
 

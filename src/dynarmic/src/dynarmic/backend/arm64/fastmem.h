@@ -61,8 +61,8 @@ public:
         return exception_handler.SupportsFastmem();
     }
 
-    bool ShouldFastmem(DoNotFastmemMarker marker) const;
-    void MarkDoNotFastmem(DoNotFastmemMarker marker);
+    bool ShouldFastmem(DoNotFastmemMarker marker, bool is_load = false) const;
+    void MarkDoNotFastmem(DoNotFastmemMarker marker, bool is_load = false);
     /// A fault of a plain load: whether it is the one that makes the load give up fastmem.
     bool LoadFaultRecompiles(DoNotFastmemMarker marker);
 
@@ -70,7 +70,9 @@ private:
     ExceptionHandler& exception_handler;
     ::Common::unordered_set<DoNotFastmemMarker, DoNotFastmemMarkerHash> do_not_fastmem;
     ::Common::unordered_set<IR::LocationDescriptor> do_not_fastmem_blocks;
+    ::Common::unordered_set<IR::LocationDescriptor> do_not_fastmem_load_blocks;
     ::Common::unordered_map<IR::LocationDescriptor, unsigned> faults_per_block;
+    ::Common::unordered_map<IR::LocationDescriptor, unsigned> load_faults_per_block;
     bool shared_markers = false;
     unsigned faults_per_block_limit = 0;
     ::Common::unordered_map<DoNotFastmemMarker, unsigned, DoNotFastmemMarkerHash> load_faults;

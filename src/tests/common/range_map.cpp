@@ -64,6 +64,17 @@ TEST_CASE("Range Map: Cached sizes survive remaps, splits and merges", "[video_c
     REQUIRE(map.GetContinuousSizeFrom(1, true) == 0);
 }
 
+TEST_CASE("Range Map: empty intervals preserve their neighbours", "[video_core]") {
+    Common::RangeMap<u64, MappedEnum> map(MappedEnum::Invalid);
+    map.Map(8, 16, MappedEnum::Valid_1);
+    map.Map(4, 4, MappedEnum::Valid_2);
+    map.Unmap(12, 12);
+    map.Map(14, 6, MappedEnum::Valid_2);
+    REQUIRE(map.GetValueAt(4) == MappedEnum::Invalid);
+    REQUIRE(map.GetContinuousSizeFrom(8) == 8);
+    REQUIRE(map.GetValueAt(16) == MappedEnum::Invalid);
+}
+
 TEST_CASE("Range Map: cache hits retain the same guarded mapping lifetime", "[video_core]") {
     Common::RangeMap<u64, MappedEnum> map(MappedEnum::Invalid);
     map.Map(100, 200, MappedEnum::Valid_1);

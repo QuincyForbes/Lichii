@@ -79,7 +79,7 @@ void InnerFence::Wait() {
         }
     }
     if (!scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
-        !VideoCommon::GpuSplit::OnBackThread() && scheduler.WaitSubmitted(wait_tick)) {
+        !VideoCommon::GpuSplit::OnBackThread() && scheduler.WaitFenceSubmitted(wait_tick, queued)) {
         scheduler.GetMasterSemaphore().Wait(wait_tick);
         return;
     }

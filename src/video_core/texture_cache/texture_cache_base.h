@@ -316,6 +316,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// SparseTiles images: binds and uploads the parts written since the last upload.
     void RefreshSparseTiles(Image& image);
 
+    /// Brings a SparseTilesUnmapped image up to date with the tiles mapped now (see the flag).
+    void RefreshUnmappedSparseTiles(Image& image, ImageId image_id);
+
     /// Image::BindTiles, counting what it binds in total_used_memory.
     bool BindSparseTiles(Image& image, std::span<const LevelRect> rects);
 
@@ -1323,6 +1326,7 @@ private:
     u64 modification_tick = 0;
     u64 frame_start_modification_tick = 0;
     u64 frame_tick = 0;
+    u64 sparse_tiles_refreshed = 0; ///< SparseTilesUnmapped images brought up to date
 
     bool rescale_trace = std::getenv("EDEN_NX2_RESCALE_TRACE") != nullptr;
     std::map<std::string, u64> rescale_trace_counts;

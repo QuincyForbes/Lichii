@@ -8,6 +8,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 
@@ -16,7 +17,6 @@
 #endif
 
 #include "common/spin_deadline.h"
-#include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_address_arbiter.h"
 #include "core/hle/kernel/k_process.h"
@@ -58,84 +58,69 @@ bool ReadFromUser(KernelCore& kernel, s64* out, KProcessAddress address) {
 }
 
 bool DecrementIfLessThan(KernelCore& kernel, s32* out, KProcessAddress address, s32 value) {
-    auto& monitor = GetCurrentProcess(kernel).GetExclusiveMonitor();
-    const auto current_core = kernel.CurrentPhysicalCoreIndex();
+    auto& memory = GetCurrentMemory(kernel);
+    const u64 raw_addr = GetInteger(address);
 
-    // NOTE: If scheduler lock is not held here, interrupt disable is required.
-    // KScopedInterruptDisable di;
-
-    // TODO(bunnei): We should call CanAccessAtomic(..) here.
-
-    s32 current_value{};
-
-    while (true) {
-        // Load the value from the address.
-        current_value =
-            static_cast<s32>(monitor.ExclusiveRead32(current_core, GetInteger(address)));
-
-        // Compare it to the desired one.
-        if (current_value < value) {
-            // If less than, we want to try to decrement.
-            const s32 decrement_value = current_value - 1;
-
-            // Decrement and try to store.
-            if (monitor.ExclusiveWrite32(current_core, GetInteger(address),
-                                         static_cast<u32>(decrement_value))) {
-                break;
-            }
-
-            // If we failed to store, try again.
-        } else {
-            // Otherwise, clear our exclusive hold and finish
-            monitor.ClearExclusive(current_core);
+    s32 current_value = static_cast<s32>(memory.Read32(raw_addr));
+    while (current_value < value) {
+        const s32 decrement_value = current_value - 1;
+        if (memory.WriteExclusive32(raw_addr, static_cast<u32>(decrement_value),
+                                    static_cast<u32>(current_value))) {
             break;
         }
+        current_value = static_cast<s32>(memory.Read32(raw_addr));
     }
 
-    // We're done.
     *out = current_value;
     return true;
 }
 
 bool UpdateIfEqual(KernelCore& kernel, s32* out, KProcessAddress address, s32 value,
                    s32 new_value) {
-    auto& monitor = GetCurrentProcess(kernel).GetExclusiveMonitor();
-    const auto current_core = kernel.CurrentPhysicalCoreIndex();
+    auto& memory = GetCurrentMemory(kernel);
+    const u64 raw_addr = GetInteger(address);
 
-    // NOTE: If scheduler lock is not held here, interrupt disable is required.
-    // KScopedInterruptDisable di;
-
-    // TODO(bunnei): We should call CanAccessAtomic(..) here.
-
-    s32 current_value{};
-
-    // Load the value from the address.
-    while (true) {
-        current_value =
-            static_cast<s32>(monitor.ExclusiveRead32(current_core, GetInteger(address)));
-
-        // Compare it to the desired one.
-        if (current_value == value) {
-            // If equal, we want to try to write the new value.
-
-            // Try to store.
-            if (monitor.ExclusiveWrite32(current_core, GetInteger(address),
-                                         static_cast<u32>(new_value))) {
-                break;
-            }
-
-            // If we failed to store, try again.
-        } else {
-            // Otherwise, clear our exclusive hold and finish.
-            monitor.ClearExclusive(current_core);
+    s32 current_value = static_cast<s32>(memory.Read32(raw_addr));
+    while (current_value == value) {
+        if (memory.WriteExclusive32(raw_addr, static_cast<u32>(new_value),
+                                    static_cast<u32>(current_value))) {
             break;
         }
+        current_value = static_cast<s32>(memory.Read32(raw_addr));
     }
 
-    // We're done.
     *out = current_value;
     return true;
 }
+
+void ArbSpinPause() {
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+    _mm_pause();
+#elif defined(__APPLE__) && defined(__aarch64__)
+    __builtin_arm_isb(0xF);
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
+}
+
+struct ScopedStripePreparing {
+    std::atomic<u32>& stripe;
+    bool inserted = false;
+
+    explicit ScopedStripePreparing(std::atomic<u32>& s) : stripe{s} {
+        stripe.fetch_add(1, std::memory_order_seq_cst);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+
+    ~ScopedStripePreparing() {
+        if (!inserted) {
+            stripe.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
+    YUZU_NON_COPYABLE(ScopedStripePreparing);
+    YUZU_NON_MOVEABLE(ScopedStripePreparing);
+};
 
 /// EDEN_NX2_ARB_SPIN: microseconds a thread about to wait on an address first watches the word
 /// (default 8; 0 turns it off).
@@ -163,38 +148,45 @@ bool SpinBeforeWait(KernelCore& kernel, KThread* cur_thread, uint64_t addr, bool
     if (spin_us == 0 || !kernel.IsMulticore() || (addr & (is_64_bit ? 7 : 3)) != 0) {
         return false;
     }
+    // Yield the core immediately when another runnable thread is already queued on it.
+    if (const s32 core_id = GetCurrentCoreId(kernel);
+        core_id >= 0 && KScheduler::GetCoreScheduledCount(kernel, core_id) > 1) {
+        return false;
+    }
     u8& credit = cur_thread->m_nx2_arb_spin_credit;
     if (credit == 0 && (++cur_thread->m_nx2_arb_spin_probe & 15) != 0) {
         return false;
     }
-    const u8* const pointer = GetCurrentMemory(kernel).GetPointerSilent(addr);
+    u8* const pointer = GetCurrentMemory(kernel).GetPointerSilent(addr);
     if (pointer == nullptr) {
         return false;
     }
     const auto load_word = [&]() -> s64 {
         if (is_64_bit) {
-            return *reinterpret_cast<const volatile s64*>(pointer);
+            return std::atomic_ref<s64>{*reinterpret_cast<s64*>(pointer)}.load(
+                std::memory_order_acquire);
         }
-        return *reinterpret_cast<const volatile s32*>(pointer);
+        return std::atomic_ref<s32>{*reinterpret_cast<s32*>(pointer)}.load(
+            std::memory_order_acquire);
     };
     if (!still_waits(load_word())) {
         credit = static_cast<u8>((std::min)(credit + 2, 16));
         return !cur_thread->IsTerminationRequested();
     }
     const PhysicalCore& core = kernel.CurrentPhysicalCore();
+    const s32 current_core = GetCurrentCoreId(kernel);
     const Common::SpinDeadline::Deadline deadline{std::chrono::microseconds{spin_us}};
     for (u32 spin = 1;; ++spin) {
-#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
-        _mm_pause();
-#endif
+        ArbSpinPause();
         if (!still_waits(load_word())) {
             credit = static_cast<u8>((std::min)(credit + 2, 16));
             // A terminating thread takes the normal path, which reports the termination first.
             return !cur_thread->IsTerminationRequested();
         }
-        if ((spin & 63) == 0) {
+        if ((spin & 31) == 0) {
             // Something else must run on this core: stop watching.
-            if (core.IsInterrupted()) {
+            if (core.IsInterrupted() ||
+                (current_core >= 0 && KScheduler::GetCoreScheduledCount(kernel, current_core) > 1)) {
                 return false;
             }
             if (deadline.Expired()) {
@@ -210,14 +202,17 @@ bool SpinBeforeWait(KernelCore& kernel, KThread* cur_thread, uint64_t addr, bool
 
 class ThreadQueueImplForKAddressArbiter final : public KThreadQueue {
 public:
-    explicit ThreadQueueImplForKAddressArbiter(KernelCore& kernel, KAddressArbiter::ThreadTree* t)
-        : KThreadQueue(kernel), m_tree(t) {}
+    explicit ThreadQueueImplForKAddressArbiter(KernelCore& kernel, KAddressArbiter* arbiter,
+                                               KAddressArbiter::ThreadTree* t)
+        : KThreadQueue(kernel), m_arbiter(arbiter), m_tree(t) {}
 
     void CancelWait(KernelCore& kernel, KThread* waiting_thread, Result wait_result, bool cancel_timer_task) override {
         // If the thread is waiting on an address arbiter, remove it from the tree.
         if (waiting_thread->IsWaitingForAddressArbiter()) {
+            const uint64_t key = waiting_thread->GetAddressArbiterKey();
             m_tree->erase(m_tree->iterator_to(*waiting_thread));
             waiting_thread->ClearAddressArbiter();
+            m_arbiter->NoteWaiterRemoved(key);
         }
 
         // Invoke the base cancel wait handler.
@@ -225,16 +220,27 @@ public:
     }
 
 private:
+    KAddressArbiter* m_arbiter{};
     KAddressArbiter::ThreadTree* m_tree{};
 };
 
 } // namespace
 
 Result KAddressArbiter::Signal(uint64_t addr, s32 count) {
+    // Dekker-linearizable fast path: pairs with ScopedStripePreparing's seq_cst increment+fence
+    // before ReadFromUser in WaitIfLessThan/WaitIfEqual.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (WaiterStripe(addr).load(std::memory_order_seq_cst) == 0) {
+        R_SUCCEED();
+    }
+
     // Perform signaling.
     s32 num_waiters{};
     {
         KScopedSchedulerLock sl(system.Kernel());
+        if (m_tree.empty()) {
+            R_SUCCEED();
+        }
 
         auto it = m_tree.nfind_key({addr, -1});
         while ((it != m_tree.end()) && (count <= 0 || num_waiters < count) &&
@@ -247,6 +253,7 @@ Result KAddressArbiter::Signal(uint64_t addr, s32 count) {
             target_thread->ClearAddressArbiter();
 
             it = m_tree.erase(it);
+            NoteWaiterRemoved(addr);
             ++num_waiters;
         }
     }
@@ -265,6 +272,10 @@ Result KAddressArbiter::SignalAndIncrementIfEqual(uint64_t addr, s32 value, s32 
                  ResultInvalidCurrentMemory);
         R_UNLESS(user_value == value, ResultInvalidState);
 
+        if (m_tree.empty()) {
+            R_SUCCEED();
+        }
+
         auto it = m_tree.nfind_key({addr, -1});
         while ((it != m_tree.end()) && (count <= 0 || num_waiters < count) &&
                (it->GetAddressArbiterKey() == addr)) {
@@ -276,6 +287,7 @@ Result KAddressArbiter::SignalAndIncrementIfEqual(uint64_t addr, s32 value, s32 
             target_thread->ClearAddressArbiter();
 
             it = m_tree.erase(it);
+            NoteWaiterRemoved(addr);
             ++num_waiters;
         }
     }
@@ -288,7 +300,7 @@ Result KAddressArbiter::SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32 
     {
         KScopedSchedulerLock sl(system.Kernel());
 
-        auto it = m_tree.nfind_key({addr, -1});
+        auto it = m_tree.empty() ? m_tree.end() : m_tree.nfind_key({addr, -1});
         // Determine the updated value.
         s32 new_value{};
         if (count <= 0) {
@@ -339,6 +351,7 @@ Result KAddressArbiter::SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32 
             target_thread->ClearAddressArbiter();
 
             it = m_tree.erase(it);
+            NoteWaiterRemoved(addr);
             ++num_waiters;
         }
     }
@@ -353,9 +366,10 @@ Result KAddressArbiter::WaitIfLessThan(uint64_t addr, s32 value, bool decrement,
         R_THROW(ResultInvalidState);
     }
     KHardwareTimer* timer{};
-    ThreadQueueImplForKAddressArbiter wait_queue(system.Kernel(), std::addressof(m_tree));
+    ThreadQueueImplForKAddressArbiter wait_queue(system.Kernel(), this, std::addressof(m_tree));
 
     {
+        ScopedStripePreparing stripe_guard{WaiterStripe(addr)};
         KScopedSchedulerLockAndSleep slp{system.Kernel(), std::addressof(timer), cur_thread, timeout};
 
         // Check that the thread isn't terminating.
@@ -393,6 +407,7 @@ Result KAddressArbiter::WaitIfLessThan(uint64_t addr, s32 value, bool decrement,
         // Set the arbiter.
         cur_thread->SetAddressArbiter(std::addressof(m_tree), addr);
         m_tree.insert(*cur_thread);
+        stripe_guard.inserted = true;
 
         // Wait for the thread to finish.
         wait_queue.SetHardwareTimer(timer);
@@ -412,9 +427,10 @@ Result KAddressArbiter::WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool 
         R_THROW(ResultInvalidState);
     }
     KHardwareTimer* timer{};
-    ThreadQueueImplForKAddressArbiter wait_queue(system.Kernel(), std::addressof(m_tree));
+    ThreadQueueImplForKAddressArbiter wait_queue(system.Kernel(), this, std::addressof(m_tree));
 
     {
+        ScopedStripePreparing stripe_guard{WaiterStripe(addr)};
         KScopedSchedulerLockAndSleep slp{system.Kernel(), std::addressof(timer), cur_thread, timeout};
 
         // Check that the thread isn't terminating.
@@ -453,6 +469,7 @@ Result KAddressArbiter::WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool 
         // Set the arbiter.
         cur_thread->SetAddressArbiter(std::addressof(m_tree), addr);
         m_tree.insert(*cur_thread);
+        stripe_guard.inserted = true;
 
         // Wait for the thread to finish.
         wait_queue.SetHardwareTimer(timer);

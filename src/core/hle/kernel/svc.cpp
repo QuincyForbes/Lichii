@@ -2655,7 +2655,9 @@ void Call(Core::System& system, u32 imm) {
         });
     }
     //kernel.ExitSVCProfile();
-    kernel.CurrentPhysicalCore().LoadSvcArguments(process, args);
+    if (imm != static_cast<u32>(SvcId::SleepThread)) {
+        kernel.CurrentPhysicalCore().LoadSvcArguments(process, args);
+    }
 }
 
 } // namespace Kernel::Svc

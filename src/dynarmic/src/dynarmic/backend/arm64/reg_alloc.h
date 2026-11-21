@@ -64,6 +64,7 @@ public:
     IR::AccType GetImmediateAccType() const;
 
     // Only valid if not immediate
+    IR::Inst* GetInst() const { return value.GetInst(); }
     HostLoc::Kind CurrentLocationKind(RegAlloc& reg_alloc) const;
     bool IsInGpr(RegAlloc& reg_alloc) const {
         return !IsImmediate() && CurrentLocationKind(reg_alloc) == HostLoc::Kind::Gpr;
@@ -141,6 +142,7 @@ private:
 
 struct HostLocInfo final {
     boost::container::small_vector<const IR::Inst*, 2> values;
+    const IR::Inst* fastmem_base = nullptr;
     std::size_t locked = 0;
     bool realized = false;
     std::size_t uses_this_inst = 0;
@@ -148,12 +150,35 @@ struct HostLocInfo final {
     std::size_t expected_uses = 0;
 
     bool Contains(const IR::Inst*) const;
+    bool HasLiveValue() const { return !values.empty() || fastmem_base != nullptr; }
     void SetupScratchLocation();
     void SetupLocation(const IR::Inst*);
     bool IsCompletelyEmpty() const;
     bool MaybeAllocatable() const;
     bool IsOneRemainingUse() const;
     void UpdateUses();
+};
+
+struct RAFastmemBase final {
+public:
+    oaknut::XReg Reg() const { return reg.value(); }
+    ~RAFastmemBase();
+    RAFastmemBase(RAFastmemBase&& other) noexcept
+            : reg_alloc{other.reg_alloc}
+            , base_inst{std::exchange(other.base_inst, nullptr)}
+            , reg{std::exchange(other.reg, std::nullopt)} {}
+    RAFastmemBase& operator=(RAFastmemBase&&) = delete;
+
+private:
+    friend class RegAlloc;
+    RAFastmemBase(RegAlloc& reg_alloc_, const IR::Inst* base_inst_, std::optional<oaknut::XReg> reg_ = std::nullopt) noexcept
+            : reg_alloc{reg_alloc_}, base_inst{base_inst_}, reg{reg_} {}
+    RAFastmemBase(const RAFastmemBase&) = delete;
+    RAFastmemBase& operator=(const RAFastmemBase&) = delete;
+
+    RegAlloc& reg_alloc;
+    const IR::Inst* base_inst;
+    std::optional<oaknut::XReg> reg;
 };
 
 class RegAlloc final {
@@ -294,6 +319,11 @@ public:
     void SpillFlags();
     void SpillAll();
 
+    bool HasFastmemBase(const IR::Inst* base_inst) const;
+    RAFastmemBase AcquireExistingFastmemBase(const IR::Inst* base_inst);
+    oaknut::XReg RealizeExistingFastmemBase(RAFastmemBase& handle);
+    RAFastmemBase CreateFastmemBase(const IR::Inst* base_inst, std::size_t total_uses, oaknut::XReg Xfastmem_reg, oaknut::XReg Xbase_reg);
+
     template<typename... Ts>
     static void Realize(Ts&... rs) {
         static_assert((mcl::is_instance_of_template<RAReg, Ts>() && ...));
@@ -308,12 +338,15 @@ public:
 
 private:
     friend struct Argument;
+    friend struct RAFastmemBase;
     template<typename> friend struct RAReg;
 
     template<HostLoc::Kind kind> int GenerateImmediate(const IR::Value& value);
     template<HostLoc::Kind kind> int RealizeReadImpl(const IR::Value& value);
     template<HostLoc::Kind kind> int RealizeWriteImpl(const IR::Inst* value);
+    template<HostLoc::Kind kind> std::optional<int> TryRealizeReadWriteInPlace(const IR::Value& read_value, const IR::Inst* write_value);
     template<HostLoc::Kind kind> int RealizeReadWriteImpl(const IR::Value& read_value, const IR::Inst* write_value);
+    std::optional<HostLoc> FastmemBaseLocation(const IR::Inst* base_inst) const;
 
     int AllocateRegister(const std::array<HostLocInfo, 32>& regs, std::span<const int> order, const OrderMasks& order_masks, u64 active_mask) const;
     void SpillGpr(int index);
@@ -426,7 +459,13 @@ void RAReg<T>::Realize() {
         reg = T{reg_alloc.RealizeWriteImpl<kind>(write_value)};
         break;
     case RWType::ReadWrite:
-        reg = T{reg_alloc.RealizeReadWriteImpl<kind>(read_value, write_value)};
+        if (const auto inplace = reg_alloc.TryRealizeReadWriteInPlace<kind>(read_value, write_value)) {
+            rw = RWType::Write;
+            read_value = {};
+            reg = T{*inplace};
+        } else {
+            reg = T{reg_alloc.RealizeReadWriteImpl<kind>(read_value, write_value)};
+        }
         break;
     default:
         UNREACHABLE();

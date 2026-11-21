@@ -5,10 +5,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <numbers>
+#include <ranges>
 
 #include "audio_core/adsp/apps/audio_renderer/command_list_processor.h"
+#include "audio_core/common/dsp_simd.h"
 #include "audio_core/renderer/command/effect/i3dl2_reverb.h"
-#include <ranges>
 
 namespace AudioCore::Renderer {
 
@@ -216,33 +217,33 @@ static void ApplyI3dl2ReverbEffectBypass(std::span<std::span<const s32>> inputs,
  * @param mix    - The new calculated sample to be written and decayed.
  * @return The next delayed and decayed sample.
  */
-static Common::FixedPoint<50, 14> Axfx2AllPassTick(I3dl2ReverbInfo::I3dl2DelayLine& decay0,
-                                                   I3dl2ReverbInfo::I3dl2DelayLine& decay1,
-                                                   I3dl2ReverbInfo::I3dl2DelayLine& fdn,
-                                                   const Common::FixedPoint<50, 14> mix) {
-    auto val{decay0.Read()};
-    auto mixed{mix - (val * decay0.wet_gain)};
-    auto out{decay0.Tick(mixed) + (mixed * decay0.wet_gain)};
+constexpr std::array<s64, I3dl2ReverbInfo::MaxDelayTaps> EarlyGainsRaw = [] {
+    std::array<s64, I3dl2ReverbInfo::MaxDelayTaps> raw{};
+    for (size_t i = 0; i < I3dl2ReverbInfo::MaxDelayTaps; ++i) {
+        raw[i] = Common::FixedPoint<50, 14>{EarlyGains[i]}.to_raw();
+    }
+    return raw;
+}();
 
-    val = decay1.Read();
-    mixed = out - (val * decay1.wet_gain);
-    out = decay1.Tick(mixed) + (mixed * decay1.wet_gain);
+static s64 Axfx2AllPassTickRaw(I3dl2ReverbInfo::I3dl2DelayLine& decay0,
+                               const s64 decay0_wet_raw,
+                               I3dl2ReverbInfo::I3dl2DelayLine& decay1,
+                               const s64 decay1_wet_raw,
+                               I3dl2ReverbInfo::I3dl2DelayLine& fdn, const s64 mix_raw) {
+    s64 val_raw = decay0.Read().to_raw();
+    s64 mixed_raw = mix_raw - DspSimd::MulFp<14>(val_raw, decay0_wet_raw);
+    s64 out_raw = decay0.Tick(Common::FixedPoint<50, 14>::from_base(mixed_raw)).to_raw() +
+                  DspSimd::MulFp<14>(mixed_raw, decay0_wet_raw);
 
-    fdn.Tick(out);
-    return out;
+    val_raw = decay1.Read().to_raw();
+    mixed_raw = out_raw - DspSimd::MulFp<14>(val_raw, decay1_wet_raw);
+    out_raw = decay1.Tick(Common::FixedPoint<50, 14>::from_base(mixed_raw)).to_raw() +
+              DspSimd::MulFp<14>(mixed_raw, decay1_wet_raw);
+
+    fdn.Tick(Common::FixedPoint<50, 14>::from_base(out_raw));
+    return out_raw;
 }
 
-/**
- * Impl. Apply a I3DL2 reverb according to the current state, on the input mix buffers,
- * saving the results to the output mix buffers.
- *
- * @tparam NumChannels - Number of channels to process. 1-6.
-                         Inputs/outputs should have this many buffers.
- * @param state        - State to use, must be initialized (see InitializeI3dl2ReverbEffect).
- * @param inputs       - Input mix buffers to perform the reverb on.
- * @param outputs      - Output mix buffers to receive the reverbed samples.
- * @param sample_count - Number of samples to process.
- */
 template <size_t NumChannels>
 static void ApplyI3dl2ReverbEffect(I3dl2ReverbInfo::State& state,
                                    std::span<std::span<const s32>> inputs,
@@ -271,87 +272,131 @@ static void ApplyI3dl2ReverbEffect(I3dl2ReverbInfo::State& state,
         tap_indexes = OutTapIndexes6Ch;
     }
 
+    std::array<const s32*, NumChannels> in_ptrs{};
+    std::array<s32*, NumChannels> out_ptrs{};
+    for (size_t c = 0; c < NumChannels; ++c) {
+        in_ptrs[c] = inputs[c].data();
+        out_ptrs[c] = outputs[c].data();
+    }
+
+    const s64 lowpass_1_raw = Common::FixedPoint<50, 14>{state.lowpass_1}.to_raw();
+    const s64 lowpass_2_raw = Common::FixedPoint<50, 14>{state.lowpass_2}.to_raw();
+    const s64 early_gain_raw = Common::FixedPoint<50, 14>{state.early_gain}.to_raw();
+    const s64 late_gain_raw = Common::FixedPoint<50, 14>{state.late_gain}.to_raw();
+    constexpr s64 half_raw = Common::FixedPoint<50, 14>{0.5f}.to_raw();
+    const f32 dry_gain = state.dry_gain;
+
+    std::array<std::array<s64, 3>, I3dl2ReverbInfo::MaxDelayLines> lp_coeff_raw{};
+    std::array<s64, I3dl2ReverbInfo::MaxDelayLines> decay0_wet_raw{};
+    std::array<s64, I3dl2ReverbInfo::MaxDelayLines> decay1_wet_raw{};
+    for (u32 i = 0; i < I3dl2ReverbInfo::MaxDelayLines; ++i) {
+        lp_coeff_raw[i][0] = Common::FixedPoint<50, 14>{state.lowpass_coeff[i][0]}.to_raw();
+        lp_coeff_raw[i][1] = Common::FixedPoint<50, 14>{state.lowpass_coeff[i][1]}.to_raw();
+        lp_coeff_raw[i][2] = Common::FixedPoint<50, 14>{state.lowpass_coeff[i][2]}.to_raw();
+        decay0_wet_raw[i] =
+            Common::FixedPoint<50, 14>{state.decay_delay_lines0[i].wet_gain}.to_raw();
+        decay1_wet_raw[i] =
+            Common::FixedPoint<50, 14>{state.decay_delay_lines1[i].wet_gain}.to_raw();
+    }
+
     for (u32 sample_index = 0; sample_index < sample_count; sample_index++) {
-        Common::FixedPoint<50, 14> early_to_late_tap{
-            state.early_delay_line.TapOut(state.early_to_late_taps)};
-        std::array<Common::FixedPoint<50, 14>, NumChannels> output_samples{};
+        const s64 early_to_late_raw =
+            state.early_delay_line.TapOut(state.early_to_late_taps).to_raw();
+        std::array<s64, NumChannels> output_samples_raw{};
 
         for (u32 early_tap = 0; early_tap < I3dl2ReverbInfo::MaxDelayTaps; early_tap++) {
-            output_samples[tap_indexes[early_tap]] +=
-                state.early_delay_line.TapOut(state.early_tap_steps[early_tap]) *
-                EarlyGains[early_tap];
+            const s64 tap_raw = DspSimd::MulFp<14>(
+                state.early_delay_line.TapOut(state.early_tap_steps[early_tap]).to_raw(),
+                EarlyGainsRaw[early_tap]);
+            output_samples_raw[tap_indexes[early_tap]] += tap_raw;
             if constexpr (NumChannels == 6) {
-                output_samples[static_cast<u32>(Channels::LFE)] +=
-                    state.early_delay_line.TapOut(state.early_tap_steps[early_tap]) *
-                    EarlyGains[early_tap];
+                output_samples_raw[static_cast<u32>(Channels::LFE)] += tap_raw;
             }
         }
 
-        Common::FixedPoint<50, 14> current_sample{};
-        for (u32 channel = 0; channel < NumChannels; channel++) {
-            current_sample += inputs[channel][sample_index];
+        s64 current_sample_sum = 0;
+        for (size_t channel = 0; channel < NumChannels; channel++) {
+            current_sample_sum += in_ptrs[channel][sample_index];
         }
 
-        state.lowpass_0 =
-            (current_sample * state.lowpass_2 + state.lowpass_0 * state.lowpass_1).to_float();
+        const s64 lp0_fp =
+            DspSimd::MulFp<14>(current_sample_sum << 14, lowpass_2_raw) +
+            DspSimd::MulFp<14>(Common::FixedPoint<50, 14>{state.lowpass_0}.to_raw(), lowpass_1_raw);
+        state.lowpass_0 = Common::FixedPoint<50, 14>::from_base(lp0_fp).to_float();
         state.early_delay_line.Tick(state.lowpass_0);
 
-        for (u32 channel = 0; channel < NumChannels; channel++) {
-            output_samples[channel] *= state.early_gain;
+        for (size_t channel = 0; channel < NumChannels; channel++) {
+            output_samples_raw[channel] =
+                DspSimd::MulFp<14>(output_samples_raw[channel], early_gain_raw);
         }
 
-        std::array<Common::FixedPoint<50, 14>, I3dl2ReverbInfo::MaxDelayLines> filtered_samples{};
+        std::array<s64, I3dl2ReverbInfo::MaxDelayLines> filtered_raw{};
         for (u32 delay_line = 0; delay_line < I3dl2ReverbInfo::MaxDelayLines; delay_line++) {
-            filtered_samples[delay_line] =
-                state.fdn_delay_lines[delay_line].Read() * state.lowpass_coeff[delay_line][0] +
-                state.shelf_filter[delay_line];
+            const s64 fdn_read_raw = state.fdn_delay_lines[delay_line].Read().to_raw();
+            const s64 shelf_raw =
+                Common::FixedPoint<50, 14>{state.shelf_filter[delay_line]}.to_raw();
+            const s64 filt =
+                DspSimd::MulFp<14>(fdn_read_raw, lp_coeff_raw[delay_line][0]) + shelf_raw;
+            filtered_raw[delay_line] = filt;
+            const s64 new_shelf = DspSimd::MulFp<14>(filt, lp_coeff_raw[delay_line][2]) +
+                                  DspSimd::MulFp<14>(fdn_read_raw, lp_coeff_raw[delay_line][1]);
             state.shelf_filter[delay_line] =
-                (filtered_samples[delay_line] * state.lowpass_coeff[delay_line][2] +
-                 state.fdn_delay_lines[delay_line].Read() * state.lowpass_coeff[delay_line][1])
-                    .to_float();
+                Common::FixedPoint<50, 14>::from_base(new_shelf).to_float();
         }
 
-        const std::array<Common::FixedPoint<50, 14>, I3dl2ReverbInfo::MaxDelayLines> mix_matrix{
-            filtered_samples[1] + filtered_samples[2] + early_to_late_tap * state.late_gain,
-            -filtered_samples[0] - filtered_samples[3] + early_to_late_tap * state.late_gain,
-            filtered_samples[0] - filtered_samples[3] + early_to_late_tap * state.late_gain,
-            filtered_samples[1] - filtered_samples[2] + early_to_late_tap * state.late_gain,
+        const s64 late_tap_raw = DspSimd::MulFp<14>(early_to_late_raw, late_gain_raw);
+        const std::array<s64, I3dl2ReverbInfo::MaxDelayLines> mix_matrix_raw{
+            filtered_raw[1] + filtered_raw[2] + late_tap_raw,
+            -filtered_raw[0] - filtered_raw[3] + late_tap_raw,
+            filtered_raw[0] - filtered_raw[3] + late_tap_raw,
+            filtered_raw[1] - filtered_raw[2] + late_tap_raw,
         };
 
-        std::array<Common::FixedPoint<50, 14>, I3dl2ReverbInfo::MaxDelayLines> allpass_samples{};
+        std::array<s64, I3dl2ReverbInfo::MaxDelayLines> allpass_raw{};
         for (u32 delay_line = 0; delay_line < I3dl2ReverbInfo::MaxDelayLines; delay_line++) {
-            allpass_samples[delay_line] = Axfx2AllPassTick(
-                state.decay_delay_lines0[delay_line], state.decay_delay_lines1[delay_line],
-                state.fdn_delay_lines[delay_line], mix_matrix[delay_line]);
+            allpass_raw[delay_line] = Axfx2AllPassTickRaw(
+                state.decay_delay_lines0[delay_line], decay0_wet_raw[delay_line],
+                state.decay_delay_lines1[delay_line], decay1_wet_raw[delay_line],
+                state.fdn_delay_lines[delay_line], mix_matrix_raw[delay_line]);
         }
 
         if constexpr (NumChannels == 6) {
-            const std::array<Common::FixedPoint<50, 14>, MaxChannels> allpass_outputs{
-                allpass_samples[0], allpass_samples[1], allpass_samples[2] - allpass_samples[3],
-                allpass_samples[3], allpass_samples[2], allpass_samples[3],
+            const std::array<s64, MaxChannels> allpass_outputs_raw{
+                allpass_raw[0], allpass_raw[1], allpass_raw[2] - allpass_raw[3],
+                allpass_raw[3], allpass_raw[2], allpass_raw[3],
             };
 
-            for (u32 channel = 0; channel < NumChannels; channel++) {
-                Common::FixedPoint<50, 14> allpass{};
-
-                if (channel == static_cast<u32>(Channels::Center)) {
-                    allpass = state.center_delay_line.Tick(allpass_outputs[channel] * 0.5f);
+            for (size_t channel = 0; channel < NumChannels; channel++) {
+                s64 ap_raw{};
+                if (channel == static_cast<size_t>(Channels::Center)) {
+                    const s64 center_in = DspSimd::MulFp<14>(allpass_outputs_raw[channel], half_raw);
+                    ap_raw = state.center_delay_line
+                                 .Tick(Common::FixedPoint<50, 14>::from_base(center_in))
+                                 .to_raw();
                 } else {
-                    allpass = allpass_outputs[channel];
+                    ap_raw = allpass_outputs_raw[channel];
                 }
 
-                auto out_sample{output_samples[channel] + allpass +
-                                state.dry_gain * static_cast<f32>(inputs[channel][sample_index])};
-
-                outputs[channel][sample_index] =
-                    static_cast<s32>(std::clamp(out_sample.to_float(), -8388600.0f, 8388600.0f));
+                const s64 dry_raw =
+                    Common::FixedPoint<50, 14>{dry_gain * static_cast<f32>(in_ptrs[channel][sample_index])}
+                        .to_raw();
+                const f32 out_f =
+                    Common::FixedPoint<50, 14>::from_base(output_samples_raw[channel] + ap_raw +
+                                                          dry_raw)
+                        .to_float();
+                out_ptrs[channel][sample_index] =
+                    static_cast<s32>(std::clamp(out_f, -8388600.0f, 8388600.0f));
             }
         } else {
-            for (u32 channel = 0; channel < NumChannels; channel++) {
-                auto out_sample{output_samples[channel] + allpass_samples[channel] +
-                                state.dry_gain * static_cast<f32>(inputs[channel][sample_index])};
-                outputs[channel][sample_index] =
-                    static_cast<s32>(std::clamp(out_sample.to_float(), -8388600.0f, 8388600.0f));
+            for (size_t channel = 0; channel < NumChannels; channel++) {
+                const s64 dry_raw =
+                    Common::FixedPoint<50, 14>{dry_gain * static_cast<f32>(in_ptrs[channel][sample_index])}
+                        .to_raw();
+                const f32 out_f = Common::FixedPoint<50, 14>::from_base(
+                                      output_samples_raw[channel] + allpass_raw[channel] + dry_raw)
+                                      .to_float();
+                out_ptrs[channel][sample_index] =
+                    static_cast<s32>(std::clamp(out_f, -8388600.0f, 8388600.0f));
             }
         }
     }

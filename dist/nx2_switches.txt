@@ -708,6 +708,12 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_BEFORE_PASS=0
 #EDEN_NX2_KEEP_DEFERRED_CLEAR=0
 
+# Portable JIT-free AArch64 cached interpreter ("cached") or Apple Silicon Hypervisor ("hypervisor").
+#EDEN_NX2_CPU_BACKEND=cached
+#EDEN_NX2_INTERP_CACHE=0
+#EDEN_NX2_INTERP_FUSION=0
+#EDEN_NX2_HV_NATIVE_TIMER=1
+
 # Metal present: 1 paces drawables from arrival times instead of the game's requested frame rate;
 # 0 draws the 720p applet capture every frame instead of on demand; 0 unswizzles guest-memory
 # framebuffers without Switch 2 native GOB tiling.

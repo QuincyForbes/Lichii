@@ -243,6 +243,10 @@ TEST_CASE("Ocarina graphics edits parse and apply to matching files", "[file_sys
 
 TEST_CASE("Ocarina graphics presets set their companions", "[file_sys]") {
     using Settings::OotGraphicsPreset;
+    const auto ultra = Settings::OotGraphicsPresetCompanions(OotGraphicsPreset::UltraLow);
+    CHECK(ultra.resolution == Settings::OotResolution::Percent40);
+    CHECK(ultra.textures == Settings::TextureQuality::Quarter);
+    CHECK(ultra.sharpening == Settings::OotAntiAliasing::NoSharpening);
     const auto low = Settings::OotGraphicsPresetCompanions(OotGraphicsPreset::PhoneLow);
     CHECK(low.resolution == Settings::OotResolution::Percent50);
     CHECK(low.textures == Settings::TextureQuality::Quarter);

@@ -8,6 +8,7 @@
 
 #include <array>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 #include "audio_core/adsp/apps/audio_renderer/command_buffer.h"
@@ -71,6 +72,15 @@ public:
     void Signal();
     void Wait();
 
+    /**
+     * Execute one ADSP render pass synchronously on the caller's thread, avoiding cross-thread
+     * mailbox ping-pong and L1/L2 cache bouncing.
+     *
+     * @return True if at least one active session's output SinkStream is ready and unpaused
+     *         (pacing execution via hardware callbacks or NullSink deadlines).
+     */
+    bool Render(std::stop_token stop_token);
+
     void Send(Direction dir, u32 message);
     u32 Receive(Direction dir);
 
@@ -82,8 +92,12 @@ public:
     u64 GetRenderingStartTick(s32 session_id) const noexcept;
 
 private:
+    void EnsureWorkerStarted();
+    bool ProcessSessions(std::stop_token stop_token);
+
     /**
-     * Main AudioRenderer thread, responsible for processing the command lists.
+     * Main AudioRenderer thread, responsible for processing the command lists when driven via
+     * mailbox messages.
      */
     void Main(std::stop_token stop_token);
 
@@ -100,10 +114,14 @@ private:
     Sink::Sink& sink;
     /// The active mailbox
     Mailbox mailbox;
-    /// Main thread
+    /// Guards lazy worker thread startup
+    std::mutex startup_mutex;
+    /// Main thread (started lazily only if driven via mailbox)
     std::jthread main_thread{};
     /// The current state
     std::atomic<bool> running{};
+    /// Whether `main_thread` has been spawned
+    bool worker_started{};
     /// Shared memory of input command buffers, set by host, read by DSP
     std::array<CommandBuffer, MaxRendererSessions> command_buffers{};
     /// The command lists to process

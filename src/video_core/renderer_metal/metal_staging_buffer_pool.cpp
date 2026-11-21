@@ -33,14 +33,15 @@ u64 BoundBytes(const char* name, u64 default_mib) {
     return default_mib << 20;
 }
 
-/// EDEN_NX2_STREAM_BUFFER_MIB as Vulkan reads it (4 to 1024 MiB), else 32 MiB.
+/// EDEN_NX2_STREAM_BUFFER_MIB as Vulkan reads it (4 to 1024 MiB), else 32 MiB on phone budgets
+/// and 128 MiB on desktop Macs.
 u64 StreamBufferBytes() {
     if (const char* const env = VulkanSwitch("EDEN_NX2_STREAM_BUFFER_MIB")) {
         if (const long mib = std::strtol(env, nullptr, 10); mib >= 4 && mib <= 1024) {
             return static_cast<u64>(mib) << 20;
         }
     }
-    return u64{32} << 20;
+    return VideoCommon::HostBudget::Active() ? (u64{32} << 20) : (u64{128} << 20);
 }
 } // Anonymous namespace
 

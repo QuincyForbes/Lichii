@@ -4,18 +4,112 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+
+#include "audio_core/common/dsp_simd.h"
 #include "audio_core/renderer/command/resample/resample.h"
 
 namespace AudioCore::Renderer {
 
-static void ResampleLowQuality(std::span<s32> output, std::span<const s16> input, const Common::FixedPoint<49, 15>& sample_rate_ratio, Common::FixedPoint<49, 15>& fraction, const u32 samples_to_write) {
+namespace {
+
+template <size_t N>
+struct alignas(32) AlignedLut {
+    std::array<f32, N> values;
+};
+
+template <size_t N>
+consteval AlignedLut<N> ScaleLut256(const std::array<f32, N>& src) {
+    AlignedLut<N> out{};
+    for (size_t i = 0; i < N; ++i) {
+        out.values[i] = src[i] * 256.0f;
+    }
+    return out;
+}
+
+#if defined(ARCHITECTURE_arm64)
+[[nodiscard]] inline s32 EvalTap4Neon(const s16* in, const float32x4_t coeffs) noexcept {
+    const float32x4_t s = vcvtq_f32_s32(vmovl_s16(vld1_s16(in)));
+    const int32x4_t p = vcvtq_s32_f32(vmulq_f32(s, coeffs));
+    return vaddvq_s32(p) >> 8;
+}
+
+[[nodiscard]] inline s32 EvalTap8Neon(const s16* in, const float32x4_t c_lo,
+                                      const float32x4_t c_hi) noexcept {
+    const int16x8_t in16 = vld1q_s16(in);
+    const float32x4_t s_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(in16)));
+    const float32x4_t s_hi = vcvtq_f32_s32(vmovl_high_s16(in16));
+    const int32x4_t p_lo = vcvtq_s32_f32(vmulq_f32(s_lo, c_lo));
+    const int32x4_t p_hi = vcvtq_s32_f32(vmulq_f32(s_hi, c_hi));
+    return vaddvq_s32(vaddq_s32(p_lo, p_hi)) >> 8;
+}
+#elif defined(ARCHITECTURE_x86_64)
+[[nodiscard]] inline s32 HSumSse2(const __m128i v) noexcept {
+    const __m128i s1 = _mm_add_epi32(v, _mm_shuffle_epi32(v, _MM_SHUFFLE(1, 0, 3, 2)));
+    const __m128i s2 = _mm_add_epi32(s1, _mm_shuffle_epi32(s1, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_cvtsi128_si32(s2);
+}
+
+[[nodiscard]] inline s32 EvalTap4Sse2(const s16* in, const __m128 coeffs) noexcept {
+    const __m128i in16 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(in));
+    const __m128i in32 = _mm_srai_epi32(_mm_unpacklo_epi16(in16, in16), 16);
+    const __m128i p = _mm_cvttps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(in32), coeffs));
+    return HSumSse2(p) >> 8;
+}
+
+#if defined(__AVX2__)
+[[nodiscard]] inline s32 EvalTap8Avx2(const s16* in, const __m256 coeffs) noexcept {
+    const __m128i in16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in));
+    const __m256 s = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(in16));
+    const __m256i p = _mm256_cvttps_epi32(_mm256_mul_ps(s, coeffs));
+    const __m128i sum4 =
+        _mm_add_epi32(_mm256_castsi256_si128(p), _mm256_extracti128_si256(p, 1));
+    return HSumSse2(sum4) >> 8;
+}
+#else
+[[nodiscard]] inline s32 EvalTap8Sse2(const s16* in, const __m128 c_lo,
+                                      const __m128 c_hi) noexcept {
+    const __m128i in16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in));
+    const __m128i lo32 = _mm_srai_epi32(_mm_unpacklo_epi16(in16, in16), 16);
+    const __m128i hi32 = _mm_srai_epi32(_mm_unpackhi_epi16(in16, in16), 16);
+    const __m128i p_lo = _mm_cvttps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(lo32), c_lo));
+    const __m128i p_hi = _mm_cvttps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(hi32), c_hi));
+    return HSumSse2(_mm_add_epi32(p_lo, p_hi)) >> 8;
+}
+#endif
+#endif
+
+} // namespace
+
+static void ResampleLowQuality(std::span<s32> output, std::span<const s16> input,
+                               const Common::FixedPoint<49, 15>& sample_rate_ratio,
+                               Common::FixedPoint<49, 15>& fraction, const u32 samples_to_write) {
+    if (samples_to_write == 0) {
+        return;
+    }
+
+    s32* __restrict out = output.data();
+    const s16* __restrict in = input.data();
+    s64 frac_raw = fraction.to_raw();
+    const s64 step_raw = sample_rate_ratio.to_raw();
+    constexpr s64 half_raw = s64{1} << 14;
+
+    if (step_raw == (s64{1} << 15) && (frac_raw & ~0x7FFFLL) == 0) {
+        const u32 off = frac_raw >= half_raw ? 1U : 0U;
+        for (u32 i = 0; i < samples_to_write; i++) {
+            out[i] = in[i + off];
+        }
+        return;
+    }
+
     u32 read_index{0};
     for (u32 i = 0; i < samples_to_write; i++) {
-        output[i] = input[read_index + (fraction >= 0.5f)];
-        fraction += sample_rate_ratio;
-        read_index += u32(fraction.to_int_floor());
-        fraction.clear_int();
+        out[i] = in[read_index + static_cast<u32>(frac_raw >= half_raw)];
+        frac_raw += step_raw;
+        read_index += static_cast<u32>(frac_raw >> 15);
+        frac_raw &= 0x7FFF;
     }
+    fraction = Common::FixedPoint<49, 15>::from_base(frac_raw);
 }
 
 static void ResampleNormalQuality(std::span<s32> output, std::span<const s16> input,
@@ -277,29 +371,75 @@ static void ResampleNormalQuality(std::span<s32> output, std::span<const s16> in
         0.80221558f,  0.09750366f,
     };
 
-    const auto get_lut = [&]() -> std::span<const f32> {
-        if (sample_rate_ratio <= 1.0f) {
-            return std::span<const f32>(lut2.data(), lut2.size());
-        } else if (sample_rate_ratio < 1.3f) {
-            return std::span<const f32>(lut1.data(), lut1.size());
-        } else {
-            return std::span<const f32>(lut0.data(), lut0.size());
-        }
-    };
+    static constexpr AlignedLut<512> lut0_s = ScaleLut256(lut0);
+    static constexpr AlignedLut<512> lut1_s = ScaleLut256(lut1);
+    static constexpr AlignedLut<512> lut2_s = ScaleLut256(lut2);
 
-    auto lut{get_lut()};
+    if (samples_to_write == 0) {
+        return;
+    }
+
+    const f32* lut_ptr{};
+    if (sample_rate_ratio <= 1.0f) {
+        lut_ptr = lut2_s.values.data();
+    } else if (sample_rate_ratio < 1.3f) {
+        lut_ptr = lut1_s.values.data();
+    } else {
+        lut_ptr = lut0_s.values.data();
+    }
+
+    s32* __restrict out = output.data();
+    const s16* __restrict in = input.data();
+    s64 frac_raw = fraction.to_raw();
+    const s64 step_raw = sample_rate_ratio.to_raw();
+
+    if (step_raw == (s64{1} << 15) && (frac_raw & ~0x7FFFLL) == 0) {
+        const u32 lut_index = static_cast<u32>((frac_raw >> 8) << 2) & 511U;
+#if defined(ARCHITECTURE_arm64)
+        const float32x4_t c = vld1q_f32(lut_ptr + lut_index);
+        for (u32 i = 0; i < samples_to_write; i++) {
+            out[i] = EvalTap4Neon(in + i, c);
+        }
+#elif defined(ARCHITECTURE_x86_64)
+        const __m128 c = _mm_load_ps(lut_ptr + lut_index);
+        for (u32 i = 0; i < samples_to_write; i++) {
+            out[i] = EvalTap4Sse2(in + i, c);
+        }
+#else
+        const f32 c0 = lut_ptr[lut_index + 0];
+        const f32 c1 = lut_ptr[lut_index + 1];
+        const f32 c2 = lut_ptr[lut_index + 2];
+        const f32 c3 = lut_ptr[lut_index + 3];
+        for (u32 i = 0; i < samples_to_write; i++) {
+            const s32 s0 = static_cast<s32>(in[i + 0] * c0);
+            const s32 s1 = static_cast<s32>(in[i + 1] * c1);
+            const s32 s2 = static_cast<s32>(in[i + 2] * c2);
+            const s32 s3 = static_cast<s32>(in[i + 3] * c3);
+            out[i] = (s0 + s1 + s2 + s3) >> 8;
+        }
+#endif
+        return;
+    }
+
     u32 read_index{0};
     for (u32 i = 0; i < samples_to_write; i++) {
-        const auto lut_index = ((fraction.get_frac() >> 8) << 2) & 511;
-        const Common::FixedPoint<56, 8> sample0{input[read_index + 0] * lut[lut_index + 0]};
-        const Common::FixedPoint<56, 8> sample1{input[read_index + 1] * lut[lut_index + 1]};
-        const Common::FixedPoint<56, 8> sample2{input[read_index + 2] * lut[lut_index + 2]};
-        const Common::FixedPoint<56, 8> sample3{input[read_index + 3] * lut[lut_index + 3]};
-        output[i] = (sample0 + sample1 + sample2 + sample3).to_int_floor();
-        fraction += sample_rate_ratio;
-        read_index += static_cast<u32>(fraction.to_int_floor());
-        fraction.clear_int();
+        const u32 lut_index = static_cast<u32>(((frac_raw & 0x7FFF) >> 8) << 2) & 511U;
+#if defined(ARCHITECTURE_arm64)
+        out[i] = EvalTap4Neon(in + read_index, vld1q_f32(lut_ptr + lut_index));
+#elif defined(ARCHITECTURE_x86_64)
+        out[i] = EvalTap4Sse2(in + read_index, _mm_load_ps(lut_ptr + lut_index));
+#else
+        const s32 s0 = static_cast<s32>(in[read_index + 0] * lut_ptr[lut_index + 0]);
+        const s32 s1 = static_cast<s32>(in[read_index + 1] * lut_ptr[lut_index + 1]);
+        const s32 s2 = static_cast<s32>(in[read_index + 2] * lut_ptr[lut_index + 2]);
+        const s32 s3 = static_cast<s32>(in[read_index + 3] * lut_ptr[lut_index + 3]);
+        out[i] = (s0 + s1 + s2 + s3) >> 8;
+#endif
+        frac_raw += step_raw;
+        read_index += static_cast<u32>(frac_raw >> 15);
+        frac_raw &= 0x7FFF;
     }
+    fraction = Common::FixedPoint<49, 15>::from_base(frac_raw);
 }
 
 static void ResampleHighQuality(std::span<s32> output, std::span<const s16> input,
@@ -827,34 +967,92 @@ static void ResampleHighQuality(std::span<s32> output, std::span<const s16> inpu
         0.99996948f,  -0.00408936f, 0.00143433f,  -0.00036621f,
     };
 
-    const auto get_lut = [&]() -> std::span<const f32> {
-        if (sample_rate_ratio <= 1.0f) {
-            return std::span<const f32>(lut2.data(), lut2.size());
-        } else if (sample_rate_ratio < 1.3f) {
-            return std::span<const f32>(lut1.data(), lut1.size());
-        } else {
-            return std::span<const f32>(lut0.data(), lut0.size());
-        }
-    };
+    static constexpr AlignedLut<1024> lut0_s = ScaleLut256(lut0);
+    static constexpr AlignedLut<1024> lut1_s = ScaleLut256(lut1);
+    static constexpr AlignedLut<1024> lut2_s = ScaleLut256(lut2);
 
-    auto lut{get_lut()};
+    if (samples_to_write == 0) {
+        return;
+    }
+
+    const f32* lut_ptr{};
+    if (sample_rate_ratio <= 1.0f) {
+        lut_ptr = lut2_s.values.data();
+    } else if (sample_rate_ratio < 1.3f) {
+        lut_ptr = lut1_s.values.data();
+    } else {
+        lut_ptr = lut0_s.values.data();
+    }
+
+    s32* __restrict out = output.data();
+    const s16* __restrict in = input.data();
+    s64 frac_raw = fraction.to_raw();
+    const s64 step_raw = sample_rate_ratio.to_raw();
+
+    if (step_raw == (s64{1} << 15) && (frac_raw & ~0x7FFFLL) == 0) {
+        const u32 lut_index = static_cast<u32>((frac_raw >> 8) << 3) & 1023U;
+#if defined(ARCHITECTURE_arm64)
+        const float32x4_t c_lo = vld1q_f32(lut_ptr + lut_index);
+        const float32x4_t c_hi = vld1q_f32(lut_ptr + lut_index + 4);
+        for (u32 i = 0; i < samples_to_write; i++) {
+            out[i] = EvalTap8Neon(in + i, c_lo, c_hi);
+        }
+#elif defined(ARCHITECTURE_x86_64) && defined(__AVX2__)
+        const __m256 c = _mm256_load_ps(lut_ptr + lut_index);
+        for (u32 i = 0; i < samples_to_write; i++) {
+            out[i] = EvalTap8Avx2(in + i, c);
+        }
+#elif defined(ARCHITECTURE_x86_64)
+        const __m128 c_lo = _mm_load_ps(lut_ptr + lut_index);
+        const __m128 c_hi = _mm_load_ps(lut_ptr + lut_index + 4);
+        for (u32 i = 0; i < samples_to_write; i++) {
+            out[i] = EvalTap8Sse2(in + i, c_lo, c_hi);
+        }
+#else
+        const f32* c = lut_ptr + lut_index;
+        for (u32 i = 0; i < samples_to_write; i++) {
+            const s32 s0 = static_cast<s32>(in[i + 0] * c[0]);
+            const s32 s1 = static_cast<s32>(in[i + 1] * c[1]);
+            const s32 s2 = static_cast<s32>(in[i + 2] * c[2]);
+            const s32 s3 = static_cast<s32>(in[i + 3] * c[3]);
+            const s32 s4 = static_cast<s32>(in[i + 4] * c[4]);
+            const s32 s5 = static_cast<s32>(in[i + 5] * c[5]);
+            const s32 s6 = static_cast<s32>(in[i + 6] * c[6]);
+            const s32 s7 = static_cast<s32>(in[i + 7] * c[7]);
+            out[i] = (s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7) >> 8;
+        }
+#endif
+        return;
+    }
+
     u32 read_index{0};
     for (u32 i = 0; i < samples_to_write; i++) {
-        const auto lut_index = ((fraction.get_frac() >> 8) << 3) & 1023;
-        const Common::FixedPoint<56, 8> sample0{input[read_index + 0] * lut[lut_index + 0]};
-        const Common::FixedPoint<56, 8> sample1{input[read_index + 1] * lut[lut_index + 1]};
-        const Common::FixedPoint<56, 8> sample2{input[read_index + 2] * lut[lut_index + 2]};
-        const Common::FixedPoint<56, 8> sample3{input[read_index + 3] * lut[lut_index + 3]};
-        const Common::FixedPoint<56, 8> sample4{input[read_index + 4] * lut[lut_index + 4]};
-        const Common::FixedPoint<56, 8> sample5{input[read_index + 5] * lut[lut_index + 5]};
-        const Common::FixedPoint<56, 8> sample6{input[read_index + 6] * lut[lut_index + 6]};
-        const Common::FixedPoint<56, 8> sample7{input[read_index + 7] * lut[lut_index + 7]};
-        output[i] = (sample0 + sample1 + sample2 + sample3 + sample4 + sample5 + sample6 + sample7)
-                        .to_int_floor();
-        fraction += sample_rate_ratio;
-        read_index += static_cast<u32>(fraction.to_int_floor());
-        fraction.clear_int();
+        const u32 lut_index = static_cast<u32>(((frac_raw & 0x7FFF) >> 8) << 3) & 1023U;
+#if defined(ARCHITECTURE_arm64)
+        out[i] = EvalTap8Neon(in + read_index, vld1q_f32(lut_ptr + lut_index),
+                              vld1q_f32(lut_ptr + lut_index + 4));
+#elif defined(ARCHITECTURE_x86_64) && defined(__AVX2__)
+        out[i] = EvalTap8Avx2(in + read_index, _mm256_load_ps(lut_ptr + lut_index));
+#elif defined(ARCHITECTURE_x86_64)
+        out[i] = EvalTap8Sse2(in + read_index, _mm_load_ps(lut_ptr + lut_index),
+                              _mm_load_ps(lut_ptr + lut_index + 4));
+#else
+        const f32* c = lut_ptr + lut_index;
+        const s32 s0 = static_cast<s32>(in[read_index + 0] * c[0]);
+        const s32 s1 = static_cast<s32>(in[read_index + 1] * c[1]);
+        const s32 s2 = static_cast<s32>(in[read_index + 2] * c[2]);
+        const s32 s3 = static_cast<s32>(in[read_index + 3] * c[3]);
+        const s32 s4 = static_cast<s32>(in[read_index + 4] * c[4]);
+        const s32 s5 = static_cast<s32>(in[read_index + 5] * c[5]);
+        const s32 s6 = static_cast<s32>(in[read_index + 6] * c[6]);
+        const s32 s7 = static_cast<s32>(in[read_index + 7] * c[7]);
+        out[i] = (s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7) >> 8;
+#endif
+        frac_raw += step_raw;
+        read_index += static_cast<u32>(frac_raw >> 15);
+        frac_raw &= 0x7FFF;
     }
+    fraction = Common::FixedPoint<49, 15>::from_base(frac_raw);
 }
 
 void Resample(std::span<s32> output, std::span<const s16> input,

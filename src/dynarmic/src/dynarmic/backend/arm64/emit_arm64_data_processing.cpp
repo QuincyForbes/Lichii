@@ -165,6 +165,10 @@ void EmitIR<IR::Opcode::MostSignificantBit>(oaknut::CodeGenerator& code, EmitCon
 template<>
 void EmitIR<IR::Opcode::IsZero32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (inst == ctx.ebi.fused_check_bit_src) {
+        ctx.reg_alloc.DefineAsExisting(inst, args[0]);
+        return;
+    }
 
     auto Wresult = ctx.reg_alloc.WriteW(inst);
     auto Woperand = ctx.reg_alloc.ReadW(args[0]);
@@ -178,6 +182,10 @@ void EmitIR<IR::Opcode::IsZero32>(oaknut::CodeGenerator& code, EmitContext& ctx,
 template<>
 void EmitIR<IR::Opcode::IsZero64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (inst == ctx.ebi.fused_check_bit_src) {
+        ctx.reg_alloc.DefineAsExisting(inst, args[0]);
+        return;
+    }
 
     auto Wresult = ctx.reg_alloc.WriteW(inst);
     auto Xoperand = ctx.reg_alloc.ReadX(args[0]);
@@ -191,11 +199,16 @@ void EmitIR<IR::Opcode::IsZero64>(oaknut::CodeGenerator& code, EmitContext& ctx,
 template<>
 void EmitIR<IR::Opcode::TestBit>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    ASSERT(args[1].IsImmediate());
+    ASSERT(args[1].GetImmediateU8() < 64);
+    if (inst == ctx.ebi.fused_check_bit_src) {
+        ctx.reg_alloc.DefineAsExisting(inst, args[0]);
+        return;
+    }
+
     auto Xresult = ctx.reg_alloc.WriteX(inst);
     auto Xoperand = ctx.reg_alloc.ReadX(args[0]);
     RegAlloc::Realize(Xresult, Xoperand);
-    ASSERT(args[1].IsImmediate());
-    ASSERT(args[1].GetImmediateU8() < 64);
 
     code.UBFX(Xresult, Xoperand, args[1].GetImmediateU8(), 1);
 }
@@ -205,6 +218,25 @@ static void EmitConditionalSelect(oaknut::CodeGenerator& code, EmitContext& ctx,
     static_assert(bitsize == 32 || bitsize == 64);
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const IR::Cond cond = args[0].GetImmediateCond();
+
+    if (FprScalarForwardingOn() && args[1].IsInFpr(ctx.reg_alloc) && args[2].IsInFpr(ctx.reg_alloc)) {
+        auto Vresult = ctx.reg_alloc.WriteVec<bitsize>(inst);
+        auto Vthen = ctx.reg_alloc.ReadVec<bitsize>(args[1]);
+        auto Velse = ctx.reg_alloc.ReadVec<bitsize>(args[2]);
+        RegAlloc::Realize(Vresult, Vthen, Velse);
+        ctx.reg_alloc.SpillFlags();
+        const bool reuse_flags = !ctx.conf.enable_cycle_counting && ReuseHostFlagsOn();
+        const bool flags_live = reuse_flags && ctx.ebi.nzcv_live_pos != nullptr &&
+                                code.xptr<const void*>() == ctx.ebi.nzcv_live_pos;
+        if (!flags_live) {
+            code.LDR(Wscratch0, Xstate, ctx.conf.state_nzcv_offset);
+            code.MSR(oaknut::SystemReg::NZCV, Xscratch0);
+        }
+        code.FCSEL(*Vresult, *Vthen, *Velse, static_cast<oaknut::Cond>(cond));
+        ctx.ebi.nzcv_live_pos = reuse_flags ? code.xptr<const void*>() : nullptr;
+        return;
+    }
+
     const auto is_zero = [](const Argument& arg) {
         return arg.IsImmediate() && (bitsize == 32 ? arg.GetImmediateU32() == 0 : arg.GetImmediateU64() == 0);
     };
@@ -220,7 +252,6 @@ static void EmitConditionalSelect(oaknut::CodeGenerator& code, EmitContext& ctx,
 
     auto Rresult = ctx.reg_alloc.WriteReg<bitsize>(inst);
 
-    // TODO: FSEL for fprs
     // Realize operands and spill flags BEFORE checking code.xptr() == nzcv_live_pos so any
     // emitted move, load, spill, or MRS advances code.xptr() and forces an NZCV reload.
     const auto emit_csel = [&](auto r_then, auto r_else) {
@@ -1055,6 +1086,11 @@ void EmitIR<IR::Opcode::Add32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR
 
 template<>
 void EmitIR<IR::Opcode::Add64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    if (ctx.ebi.IsFoldedOffset(inst)) {
+        auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+        ctx.reg_alloc.DefineAsExisting(inst, args[0]);
+        return;
+    }
     EmitAddSub<64, false>(code, ctx, inst);
 }
 
@@ -1065,6 +1101,11 @@ void EmitIR<IR::Opcode::Sub32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR
 
 template<>
 void EmitIR<IR::Opcode::Sub64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    if (ctx.ebi.IsFoldedOffset(inst)) {
+        auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+        ctx.reg_alloc.DefineAsExisting(inst, args[0]);
+        return;
+    }
     EmitAddSub<64, true>(code, ctx, inst);
 }
 
@@ -1388,11 +1429,37 @@ void EmitIR<IR::Opcode::ZeroExtendWordToLong>(oaknut::CodeGenerator&, EmitContex
 template<>
 void EmitIR<IR::Opcode::ZeroExtendLongToQuad>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (FprScalarForwardingOn()) {
+        if (args[0].IsImmediate()) {
+            const u64 imm = args[0].GetImmediateU64();
+            const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
+            auto Qresult = ctx.reg_alloc.WriteQ(inst);
+            RegAlloc::Realize(Qresult);
+            if (imm == 0) {
+                code.MOVI(Qresult->toD(), oaknut::RepImm{0});
+            } else {
+                code.MOV(Xscratch0, imm);
+                code.FMOV(Qresult->toD(), Xscratch0);
+            }
+            if (flags_live) {
+                ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+            }
+            return;
+        }
+        if (args[0].IsInFpr(ctx.reg_alloc)) {
+            ctx.reg_alloc.DefineAsExisting(inst, args[0]);
+            return;
+        }
+    }
+    const bool flags_live = ctx.ebi.nzcv_live_pos != nullptr && ctx.ebi.nzcv_live_pos == code.xptr<const void*>();
     auto Xvalue = ctx.reg_alloc.ReadX(args[0]);
     auto Qresult = ctx.reg_alloc.WriteQ(inst);
     RegAlloc::Realize(Xvalue, Qresult);
 
     code.FMOV(Qresult->toD(), Xvalue);
+    if (flags_live) {
+        ctx.ebi.nzcv_live_pos = code.xptr<const void*>();
+    }
 }
 
 template<>

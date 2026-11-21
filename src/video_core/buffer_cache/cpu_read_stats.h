@@ -37,11 +37,7 @@ inline constexpr size_t CauseCount = static_cast<size_t>(Cause::Count);
 /// PC phone sim, Ocarina of Time in Kokiri (3 interleaved sessions each): the GPU thread held by
 /// these reads 79 -> 49 -> 5.5 ms/s, a GPU-tracked guest load 13.2 -> 9.7 -> 8.2 us, fps within
 /// run-to-run noise. Apple hosts read-trap (no reactive flushing) and wait on a busier GPU.
-#ifdef __APPLE__
 inline constexpr int DefaultLand = 2;
-#else
-inline constexpr int DefaultLand = 0;
-#endif
 
 inline int LandMode() {
     static const int mode = [] {

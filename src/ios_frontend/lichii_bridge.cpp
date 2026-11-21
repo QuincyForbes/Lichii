@@ -794,6 +794,9 @@ static void ApplyOotPresetCompanions() {
     if (companions.textures) {
         set(v.texture_quality, *companions.textures);
     }
+    if (companions.sharpening) {
+        set(v.oot_anti_aliasing, *companions.sharpening);
+    }
 }
 
 static void ApplySettingMutualExclusions(std::string_view key) {

@@ -34,6 +34,7 @@ add_library(audio_core STATIC
     audio_manager.h
     common/audio_renderer_parameter.h
     common/common.h
+    common/dsp_simd.h
     common/feature_support.h
     common/wave_buffer.h
     common/workbuffer_allocator.h

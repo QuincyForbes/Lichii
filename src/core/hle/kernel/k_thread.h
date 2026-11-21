@@ -327,7 +327,9 @@ public:
     }
 
     void SetEnteredKernel() {
-        m_entered_kernel.store(true, std::memory_order_release);
+        if (!m_entered_kernel.load(std::memory_order_relaxed)) {
+            m_entered_kernel.store(true, std::memory_order_release);
+        }
     }
 
     void AddCpuTime(s32 core_id, s64 amount) {
@@ -404,6 +406,19 @@ public:
 
     void SetYieldScheduleCount(s64 count) {
         m_schedule_count = count;
+    }
+
+    s32 GetYieldCoreId() const {
+        return m_yield_core_id;
+    }
+
+    u64 GetYieldCoreSeq() const {
+        return m_yield_core_seq;
+    }
+
+    void SetYieldCoreSeq(s32 core_id, u64 seq) {
+        m_yield_core_id = core_id;
+        m_yield_core_seq = seq;
     }
 
     void WaitCancel(KernelCore& kernel);
@@ -932,6 +947,7 @@ private:
     KLightLock m_activity_pause_lock;
     SyncObjectBuffer m_sync_object_buffer{};
     s64 m_schedule_count{};
+    u64 m_yield_core_seq{};
     s64 m_last_scheduled_tick{};
     std::vector<KThread*> m_pending_started_threads;
     std::atomic<bool> m_entered_kernel{false};
@@ -951,6 +967,7 @@ private:
     s32 m_num_kernel_waiters{};
     s32 m_current_core_id{};
     s32 m_core_id{};
+    s32 m_yield_core_id{-1};
     KAffinityMask m_original_physical_affinity_mask{};
     s32 m_original_physical_ideal_core_id{};
     s32 m_num_core_migration_disables{};
@@ -1027,6 +1044,10 @@ public:
     /// by the thread itself.
     u8 m_nx2_arb_spin_credit{8};
     u8 m_nx2_arb_spin_probe{};
+    u8 m_nx2_lock_spin_credit{8};
+    u8 m_nx2_lock_spin_probe{};
+    u16 m_nx2_futile_yield_streak{};
+    bool m_nx2_last_yield_futile{};
 
     /// EDEN_NX2_YIELD_BACKOFF (SleepThread): the current run of yields that found nothing else
     /// to run (host steady clock ns), and the callee-saved registers of the last one, whose

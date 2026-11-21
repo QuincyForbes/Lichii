@@ -420,6 +420,7 @@ private:
     /// Records the copies of the command list pages the dispatch just encoded wrote, and commits
     /// them at once (the front waits on them), as Vulkan's SubmitNx2ListCopies.
     void SubmitListCopies(u64 writer);
+    bool FlushSplitIdle(bool requested);
 
     /// Builds the index rewrite and indirect argument kernels on first use.
     void EnsureIndexKernels();
@@ -783,19 +784,24 @@ private:
     /// Shader::Backend::SPIRV::RescalingLayout of the draw or dispatch being bound.
     std::array<u32, 8> rescaling_words{};
 
-    static constexpr size_t MaxConvertedIndexEntries = 256;
-    static constexpr u64 MaxConvertedIndexBytes = u64{32} << 20;
+    static constexpr size_t MaxConvertedIndexEntries = 4096;
+    static constexpr u64 MaxConvertedIndexBytes = u64{64} << 20;
     static constexpr u64 MaxSingleConvertedIndexBytes = MaxConvertedIndexBytes / 4;
+    static constexpr u64 ConvertedIndexSlabBytes = u64{1} << 20;
+    static constexpr u64 MaxSlabAllocBytes = u64{64} << 10;
 
     /// The GPU index rewrite of the draw being prepared.
     struct IndexRewrite {
         bool wanted{};
         bool only_ahead{};
         bool cacheable{};
+        bool restart_off_only{};
+        bool skip_conversion{};
         DAddr device_addr{};
         IndexConvert::RewriteParams params{};
         StagingBufferRef output;
         BufferHandle cached_buffer{};
+        u64 cached_offset{};
         u32 cached_count{};
     } index_rewrite;
     struct ConvertedIndexEntry {
@@ -810,14 +816,38 @@ private:
         u32 restart{};
         u32 converted{};
         u32 hits{};
+        u32 slab_index{~0U};
+        u32 buffer_offset{};
+        bool no_u16_restart{};
+        BufferHandle slab_handle{};
         Object buffer;
+
+        [[nodiscard]] BufferHandle CachedHandle() const noexcept {
+            return buffer ? buffer.Get() : slab_handle;
+        }
+    };
+    struct ConvertedIndexSlab {
+        Object buffer;
+        u8* mapped{};
+        u64 write_offset{};
+        u64 last_retire_tick{};
+        u32 live_entries{};
+    };
+    struct GeneratedIndexPattern {
+        Object buffer;
+        u32 max_guest_count{};
     };
     std::unordered_map<BufferHandle, std::vector<ConvertedIndexEntry>> converted_index_cache;
+    std::vector<ConvertedIndexSlab> converted_index_slabs;
+    std::array<GeneratedIndexPattern, 18> generated_index_patterns{};
     size_t converted_index_count{};
     u64 converted_index_bytes{};
     u64 converted_index_clock{};
     DAddr converted_index_min_addr{~DAddr{0}};
     DAddr converted_index_max_addr{};
+    void ReleaseConvertedIndexStorage(ConvertedIndexEntry& entry) noexcept;
+    [[nodiscard]] u8* AllocateConvertedIndexStorage(ConvertedIndexEntry& entry,
+                                                    u64 needed_bytes);
     void InvalidateConvertedIndices(BufferHandle buffer, u64 offset, u64 size);
     void InvalidateConvertedIndicesAddr(DAddr addr, u64 size);
     void RefreshConvertedIndexAddrBounds() noexcept;

@@ -8,8 +8,8 @@
 #include <ranges>
 
 #include "audio_core/adsp/apps/audio_renderer/command_list_processor.h"
+#include "audio_core/common/dsp_simd.h"
 #include "audio_core/renderer/command/effect/reverb.h"
-#include <ranges>
 
 namespace AudioCore::Renderer {
 
@@ -261,29 +261,18 @@ static void ApplyReverbEffectBypass(std::span<std::span<const s32>> inputs,
  * @param mix    - The new calculated sample to be written and decayed.
  * @return The next delayed and decayed sample.
  */
-static Common::FixedPoint<50, 14> Axfx2AllPassTick(ReverbInfo::ReverbDelayLine& decay,
-                                                   ReverbInfo::ReverbDelayLine& fdn,
-                                                   const Common::FixedPoint<50, 14> mix) {
-    const auto val{decay.Read()};
-    const auto mixed{mix - (val * decay.decay)};
-    const auto out{decay.Tick(mixed) + (mixed * decay.decay)};
+static s64 Axfx2AllPassTickRaw(ReverbInfo::ReverbDelayLine& decay, ReverbInfo::ReverbDelayLine& fdn,
+                               const s64 mix_raw) {
+    const s64 decay_raw = decay.decay.to_raw();
+    const s64 val_raw = decay.Read().to_raw();
+    const s64 mixed_raw = mix_raw - DspSimd::MulFp<14>(val_raw, decay_raw);
+    const s64 out_raw = decay.Tick(Common::FixedPoint<50, 14>::from_base(mixed_raw)).to_raw() +
+                        DspSimd::MulFp<14>(mixed_raw, decay_raw);
 
-    fdn.Tick(out);
-    return out;
+    fdn.Tick(Common::FixedPoint<50, 14>::from_base(out_raw));
+    return out_raw;
 }
 
-/**
- * Impl. Apply a Reverb according to the current state, on the input mix buffers,
- * saving the results to the output mix buffers.
- *
- * @tparam NumChannels - Number of channels to process. 1-6.
-                         Inputs/outputs should have this many buffers.
- * @param params       - Input parameters to update the state.
- * @param state        - State to use, must be initialized (see InitializeReverbEffect).
- * @param inputs       - Input mix buffers to perform the reverb on.
- * @param outputs      - Output mix buffers to receive the reverbed samples.
- * @param sample_count - Number of samples to process.
- */
 template <size_t NumChannels>
 static void ApplyReverbEffect(const ReverbInfo::ParameterVersion2& params, ReverbInfo::State& state,
                               std::span<std::span<const s32>> inputs,
@@ -312,84 +301,120 @@ static void ApplyReverbEffect(const ReverbInfo::ParameterVersion2& params, Rever
         tap_indexes = OutTapIndexes6Ch;
     }
 
+    std::array<const s32*, NumChannels> in_ptrs{};
+    std::array<s32*, NumChannels> out_ptrs{};
+    for (size_t c = 0; c < NumChannels; ++c) {
+        in_ptrs[c] = inputs[c].data();
+        out_ptrs[c] = outputs[c].data();
+    }
+
+    const s64 base_gain_raw = params.base_gain;
+    const s64 late_gain_raw = params.late_gain;
+    const s64 dry_gain_raw = params.dry_gain;
+    const s64 wet_gain_raw = params.wet_gain;
+    constexpr s64 lfe_scale_raw = Common::FixedPoint<50, 14>{0.2f}.to_raw();
+    constexpr s64 half_raw = Common::FixedPoint<50, 14>{0.5f}.to_raw();
+
+    std::array<s64, ReverbInfo::MaxDelayTaps> early_gains_raw{};
+    for (u32 t = 0; t < ReverbInfo::MaxDelayTaps; ++t) {
+        early_gains_raw[t] = state.early_gains[t].to_raw();
+    }
+    std::array<s64, ReverbInfo::MaxDelayLines> hf_prev_raw{};
+    std::array<s64, ReverbInfo::MaxDelayLines> hf_gain_raw{};
+    std::array<s64, ReverbInfo::MaxDelayLines> prev_fb_raw{};
+    for (u32 i = 0; i < ReverbInfo::MaxDelayLines; ++i) {
+        hf_prev_raw[i] = state.hf_decay_prev_gain[i].to_raw();
+        hf_gain_raw[i] = state.hf_decay_gain[i].to_raw();
+        prev_fb_raw[i] = state.prev_feedback_output[i].to_raw();
+    }
+
     for (u32 sample_index = 0; sample_index < sample_count; sample_index++) {
-        std::array<Common::FixedPoint<50, 14>, NumChannels> output_samples{};
+        std::array<s64, NumChannels> output_samples_raw{};
 
         for (u32 early_tap = 0; early_tap < ReverbInfo::MaxDelayTaps; early_tap++) {
-            const auto sample{state.pre_delay_line.TapOut(state.early_delay_times[early_tap]) *
-                              state.early_gains[early_tap]};
-            output_samples[tap_indexes[early_tap]] += sample;
+            const s64 sample_raw = DspSimd::MulFp<14>(
+                state.pre_delay_line.TapOut(state.early_delay_times[early_tap]).to_raw(),
+                early_gains_raw[early_tap]);
+            output_samples_raw[tap_indexes[early_tap]] += sample_raw;
             if constexpr (NumChannels == 6) {
-                output_samples[static_cast<u32>(Channels::LFE)] += sample;
+                output_samples_raw[static_cast<u32>(Channels::LFE)] += sample_raw;
             }
         }
 
         if constexpr (NumChannels == 6) {
-            output_samples[static_cast<u32>(Channels::LFE)] *= 0.2f;
+            output_samples_raw[static_cast<u32>(Channels::LFE)] = DspSimd::MulFp<14>(
+                output_samples_raw[static_cast<u32>(Channels::LFE)], lfe_scale_raw);
         }
 
-        Common::FixedPoint<50, 14> input_sample{};
-        for (u32 channel = 0; channel < NumChannels; channel++) {
-            input_sample += inputs[channel][sample_index];
+        s64 sum_in = 0;
+        for (size_t channel = 0; channel < NumChannels; channel++) {
+            sum_in += in_ptrs[channel][sample_index];
         }
 
-        input_sample *= 64;
-        input_sample *= Common::FixedPoint<50, 14>::from_base(params.base_gain);
-        state.pre_delay_line.Write(input_sample);
+        const s64 input_sample_raw = DspSimd::MulFp<14>(sum_in << 20, base_gain_raw);
+        state.pre_delay_line.Write(Common::FixedPoint<50, 14>::from_base(input_sample_raw));
 
         for (u32 i = 0; i < ReverbInfo::MaxDelayLines; i++) {
-            state.prev_feedback_output[i] =
-                state.prev_feedback_output[i] * state.hf_decay_prev_gain[i] +
-                state.fdn_delay_lines[i].Read() * state.hf_decay_gain[i];
+            prev_fb_raw[i] =
+                DspSimd::MulFp<14>(prev_fb_raw[i], hf_prev_raw[i]) +
+                DspSimd::MulFp<14>(state.fdn_delay_lines[i].Read().to_raw(), hf_gain_raw[i]);
         }
 
-        Common::FixedPoint<50, 14> pre_delay_sample{
-            state.pre_delay_line.TapOut(state.pre_delay_time) *
-            Common::FixedPoint<50, 14>::from_base(params.late_gain)};
+        const s64 pre_delay_sample_raw =
+            DspSimd::MulFp<14>(state.pre_delay_line.TapOut(state.pre_delay_time).to_raw(),
+                               late_gain_raw);
 
-        std::array<Common::FixedPoint<50, 14>, ReverbInfo::MaxDelayLines> mix_matrix{
-            state.prev_feedback_output[2] + state.prev_feedback_output[1] + pre_delay_sample,
-            -state.prev_feedback_output[0] - state.prev_feedback_output[3] + pre_delay_sample,
-            state.prev_feedback_output[0] - state.prev_feedback_output[3] + pre_delay_sample,
-            state.prev_feedback_output[1] - state.prev_feedback_output[2] + pre_delay_sample,
+        const std::array<s64, ReverbInfo::MaxDelayLines> mix_matrix_raw{
+            prev_fb_raw[2] + prev_fb_raw[1] + pre_delay_sample_raw,
+            -prev_fb_raw[0] - prev_fb_raw[3] + pre_delay_sample_raw,
+            prev_fb_raw[0] - prev_fb_raw[3] + pre_delay_sample_raw,
+            prev_fb_raw[1] - prev_fb_raw[2] + pre_delay_sample_raw,
         };
 
-        std::array<Common::FixedPoint<50, 14>, ReverbInfo::MaxDelayLines> allpass_samples{};
+        std::array<s64, ReverbInfo::MaxDelayLines> allpass_raw{};
         for (u32 i = 0; i < ReverbInfo::MaxDelayLines; i++) {
-            allpass_samples[i] = Axfx2AllPassTick(state.decay_delay_lines[i],
-                                                  state.fdn_delay_lines[i], mix_matrix[i]);
+            allpass_raw[i] = Axfx2AllPassTickRaw(state.decay_delay_lines[i],
+                                                 state.fdn_delay_lines[i], mix_matrix_raw[i]);
         }
-
-        const auto dry_gain{Common::FixedPoint<50, 14>::from_base(params.dry_gain)};
-        const auto wet_gain{Common::FixedPoint<50, 14>::from_base(params.wet_gain)};
 
         if constexpr (NumChannels == 6) {
-            const std::array<Common::FixedPoint<50, 14>, MaxChannels> allpass_outputs{
-                allpass_samples[0], allpass_samples[1], allpass_samples[2] - allpass_samples[3],
-                allpass_samples[3], allpass_samples[2], allpass_samples[3],
+            const std::array<s64, MaxChannels> allpass_outputs_raw{
+                allpass_raw[0], allpass_raw[1], allpass_raw[2] - allpass_raw[3],
+                allpass_raw[3], allpass_raw[2], allpass_raw[3],
             };
 
-            for (u32 channel = 0; channel < NumChannels; channel++) {
-                auto in_sample{inputs[channel][sample_index] * dry_gain};
-
-                Common::FixedPoint<50, 14> allpass{};
-                if (channel == static_cast<u32>(Channels::Center)) {
-                    allpass = state.center_delay_line.Tick(allpass_outputs[channel] * 0.5f);
+            for (size_t channel = 0; channel < NumChannels; channel++) {
+                const s64 in_sample_raw = s64{in_ptrs[channel][sample_index]} * dry_gain_raw;
+                s64 ap_raw{};
+                if (channel == static_cast<size_t>(Channels::Center)) {
+                    const s64 center_in = DspSimd::MulFp<14>(allpass_outputs_raw[channel], half_raw);
+                    ap_raw = state.center_delay_line
+                                 .Tick(Common::FixedPoint<50, 14>::from_base(center_in))
+                                 .to_raw();
                 } else {
-                    allpass = allpass_outputs[channel];
+                    ap_raw = allpass_outputs_raw[channel];
                 }
 
-                auto out_sample{((output_samples[channel] + allpass) * wet_gain) / 64};
-                outputs[channel][sample_index] = (in_sample + out_sample).to_int();
+                const s64 out_sample_raw =
+                    DspSimd::MulFp<14>(output_samples_raw[channel] + ap_raw, wet_gain_raw) / 64;
+                out_ptrs[channel][sample_index] =
+                    DspSimd::RoundFpToInt<14>(in_sample_raw + out_sample_raw);
             }
         } else {
-            for (u32 channel = 0; channel < NumChannels; channel++) {
-                auto in_sample{inputs[channel][sample_index] * dry_gain};
-                auto out_sample{((output_samples[channel] + allpass_samples[channel]) * wet_gain) /
-                                64};
-                outputs[channel][sample_index] = (in_sample + out_sample).to_int();
+            for (size_t channel = 0; channel < NumChannels; channel++) {
+                const s64 in_sample_raw = s64{in_ptrs[channel][sample_index]} * dry_gain_raw;
+                const s64 out_sample_raw =
+                    DspSimd::MulFp<14>(output_samples_raw[channel] + allpass_raw[channel],
+                                       wet_gain_raw) /
+                    64;
+                out_ptrs[channel][sample_index] =
+                    DspSimd::RoundFpToInt<14>(in_sample_raw + out_sample_raw);
             }
         }
+    }
+
+    for (u32 i = 0; i < ReverbInfo::MaxDelayLines; ++i) {
+        state.prev_feedback_output[i] = Common::FixedPoint<50, 14>::from_base(prev_fb_raw[i]);
     }
 }
 

@@ -1124,7 +1124,8 @@ VideoCommon::Fsr4PortDevice Device::Fsr4PortDevice() const {
         .mixed_dot4_accelerated = properties.integer_dot_product
                                       .integerDotProduct4x8BitPackedMixedSignednessAccelerated !=
                                   VK_FALSE,
-        .descriptor_buffer = extensions.descriptor_buffer && extensions.buffer_device_address &&
+        .descriptor_buffer = extensions.descriptor_buffer &&
+                             features.buffer_device_address.bufferDeviceAddress &&
                              features.descriptor_indexing.runtimeDescriptorArray,
         .synchronization2 = extensions.synchronization2,
         .compute_wave32 = extensions.subgroup_size_control &&
@@ -2025,6 +2026,21 @@ void Device::RemoveUnsuitableExtensions() {
                                    std::getenv("EDEN_NX2_NO_MESH_SHADER") != nullptr)) {
         LOG_WARNING(Render_Vulkan, "Mesh fallback forced: VK_EXT_mesh_shader disabled");
         extensions.mesh_shader = false;
+    }
+    if (extensions.mesh_shader) {
+        const char* const native_mesh_env = std::getenv("EDEN_NX2_NATIVE_MESH");
+        const bool force_native = native_mesh_env != nullptr && native_mesh_env[0] == '1';
+        const VkDriverId driver_id = GetDriverID();
+        const bool amd_driver = driver_id == VK_DRIVER_ID_MESA_RADV ||
+                                driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                                driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE;
+        if (!force_native && (amd_driver || IsMoltenVK())) {
+            LOG_INFO(Render_Vulkan,
+                     "Disabling VK_EXT_mesh_shader by default on {} (use compute mesh fallback; "
+                     "set EDEN_NX2_NATIVE_MESH=1 to override)",
+                     IsMoltenVK() ? "MoltenVK" : "AMD driver");
+            extensions.mesh_shader = false;
+        }
     }
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
                                        VK_EXT_MESH_SHADER_EXTENSION_NAME);

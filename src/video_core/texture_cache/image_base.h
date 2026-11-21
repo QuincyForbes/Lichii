@@ -69,6 +69,10 @@ enum class ImageFlagBits : u32 {
     /// Its own address space mapped it to more than one device range when it was made (with
     /// Sparse only when the texture says so).
     NonContiguous = 1 << 25,
+    /// A SparseTiles image whose guest tiles were unmapped: before its next use its blocks go
+    /// back to the zeroed one and the tiles mapped then are loaded again (TextureCache::
+    /// RefreshUnmappedSparseTiles), instead of deleting and re-creating the image.
+    SparseTilesUnmapped = 1 << 26,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 

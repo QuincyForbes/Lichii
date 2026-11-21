@@ -297,7 +297,7 @@ void FixedPipelineState::RefreshTopology(const Maxwell& regs, Maxwell::Primitive
                         ? TOPOLOGY_CLASS_REPRESENTATIVE_LUT[static_cast<size_t>(topology_)]
                         : topology_);
     if (!features.has_extended_dynamic_state_2) {
-        dynamic_state.Refresh2(regs, topology_, false);
+        dynamic_state.Refresh2(regs, RasterTopologyOf(regs, topology_), false);
     }
 }
 

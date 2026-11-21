@@ -419,6 +419,7 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
         .page_table_log2_stride = conf.page_table_log2_stride,
         .page_table_marked_bit = conf.page_table_marked_bit,
         .page_table_sign_extension = conf.page_table_sign_extension,
+        .untrapped_read_bitmap_ptr = conf.untrapped_read_bitmap_ptr,
         .silently_mirror_page_table = true,
         .absolute_offset_page_table = conf.absolute_offset_page_table,
         .detect_misaligned_access_via_page_table = conf.detect_misaligned_access_via_page_table,

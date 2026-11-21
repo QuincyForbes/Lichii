@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -79,6 +80,9 @@ private:
     std::mutex mutex1{};
     /// Mutex for adding/removing systems
     std::mutex mutex2{};
+    /// Pacing mutex and condition variable when idle or unthrottled by a sink stream
+    std::mutex pace_mutex{};
+    std::condition_variable_any pace_cv{};
     /// Is the system manager thread active?
     std::atomic<bool> active{};
     /// Reference to the ADSP's AudioRenderer for communication

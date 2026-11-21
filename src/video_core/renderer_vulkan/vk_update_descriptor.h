@@ -49,6 +49,8 @@ public:
     static constexpr size_t GUEST_FRAME_PAYLOAD_SIZE = 0x80000;
     static constexpr size_t COMPUTE_FRAME_PAYLOAD_SIZE = 0x20000;
 
+    explicit UpdateDescriptorQueue(size_t frame_payload_size_,
+                                   bool supports_descriptor_buffer_ = false);
     explicit UpdateDescriptorQueue(const Device& device_, size_t frame_payload_size_,
                                    bool supports_descriptor_buffer_ = false);
     ~UpdateDescriptorQueue();
@@ -60,6 +62,7 @@ public:
     void TickFrame();
     void Acquire(Scheduler& scheduler, size_t required_entries = 0,
                  bool use_descriptor_buffer_ = false);
+    void AcquireScratch(size_t required_entries = 0, bool use_descriptor_buffer_ = false);
 
     const DescriptorUpdateEntry* UpdateData() const noexcept {
         return upload_start;
@@ -69,24 +72,33 @@ public:
         return upload_start ? static_cast<size_t>(payload_cursor - upload_start) : 0;
     }
 
+    /// Reclaims the entries acquired for the current draw/dispatch when no worker command needs
+    /// them (descriptor buffer path or reused descriptor payload), keeping the arena L1-resident.
+    void Rewind() noexcept {
+        if (upload_start != nullptr) {
+            payload_cursor = const_cast<DescriptorUpdateEntry*>(upload_start);
+        }
+    }
+
     void AddSampledImage(VkImageView image_view, VkSampler sampler) {
-        *(payload_cursor++) = VkDescriptorImageInfo{
-            .sampler = sampler,
-            .imageView = image_view,
-            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-        };
+        DescriptorUpdateEntry& dst = *(payload_cursor++);
+        dst.raw[2] = 0;
+        dst.image.sampler = sampler;
+        dst.image.imageView = image_view;
+        dst.image.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     }
 
     void AddImage(VkImageView image_view) {
-        *(payload_cursor++) = VkDescriptorImageInfo{
-            .sampler = VK_NULL_HANDLE,
-            .imageView = image_view,
-            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-        };
+        DescriptorUpdateEntry& dst = *(payload_cursor++);
+        dst.raw[2] = 0;
+        dst.image.sampler = VK_NULL_HANDLE;
+        dst.image.imageView = image_view;
+        dst.image.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     }
 
     void AddBuffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {
-        *(payload_cursor++) = VkDescriptorBufferInfo{
+        DescriptorUpdateEntry& dst = *(payload_cursor++);
+        dst.buffer = VkDescriptorBufferInfo{
             .buffer = buffer,
             .offset = offset,
             .range = size,
@@ -99,15 +111,19 @@ public:
             AddBuffer(buffer, offset, size);
             return;
         }
-        *(payload_cursor++) = DescriptorAddress{
+        DescriptorUpdateEntry& dst = *(payload_cursor++);
+        dst.address = DescriptorAddress{
             .address = base_address == 0 ? 0 : base_address + offset,
             .range = base_address == 0 ? VK_WHOLE_SIZE : size,
             .format = VK_FORMAT_UNDEFINED,
+            .padding = 0,
         };
     }
 
     void AddTexelBuffer(VkBufferView texel_buffer) {
-        *(payload_cursor++) = texel_buffer;
+        DescriptorUpdateEntry& dst = *(payload_cursor++);
+        dst.raw = {};
+        dst.texel_buffer = texel_buffer;
     }
 
     /// Adds an entry kept as raw bytes (TextureCache::BindingMemo::payload).
@@ -126,10 +142,12 @@ public:
             AddTexelBuffer(texel_buffer);
             return;
         }
-        *(payload_cursor++) = DescriptorAddress{
+        DescriptorUpdateEntry& dst = *(payload_cursor++);
+        dst.address = DescriptorAddress{
             .address = base_address == 0 ? 0 : base_address + offset,
             .range = base_address == 0 ? VK_WHOLE_SIZE : size,
             .format = format,
+            .padding = 0,
         };
     }
 
@@ -148,7 +166,7 @@ private:
         u32 excess_turns{};
     };
 
-    void AcquireSlow(Scheduler& scheduler, size_t reserve);
+    void AcquireSlow(Scheduler* scheduler, size_t reserve);
 
     const size_t maximum_frame_payload_size;
     const bool supports_descriptor_buffer;

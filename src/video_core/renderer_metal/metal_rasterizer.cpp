@@ -39,6 +39,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/host_budget.h"
 #include "video_core/indirect_reset.h"
 #include "video_core/memory_manager.h"
 #include "video_core/native_indirect_reset.h"
@@ -341,7 +342,7 @@ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 
         // As Vulkan's: command list pages the copy writes are copied for the split's front.
         buffer_cache.Nx2CollectListCopies(true);
         copied = do_copy(buffer_cache);
-        if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
+        if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) && !scheduler.DeferFlush()) {
             scheduler.Flush(CommitReason::ListCopy);
         }
         buffer_cache.Nx2CollectListCopies(false);
@@ -435,10 +436,12 @@ RasterizerMetal::RasterizerMetal(Tegra::GPU& gpu_,
     // through the same hooks.
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument, bool requested) {
-            return static_cast<Scheduler*>(argument)->FlushDeferredFromIdle(requested);
+            return static_cast<RasterizerMetal*>(argument)->FlushSplitIdle(requested);
         },
-        [](void* argument) { return static_cast<Scheduler*>(argument)->DeferredFlushMayWait(); },
-        &scheduler);
+        [](void* argument) {
+            return static_cast<RasterizerMetal*>(argument)->scheduler.DeferredFlushMayWait();
+        },
+        this);
     VideoCommon::GpuSplit::Get().SetIdleBusy(
         [](void* argument) { return static_cast<Scheduler*>(argument)->GpuBehind(); });
     if (!CachePathsEnabled()) {
@@ -901,8 +904,11 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     const bool restart = maxwell3d->regs.primitive_restart.enabled != 0;
     const bool provoking_last = ProvokingLastWanted(*pipeline);
     CountDraw(count, instance_count);
-    const bool convert = IndexConvert::NeedsConversion(DrawTopology(*maxwell3d)) || u8_indices ||
-                         provoking_last || RestartOffWidens(is_indexed);
+    const bool topology_convert = IndexConvert::NeedsConversion(DrawTopology(*maxwell3d));
+    const bool restart_off_widen = RestartOffWidens(is_indexed);
+    bool convert = topology_convert || u8_indices || provoking_last || restart_off_widen;
+    const bool restart_off_only =
+        restart_off_widen && !topology_convert && !u8_indices && !provoking_last;
     const std::optional<u32> primitive =
         PrimitiveType(IndexConvert::ConvertedTopology(DrawTopology(*maxwell3d), provoking_last));
     if (!primitive) {
@@ -942,10 +948,12 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         if (gpu_indices != '0' && (gpu_indices == '1' || gpu_modified)) {
             index_rewrite.wanted = true;
             index_rewrite.only_ahead = false;
-        } else if (!gpu_modified && (cacheable || (gpu_indices != '0' && count >= 256))) {
+        } else if (!gpu_modified &&
+                   (cacheable || restart_off_only || (gpu_indices != '0' && count >= 256))) {
             index_rewrite.wanted = true;
             index_rewrite.only_ahead = true;
             index_rewrite.cacheable = cacheable;
+            index_rewrite.restart_off_only = restart_off_only;
             index_rewrite.device_addr = device_addr.value_or(0);
         }
         index_rewrite.params = {
@@ -975,6 +983,9 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
     if (!PrepareDraw(*pipeline, is_indexed)) {
         NoteUnprepared();
         return;
+    }
+    if (index_rewrite.skip_conversion) {
+        convert = false;
     }
     CountOcclusion();
     Coverage::Note(Coverage::Work::Draw, convert ? Coverage::Path::RewrittenIndices
@@ -1023,7 +1034,7 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
         // 32-bit indices: from the converted-index cache, the GPU rewrite, or rewritten on the CPU
         // from the guest's indices (or the vertex range).
         BufferHandle draw_index_buffer = index_rewrite.cached_buffer;
-        u64 draw_index_offset = 0;
+        u64 draw_index_offset = index_rewrite.cached_offset;
         if (draw_index_buffer != nullptr) {
             converted = index_rewrite.cached_count;
         } else if (index_rewrite.output.buffer != nullptr) {
@@ -1031,71 +1042,114 @@ void RasterizerMetal::Draw(bool is_indexed, u32 instance_count) {
             draw_index_buffer = index_rewrite.output.buffer;
             draw_index_offset = index_rewrite.output.offset;
         } else {
-            std::span<const u8> source;
-            if (is_indexed) {
-                if (!draw_state.inline_index_draw_indexes.empty()) {
-                    source = draw_state.inline_index_draw_indexes;
-                } else {
-                    converted_source.resize(size_t{count} * index_size);
-                    gpu_memory->ReadBlockUnsafe(
-                        draw_state.index_buffer.StartAddress() +
-                            GPUVAddr{draw_state.index_buffer.first} * index_size,
-                        converted_source.data(), converted_source.size());
-                    source = converted_source;
-                }
-            }
-            ConvertedIndexEntry* promote_entry = nullptr;
-            const u64 needed_bytes = u64{converted} * sizeof(u32);
-            if (index_rewrite.wanted && index_rewrite.only_ahead && index_rewrite.cacheable &&
-                needed_bytes != 0 && needed_bytes <= MaxSingleConvertedIndexBytes) {
-                const BufferCacheRuntime::IndexState& idx = buffer_cache_runtime.Index();
-                const auto found = converted_index_cache.find(idx.buffer);
-                if (found != converted_index_cache.end()) {
-                    const u64 src_offset = u64{idx.offset} + index_rewrite.params.source_offset;
-                    const u64 src_size = u64{count} * index_size;
-                    for (ConvertedIndexEntry& item : found->second) {
-                        if (!item.buffer && item.hits >= 2 &&
-                            item.device_addr == index_rewrite.device_addr &&
-                            item.offset == src_offset && item.size == src_size &&
-                            item.mode == index_rewrite.params.mode &&
-                            item.index_size == index_size &&
-                            item.restart == index_rewrite.params.restart &&
-                            MakeRoomForConvertedIndexBytes(needed_bytes, &item)) {
-                            promote_entry = &item;
-                            break;
+            bool from_pattern = false;
+            if (!is_indexed && draw_state.vertex_buffer.first == 0 && count <= 65536U) {
+                const u32 mode =
+                    IndexConvert::RewriteMode(DrawTopology(*maxwell3d), provoking_last, false);
+                if (mode < generated_index_patterns.size() &&
+                    IndexConvert::IsPrefixInvariant(mode)) {
+                    GeneratedIndexPattern& pat = generated_index_patterns[mode];
+                    if (!pat.buffer || pat.max_guest_count < count) {
+                        const u32 new_max =
+                            (std::min)(std::bit_ceil((std::max)(count, 256U)), 65536U);
+                        const u32 max_conv = IndexConvert::ConvertedCount(
+                            DrawTopology(*maxwell3d), new_max, provoking_last);
+                        u8* pat_mapped = nullptr;
+                        Object pat_buf = max_conv != 0
+                                             ? CreateBuffer(device, u64{max_conv} * sizeof(u32),
+                                                            true, &pat_mapped)
+                                             : Object{};
+                        if (pat_buf && pat_mapped != nullptr) {
+                            const std::span<u32> pat_out(reinterpret_cast<u32*>(pat_mapped),
+                                                         max_conv);
+                            if (IndexConvert::Convert(DrawTopology(*maxwell3d), {}, 0, 0, new_max,
+                                                      false, pat_out, provoking_last) == max_conv) {
+                                pat.buffer = std::move(pat_buf);
+                                pat.max_guest_count = new_max;
+                            }
                         }
+                    }
+                    if (pat.buffer && pat.max_guest_count >= count) {
+                        draw_index_buffer = pat.buffer.Get();
+                        draw_index_offset = 0;
+                        from_pattern = true;
                     }
                 }
             }
-            u8* mapped = nullptr;
-            Object promoted_buffer;
-            if (promote_entry != nullptr) {
-                promoted_buffer = CreateBuffer(device, needed_bytes, true, &mapped);
-            }
-            if (promoted_buffer && mapped != nullptr) {
-                const std::span<u32> out(reinterpret_cast<u32*>(mapped), converted);
-                converted = IndexConvert::Convert(DrawTopology(*maxwell3d), source, index_size,
-                                                  is_indexed ? 0U : draw_state.vertex_buffer.first,
-                                                  count, restart, out, provoking_last);
-                if (converted != 0) {
-                    promote_entry->converted = converted;
-                    promote_entry->buffer_bytes = needed_bytes;
-                    promote_entry->last_use = ++converted_index_clock;
-                    promote_entry->last_frame = oot_frame;
-                    promote_entry->buffer = std::move(promoted_buffer);
-                    converted_index_bytes += needed_bytes;
-                    draw_index_buffer = promote_entry->buffer.Get();
+            if (!from_pattern) {
+                std::span<const u8> source;
+                if (is_indexed) {
+                    if (!draw_state.inline_index_draw_indexes.empty()) {
+                        source = draw_state.inline_index_draw_indexes;
+                    } else {
+                        const GPUVAddr start = draw_state.index_buffer.StartAddress() +
+                                               GPUVAddr{draw_state.index_buffer.first} * index_size;
+                        const size_t byte_len = size_t{count} * index_size;
+                        const u8* const direct = gpu_memory->IsContinuousRange(start, byte_len)
+                                                     ? gpu_memory->GetPointer(start)
+                                                     : nullptr;
+                        if (direct != nullptr) {
+                            source = std::span<const u8>{direct, byte_len};
+                        } else {
+                            converted_source.resize(byte_len);
+                            gpu_memory->ReadBlockUnsafe(start, converted_source.data(), byte_len);
+                            source = converted_source;
+                        }
+                    }
                 }
-            } else {
-                const StagingBufferRef indices =
-                    staging_pool.RequestUpload(size_t{converted} * sizeof(u32), 4);
-                const std::span<u32> out(reinterpret_cast<u32*>(indices.mapped_span.data()),
-                                         converted);
-                converted = IndexConvert::Convert(DrawTopology(*maxwell3d), source, index_size,
-                                                  is_indexed ? 0U : draw_state.vertex_buffer.first,
-                                                  count, restart, out, provoking_last);
-                draw_index_buffer = indices.buffer;
-                draw_index_offset = indices.offset;
+                ConvertedIndexEntry* promote_entry = nullptr;
+                const u64 needed_bytes = u64{converted} * sizeof(u32);
+                if (index_rewrite.wanted && index_rewrite.only_ahead && index_rewrite.cacheable &&
+                    needed_bytes != 0 && needed_bytes <= MaxSingleConvertedIndexBytes) {
+                    const BufferCacheRuntime::IndexState& idx = buffer_cache_runtime.Index();
+                    const auto found = converted_index_cache.find(idx.buffer);
+                    if (found != converted_index_cache.end()) {
+                        const u64 src_offset = u64{idx.offset} + index_rewrite.params.source_offset;
+                        const u64 src_size = u64{count} * index_size;
+                        for (ConvertedIndexEntry& item : found->second) {
+                            if (item.CachedHandle() == nullptr && item.hits >= 2 &&
+                                item.device_addr == index_rewrite.device_addr &&
+                                item.offset == src_offset && item.size == src_size &&
+                                item.mode == index_rewrite.params.mode &&
+                                item.index_size == index_size &&
+                                item.restart == index_rewrite.params.restart) {
+                                promote_entry = &item;
+                                break;
+                            }
+                        }
+                    }
+                }
+                u8* const mapped =
+                    promote_entry != nullptr
+                        ? AllocateConvertedIndexStorage(*promote_entry, needed_bytes)
+                        : nullptr;
+                if (mapped != nullptr) {
+                    const std::span<u32> out(reinterpret_cast<u32*>(mapped), converted);
+                    converted = IndexConvert::Convert(
+                        DrawTopology(*maxwell3d), source, index_size,
+                        is_indexed ? 0U : draw_state.vertex_buffer.first, count, restart, out,
+                        provoking_last);
+                    if (converted != 0) {
+                        promote_entry->converted = converted;
+                        promote_entry->last_use = ++converted_index_clock;
+                        promote_entry->last_frame = oot_frame;
+                        draw_index_buffer = promote_entry->CachedHandle();
+                        draw_index_offset = promote_entry->buffer_offset;
+                    } else {
+                        ReleaseConvertedIndexStorage(*promote_entry);
+                    }
+                } else {
+                    const StagingBufferRef indices =
+                        staging_pool.RequestUpload(size_t{converted} * sizeof(u32), 4);
+                    const std::span<u32> out(reinterpret_cast<u32*>(indices.mapped_span.data()),
+                                             converted);
+                    converted = IndexConvert::Convert(
+                        DrawTopology(*maxwell3d), source, index_size,
+                        is_indexed ? 0U : draw_state.vertex_buffer.first, count, restart, out,
+                        provoking_last);
+                    draw_index_buffer = indices.buffer;
+                    draw_index_offset = indices.offset;
+                }
             }
         }
         if (converted != 0 && draw_index_buffer != nullptr &&
@@ -1199,6 +1253,102 @@ void RasterizerMetal::RefreshConvertedIndexAddrBounds() noexcept {
     }
 }
 
+void RasterizerMetal::ReleaseConvertedIndexStorage(ConvertedIndexEntry& entry) noexcept {
+    if (entry.buffer) {
+        converted_index_bytes -= entry.buffer_bytes;
+        entry.buffer = {};
+        entry.buffer_bytes = 0;
+    } else if (entry.slab_index < converted_index_slabs.size() && entry.slab_handle != nullptr) {
+        ConvertedIndexSlab& slab = converted_index_slabs[entry.slab_index];
+        if (slab.live_entries != 0) {
+            --slab.live_entries;
+        }
+        slab.last_retire_tick = scheduler.CurrentTick();
+    }
+    entry.slab_index = ~0U;
+    entry.slab_handle = nullptr;
+    entry.buffer_offset = 0;
+    entry.converted = 0;
+    entry.no_u16_restart = false;
+}
+
+u8* RasterizerMetal::AllocateConvertedIndexStorage(ConvertedIndexEntry& entry, u64 needed_bytes) {
+    if (needed_bytes == 0 || needed_bytes > MaxSingleConvertedIndexBytes) {
+        return nullptr;
+    }
+    if (needed_bytes <= MaxSlabAllocBytes) {
+        const u64 aligned = Common::AlignUp(needed_bytes, u64{16});
+        for (u32 i = 0; i < converted_index_slabs.size(); ++i) {
+            ConvertedIndexSlab& slab = converted_index_slabs[i];
+            if (slab.buffer && slab.mapped != nullptr &&
+                slab.write_offset + aligned <= ConvertedIndexSlabBytes) {
+                const u32 off = static_cast<u32>(slab.write_offset);
+                slab.write_offset += aligned;
+                ++slab.live_entries;
+                entry.slab_index = i;
+                entry.slab_handle = slab.buffer.Get();
+                entry.buffer_offset = off;
+                return slab.mapped + off;
+            }
+        }
+        for (u32 i = 0; i < converted_index_slabs.size(); ++i) {
+            ConvertedIndexSlab& slab = converted_index_slabs[i];
+            if (slab.buffer && slab.mapped != nullptr && slab.live_entries == 0 &&
+                scheduler.IsFree(slab.last_retire_tick) &&
+                !scheduler.IsBufferActiveInOpenCommands(slab.buffer.Get())) {
+                slab.write_offset = aligned;
+                slab.live_entries = 1;
+                entry.slab_index = i;
+                entry.slab_handle = slab.buffer.Get();
+                entry.buffer_offset = 0;
+                return slab.mapped;
+            }
+        }
+        if (MakeRoomForConvertedIndexBytes(ConvertedIndexSlabBytes, &entry)) {
+            u8* slab_mapped = nullptr;
+            Object slab_buf = CreateBuffer(device, ConvertedIndexSlabBytes, true, &slab_mapped);
+            if (slab_buf && slab_mapped != nullptr) {
+                u32 slot = static_cast<u32>(converted_index_slabs.size());
+                for (u32 i = 0; i < converted_index_slabs.size(); ++i) {
+                    if (!converted_index_slabs[i].buffer) {
+                        slot = i;
+                        break;
+                    }
+                }
+                if (slot == converted_index_slabs.size()) {
+                    converted_index_slabs.emplace_back();
+                }
+                converted_index_slabs[slot] = ConvertedIndexSlab{
+                    .buffer = std::move(slab_buf),
+                    .mapped = slab_mapped,
+                    .write_offset = aligned,
+                    .last_retire_tick = 0,
+                    .live_entries = 1,
+                };
+                converted_index_bytes += ConvertedIndexSlabBytes;
+                entry.slab_index = slot;
+                entry.slab_handle = converted_index_slabs[slot].buffer.Get();
+                entry.buffer_offset = 0;
+                return slab_mapped;
+            }
+        }
+        return nullptr;
+    }
+    if (!MakeRoomForConvertedIndexBytes(needed_bytes, &entry)) {
+        return nullptr;
+    }
+    u8* mapped = nullptr;
+    Object promoted = CreateBuffer(device, needed_bytes, true, &mapped);
+    if (!promoted || mapped == nullptr) {
+        return nullptr;
+    }
+    entry.buffer = std::move(promoted);
+    entry.buffer_bytes = needed_bytes;
+    entry.buffer_offset = 0;
+    converted_index_bytes += needed_bytes;
+    return mapped;
+}
+
 void RasterizerMetal::InvalidateConvertedIndices(BufferHandle buf, u64 offset, u64 size) {
     if (converted_index_count == 0) {
         return;
@@ -1208,20 +1358,20 @@ void RasterizerMetal::InvalidateConvertedIndices(BufferHandle buf, u64 offset, u
         return;
     }
     if (size == ~u64{0}) {
-        for (const ConvertedIndexEntry& entry : it->second) {
-            converted_index_bytes -= entry.buffer_bytes;
+        for (ConvertedIndexEntry& entry : it->second) {
+            ReleaseConvertedIndexStorage(entry);
         }
         converted_index_count -= it->second.size();
         converted_index_cache.erase(it);
         RefreshConvertedIndexAddrBounds();
         return;
     }
-    const size_t removed = std::erase_if(it->second, [&](const ConvertedIndexEntry& entry) {
+    const size_t removed = std::erase_if(it->second, [&](ConvertedIndexEntry& entry) {
         const bool overlaps = entry.size != 0 && size != 0 &&
                               (entry.offset < offset ? offset - entry.offset < entry.size
                                                      : entry.offset - offset < size);
         if (overlaps) {
-            converted_index_bytes -= entry.buffer_bytes;
+            ReleaseConvertedIndexStorage(entry);
         }
         return overlaps;
     });
@@ -1244,12 +1394,12 @@ void RasterizerMetal::InvalidateConvertedIndicesAddr(DAddr addr, u64 size) {
     }
     size_t total_removed = 0;
     std::erase_if(converted_index_cache, [&](auto& item) {
-        const size_t removed = std::erase_if(item.second, [&](const ConvertedIndexEntry& entry) {
+        const size_t removed = std::erase_if(item.second, [&](ConvertedIndexEntry& entry) {
             const bool overlaps = entry.size != 0 &&
                                   (entry.device_addr < addr ? addr - entry.device_addr < entry.size
                                                             : entry.device_addr - addr < size);
             if (overlaps) {
-                converted_index_bytes -= entry.buffer_bytes;
+                ReleaseConvertedIndexStorage(entry);
             }
             return overlaps;
         });
@@ -1264,23 +1414,38 @@ void RasterizerMetal::InvalidateConvertedIndicesAddr(DAddr addr, u64 size) {
 
 void RasterizerMetal::EvictConvertedIndexEntry() {
     while (converted_index_count >= MaxConvertedIndexEntries && !converted_index_cache.empty()) {
+        auto probe_bucket = converted_index_cache.end();
+        size_t probe_index = 0;
+        u64 oldest_probe = ~u64{0};
         auto victim_bucket = converted_index_cache.end();
         size_t victim_index = 0;
         u64 oldest_use = ~u64{0};
         for (auto it = converted_index_cache.begin(); it != converted_index_cache.end(); ++it) {
             for (size_t i = 0; i < it->second.size(); ++i) {
-                if (it->second[i].last_use < oldest_use) {
-                    oldest_use = it->second[i].last_use;
+                const ConvertedIndexEntry& entry = it->second[i];
+                if (entry.CachedHandle() == nullptr && !entry.no_u16_restart) {
+                    if (entry.last_use < oldest_probe) {
+                        oldest_probe = entry.last_use;
+                        probe_bucket = it;
+                        probe_index = i;
+                    }
+                }
+                if (entry.last_use < oldest_use) {
+                    oldest_use = entry.last_use;
                     victim_bucket = it;
                     victim_index = i;
                 }
             }
         }
+        if (probe_bucket != converted_index_cache.end()) {
+            victim_bucket = probe_bucket;
+            victim_index = probe_index;
+        }
         if (victim_bucket == converted_index_cache.end()) {
             break;
         }
         auto& vec = victim_bucket->second;
-        converted_index_bytes -= vec[victim_index].buffer_bytes;
+        ReleaseConvertedIndexStorage(vec[victim_index]);
         vec.erase(vec.begin() + static_cast<std::ptrdiff_t>(victim_index));
         --converted_index_count;
         if (vec.empty()) {
@@ -1292,10 +1457,27 @@ void RasterizerMetal::EvictConvertedIndexEntry() {
 
 bool RasterizerMetal::MakeRoomForConvertedIndexBytes(u64 needed_bytes,
                                                      const ConvertedIndexEntry* keep) noexcept {
-    if (needed_bytes == 0 || needed_bytes > MaxSingleConvertedIndexBytes) {
+    const u64 max_bytes =
+        VideoCommon::HostBudget::Active() ? (u64{32} << 20) : MaxConvertedIndexBytes;
+    if (needed_bytes == 0 || needed_bytes > MaxSingleConvertedIndexBytes ||
+        needed_bytes > max_bytes) {
         return false;
     }
-    while (converted_index_bytes + needed_bytes > MaxConvertedIndexBytes) {
+    if (converted_index_bytes + needed_bytes > max_bytes) {
+        for (ConvertedIndexSlab& slab : converted_index_slabs) {
+            if (slab.buffer && slab.live_entries == 0 && scheduler.IsFree(slab.last_retire_tick) &&
+                !scheduler.IsBufferActiveInOpenCommands(slab.buffer.Get())) {
+                slab.buffer = {};
+                slab.mapped = nullptr;
+                slab.write_offset = 0;
+                converted_index_bytes -= ConvertedIndexSlabBytes;
+                if (converted_index_bytes + needed_bytes <= max_bytes) {
+                    return true;
+                }
+            }
+        }
+    }
+    while (converted_index_bytes + needed_bytes > max_bytes) {
         ConvertedIndexEntry* victim = nullptr;
         u64 oldest_use = ~u64{0};
         for (auto& [buf, entries] : converted_index_cache) {
@@ -1310,10 +1492,7 @@ bool RasterizerMetal::MakeRoomForConvertedIndexBytes(u64 needed_bytes,
             return false;
         }
         // Release the buffer in place so pointers into `entries` stay valid.
-        converted_index_bytes -= victim->buffer_bytes;
-        victim->buffer = {};
-        victim->buffer_bytes = 0;
-        victim->converted = 0;
+        ReleaseConvertedIndexStorage(*victim);
         victim->hits = 0;
     }
     return true;
@@ -1970,11 +2149,12 @@ RasterizerMetal::MeshArena& RasterizerMetal::AcquireMeshArena() {
 
 void RasterizerMetal::FinishTexelWritebacks() {
     for (const TexelWriteback& writeback : texel_writebacks) {
-        if (writeback.buffer_obj != nullptr) {
-            writeback.buffer_obj->RefreshTick();
+        const bool tracked = writeback.buffer_obj != nullptr;
+        if (tracked) {
+            writeback.buffer_obj->MarkUsage(writeback.offset, writeback.size);
         }
         scheduler.CopyBuffer(writeback.copy, writeback.copy_offset, writeback.buffer,
-                             writeback.offset, writeback.size);
+                             writeback.offset, writeback.size, false, tracked);
     }
     texel_writebacks.clear();
 }
@@ -2176,22 +2356,62 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                                          std::span<const VideoCommon::SamplerId> samplers,
                                          u32 render_width, u32 render_height) {
     const Shader::Info& info = program.info;
-    // EDEN_NX2_METAL_BIND_SCRATCH: the lists keep their storage between calls (a nested call
-    // finds them taken and allocates its own).
-    const bool scratch = BindScratchEnabled();
-    ScratchList scratch_texture_slots{bind_scratch.texture_slots, scratch};
-    ScratchList scratch_sampler_slots{bind_scratch.sampler_slots, scratch};
-    ScratchList scratch_spill_table{bind_scratch.spill_table, scratch};
-    ScratchList scratch_sampler_table{bind_scratch.sampler_table, scratch};
-    ScratchList scratch_array_table{bind_scratch.array_table, scratch};
-    std::vector<u32>& texture_slots = scratch_texture_slots.value;
-    std::vector<u32>& sampler_slots = scratch_sampler_slots.value;
-    std::vector<u64>& spill_table = scratch_spill_table.value;
-    std::vector<u64>& sampler_table = scratch_sampler_table.value;
     /// Marks a sampler_slots entry as an entry of the spilled samplers' table.
     constexpr u32 SpilledSamplerFlag = 0x8000'0000U;
     /// Marks a texture_slots or sampler_slots entry as an entry of the array table.
     constexpr u32 ArrayEntryFlag = 0x4000'0000U;
+    if (!program.flat_slots_built) {
+        program.flat_buffer_slots.clear();
+        program.flat_texture_slots.clear();
+        program.flat_sampler_slots.clear();
+        program.max_buffer_spill = 0;
+        program.max_sampler_spill = 0;
+        for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
+            for (u32 element = 0; element < slot.count; ++element) {
+                const u32 slot_index = slot.index + element;
+                switch (slot.kind) {
+                case ShaderTranslate::ResourceKind::Buffer:
+                    if (slot.spill != ~0U) {
+                        program.max_buffer_spill =
+                            (std::max)(program.max_buffer_spill, slot.spill + 1U);
+                    }
+                    program.flat_buffer_slots.push_back({
+                        .slot_index = slot_index,
+                        .spill = slot.spill,
+                        .is_push_constant = slot.set == ShaderTranslate::PushConstantSet,
+                    });
+                    break;
+                case ShaderTranslate::ResourceKind::Texture:
+                    program.flat_texture_slots.push_back(
+                        slot.in_array_table ? ArrayEntryFlag | (slot.spill + element) : slot_index);
+                    break;
+                case ShaderTranslate::ResourceKind::Sampler:
+                    if (!slot.in_array_table && slot.spill != ~0U) {
+                        program.max_sampler_spill =
+                            (std::max)(program.max_sampler_spill, slot.spill + 1U);
+                    }
+                    program.flat_sampler_slots.push_back(
+                        slot.in_array_table   ? ArrayEntryFlag | (slot.spill + element)
+                        : slot.spill != ~0U   ? SpilledSamplerFlag | slot.spill
+                                              : slot_index);
+                    break;
+                }
+            }
+        }
+        program.flat_slots_built = true;
+    }
+    const std::span<const u32> texture_slots{program.flat_texture_slots};
+    const std::span<const u32> sampler_slots{program.flat_sampler_slots};
+    // EDEN_NX2_METAL_BIND_SCRATCH: the lists keep their storage between calls (a nested call
+    // finds them taken and allocates its own).
+    const bool scratch = BindScratchEnabled();
+    ScratchList scratch_spill_table{bind_scratch.spill_table, scratch};
+    ScratchList scratch_sampler_table{bind_scratch.sampler_table, scratch};
+    ScratchList scratch_array_table{bind_scratch.array_table, scratch};
+    std::vector<u64>& spill_table = scratch_spill_table.value;
+    std::vector<u64>& sampler_table = scratch_sampler_table.value;
+    spill_table.assign(program.max_buffer_spill, 0);
+    sampler_table.assign(program.max_sampler_spill, 0);
     std::vector<u64>& array_table = scratch_array_table.value;
     array_table.assign(program.array_spill_slot != ~0U ? program.array_spill_entries : 0U, 0);
     // on_buffer=false: a texture cache view or placeholder, never a view of a buffer.
@@ -2228,76 +2448,56 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     const bool force_ssbo_write = HasGlobalWrites(info);
     size_t next_buffer = 0;
     size_t buffer_ordinal = 0;
-    for (const ShaderTranslate::ResourceSlot& slot : program.slots) {
-        for (u32 element = 0; element < slot.count; ++element) {
-            const u32 slot_index = slot.index + element;
-            switch (slot.kind) {
-            case ShaderTranslate::ResourceKind::Buffer:
-                if (slot.spill != ~0U) {
-                    // Read through the table of addresses bound after the loop.
-                    while (next_buffer < pending.size() &&
-                           pending[next_buffer].kind != Binding::Kind::Buffer) {
-                        ++next_buffer;
-                    }
-                    if (spill_table.size() <= slot.spill) {
-                        spill_table.resize(slot.spill + 1, 0);
-                    }
-                    if (next_buffer < pending.size()) {
-                        const Binding& b = pending[next_buffer++];
-                        const bool is_ssbo = buffer_ordinal++ >= num_ubos;
-                        const bool write = b.is_written || (is_ssbo && force_ssbo_write);
-                        if (is_ssbo && force_ssbo_write && !b.is_written && b.size != 0) {
-                            InvalidateConvertedIndices(b.buffer, b.offset, b.size);
-                        }
-                        spill_table[slot.spill] =
-                            scheduler.UseBuffer(metal_stage, b.buffer, b.offset, write);
-                    }
-                    break;
-                }
-                if (slot.set == ShaderTranslate::PushConstantSet) {
-                    if (info.uses_render_area) {
-                        std::array<u32, 16> words{};
-                        std::copy(rescaling_words.begin(), rescaling_words.end(), words.begin());
-                        words[12] = std::bit_cast<u32>(static_cast<f32>(render_width));
-                        words[13] = std::bit_cast<u32>(static_cast<f32>(render_height));
-                        scheduler.BindBytes(metal_stage, slot_index, words.data(),
-                                            static_cast<u32>(sizeof(words)));
-                    } else if (Shader::Backend::SPIRV::MeshFirstEnabled()) {
-                        std::array<u32, 12> words{};
-                        std::copy(rescaling_words.begin(), rescaling_words.end(), words.begin());
-                        scheduler.BindBytes(metal_stage, slot_index, words.data(),
-                                            static_cast<u32>(sizeof(words)));
-                    } else {
-                        scheduler.BindBytes(metal_stage, slot_index, rescaling_words.data(),
-                                            static_cast<u32>(sizeof(rescaling_words)));
-                    }
-                    break;
-                }
-                while (next_buffer < pending.size() &&
-                       pending[next_buffer].kind != Binding::Kind::Buffer) {
-                    ++next_buffer;
-                }
-                if (next_buffer < pending.size()) {
-                    const Binding& b = pending[next_buffer++];
-                    const bool is_ssbo = buffer_ordinal++ >= num_ubos;
-                    const bool write = b.is_written || (is_ssbo && force_ssbo_write);
-                    if (is_ssbo && force_ssbo_write && !b.is_written && b.size != 0) {
-                        InvalidateConvertedIndices(b.buffer, b.offset, b.size);
-                    }
-                    scheduler.BindBuffer(metal_stage, slot_index, b.buffer, b.offset, write);
-                }
-                break;
-            case ShaderTranslate::ResourceKind::Texture:
-                texture_slots.push_back(slot.in_array_table ? ArrayEntryFlag | (slot.spill + element)
-                                                            : slot_index);
-                break;
-            case ShaderTranslate::ResourceKind::Sampler:
-                // A spilled sampler is read from a table (an entry, flagged).
-                sampler_slots.push_back(slot.in_array_table ? ArrayEntryFlag | (slot.spill + element)
-                                        : slot.spill != ~0U ? SpilledSamplerFlag | slot.spill
-                                                            : slot_index);
-                break;
+    for (const StageProgram::FlatBufferSlot& bslot : program.flat_buffer_slots) {
+        if (bslot.spill != ~0U) {
+            // Read through the table of addresses bound after the loop.
+            while (next_buffer < pending.size() &&
+                   pending[next_buffer].kind != Binding::Kind::Buffer) {
+                ++next_buffer;
             }
+            if (next_buffer < pending.size()) {
+                const Binding& b = pending[next_buffer++];
+                const bool is_ssbo = buffer_ordinal++ >= num_ubos;
+                const bool write = b.is_written || (is_ssbo && force_ssbo_write);
+                if (is_ssbo && force_ssbo_write && !b.is_written && b.size != 0) {
+                    InvalidateConvertedIndices(b.buffer, b.offset, b.size);
+                }
+                spill_table[bslot.spill] =
+                    scheduler.UseBuffer(metal_stage, b.buffer, b.offset, write);
+            }
+            continue;
+        }
+        if (bslot.is_push_constant) {
+            if (info.uses_render_area) {
+                std::array<u32, 16> words{};
+                std::copy(rescaling_words.begin(), rescaling_words.end(), words.begin());
+                words[12] = std::bit_cast<u32>(static_cast<f32>(render_width));
+                words[13] = std::bit_cast<u32>(static_cast<f32>(render_height));
+                scheduler.BindBytes(metal_stage, bslot.slot_index, words.data(),
+                                    static_cast<u32>(sizeof(words)));
+            } else if (Shader::Backend::SPIRV::MeshFirstEnabled()) {
+                std::array<u32, 12> words{};
+                std::copy(rescaling_words.begin(), rescaling_words.end(), words.begin());
+                scheduler.BindBytes(metal_stage, bslot.slot_index, words.data(),
+                                    static_cast<u32>(sizeof(words)));
+            } else {
+                scheduler.BindBytes(metal_stage, bslot.slot_index, rescaling_words.data(),
+                                    static_cast<u32>(sizeof(rescaling_words)));
+            }
+            continue;
+        }
+        while (next_buffer < pending.size() &&
+               pending[next_buffer].kind != Binding::Kind::Buffer) {
+            ++next_buffer;
+        }
+        if (next_buffer < pending.size()) {
+            const Binding& b = pending[next_buffer++];
+            const bool is_ssbo = buffer_ordinal++ >= num_ubos;
+            const bool write = b.is_written || (is_ssbo && force_ssbo_write);
+            if (is_ssbo && force_ssbo_write && !b.is_written && b.size != 0) {
+                InvalidateConvertedIndices(b.buffer, b.offset, b.size);
+            }
+            scheduler.BindBuffer(metal_stage, bslot.slot_index, b.buffer, b.offset, write);
         }
     }
 
@@ -2397,9 +2597,6 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                     }
                 } else if ((sampler_slots[sampler] & SpilledSamplerFlag) != 0) {
                     const u32 entry = sampler_slots[sampler] & ~SpilledSamplerFlag;
-                    if (sampler_table.size() <= entry) {
-                        sampler_table.resize(entry + 1, 0);
-                    }
                     sampler_table[entry] = Scheduler::SamplerResourceId(handle);
                 } else {
                     scheduler.BindSampler(metal_stage, sampler_slots[sampler], handle);
@@ -2793,18 +2990,14 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         : native != nullptr   ? pipeline.NativeBindingKinds()
         : mesh != nullptr     ? pipeline.MeshEmulationBindingKinds()
                               : pipeline.DefaultBindingKinds();
-    ResolveStageBindings(false, true, binding_kinds, views, sampler_handles, samplers);
-    const u64 clock_before = texture_cache.BindingClock();
     texture_cache.UpdateRenderTargets(false);
-    const bool bindings_invalidated = [&]<typename TC = TextureCache>(const TC& tc) {
-        if constexpr (requires { tc.HasDeletedImages(); }) {
-            return tc.BindingClock() != clock_before || tc.HasDeletedImages();
-        } else {
-            return tc.BindingClock() != clock_before;
+    ResolveStageBindings(false, true, binding_kinds, views, sampler_handles, samplers);
+    if (maxwell3d->dirty.flags[VideoCommon::Dirty::RenderTargets]) {
+        const u64 clock_before = texture_cache.BindingClock();
+        texture_cache.UpdateRenderTargets(false);
+        if (texture_cache.BindingClock() != clock_before) {
+            ResolveStageBindings(false, true, binding_kinds, views, sampler_handles, samplers);
         }
-    }(texture_cache);
-    if (bindings_invalidated) {
-        ResolveStageBindings(false, true, binding_kinds, views, sampler_handles, samplers);
     }
     for (size_t index = 0; index < stages.size(); ++index) {
         if (!absent(index)) {
@@ -2967,7 +3160,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
         }
         buffer_cache_runtime.PendingBindings().clear();
         buffer_cache.BindHostStageBuffers(stages[index]);
-        stage_bindings[index] = buffer_cache_runtime.PendingBindings();
+        stage_bindings[index].swap(buffer_cache_runtime.PendingBindings());
         const Shader::Info& info = programs[index]->info;
         if (!info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty()) {
             texel_views[index] = PrepareTexelBuffers(stage_bindings[index], info);
@@ -3359,85 +3552,146 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                     }
                 }
             }
-            if (matched != nullptr && matched->buffer) {
+            if (matched != nullptr && index_rewrite.restart_off_only && matched->no_u16_restart) {
                 matched->last_use = ++converted_index_clock;
                 matched->last_frame = oot_frame;
-                index_rewrite.cached_buffer = matched->buffer.Get();
-                index_rewrite.cached_count = matched->converted;
-            } else if (matched != nullptr) {
-                ++matched->hits;
-                matched->last_use = ++converted_index_clock;
-                matched->last_frame = oot_frame;
-                if (gpu_indices != '0' && params.count >= 256 && record_ahead(false)) {
-                    EnsureIndexKernels();
-                    const u64 needed_bytes = u64{params.converted} * sizeof(u32);
-                    Object promoted;
-                    if (index_kernel && MakeRoomForConvertedIndexBytes(needed_bytes, matched)) {
-                        promoted = CreateBuffer(device, needed_bytes, false, nullptr);
-                    }
-                    if (promoted) {
-                        IndexConvert::RewriteParams gpu_params = params;
-                        gpu_params.source_offset += idx.offset;
-                        const bool strip = gpu_params.mode == IndexConvert::StripRestartMode;
-                        scheduler.BeginCompute(
-                            strip ? index_strip_kernel.Get() : index_kernel.Get(), true);
-                        scheduler.BindBuffer(ShaderStage::Compute, 0, idx.buffer, 0, false);
-                        scheduler.BindBuffer(ShaderStage::Compute, 1, promoted.Get(), 0, true);
-                        scheduler.BindBytes(ShaderStage::Compute, 2, &gpu_params,
-                                            static_cast<u32>(sizeof(gpu_params)));
-                        if (strip) {
-                            scheduler.Dispatch({1, 1, 1}, {IndexConvert::StripRestartThreads, 1, 1});
-                        } else {
-                            constexpr u32 GroupSize = 64;
-                            scheduler.Dispatch(
-                                {(gpu_params.converted + GroupSize - 1) / GroupSize, 1, 1},
-                                {GroupSize, 1, 1});
+                index_rewrite.skip_conversion = true;
+            } else if (index_rewrite.restart_off_only &&
+                       (matched == nullptr || matched->CachedHandle() == nullptr)) {
+                const auto& draw_state = maxwell3d->draw_manager.draw_state;
+                const GPUVAddr start =
+                    draw_state.index_buffer.StartAddress() + params.source_offset;
+                std::span<const u8> guest_span;
+                const u8* const direct =
+                    gpu_memory->IsContinuousRange(start, src_size) ? gpu_memory->GetPointer(start)
+                                                                   : nullptr;
+                if (direct != nullptr) {
+                    guest_span = std::span<const u8>{direct, static_cast<size_t>(src_size)};
+                } else {
+                    converted_source.resize(static_cast<size_t>(src_size));
+                    gpu_memory->ReadBlockUnsafe(start, converted_source.data(),
+                                                converted_source.size());
+                    guest_span = converted_source;
+                }
+                if (!IndexConvert::HasU16RestartIndex(guest_span, params.count)) {
+                    index_rewrite.skip_conversion = true;
+                    if (matched != nullptr) {
+                        matched->no_u16_restart = true;
+                        matched->last_use = ++converted_index_clock;
+                        matched->last_frame = oot_frame;
+                    } else if (index_rewrite.cacheable && src_size != 0) {
+                        if (converted_index_count >= MaxConvertedIndexEntries) {
+                            EvictConvertedIndexEntry();
                         }
-                        matched->converted = params.converted;
-                        matched->buffer_bytes = needed_bytes;
-                        matched->buffer = std::move(promoted);
-                        converted_index_bytes += needed_bytes;
-                        index_rewrite.cached_buffer = matched->buffer.Get();
-                        index_rewrite.cached_count = params.converted;
-                        ++indices_rewritten_on_gpu;
-                    } else {
+                        if (converted_index_count < MaxConvertedIndexEntries) {
+                            converted_index_cache[idx.buffer].push_back(ConvertedIndexEntry{
+                                .device_addr = index_rewrite.device_addr,
+                                .offset = src_offset,
+                                .size = src_size,
+                                .last_use = ++converted_index_clock,
+                                .last_frame = oot_frame,
+                                .mode = params.mode,
+                                .index_size = params.index_size,
+                                .restart = params.restart,
+                                .hits = 1,
+                                .no_u16_restart = true,
+                            });
+                            ++converted_index_count;
+                            converted_index_min_addr =
+                                (std::min)(converted_index_min_addr, index_rewrite.device_addr);
+                            const DAddr end = src_size > ~DAddr{0} - index_rewrite.device_addr
+                                                  ? ~DAddr{0}
+                                                  : index_rewrite.device_addr + src_size;
+                            converted_index_max_addr = (std::max)(converted_index_max_addr, end);
+                        }
+                    }
+                }
+            }
+            if (!index_rewrite.skip_conversion) {
+                if (matched != nullptr && matched->CachedHandle() != nullptr) {
+                    matched->last_use = ++converted_index_clock;
+                    matched->last_frame = oot_frame;
+                    index_rewrite.cached_buffer = matched->CachedHandle();
+                    index_rewrite.cached_offset = matched->buffer_offset;
+                    index_rewrite.cached_count = matched->converted;
+                } else if (matched != nullptr) {
+                    ++matched->hits;
+                    matched->last_use = ++converted_index_clock;
+                    matched->last_frame = oot_frame;
+                    if (gpu_indices != '0' && params.count >= 256 && record_ahead(false)) {
+                        EnsureIndexKernels();
+                        const u64 needed_bytes = u64{params.converted} * sizeof(u32);
+                        Object promoted;
+                        if (index_kernel && MakeRoomForConvertedIndexBytes(needed_bytes, matched)) {
+                            promoted = CreateBuffer(device, needed_bytes, false, nullptr);
+                        }
+                        if (promoted) {
+                            IndexConvert::RewriteParams gpu_params = params;
+                            gpu_params.source_offset += idx.offset;
+                            const bool strip = gpu_params.mode == IndexConvert::StripRestartMode;
+                            scheduler.BeginCompute(
+                                strip ? index_strip_kernel.Get() : index_kernel.Get(), true);
+                            scheduler.BindBuffer(ShaderStage::Compute, 0, idx.buffer, 0, false);
+                            scheduler.BindBuffer(ShaderStage::Compute, 1, promoted.Get(), 0, true);
+                            scheduler.BindBytes(ShaderStage::Compute, 2, &gpu_params,
+                                                static_cast<u32>(sizeof(gpu_params)));
+                            if (strip) {
+                                scheduler.Dispatch({1, 1, 1},
+                                                   {IndexConvert::StripRestartThreads, 1, 1});
+                            } else {
+                                constexpr u32 GroupSize = 64;
+                                scheduler.Dispatch(
+                                    {(gpu_params.converted + GroupSize - 1) / GroupSize, 1, 1},
+                                    {GroupSize, 1, 1});
+                            }
+                            matched->converted = params.converted;
+                            matched->buffer_bytes = needed_bytes;
+                            matched->buffer_offset = 0;
+                            matched->buffer = std::move(promoted);
+                            converted_index_bytes += needed_bytes;
+                            index_rewrite.cached_buffer = matched->buffer.Get();
+                            index_rewrite.cached_offset = 0;
+                            index_rewrite.cached_count = params.converted;
+                            ++indices_rewritten_on_gpu;
+                        } else {
+                            RewriteIndices(true);
+                        }
+                    }
+                } else {
+                    const u64 needed_bytes = u64{params.converted} * sizeof(u32);
+                    if (index_rewrite.cacheable && needed_bytes != 0 &&
+                        needed_bytes <= MaxSingleConvertedIndexBytes) {
+                        if (converted_index_count >= MaxConvertedIndexEntries) {
+                            EvictConvertedIndexEntry();
+                        }
+                        if (converted_index_count < MaxConvertedIndexEntries) {
+                            auto& entries = converted_index_cache[idx.buffer];
+                            entries.push_back(ConvertedIndexEntry{
+                                .device_addr = index_rewrite.device_addr,
+                                .offset = src_offset,
+                                .size = src_size,
+                                .buffer_bytes = 0,
+                                .last_use = ++converted_index_clock,
+                                .last_frame = oot_frame,
+                                .mode = params.mode,
+                                .index_size = params.index_size,
+                                .restart = params.restart,
+                                .converted = 0,
+                                .hits = 1,
+                            });
+                            ++converted_index_count;
+                            converted_index_min_addr =
+                                (std::min)(converted_index_min_addr, index_rewrite.device_addr);
+                            const DAddr end =
+                                src_size > ~DAddr{0} - index_rewrite.device_addr
+                                    ? ~DAddr{0}
+                                    : index_rewrite.device_addr + src_size;
+                            converted_index_max_addr = (std::max)(converted_index_max_addr, end);
+                        }
+                    }
+                    if (gpu_indices != '0' && params.count >= 256 && record_ahead(false)) {
                         RewriteIndices(true);
                     }
-                }
-            } else {
-                const u64 needed_bytes = u64{params.converted} * sizeof(u32);
-                if (index_rewrite.cacheable && needed_bytes != 0 &&
-                    needed_bytes <= MaxSingleConvertedIndexBytes) {
-                    if (converted_index_count >= MaxConvertedIndexEntries) {
-                        EvictConvertedIndexEntry();
-                    }
-                    if (converted_index_count < MaxConvertedIndexEntries) {
-                        auto& entries = converted_index_cache[idx.buffer];
-                        entries.push_back(ConvertedIndexEntry{
-                            .device_addr = index_rewrite.device_addr,
-                            .offset = src_offset,
-                            .size = src_size,
-                            .buffer_bytes = 0,
-                            .last_use = ++converted_index_clock,
-                            .last_frame = oot_frame,
-                            .mode = params.mode,
-                            .index_size = params.index_size,
-                            .restart = params.restart,
-                            .converted = 0,
-                            .hits = 1,
-                        });
-                        ++converted_index_count;
-                        converted_index_min_addr =
-                            (std::min)(converted_index_min_addr, index_rewrite.device_addr);
-                        const DAddr end =
-                            src_size > ~DAddr{0} - index_rewrite.device_addr
-                                ? ~DAddr{0}
-                                : index_rewrite.device_addr + src_size;
-                        converted_index_max_addr = (std::max)(converted_index_max_addr, end);
-                    }
-                }
-                if (gpu_indices != '0' && params.count >= 256 && record_ahead(false)) {
-                    RewriteIndices(true);
                 }
             }
         }
@@ -6428,14 +6682,18 @@ void RasterizerMetal::DispatchCompute() {
     for (const auto& desc : info.image_buffer_descriptors) {
         add_buffer(desc, true);
     }
+    const bool any_byte_image = std::ranges::any_of(
+        info.image_descriptors, [](const auto& desc) { return desc.is_byte_addressed; });
+    if (!any_byte_image) {
+        scheduler.PrepareCompute();
+    }
     const u64 dispatch_segment = scheduler.SegmentSerial();
     buffer_cache.UpdateComputeBuffers();
     buffer_cache_runtime.PendingBindings().clear();
     buffer_cache.BindHostComputeBuffers();
     ScratchList scratch_bindings{compute_scratch.bindings};
     std::vector<Binding>& bindings = scratch_bindings.value;
-    const auto& pending_bindings = buffer_cache_runtime.PendingBindings();
-    bindings.assign(pending_bindings.begin(), pending_bindings.end());
+    bindings.swap(buffer_cache_runtime.PendingBindings());
     std::vector<TextureHandle> texel_views;
     if (!info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty()) {
         texel_views = PrepareTexelBuffers(bindings, info);
@@ -7156,15 +7414,33 @@ void RasterizerMetal::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
 void RasterizerMetal::FlushAll() {}
 
 void RasterizerMetal::SubmitListCopies(u64 writer) {
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick(), writer)) {
+    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick(), writer) && !scheduler.DeferFlush()) {
         scheduler.Flush(CommitReason::ListCopy);
     }
+}
+
+bool RasterizerMetal::FlushSplitIdle(bool requested) {
+    bool submitted = false;
+    if (buffer_cache.HasPendingNx2ListCopies()) {
+        std::scoped_lock lock{buffer_cache.mutex};
+        if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick(), 0)) {
+            scheduler.RequestCommit();
+            submitted = true;
+        }
+    }
+    return scheduler.FlushDeferredFromIdle(requested) || submitted;
 }
 
 VideoCore::RasterizerInterface::GpuWrittenList RasterizerMetal::ReadGpuWrittenCommandList(
     DAddr addr, std::span<u8> out, bool past_sync) {
     if (!ListCopiesEnabled()) {
         return GpuWrittenList::Unknown;
+    }
+    if (!VideoCommon::GpuSplit::Get().Active() && buffer_cache.HasPendingNx2ListCopies()) {
+        std::scoped_lock lock{buffer_cache.mutex};
+        if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick(), 0)) {
+            scheduler.Flush(CommitReason::ListCopy);
+        }
     }
     // No cache lock: the front only reads the copies, under their own lock.
     switch (buffer_cache.Nx2ReadListCopy(addr, out, past_sync)) {
@@ -7263,6 +7539,11 @@ VideoCore::RasterizerDownloadArea RasterizerMetal::GetFlushArea(DAddr addr, u64 
         }
     }
     if (!skip_buffers && (!CachePathsEnabled() || buffer_cache.FlushesOnCpuRead())) {
+        if (fast) {
+            if (const auto fast_area = buffer_cache.TryFastGetFlushArea(addr, size)) {
+                return *fast_area;
+            }
+        }
         const u64 lock_begin = ReadStats::NowNs();
         std::scoped_lock lock{buffer_cache.mutex};
         ReadStats::Add(ReadStats::g_counters.buffer_lock_ns, ReadStats::NowNs() - lock_begin);
@@ -8157,10 +8438,12 @@ void RasterizerMetal::TickFrame() {
         buffer_cache.TickFrame();
         size_t stale_removed = 0;
         std::erase_if(converted_index_cache, [&](auto& item) {
-            stale_removed += std::erase_if(item.second, [this](const ConvertedIndexEntry& entry) {
-                const bool stale = oot_frame - entry.last_frame > 120;
+            stale_removed += std::erase_if(item.second, [this](ConvertedIndexEntry& entry) {
+                const bool promoted = entry.CachedHandle() != nullptr || entry.no_u16_restart;
+                const u64 max_age = promoted ? u64{300} : u64{8};
+                const bool stale = oot_frame - entry.last_frame > max_age;
                 if (stale) {
-                    converted_index_bytes -= entry.buffer_bytes;
+                    ReleaseConvertedIndexStorage(entry);
                 }
                 return stale;
             });
@@ -8169,6 +8452,22 @@ void RasterizerMetal::TickFrame() {
         if (stale_removed != 0) {
             converted_index_count -= stale_removed;
             RefreshConvertedIndexAddrBounds();
+        }
+        size_t active_slabs = 0;
+        for (const ConvertedIndexSlab& slab : converted_index_slabs) {
+            if (slab.buffer && slab.live_entries != 0) {
+                ++active_slabs;
+            }
+        }
+        for (ConvertedIndexSlab& slab : converted_index_slabs) {
+            if (slab.buffer && slab.live_entries == 0 && active_slabs != 0 &&
+                scheduler.IsFree(slab.last_retire_tick) &&
+                !scheduler.IsBufferActiveInOpenCommands(slab.buffer.Get())) {
+                slab.buffer = {};
+                slab.mapped = nullptr;
+                slab.write_offset = 0;
+                converted_index_bytes -= ConvertedIndexSlabBytes;
+            }
         }
     }
     staging_pool.TickFrame();

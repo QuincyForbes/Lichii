@@ -1008,6 +1008,28 @@ static void FoldZeroExtendXToLong(IR::Inst& inst) {
     inst.ReplaceUsesWith(IR::Value{value});
 }
 
+// Scalar A64 register writes widen their result to Q. A subsequent read of
+// lane zero at the same width can use the scalar producer directly.
+static void FoldScalarLaneRead(IR::Inst& inst) {
+    const auto vec = inst.GetArg(0);
+    if (!inst.GetArg(1).IsZero() || vec.IsImmediate()) {
+        return;
+    }
+    const auto* quad = vec.GetInstRecursive();
+    if (quad->GetOpcode() != Op::ZeroExtendLongToQuad) {
+        return;
+    }
+    const auto lo = quad->GetArg(0);
+    if (inst.GetOpcode() == Op::VectorGetElement64) {
+        inst.ReplaceUsesWith(lo);
+    } else if (!lo.IsImmediate()) {
+        const auto* wide = lo.GetInstRecursive();
+        if (wide->GetOpcode() == Op::ZeroExtendWordToLong) {
+            inst.ReplaceUsesWith(wide->GetArg(0));
+        }
+    }
+}
+
 static void ConstantPropagation(IR::Block& block) {
     for (auto& inst : block.instructions) {
         auto const opcode = inst.GetOpcode();
@@ -1017,6 +1039,10 @@ static void ConstantPropagation(IR::Block& block) {
         if (IR::MayGetNZCVFromOp(opcode) && inst.GetAssociatedPseudoOperation(IR::Opcode::GetNZCVFromOp))
             continue;
         switch (opcode) {
+        case Op::VectorGetElement32:
+        case Op::VectorGetElement64:
+            FoldScalarLaneRead(inst);
+            break;
         case Op::LeastSignificantWord:
             FoldLeastSignificantWord(inst);
             break;

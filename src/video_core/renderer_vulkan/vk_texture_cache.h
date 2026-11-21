@@ -745,6 +745,11 @@ public:
     /// gets memory of its own, all cleared (the caller loads the data again). False on failure.
     bool BackTilesWhole();
 
+    /// SparseTiles images sharing a zeroed block: every block with memory of its own goes back to
+    /// the zeroed block and the image is cleared, as if it had just been created. False when the
+    /// image has no zeroed block (the caller re-creates it).
+    bool ResetTiles();
+
     /// Device memory BindLayers has bound to the image's layers (an unbacked image has no other).
     u64 SparseBoundBytes() const noexcept {
         return sparse_layers.bound_bytes;
@@ -755,6 +760,11 @@ public:
     bool ScaleUp(bool ignore = false);
 
     bool ScaleDown(bool ignore = false);
+
+    void NoteInitialTransition(u64 tick, u64 records) noexcept {
+        initial_upload_tick = tick;
+        initial_upload_records = records;
+    }
 
     u64 allocation_tick;
 
@@ -795,6 +805,8 @@ private:
             other.level_tiles.clear();
             tail_level = other.tail_level;
             zero_block = std::exchange(other.zero_block, VK_NULL_HANDLE);
+            zero_memory = other.zero_memory;
+            zero_offset = other.zero_offset;
             tail_memory = std::exchange(other.tail_memory, VK_NULL_HANDLE);
             layer_tails = std::move(other.layer_tails);
             other.layer_tails.clear();
@@ -824,6 +836,8 @@ private:
             allocator->FreeSparseMemory(tail_memory);
             allocator->FreeSparseMemory(zero_block);
             zero_block = VK_NULL_HANDLE;
+            zero_memory = VK_NULL_HANDLE;
+            zero_offset = 0;
             layer_memory.clear();
             level_tiles.clear();
             tail_memory = VK_NULL_HANDLE;
@@ -845,6 +859,8 @@ private:
         /// SparseTiles: the zeroed block every block without memory of its own is bound to, where
         /// the driver can't sample unbound memory
         VmaAllocation zero_block{};
+        VkDeviceMemory zero_memory{}; ///< zero_block's memory and offset, for ResetTiles
+        VkDeviceSize zero_offset{};
         VmaAllocation tail_memory{};             ///< The mip tail all layers share, if one
         std::vector<VmaAllocation> layer_tails;   ///< SparseTiles with separate mip tails
         VkDeviceSize bound_bytes{};
@@ -886,6 +902,8 @@ private:
     std::vector<vk::ImageView> storage_image_views;
     std::vector<vk::ImageView> storage_layer_views; ///< By host level * layers + layer
     VkImageAspectFlags aspect_mask = 0;
+    u64 initial_upload_tick = 0;
+    u64 initial_upload_records = ~u64{0};
     bool initialized = false;
 
     std::optional<Framebuffer> scale_framebuffer;

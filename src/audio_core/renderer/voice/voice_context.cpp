@@ -37,6 +37,7 @@ void VoiceContext::Initialize(std::span<VoiceInfo*> sorted_voice_infos_,
     dsp_states = dsp_states_;
     voice_count = voice_count_;
     active_count = 0;
+    sorted_count = 0;
 }
 
 VoiceInfo* VoiceContext::GetSortedInfo(const u32 index) {
@@ -73,11 +74,15 @@ void VoiceContext::SetActiveCount(const u32 active_count_) {
 }
 
 void VoiceContext::SortInfo() {
+    u32 count = 0;
     for (u32 i = 0; i < voice_count; i++) {
-        sorted_voice_info[i] = &voices[i];
+        if (!voices[i].ShouldSkip()) {
+            sorted_voice_info[count++] = &voices[i];
+        }
     }
+    sorted_count = count;
 
-    std::ranges::sort(sorted_voice_info, [](const VoiceInfo* a, const VoiceInfo* b) {
+    std::ranges::sort(sorted_voice_info.first(count), [](const VoiceInfo* a, const VoiceInfo* b) {
         return a->priority != b->priority ? a->priority > b->priority
                                           : a->sort_order > b->sort_order;
     });

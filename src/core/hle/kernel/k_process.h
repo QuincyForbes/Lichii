@@ -118,7 +118,7 @@ private:
     size_t m_main_thread_stack_size{};
     size_t m_max_process_memory{};
     size_t m_memory_release_hint{};
-    s64 m_schedule_count{};
+    std::atomic<s64> m_schedule_count{};
     u64 m_program_id{};
     u64 m_process_id{};
 
@@ -405,10 +405,10 @@ public:
     }
 
     s64 GetScheduledCount() const {
-        return m_schedule_count;
+        return m_schedule_count.load(std::memory_order_acquire);
     }
     void IncrementScheduledCount() {
-        ++m_schedule_count;
+        m_schedule_count.fetch_add(1, std::memory_order_acq_rel);
     }
 
     void IncrementRunningThreadCount(KernelCore& kernel);

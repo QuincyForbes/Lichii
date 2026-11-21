@@ -1026,6 +1026,9 @@ jstring Java_org_yuzu_yuzu_1emu_NativeLibrary_getCpuBackend(JNIEnv* env, jclass 
     if (Settings::IsNceEnabled()) {
         return Common::Android::ToJString(env, "NCE");
     }
+    if (Settings::IsCachedInterpreterEnabled()) {
+        return Common::Android::ToJString(env, "Cached");
+    }
 
     return Common::Android::ToJString(env, "JIT");
 }

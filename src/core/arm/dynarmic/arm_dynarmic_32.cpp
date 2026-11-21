@@ -211,6 +211,7 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
     config.code_cache_evict_slice = JitEvictSliceBytes();
     config.fastmem_shared_markers = fault_policy.shared_markers;
     config.fastmem_block_after_faults = fault_policy.block_after_faults;
+    config.fastmem_load_fault_limit = fault_policy.load_fault_limit;
 
     // Allow memory fault handling to work
     if (m_system.DebuggerEnabled()) {

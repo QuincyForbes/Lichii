@@ -36,6 +36,17 @@ namespace {
     Choice{&Settings::EnumMetadata<Settings::ENUM>::Index, static_cast<u32>(Settings::ENUM::VALUE),  \
            #VALUE, LABEL, SHOWN}
 
+#ifdef HAS_NCE
+constexpr u8 NceShown = Linux | Android;
+#else
+constexpr u8 NceShown = Nowhere;
+#endif
+#ifdef HAS_HYPERVISOR
+constexpr u8 HypervisorShown = MacOS;
+#else
+constexpr u8 HypervisorShown = Nowhere;
+#endif
+
 // clang-format off
 const Setting kSettings[] = {
     {"cabinet_applet_mode",
@@ -188,9 +199,14 @@ const Setting kSettings[] = {
      Desktop | IOS},
     {"cpu_backend",
      QT_TRANSLATE_NOOP("ConfigurationShared", "CPU Backend"),
-     nullptr,
-     Desktop,
-     QT_TRANSLATE_NOOP("ConfigurationShared", "iOS runs games with the Dynarmic JIT only.")},
+     QT_TRANSLATE_NOOP("ConfigurationShared", "How guest ARM instructions run.\n"
+                                              "{choice:cpu_backend.Dynarmic}: translates guest code to "
+                                              "native host instructions at runtime (requires JIT).\n"
+                                              "{choice:cpu_backend.CachedInterpreter}: decodes and "
+                                              "fuses guest blocks into ordinary data memory, so games "
+                                              "can start without JIT or executable-memory entitlements "
+                                              "(experimental 64-bit coverage, slower than JIT)."),
+     Desktop | IOS},
     {"fast_cpu_time",
      QT_TRANSLATE_NOOP("ConfigurationShared", "CPU Clocks"),
      QT_TRANSLATE_NOOP("ConfigurationShared", "Raises the clock the emulated CPU reports, which "
@@ -430,6 +446,11 @@ const Setting kSettings[] = {
      QT_TRANSLATE_NOOP("ConfigurationShared", "Graphics Preset"),
      QT_TRANSLATE_NOOP("ConfigurationShared", "Shadows, reflections and effects as the game sets them "
                                               "in its own parameter files. "
+                                              "{choice:oot_graphics_preset.UltraLow}: cuts grass "
+                                              "density to a third, disables moss, secondary undergrowth "
+                                              "and grass shadows, turns off bloom, depth of field and "
+                                              "the sharpening network, and pairs with 40% resolution "
+                                              "and Quarter textures for maximum FPS. "
                                               "{choice:oot_graphics_preset.PhoneLow}: a small "
                                               "reflection probe, no bloom or depth of field, one small "
                                               "sun shadow, thinner grass, 50% resolution and Quarter "
@@ -1702,7 +1723,9 @@ const Choice kChoices[] = {
     CHOICE(CpuAccuracy, Paranoid, QT_TRANSLATE_NOOP("ConfigurationShared", "Paranoid")),
     CHOICE(CpuAccuracy, Debugging, QT_TRANSLATE_NOOP("ConfigurationShared", "Debugging")),
     CHOICE(CpuBackend, Dynarmic, QT_TRANSLATE_NOOP("ConfigurationShared", "Dynarmic")),
-    CHOICE(CpuBackend, Nce, QT_TRANSLATE_NOOP("ConfigurationShared", "NCE")),
+    CHOICE_ON(CpuBackend, Nce, QT_TRANSLATE_NOOP("ConfigurationShared", "NCE"), NceShown),
+    CHOICE_ON(CpuBackend, Hypervisor, QT_TRANSLATE_NOOP("ConfigurationShared", "Hypervisor"), HypervisorShown),
+    CHOICE(CpuBackend, CachedInterpreter, QT_TRANSLATE_NOOP("ConfigurationShared", "Cached Interpreter")),
     CHOICE(FullscreenMode, Borderless, QT_TRANSLATE_NOOP("ConfigurationShared", "Borderless Window")),
     CHOICE(FullscreenMode, Exclusive, QT_TRANSLATE_NOOP("ConfigurationShared", "Exclusive Fullscreen")),
     CHOICE(NvdecEmulation, Off, QT_TRANSLATE_NOOP("ConfigurationShared", "Off")),
@@ -1787,6 +1810,7 @@ const Choice kChoices[] = {
     CHOICE(OotResolution, Percent150, QT_TRANSLATE_NOOP("ConfigurationShared", "150%")),
     CHOICE(OotResolution, Percent200, QT_TRANSLATE_NOOP("ConfigurationShared", "200%")),
     CHOICE(OotResolution, Percent300, QT_TRANSLATE_NOOP("ConfigurationShared", "300%")),
+    CHOICE(OotGraphicsPreset, UltraLow, QT_TRANSLATE_NOOP("ConfigurationShared", "Ultra Low")),
     CHOICE(OotGraphicsPreset, PhoneLow, QT_TRANSLATE_NOOP("ConfigurationShared", "Phone Low")),
     CHOICE(OotGraphicsPreset, PhoneMedium, QT_TRANSLATE_NOOP("ConfigurationShared", "Phone Medium")),
     CHOICE(OotGraphicsPreset, Console, QT_TRANSLATE_NOOP("ConfigurationShared", "Console")),

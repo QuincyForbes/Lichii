@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <boost/container/flat_map.hpp>
+#include <boost/container/small_vector.hpp>
 #include "common/common_types.h"
 
 #include "dynarmic/backend/arm64/fastmem.h"
@@ -99,6 +100,11 @@ enum class LinkTarget {
     PageTableLookup32,
     PageTableLookup64,
     PageTableLookup128,
+    PageTableReadLookup8,
+    PageTableReadLookup16,
+    PageTableReadLookup32,
+    PageTableReadLookup64,
+    PageTableReadLookup128,
 };
 
 struct Relocation {
@@ -116,13 +122,86 @@ struct BlockRelocation {
     BlockRelocationType type;
 };
 
+enum class CheckBitKind : u8 {
+    Stack,
+    RegZero32,
+    RegZero64,
+    TestBit,
+    RegBit,
+    ConstTrue,
+    ConstFalse,
+};
+
 struct EmittedBlockInfo {
+    struct ScalarGetQInfo {
+        const IR::Inst* get_q = nullptr;
+        u8 elem_bits = 0;
+        u8 lane = 0;
+    };
+    struct FoldedOffsetInfo {
+        const IR::Inst* off_inst = nullptr;
+        const IR::Inst* base_inst = nullptr;
+        s64 disp = 0;
+    };
+    struct FoldedAccessInfo {
+        const IR::Inst* mem_inst = nullptr;
+        const IR::Inst* base_inst = nullptr;
+        s64 disp = 0;
+    };
+    struct BaseCountInfo {
+        const IR::Inst* base_inst = nullptr;
+        std::size_t count = 0;
+    };
+
     CodePtr entry_point;
     std::size_t size;
     std::vector<Relocation> relocations;
     boost::container::flat_map<IR::LocationDescriptor, std::vector<BlockRelocation>> block_relocations;
     boost::container::flat_map<std::ptrdiff_t, FastmemPatchInfo> fastmem_patch_info;
     const void* nzcv_live_pos = nullptr;
+
+    const IR::Inst* terminal_set_check_bit = nullptr;
+    const IR::Inst* fused_check_bit_src = nullptr;
+    CheckBitKind check_bit_kind = CheckBitKind::Stack;
+    u8 check_bit_num = 0;
+
+    boost::container::small_vector<ScalarGetQInfo, 8> scalar_get_q;
+    boost::container::small_vector<FoldedOffsetInfo, 16> folded_offsets;
+    boost::container::small_vector<FoldedAccessInfo, 16> folded_accesses;
+    boost::container::small_vector<BaseCountInfo, 8> fastmem_base_counts;
+
+    const ScalarGetQInfo* FindScalarGetQ(const IR::Inst* inst) const noexcept {
+        for (const auto& item : scalar_get_q) {
+            if (item.get_q == inst) {
+                return &item;
+            }
+        }
+        return nullptr;
+    }
+    bool IsFoldedOffset(const IR::Inst* inst) const noexcept {
+        for (const auto& item : folded_offsets) {
+            if (item.off_inst == inst) {
+                return true;
+            }
+        }
+        return false;
+    }
+    const FoldedAccessInfo* FindFoldedAccess(const IR::Inst* inst) const noexcept {
+        for (const auto& item : folded_accesses) {
+            if (item.mem_inst == inst) {
+                return &item;
+            }
+        }
+        return nullptr;
+    }
+    std::size_t BaseAccessCount(const IR::Inst* base_inst) const noexcept {
+        for (const auto& item : fastmem_base_counts) {
+            if (item.base_inst == base_inst) {
+                return item.count;
+            }
+        }
+        return 0;
+    }
 };
 
 struct EmitConfig {
@@ -148,6 +227,7 @@ struct EmitConfig {
     std::size_t page_table_log2_stride;
     std::optional<std::uint8_t> page_table_marked_bit;
     std::optional<std::uint8_t> page_table_sign_extension;
+    u64 untrapped_read_bitmap_ptr = 0;
     bool silently_mirror_page_table;
     bool absolute_offset_page_table;
     u8 detect_misaligned_access_via_page_table;
@@ -203,6 +283,11 @@ struct EmitConfig {
 
 EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const EmitConfig& emit_conf, FastmemManager& fastmem_manager);
 bool ReuseHostFlagsOn() noexcept;
+bool ElideRedundantZextOn() noexcept;
+bool FoldAddressOffsetsOn() noexcept;
+bool FprScalarForwardingOn() noexcept;
+bool IsZeroExtendedU32Producer(const IR::Inst* inst) noexcept;
+bool CanEncodeMemDisp(std::size_t bitsize, s64 disp) noexcept;
 
 template<IR::Opcode op>
 void EmitIR(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst);

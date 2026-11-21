@@ -322,6 +322,15 @@ void StagingBufferPool::TickFrame() {
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);
     ReleaseCache(MemoryUsage::Download);
+
+    // Ported from Djihads80/Eglantine#910: reclaim finished >= 4 MiB staging allocations promptly
+    // instead of leaving levels above LARGE_BUFFER_LOG2 unvisited.
+    static constexpr size_t LargeLevelEnd = (std::min)(size_t{34}, NUM_LEVELS);
+    for (size_t log2 = LARGE_BUFFER_LOG2; log2 < LargeLevelEnd; ++log2) {
+        ReleaseLevel(device_local_cache, log2);
+        ReleaseLevel(upload_cache, log2);
+        ReleaseLevel(download_cache, log2);
+    }
 }
 
 void StagingBufferPool::ReleaseIdleBuffers() {
@@ -448,13 +457,45 @@ bool StagingBufferPool::BoundUploads() {
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
-    // Checked before wrapping: wrapping first marked the start free (free_iterator = size), so the
-    // next request was handed the start of the ring while the GPU could still read it.
-    if (iterator + size >= stream_buffer_size && AreRegionsActive(0, Region(size) + 1)) {
-        return GetStagingBuffer(size, MemoryUsage::Upload);
+    if (iterator + size < stream_buffer_size && iterator + size <= free_iterator) {
+        const size_t offset = iterator;
+        iterator = Common::AlignUp(iterator + size, MAX_ALIGNMENT);
+        return StagingBufferRef{
+            .buffer = *stream_buffer,
+            .device_address = stream_buffer_address,
+            .offset = static_cast<VkDeviceSize>(offset),
+            .mapped_span = stream_pointer.subspan(offset, size),
+            .usage{},
+            .log2_level{},
+            .index{},
+        };
     }
-    if (AreRegionsActive(Region(free_iterator) + 1,
-                         (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
+    if (iterator + size >= stream_buffer_size) {
+        const size_t wrap_regions =
+            (std::min)(size == 0 ? size_t{1} : Region(size - 1) + 1, NUM_SYNCS);
+        if (AreRegionsActive(0, wrap_regions)) {
+            return GetStagingBuffer(size, MemoryUsage::Upload);
+        }
+        const u64 current_tick = scheduler.CurrentTick();
+        std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + NUM_SYNCS,
+                  current_tick);
+        used_iterator = 0;
+        free_iterator = wrap_regions * region_size;
+        iterator = Common::AlignUp(size, MAX_ALIGNMENT);
+        return StagingBufferRef{
+            .buffer = *stream_buffer,
+            .device_address = stream_buffer_address,
+            .offset = 0,
+            .mapped_span = stream_pointer.subspan(0, size),
+            .usage{},
+            .log2_level{},
+            .index{},
+        };
+    }
+    const size_t verified_regions = free_iterator / region_size;
+    const size_t needed_regions =
+        (std::min)(size == 0 ? Region(iterator) + 1 : Region(iterator + size - 1) + 1, NUM_SYNCS);
+    if (AreRegionsActive(verified_regions, needed_regions)) {
         // Avoid waiting for the previous usages to be free
         return GetStagingBuffer(size, MemoryUsage::Upload);
     }
@@ -462,15 +503,7 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
     std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + Region(iterator),
               current_tick);
     used_iterator = iterator;
-    free_iterator = (std::max)(free_iterator, iterator + size);
-
-    if (iterator + size >= stream_buffer_size) {
-        std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + NUM_SYNCS,
-                  current_tick);
-        used_iterator = 0;
-        iterator = 0;
-        free_iterator = size;
-    }
+    free_iterator = needed_regions * region_size;
     const size_t offset = iterator;
     iterator = Common::AlignUp(iterator + size, MAX_ALIGNMENT);
     return StagingBufferRef{
@@ -485,6 +518,9 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
 }
 
 bool StagingBufferPool::AreRegionsActive(size_t region_begin, size_t region_end) const {
+    if (region_begin >= region_end) {
+        return false;
+    }
     u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
     const auto has_active = [&](u64 tick) {
         return std::any_of(sync_ticks.begin() + region_begin, sync_ticks.begin() + region_end,
@@ -675,8 +711,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
                     buffer_ci.size >> 20, e.what(), freed);
         buffer = memory_allocator.CreateBuffer(buffer_ci, alloc_usage);
     }
-    if (usage != MemoryUsage::DeviceLocal && buffer.Mapped().empty() &&
-        alloc_usage != usage) [[unlikely]] {
+    if (usage != MemoryUsage::DeviceLocal && buffer.Mapped().empty() && alloc_usage != usage) {
         // The rebar (Stream) memory came back without a host mapping: staging is written by the
         // CPU, so take plain host memory instead.
         static std::atomic<u32> logged{};

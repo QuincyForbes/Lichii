@@ -9,6 +9,9 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "core/hle/kernel/k_condition_variable.h"
@@ -59,7 +62,22 @@ public:
         }
     }
 
+public:
+    static constexpr size_t NumWaiterStripes = 64;
+
+    static constexpr size_t WaiterStripeIndex(uint64_t addr) {
+        return static_cast<size_t>(((addr >> 2) ^ (addr >> 10)) & (NumWaiterStripes - 1));
+    }
+
+    void NoteWaiterRemoved(uint64_t addr) {
+        m_waiter_stripes[WaiterStripeIndex(addr)].fetch_sub(1, std::memory_order_relaxed);
+    }
+
 private:
+    std::atomic<u32>& WaiterStripe(uint64_t addr) {
+        return m_waiter_stripes[WaiterStripeIndex(addr)];
+    }
+
     Result Signal(uint64_t addr, s32 count);
     Result SignalAndIncrementIfEqual(uint64_t addr, s32 value, s32 count);
     Result SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32 value, s32 count);
@@ -68,6 +86,7 @@ private:
 
 private:
     ThreadTree m_tree;
+    std::array<std::atomic<u32>, NumWaiterStripes> m_waiter_stripes{};
     Core::System& system;
 };
 

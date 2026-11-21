@@ -208,6 +208,8 @@ namespace Kernel {
 
         // We haven't been scheduled, and we have done no light IPC.
         m_schedule_count = -1;
+        m_yield_core_id = -1;
+        m_yield_core_seq = 0;
         m_last_scheduled_tick = 0;
         m_light_ipc_data = nullptr;
 

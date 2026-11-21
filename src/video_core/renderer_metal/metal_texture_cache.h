@@ -212,6 +212,8 @@ public:
 private:
     void ZeroTexture(TextureHandle tex, const TextureDesc& tex_desc,
                      VideoCore::Surface::PixelFormat guest_format);
+    Object pool_zero_buffer;
+    u64 pool_zero_size{};
     void NoteTemporalLodBias(std::array<u32, 2> render_size,
                              std::array<u32, 2> output_size) noexcept;
     static bool TemporalStandInEnabled();

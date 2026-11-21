@@ -85,6 +85,14 @@ enum class Opt : unsigned {
     /// Native graphics SPIR-V emitted by the pipeline worker, not the back
     AsyncPipelines,
     UnswizzleWorkers,
+    /// Vulkan: bounded 250 us fence flush coalescing while >= 2 GPU submissions are in flight
+    VkFenceBatch,
+    /// Vulkan: lazy before-pass command buffer allocation and adaptive per-target splitting
+    BeforePassAdaptive,
+    /// Vulkan: elide barriers between consecutive compute dispatches with disjoint read/write sets
+    ComputeBarrierElide,
+    /// Vulkan: reuse unchanged graphics draw descriptors/offsets and patch clean pipeline keys
+    VkDrawStateReuse,
     Count,
 };
 
@@ -100,6 +108,7 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Opt::Count)> o
     "geometry_consistency",
     "split_overlap", "frames_ahead", "async_pipelines",
     "unswizzle_workers",
+    "vk_fence_batch", "before_pass_adaptive", "compute_barrier_elide", "vk_draw_state_reuse",
 };
 
 static_assert(static_cast<size_t>(Opt::Count) <= 64, "the off-mask is 64 bits");
@@ -132,7 +141,8 @@ inline constexpr u64 DefaultOffMask() {
                           Opt::DownloadBatch, Opt::PipelineFastCache, Opt::DrawPreamble,
                           Opt::BindMemo, Opt::SubmitWhileWaited, Opt::DmaForward,
                           Opt::BankOncePerFrame, Opt::DrawBeginCoalesce, Opt::PendingWake,
-                          Opt::DiagDrawLite}) {
+                          Opt::DiagDrawLite, Opt::VkFenceBatch, Opt::BeforePassAdaptive,
+                          Opt::ComputeBarrierElide, Opt::VkDrawStateReuse}) {
         mask |= Bit(opt);
     }
     return mask;

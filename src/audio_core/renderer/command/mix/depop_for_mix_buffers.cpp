@@ -22,18 +22,25 @@ namespace AudioCore::Renderer {
 static s32 ApplyDepopMix(std::span<s32> output, const s32 depop_sample,
                          Common::FixedPoint<49, 15>& decay_, const u32 sample_count) {
     auto sample{std::abs(depop_sample)};
-    auto decay{decay_.to_raw()};
+    const auto decay{decay_.to_raw()};
+    s32* __restrict out = output.data();
 
     if (depop_sample <= 0) {
         for (u32 i = 0; i < sample_count; i++) {
             sample = static_cast<s32>((static_cast<s64>(sample) * decay) >> 15);
-            output[i] -= sample;
+            if (sample == 0) {
+                break;
+            }
+            out[i] -= sample;
         }
         return -sample;
     } else {
         for (u32 i = 0; i < sample_count; i++) {
             sample = static_cast<s32>((static_cast<s64>(sample) * decay) >> 15);
-            output[i] += sample;
+            if (sample == 0) {
+                break;
+            }
+            out[i] += sample;
         }
         return sample;
     }
