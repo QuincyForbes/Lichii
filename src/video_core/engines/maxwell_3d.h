@@ -3286,6 +3286,8 @@ public:
     /// GpuSplit's back (fast_maxwell3d): processes a contiguous run of non-executable state
     /// register writes from the SPSC ring in one loop.
     size_t CallStateMethodRun(const u64* entry, size_t max_words);
+    /// A compact ring block of consecutive state registers.
+    void CallStateMethodBlock(u32 method, const u32* arguments, u32 count);
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
@@ -3293,7 +3295,8 @@ public:
     void FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
-                              const u32* base_start, u32 amount, u32 methods_pending);
+                              const u32* base_start, u32 amount, u32 methods_pending,
+                              bool allow_borrow = true);
     /// Split front, before an entry holding the remaining 5 parameters (at `record`) of the
     /// pending macro call: true when that macro is DrawIndexedIndirect with a topology the host
     /// draws indirectly. The host GPU then reads the record itself (the words may still be
@@ -3581,6 +3584,8 @@ private:
     /// the back proved its exact programs write no memory, Gpu otherwise.
     VideoCommon::SplitWriteTracker::Effect FrontDrawEffect(VideoCommon::GpuSplit& split,
                                                            FrontState& state);
+    VideoCommon::SplitWriteTracker::Effect ComputeFrontDrawEffect(VideoCommon::GpuSplit& split,
+                                                                  FrontState& state);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     /// What a native macro does with two parameters, found by running its code in a sandbox

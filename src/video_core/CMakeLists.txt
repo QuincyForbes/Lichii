@@ -143,6 +143,7 @@ add_library(video_core STATIC
     nx2_profile.h
     nx2_qmd_prediction.cpp
     nx2_qmd_prediction.h
+    nx2_front_options.h
     nx2_perf.h
     nx2_download_trace.h
     pending_maps.h

@@ -21,7 +21,7 @@ namespace Metal::Condition {
 /// the CPU.
 constexpr u32 MaxSlots = 16;
 /// Draws one region's kernel takes; the next draw starts a new region.
-constexpr u32 RegionDraws = 256;
+constexpr u32 RegionDraws = 64;
 /// Words of a region before the first draw's arguments (the first holds the draw count).
 constexpr u32 HeaderWords = 4;
 /// Words per draw's arguments (MTLDrawIndexedPrimitivesIndirectArguments; the instance count is

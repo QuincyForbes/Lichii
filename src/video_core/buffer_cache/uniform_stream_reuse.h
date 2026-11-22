@@ -13,6 +13,8 @@
 #include <type_traits>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
 #endif
 
 #include "common/common_types.h"
@@ -225,6 +227,31 @@ inline void ResetUniformStreamReuse() noexcept {
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(copy_bytes + off)),
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(guest + off)));
         if (!_mm256_testz_si256(d, d)) {
+            return false;
+        }
+    }
+    return size == off || std::memcmp(copy_bytes + off, guest + off, size - off) == 0;
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    size_t off = 0;
+    for (; off + 128 <= size; off += 128) {
+        const uint8x16_t d0 = veorq_u8(vld1q_u8(copy_bytes + off), vld1q_u8(guest + off));
+        const uint8x16_t d1 = veorq_u8(vld1q_u8(copy_bytes + off + 16), vld1q_u8(guest + off + 16));
+        const uint8x16_t d2 = veorq_u8(vld1q_u8(copy_bytes + off + 32), vld1q_u8(guest + off + 32));
+        const uint8x16_t d3 = veorq_u8(vld1q_u8(copy_bytes + off + 48), vld1q_u8(guest + off + 48));
+        const uint8x16_t d4 = veorq_u8(vld1q_u8(copy_bytes + off + 64), vld1q_u8(guest + off + 64));
+        const uint8x16_t d5 = veorq_u8(vld1q_u8(copy_bytes + off + 80), vld1q_u8(guest + off + 80));
+        const uint8x16_t d6 = veorq_u8(vld1q_u8(copy_bytes + off + 96), vld1q_u8(guest + off + 96));
+        const uint8x16_t d7 = veorq_u8(vld1q_u8(copy_bytes + off + 112), vld1q_u8(guest + off + 112));
+        const uint8x16_t a0 = vorrq_u8(vorrq_u8(d0, d1), vorrq_u8(d2, d3));
+        const uint8x16_t a1 = vorrq_u8(vorrq_u8(d4, d5), vorrq_u8(d6, d7));
+        if (vmaxvq_u32(vreinterpretq_u32_u8(vorrq_u8(a0, a1))) != 0) {
+            return false;
+        }
+    }
+    for (; off + 32 <= size; off += 32) {
+        const uint8x16_t d0 = veorq_u8(vld1q_u8(copy_bytes + off), vld1q_u8(guest + off));
+        const uint8x16_t d1 = veorq_u8(vld1q_u8(copy_bytes + off + 16), vld1q_u8(guest + off + 16));
+        if (vmaxvq_u32(vreinterpretq_u32_u8(vorrq_u8(d0, d1))) != 0) {
             return false;
         }
     }

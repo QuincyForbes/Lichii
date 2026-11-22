@@ -5461,7 +5461,10 @@ bool RasterizerVulkan::AccelerateConditionalRendering() {
         regs.render_enable_override == Maxwell::RenderEnable::Override::UseRenderEnable &&
         regs.render_enable.mode != Maxwell::RenderEnable::Mode::False &&
         regs.render_enable.mode != Maxwell::RenderEnable::Mode::True;
-    if (reads_memory) {
+    if (reads_memory &&
+        (device.IsExtConditionalRendering() ||
+         gpu_memory->IsMemoryDirty(regs.render_enable.Address(), 24,
+                                   VideoCommon::CacheType::BufferCache))) {
         gpu_memory->FlushCaching();
     }
     return query_cache.AccelerateHostConditionalRendering();

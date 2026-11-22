@@ -253,7 +253,17 @@ TEST_CASE("Ocarina graphics presets set their companions", "[file_sys]") {
     const auto medium = Settings::OotGraphicsPresetCompanions(OotGraphicsPreset::PhoneMedium);
     CHECK(medium.resolution == Settings::OotResolution::Percent56);
     CHECK(medium.textures == Settings::TextureQuality::Half);
+    CHECK_FALSE(Settings::OotGraphicsPresetCompanions(OotGraphicsPreset::Balanced).resolution);
+    CHECK_FALSE(Settings::OotGraphicsPresetCompanions(OotGraphicsPreset::Balanced).textures);
     CHECK_FALSE(Settings::OotGraphicsPresetCompanions(OotGraphicsPreset::Console).resolution);
     CHECK_FALSE(Settings::OotGraphicsPresetCompanions(OotGraphicsPreset::High).textures);
     CHECK(FileSys::OotGameParamsFor(0x0100000000010000).edits.empty());
+
+    const auto prev = Settings::values.oot_graphics_preset.GetValue();
+    Settings::values.oot_graphics_preset.SetValue(OotGraphicsPreset::Balanced);
+    const auto balanced = FileSys::OotGameParamsFor(0x0400486024DEC000);
+    Settings::values.oot_graphics_preset.SetValue(prev);
+    CHECK(balanced.preset == "Balanced");
+    CHECK(balanced.foliage == 0);
+    CHECK(balanced.edits.size() == 4);
 }

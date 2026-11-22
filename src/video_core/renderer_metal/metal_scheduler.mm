@@ -5933,7 +5933,9 @@ bool Scheduler::Blit(const BlitPass& blit) {
         }
         [encoder setRenderPipelineState:pipeline];
         if (depth) {
-            [encoder setDepthStencilState:impl->DepthWriteAlways()];
+            [encoder setDepthStencilState:format_class == FormatClass::DepthStencil
+                                              ? impl->DepthWriteAlways()
+                                              : impl->ClearDepthState(true, false, 0)];
             [encoder setFragmentTexture:src_stencil atIndex:1];
         }
         [encoder setViewport:MTLViewport{static_cast<f64>(x), static_cast<f64>(y),
@@ -6173,7 +6175,8 @@ bool Scheduler::DepthFromBuffer(BufferHandle src, u64 offset, u32 bytes_per_row,
             return false;
         }
         [encoder setRenderPipelineState:it->second];
-        [encoder setDepthStencilState:state.DepthWriteAlways()];
+        [encoder setDepthStencilState:stencil ? state.DepthWriteAlways()
+                                              : state.ClearDepthState(true, false, 0)];
         [encoder setViewport:MTLViewport{static_cast<f64>(x), static_cast<f64>(y),
                                          static_cast<f64>(w), static_cast<f64>(h), 0.0, 1.0}];
         [encoder setScissorRect:MTLScissorRect{x, y, w, h}];
@@ -6463,7 +6466,7 @@ bool Scheduler::ScaleNearest(const ScalePass& scale) {
         if (format_class == FormatClass::Depth) {
             [encoder setDepthStencilState:impl->ClearDepthState(true, false, 0)];
         } else if (format_class == FormatClass::Stencil) {
-            [encoder setDepthStencilState:impl->DepthWriteAlways()];
+            [encoder setDepthStencilState:impl->ClearDepthState(false, true, 0xFF)];
         }
         [encoder setViewport:MTLViewport{0.0, 0.0, static_cast<f64>(width),
                                          static_cast<f64>(height), 0.0, 1.0}];

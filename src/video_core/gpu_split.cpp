@@ -1200,6 +1200,33 @@ void GpuSplit::VerifyRepeat(u64 head) {
     verify_previous = word;
 }
 
+bool GpuSplit::WritePipeEnabled() {
+    return !Nx2Perf::Verify();
+}
+
+void GpuSplit::StateMethodRun(Tegra::Engines::EngineInterface* engine, u32 method,
+                              const u32* arguments, u32 count, Effect effect) {
+    if (count == 0) {
+        return;
+    }
+    DEBUG_ASSERT(count <= 64);
+    using Tegra::Engines::Maxwell3D;
+    if (count < 4 || !WritePipeEnabled() || !engine->fast_maxwell3d ||
+        method >= Maxwell3D::Regs::NUM_REGS || engine->execution_mask[method]) {
+        for (u32 i = 0; i < count; ++i) {
+            Method(engine, method + i, arguments[i], true, nullptr, effect);
+        }
+        return;
+    }
+    SelectEngine(engine);
+    const size_t words = 1 + (count + 1) / 2;
+    u64* const entry = Reserve(words);
+    entry[0] = static_cast<u64>(Kind::StateBlock) | (u64{method} << 8) | (u64{count} << 32);
+    entry[words - 1] = 0;
+    std::memcpy(entry + 1, arguments, size_t{count} * sizeof(u32));
+    Commit(words, effect);
+}
+
 size_t GpuSplit::Execute(const u64* entry, size_t words) {
     const u64 head = entry[0];
     if (verify_repeats) [[unlikely]] {
@@ -1211,6 +1238,14 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
     case Kind::Engine:
         back_engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1]);
         return 2;
+    case Kind::StateBlock: {
+        const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+        const u32 count = static_cast<u32>(head >> 32);
+        auto* const maxwell3d = static_cast<Tegra::Engines::Maxwell3D*>(back_engine);
+        maxwell3d->ConsumeSink(*system);
+        maxwell3d->CallStateMethodBlock(method, reinterpret_cast<const u32*>(entry + 1), count);
+        return 1 + (count + 1) / 2;
+    }
     case Kind::Method: {
         if ((head & RepeatMask) != 0) [[unlikely]] {
             ExecuteRepeated(head);

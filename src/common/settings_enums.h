@@ -175,7 +175,7 @@ ENUM(OotResolution, Game, Full, Percent87, Percent75, Percent56, Percent50, Perc
      Percent300, Percent40, Percent33);
 // Ocarina of Time's graphics: edits of the game's own parameter files (Settings
 // oot_graphics_preset, core/file_sys/oot_game_params.cpp).
-ENUM(OotGraphicsPreset, PhoneLow, PhoneMedium, Console, High, UltraLow);
+ENUM(OotGraphicsPreset, PhoneLow, PhoneMedium, Console, High, UltraLow, Balanced);
 // Ocarina of Time's frame rate (Settings oot_frame_rate).
 ENUM(OotFrameRate, Fps30, Fps60, Unlocked);
 // Mario Kart World's frame rate mode (Settings mkw_frame_rate, loader/nso.cpp).

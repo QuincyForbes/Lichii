@@ -2833,12 +2833,22 @@ void RasterizerMetal::CollectStageDescriptors(
     };
     const auto read_handle = [&](const auto& desc, u32 element) {
         if (desc.handle_program != ~0U) {
-            return Tegra::Texture::TexturePair(
-                VideoCommon::EvaluateTextureHandle(
-                    info, desc.handle_program, handle_reader,
-                    [&](u32 cbuf) -> GPUVAddr { return cbuf_addr_of(cbuf, true); },
-                    storage_alignment, element),
-                via_header_index);
+            ensure_handle_addrs();
+            const u32 raw = Shader::EvaluateHandleProgram(
+                                info.handle_programs[desc.handle_program],
+                                [&](u32 cbuf, u32 offset) -> u32 {
+                                    const GPUVAddr base =
+                                        cbuf < cbuf_addrs.size() ? cbuf_addrs[cbuf] : GPUVAddr{};
+                                    return base != 0 ? read_handle_word(base + offset) : 0U;
+                                },
+                                [&](u32 binding, u32 offset) -> u32 {
+                                    const GPUVAddr base =
+                                        binding < num_ssbos ? ssbo_addrs[binding] : GPUVAddr{};
+                                    return base != 0 ? read_handle_word(base + offset) : 0U;
+                                },
+                                element)
+                                .value_or(0U);
+            return Tegra::Texture::TexturePair(raw, via_header_index);
         }
         const GPUVAddr addr =
             cbuf_addr_of(desc.cbuf_index, false) + desc.cbuf_offset + (element << desc.size_shift);
@@ -8098,7 +8108,9 @@ bool RasterizerMetal::AccelerateConditionalRendering() {
         regs.render_enable_override == Maxwell::RenderEnable::Override::UseRenderEnable &&
         regs.render_enable.mode != Maxwell::RenderEnable::Mode::False &&
         regs.render_enable.mode != Maxwell::RenderEnable::Mode::True;
-    if (reads_memory && CachePathsEnabled()) {
+    if (reads_memory && CachePathsEnabled() &&
+        gpu_memory->IsMemoryDirty(regs.render_enable.Address(), 24,
+                                  VideoCommon::CacheType::BufferCache)) {
         gpu_memory->FlushCaching();
     }
     if (!reads_memory || !on_gpu) {
@@ -8146,6 +8158,16 @@ bool RasterizerMetal::AccelerateConditionalRendering() {
     }
     if (!pending) {
         // Every value is in memory: the caller's comparison is exact.
+        return false;
+    }
+    if ((ticks[0] == 0 || scheduler.IsFree(ticks[0])) &&
+        (ticks[1] == 0 || scheduler.IsFree(ticks[1]))) {
+        if (ticks[0] != 0) {
+            WritePendingReport(*first, 0);
+        }
+        if (ticks[1] != 0 && *second != *first) {
+            WritePendingReport(*second, 0);
+        }
         return false;
     }
     gpu_condition = GpuCondition{.active = true, .params = params, .ticks = ticks};
@@ -8256,17 +8278,19 @@ bool RasterizerMetal::PrepareConditionRegion() {
     gpu_condition.region_words = reinterpret_cast<u32*>(gpu_condition.region.mapped_span.data());
     gpu_condition.region_words[0] = 0;
     gpu_condition.draws = 0;
-    // After the render passes that counted the samples (not ahead of the segment), before the
-    // draws: the draw count and their arguments are written before the commit.
-    scheduler.BeginCompute(condition_kernel.Get(), false);
+    const u64 current_tick = scheduler.CurrentTick();
+    const bool can_ahead =
+        gpu_condition.ticks[0] < current_tick && gpu_condition.ticks[1] < current_tick;
+    scheduler.BeginCompute(condition_kernel.Get(), can_ahead);
     scheduler.BindBuffer(ShaderStage::Compute, 0, scheduler.VisibilityBuffer(), 0, false);
     scheduler.BindBytes(ShaderStage::Compute, 1, &gpu_condition.params,
                         static_cast<u32>(sizeof(gpu_condition.params)));
     scheduler.BindBuffer(ShaderStage::Compute, 2, gpu_condition.region.buffer,
-                         static_cast<u32>(gpu_condition.region.offset), true);
+                         static_cast<u32>(gpu_condition.region.offset), true, RegionBytes,
+                         RegionBytes);
     constexpr u32 GroupSize = 64;
     scheduler.Dispatch({Condition::RegionDraws / GroupSize, 1, 1}, {GroupSize, 1, 1});
-    gpu_condition.region_tick = scheduler.CurrentTick();
+    gpu_condition.region_tick = current_tick;
     return true;
 }
 

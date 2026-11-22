@@ -285,6 +285,10 @@ public:
     /// `effect`: what the entry may write (SplitWriteTracker; unknown unless the caller knows).
     using Effect = SplitWriteTracker::Effect;
     using WriteKind = SplitWriteTracker::WriteKind;
+    static bool WritePipeEnabled();
+    /// Up to 64 consecutive non-executable Maxwell3D registers, without a DMA segment.
+    void StateMethodRun(Tegra::Engines::EngineInterface* engine, u32 method, const u32* arguments,
+                        u32 count, Effect effect);
     void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
                 const GPUVAddr* segment, Effect effect = Effect::Unknown) {
         SelectEngine(engine);
@@ -1026,12 +1030,13 @@ private:
     friend struct GpuSplitTestAccess;
 
     enum class Kind : u64 {
-        Wrap,   ///< The rest of the ring is unused: continue at its start
-        Engine, ///< The engine the next methods go to: word 1
-        Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
-        Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
-        Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
-        Pairs,  ///< Bits 32-63 count; then one word per write: bits 0-15 method, 32-63 value
+        Wrap,       ///< The rest of the ring is unused: continue at its start
+        Engine,     ///< The engine the next methods go to: word 1
+        Method,     ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
+        Multi,      ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
+        Call,       ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+        Pairs,      ///< Bits 32-63 count; then one word per write: bits 0-15 method, 32-63 value
+        StateBlock, ///< Bits 8-23 first method, 32-63 count; then packed u32 arguments
     };
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
@@ -1059,6 +1064,7 @@ private:
     static constexpr size_t RingMask = RingWords - 1;
     static constexpr u32 MaxMultiWords = 8192;
     static constexpr size_t PublishEvery = 64;
+    static constexpr size_t EagerWords = 16;
 
     template <typename Func>
     static void CallThunk(const u64* payload) {
@@ -1080,14 +1086,13 @@ private:
         write_position += words;
         writes.Entry(effect, write_position);
         const size_t pending = write_position - published_local;
-        // EagerPublish: while the back has nothing to do, every entry goes out at once instead of
-        // waiting for the next 256-word batch (the back idled while the front filled it, then the
-        // front waited for the back to catch up).
+        // EagerPublish: while the back has nothing to do, publish once EagerWords accumulate
+        // instead of reading back_idle / back_waiting on every single ring entry.
         if (pending >= publish_every ||
-            back_waiting.load(std::memory_order_relaxed) ||
-            (pending >= 8 &&
-             consumed.load(std::memory_order_relaxed) == published_local) ||
-            (eager_publish && back_idle.load(std::memory_order_relaxed))) {
+            (pending >= EagerWords &&
+             (back_waiting.load(std::memory_order_relaxed) ||
+              consumed.load(std::memory_order_relaxed) == published_local ||
+              (eager_publish && back_idle.load(std::memory_order_relaxed))))) {
             Publish();
         }
     }

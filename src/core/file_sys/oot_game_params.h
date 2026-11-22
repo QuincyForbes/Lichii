@@ -97,7 +97,7 @@ struct OotGameParams {
 };
 
 /// The edits of Settings oot_graphics_preset for `title_id` (nothing for other games).
-/// EDEN_NX2_OOT_GRAPHICS_PRESET=0..3 overrides the setting, EDEN_NX2_OOT_FOLIAGE=0..2 the foliage
+/// EDEN_NX2_OOT_GRAPHICS_PRESET=0..5 overrides the setting, EDEN_NX2_OOT_FOLIAGE=0..2 the foliage
 /// level, and EDEN_NX2_OOT_GFX adds edits (replacing the preset's for the same value); an entry
 /// of EDEN_NX2_OOT_GFX_SKIP (a key name) leaves the preset's edits of that key out.
 OotGameParams OotGameParamsFor(u64 title_id);

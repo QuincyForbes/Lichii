@@ -44,6 +44,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/nx2_front_options.h"
 #include "video_core/nx2_indirect_grid.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/rasterizer_interface.h"
@@ -317,6 +318,10 @@ DmaPusher::~DmaPusher() {
 }
 
 void DmaPusher::DispatchCalls() {
+    front_lean = VideoCommon::FrontLeanEnabled();
+    if (front_lean) {
+        dispatch_program_id = system.GetApplicationProcessProgramID();
+    }
     // EXPERIMENT EDEN_NX2_INVALIDATE_BEFORE_DISPATCH=list: apply the guest's collected CPU writes
     // before the submitted lists run; they were made before the submit.
     static const bool invalidate_at_list = [] {
@@ -415,7 +420,8 @@ bool DmaPusher::Step() {
         const std::span<const CommandHeader> commands{command_list.prefetch_command_list};
         if (command_resume_offset < commands.size()) {
             command_resume_offset +=
-                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset,
+                                true);
         }
         if (puller.HasPendingAcquire()) {
             return false;
@@ -452,8 +458,11 @@ bool DmaPusher::Step() {
         if (fetch_drain && g_nx2_ampere.load(std::memory_order_relaxed)) {
             VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::FetchDrain);
         }
-        bool gpu_written = IsGpuWrittenCommands(dma_state.dma_get,
-                                                 size_t{header.size} * sizeof(u32));
+        bool gpu_written = front_lean
+                               ? IsGpuWrittenCommandsFront(dma_state.dma_get,
+                                                           size_t{header.size} * sizeof(u32))
+                               : IsGpuWrittenCommands(dma_state.dma_get,
+                                                      size_t{header.size} * sizeof(u32));
         if (subchannels[dma_state.subchannel] && dma_state.method_count) {
             const auto engine = subchannel_type[dma_state.subchannel];
             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
@@ -509,7 +518,20 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
+        // Waiting for every earlier writer before each entry stalled the front on nearly every
+        // entry (OoT Hyrule Market ~7,400/frame, Kokiri ~3 ms/frame) without finding newly
+        // GPU-written words; only Fast Fusion (040041E0212AE000) needs per-entry waits.
+        // EDEN_NX2_ENTRY_WRITER_WAIT=1 forces the wait back on for diagnostics.
+        static const bool force_entry_writer_wait = [] {
+            const char* value = std::getenv("EDEN_NX2_ENTRY_WRITER_WAIT");
+            return value != nullptr && value[0] == '1';
+        }();
+        constexpr u64 EntryWriterWaitProgramId = u64{0x040041E0212AE000};
+        const bool wait_entry_writers =
+            force_entry_writer_wait ||
+            (front_lean ? dispatch_program_id : system.GetApplicationProcessProgramID()) ==
+                EntryWriterWaitProgramId;
+        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() && wait_entry_writers &&
             !SkipWriterWait(u64{header.size} * sizeof(u32))) {
             gpu_written = WaitForListWriters(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         }
@@ -522,8 +544,10 @@ bool DmaPusher::Step() {
             dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
             command_list.submitted_offsets[dma_pushbuffer_subindex] + header.size <=
                 command_list.submitted_words.size() &&
-            !std::ranges::binary_search(command_list.deferred_entries,
-                                        static_cast<u32>(dma_pushbuffer_subindex));
+            !(front_lean
+                  ? command_list.FrontDeferredEntry(static_cast<u32>(dma_pushbuffer_subindex))
+                  : std::ranges::binary_search(command_list.deferred_entries,
+                                               static_cast<u32>(dma_pushbuffer_subindex)));
         if (gpu_written && command_resume_offset == 0 &&
             IsReleasedEntry(command_list, dma_pushbuffer_subindex)) {
             NoteReleasedEntry(ReleasedUse::GpuWritten, command_list, dma_pushbuffer_subindex);
@@ -539,10 +563,11 @@ bool DmaPusher::Step() {
             gpu_written,
             !trust && use_safe &&
                 memory_manager.IsMemoryDirty(dma_state.dma_get, header.size * sizeof(u32)));
-        const auto process_from_resume = [&](std::span<const CommandHeader> commands) {
+        const auto process_from_resume = [&](std::span<const CommandHeader> commands,
+                                             bool owned_words = false) {
             if (command_resume_offset < commands.size()) {
-                command_resume_offset +=
-                    ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+                command_resume_offset += ProcessCommands(commands.subspan(command_resume_offset),
+                                                         command_resume_offset, owned_words);
             } else {
                 command_resume_offset = header.size;
                 if (commands.size() < header.size) {
@@ -563,7 +588,7 @@ bool DmaPusher::Step() {
             }
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Submitted);
-            process_from_resume(commands);
+            process_from_resume(commands, true);
         };
         const auto try_recycled_gpu_page = [&](bool had_live_gpu_data) {
             if (had_live_gpu_data ||
@@ -735,7 +760,156 @@ static bool RecordParsedEntries() {
     return record;
 }
 
-size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
+size_t DmaPusher::ProcessCommandsFront(std::span<const CommandHeader> commands,
+                                       size_t word_offset, bool owned_words) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    u32 cached_subchannel = max_subchannels;
+    Engines::Maxwell3D* cached_3d = nullptr;
+    const auto front_3d = [&]() -> Engines::Maxwell3D* {
+        if (dma_state.method < non_puller_methods) {
+            return nullptr;
+        }
+        if (cached_subchannel != dma_state.subchannel) {
+            cached_subchannel = dma_state.subchannel;
+            cached_3d = nullptr;
+            auto* const engine = subchannels[cached_subchannel];
+            if (engine != nullptr &&
+                subchannel_type[cached_subchannel] == Engines::EngineTypes::Maxwell3D) {
+                auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(engine);
+                if (maxwell3d->GetNativeMacroEngine().native_turing) {
+                    cached_3d = maxwell3d;
+                }
+            }
+        }
+        return cached_3d;
+    };
+
+    size_t index = 0;
+    while (index < commands.size()) {
+        if (dma_state.method_count == 0) {
+            const u32 header = commands[index++].argument;
+            const auto mode = static_cast<SubmissionMode>(header >> 29);
+            switch (mode) {
+            case SubmissionMode::Increasing:
+            case SubmissionMode::NonIncreasing:
+            case SubmissionMode::IncreaseOnce:
+                dma_state.method = header & 0x1fff;
+                dma_state.subchannel = (header >> 13) & 7;
+                dma_state.method_count = (header >> 16) & 0x1fff;
+                dma_state.non_incrementing = mode == SubmissionMode::NonIncreasing;
+                dma_increment_once = mode == SubmissionMode::IncreaseOnce;
+                break;
+            case SubmissionMode::Inline:
+                dma_state.method = header & 0x1fff;
+                dma_state.subchannel = (header >> 13) & 7;
+                dma_state.dma_word_offset = u64(-s64(dma_state.dma_get));
+                if (auto* const maxwell3d = front_3d()) {
+                    maxwell3d->FrontCallMethod(system, split, dma_state.method,
+                                               (header >> 16) & 0x1fff,
+                                               dma_state.is_last_call);
+                } else {
+                    CallMethod((header >> 16) & 0x1fff);
+                    cached_subchannel = max_subchannels;
+                }
+                dma_state.non_incrementing = true;
+                dma_increment_once = false;
+                if (puller.HasPendingAcquire()) {
+                    return index;
+                }
+                continue;
+            default:
+                continue;
+            }
+            if (dma_state.method_count == 0 || index == commands.size()) {
+                continue;
+            }
+        }
+
+        const u32 pending = dma_state.method_count;
+        u32 count = static_cast<u32>(std::min<size_t>(pending, commands.size() - index));
+        const u32 method = dma_state.method;
+        const u32* const words = &commands[index].argument;
+        dma_state.dma_word_offset = u64((word_offset + index) * sizeof(u32));
+        auto* const maxwell3d = front_3d();
+
+        if (dma_state.non_incrementing) {
+            if (maxwell3d != nullptr) {
+                maxwell3d->FrontCallMultiMethod(system, split, method, words, count, pending);
+            } else {
+                if (method < non_puller_methods) {
+                    count = 1;
+                }
+                CallMultiMethod(words, count);
+                cached_subchannel = max_subchannels;
+            }
+            dma_state.method_count -= count;
+            dma_state.is_last_call = true;
+        } else if (maxwell3d != nullptr && method >= MacroRegistersStart) {
+            if (dma_increment_once && count > 1) {
+                ++dma_state.method;
+                dma_state.non_incrementing = true;
+                dma_state.method_count = pending - 1;
+                dma_state.is_last_call = false;
+                dma_state.dma_word_offset += sizeof(u32);
+                maxwell3d->FrontCallMultiMethod(system, split, method, words, count, pending,
+                                                owned_words);
+                dma_state.method_count = pending - count;
+                dma_state.is_last_call = true;
+            } else if (dma_increment_once) {
+                dma_state.is_last_call = pending <= 1;
+                maxwell3d->FrontCallMethod(system, split, method, words[0],
+                                           dma_state.is_last_call);
+                ++dma_state.method;
+                dma_state.non_incrementing = true;
+                --dma_state.method_count;
+            } else {
+                dma_state.is_last_call = count == pending;
+                dma_state.dma_word_offset += u64{count - 1} * sizeof(u32);
+                dma_state.method = method + count - 1;
+                dma_state.method_count = pending - count + 1;
+                maxwell3d->FrontCallMultiMethod(system, split, method, words, count, pending,
+                                                owned_words);
+                dma_state.method = method + count;
+                dma_state.method_count = pending - count;
+            }
+        } else if (maxwell3d != nullptr && !dma_increment_once) {
+            count = std::min(count, MacroRegistersStart - method);
+            maxwell3d->FrontCallMethodRun(system, split, method, words, count, true, pending);
+            dma_state.dma_word_offset += u64{count - 1} * sizeof(u32);
+            dma_state.is_last_call = count == pending;
+            dma_state.method += count;
+            dma_state.method_count -= count;
+        } else {
+            count = 1;
+            dma_state.is_last_call = pending <= 1;
+            if (maxwell3d != nullptr) {
+                maxwell3d->FrontCallMethod(system, split, method, words[0],
+                                           dma_state.is_last_call);
+            } else {
+                CallMethod(words[0]);
+                cached_subchannel = max_subchannels;
+            }
+            ++dma_state.method;
+            dma_state.non_incrementing |= dma_increment_once;
+            --dma_state.method_count;
+        }
+        index += count;
+        if (maxwell3d == nullptr && puller.HasPendingAcquire()) {
+            return index;
+        }
+    }
+    return index;
+}
+
+size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset,
+                                  bool owned_words) {
+    if (g_semaphore_watch == 0 &&
+        g_nx2_ampere.load(std::memory_order_relaxed) &&
+        VideoCommon::GpuSplit::Get().Active() && VideoCommon::GpuSplit::Get().FrontMacros() &&
+        VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FrontRun) &&
+        !VideoCommon::Nx2Perf::Verify() && !puller.HasPendingAcquire()) {
+        return ProcessCommandsFront(commands, word_offset, owned_words);
+    }
     for (size_t index = 0; index < commands.size();) {
         // Data word of methods command
         if (dma_state.method_count && dma_state.non_incrementing) {
@@ -1178,6 +1352,8 @@ void DmaPusher::RefreshSnapshot(CommandList& list, u64 now, size_t first_entry) 
     // A deferred entry whose memory was released since has no copy to run: it stays deferred.
     std::erase_if(list.deferred_entries,
                   [&list](u32 i) { return !IsReleasedEntry(list, i); });
+    list.front_deferred_cursor = 0;
+    list.front_deferred_index = 0;
 }
 
 size_t DmaPusher::RefreshEntry(CommandList& list, size_t index, bool guard, size_t carry) {
@@ -1460,6 +1636,8 @@ void DmaPusher::RefreshDeferredEntries(CommandList& list, size_t first_entry) {
     // Released ones have no copy to run: they stay deferred.
     std::erase_if(list.deferred_entries,
                   [&list](u32 i) { return !IsReleasedEntry(list, i); });
+    list.front_deferred_cursor = 0;
+    list.front_deferred_index = 0;
 }
 
 bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size) {
@@ -1530,6 +1708,24 @@ bool DmaPusher::SkipWriterWait(u64 size) {
         });
     }
     return true;
+}
+
+bool DmaPusher::IsGpuWrittenCommandsFront(GPUVAddr address, size_t size) {
+    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
+        return false;
+    }
+    const u64 serial = memory_manager.GetMapSerial();
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
+        if (page != written_gpu_page || serial != written_map_serial) {
+            written_device_page = memory_manager.GpuToCpuAddress(page);
+            written_gpu_page = page;
+            written_map_serial = serial;
+        }
+        if (written_device_page && Tegra::Nx2IsGpuWritten(*written_device_page)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {

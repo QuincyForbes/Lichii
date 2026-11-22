@@ -457,7 +457,12 @@ const Setting kSettings[] = {
                                               "textures (about a third fewer render passes). "
                                               "{choice:oot_graphics_preset.PhoneMedium}: a small "
                                               "reflection probe and two small sun shadows, 56% and "
-                                              "Half. {choice:oot_graphics_preset.Console}: the game as "
+                                              "Half. {choice:oot_graphics_preset.Balanced}: Console "
+                                              "shadows, foliage, bloom, resolution and textures with "
+                                              "a single reflection probe and no translucent depth "
+                                              "prepass or field depth-of-field pass (~22 fewer "
+                                              "render passes per frame). "
+                                              "{choice:oot_graphics_preset.Console}: the game as "
                                               "shipped. {choice:oot_graphics_preset.High}: sharper sun "
                                               "shadows.\n"
                                               "Picking one sets {setting:oot_resolution} and "
@@ -1813,6 +1818,7 @@ const Choice kChoices[] = {
     CHOICE(OotGraphicsPreset, UltraLow, QT_TRANSLATE_NOOP("ConfigurationShared", "Ultra Low")),
     CHOICE(OotGraphicsPreset, PhoneLow, QT_TRANSLATE_NOOP("ConfigurationShared", "Phone Low")),
     CHOICE(OotGraphicsPreset, PhoneMedium, QT_TRANSLATE_NOOP("ConfigurationShared", "Phone Medium")),
+    CHOICE(OotGraphicsPreset, Balanced, QT_TRANSLATE_NOOP("ConfigurationShared", "Balanced")),
     CHOICE(OotGraphicsPreset, Console, QT_TRANSLATE_NOOP("ConfigurationShared", "Console")),
     CHOICE(OotGraphicsPreset, High, QT_TRANSLATE_NOOP("ConfigurationShared", "High")),
     CHOICE(Upscaler, Auto, QT_TRANSLATE_NOOP("ConfigurationShared", "Automatic")),

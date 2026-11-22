@@ -34,6 +34,9 @@ public:
     }
 
     void Reset() noexcept {
+        interval_begin = 0;
+        interval_end = 0;
+        bitmap_mode = false;
         if (!touched) {
             return;
         }
@@ -60,6 +63,36 @@ public:
     }
 
     void Track(u64 offset, u64 size) noexcept {
+        if (!bitmap_mode && !bitmap_observed && size != 0) {
+            const size_t page = offset >> BUFFER_PAGE_SHIFT;
+            const size_t page_end = (offset + size) >> BUFFER_PAGE_SHIFT;
+            if (page_end < page || page_end >= pages.size()) {
+                return;
+            }
+            constexpr u64 granule = u64{1} << BUFFER_BYTES_PER_BITSHIFT;
+            const u64 begin = Common::AlignDown(offset, granule);
+            const u64 end = Common::AlignUp(offset + size, granule);
+            if (interval_begin == interval_end) {
+                interval_begin = begin;
+                interval_end = end;
+                return;
+            }
+            if (begin <= interval_end && interval_begin <= end) {
+                interval_begin = (std::min)(interval_begin, begin);
+                interval_end = (std::max)(interval_end, end);
+                return;
+            }
+            bitmap_mode = true;
+            // One byte less marks the same granules without entering the sentinel page.
+            TrackBitmap(interval_begin, interval_end - interval_begin - 1);
+            interval_begin = 0;
+            interval_end = 0;
+        }
+        TrackBitmap(offset, size);
+    }
+
+private:
+    void TrackBitmap(u64 offset, u64 size) const noexcept {
         if (size == 0) {
             return;
         }
@@ -93,6 +126,7 @@ public:
         }
     }
 
+public:
     [[nodiscard]] bool IsUsed(u64 offset, u64 size) const noexcept {
         if (size == 0) {
             return false;
@@ -101,6 +135,9 @@ public:
         const size_t page_end = (offset + size) >> BUFFER_PAGE_SHIFT;
         if (page_end < page || page_end >= pages.size()) {
             return false;
+        }
+        if (interval_begin != interval_end) {
+            return offset < interval_end && interval_begin < offset + size;
         }
         if (IsPageUsed(page, offset, size)) {
             return true;
@@ -120,11 +157,18 @@ public:
     }
 
     [[nodiscard]] std::span<const u64> Pages() const noexcept {
+        bitmap_observed = true;
+        if (interval_begin != interval_end) {
+            TrackBitmap(interval_begin, interval_end - interval_begin - 1);
+            interval_begin = 0;
+            interval_end = 0;
+            bitmap_mode = true;
+        }
         return pages;
     }
 
 private:
-    void FillPages(size_t begin, size_t end) noexcept {
+    void FillPages(size_t begin, size_t end) const noexcept {
         if (begin >= end) {
             return;
         }
@@ -178,7 +222,7 @@ private:
         return mask << first_bit;
     }
 
-    void TrackPage(u64 page, u64 offset, u64 size) noexcept {
+    void TrackPage(u64 page, u64 offset, u64 size) const noexcept {
         pages[page] |= PageMask(offset, size);
     }
 
@@ -187,17 +231,21 @@ private:
     }
 
 private:
-    std::vector<u64> pages;
+    mutable std::vector<u64> pages;
+    mutable u64 interval_begin{};
+    mutable u64 interval_end{};
+    mutable bool bitmap_mode{};
+    mutable bool bitmap_observed{};
     /// Ranges tracked last, (offset, size).
-    std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
-    size_t recent_cursor{};
-    bool touched{}; ///< Tracked since the last Reset (Reset skips untouched trackers)
+    mutable std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
+    mutable size_t recent_cursor{};
+    mutable bool touched{}; ///< Tracked since the last Reset (Reset skips untouched trackers)
     /// Pages known to be all ones (FillPages).
-    size_t full_begin{};
-    size_t full_end{};
+    mutable size_t full_begin{};
+    mutable size_t full_end{};
     /// The words set since the last reset lie in [set_begin, set_end) (none when set_end is 0).
-    size_t set_begin{};
-    size_t set_end{};
+    mutable size_t set_begin{};
+    mutable size_t set_end{};
 
     /// EDEN_NX2_USAGE_RESET_BOUNDED=0: Reset clears every word, as before.
     [[nodiscard]] static bool BoundedReset() noexcept {

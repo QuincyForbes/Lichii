@@ -907,6 +907,18 @@ bool Puller::PollAcquire(DmaPusher& dma_pusher) {
         return false;
     }
     if (VideoCommon::GpuSplit::Get().Active() &&
+        SettledSemaphoreChecks(dma_pusher.memory_manager, pending_acquire->address)) {
+        if (pending_acquire->Matches(dma_pusher.memory_manager.Read<u32>(pending_acquire->address))) {
+            VideoCommon::GpuSplit::Get().NoteSync();
+            return true;
+        }
+        if (pending_acquire->reported ||
+            std::chrono::steady_clock::now() - pending_acquire->since <= std::chrono::seconds{2}) {
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquirePollsFast, 1);
+            return false;
+        }
+    }
+    if (VideoCommon::GpuSplit::Get().Active() &&
         std::chrono::steady_clock::now() - pending_acquire->last_drain <
             std::chrono::microseconds{50} &&
         !pending_acquire->Matches(dma_pusher.memory_manager.Read<u32>(pending_acquire->address))) {

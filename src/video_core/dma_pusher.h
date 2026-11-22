@@ -185,6 +185,21 @@ struct CommandList final {
     /// Entries (ascending) whose memory was released or remapped since the submit: never read from
     /// memory again (DmaPusher::UpdateReleasedEntries).
     std::vector<u32> released_entries;
+    size_t front_deferred_cursor{};
+    u32 front_deferred_index{};
+
+    bool FrontDeferredEntry(u32 index) {
+        if (index < front_deferred_index) {
+            front_deferred_cursor = 0;
+        }
+        front_deferred_index = index;
+        while (front_deferred_cursor < deferred_entries.size() &&
+               deferred_entries[front_deferred_cursor] < index) {
+            ++front_deferred_cursor;
+        }
+        return front_deferred_cursor < deferred_entries.size() &&
+               deferred_entries[front_deferred_cursor] == index;
+    }
 };
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
@@ -246,9 +261,18 @@ private:
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;
     bool Step();
+    bool IsGpuWrittenCommandsFront(GPUVAddr address, size_t size);
+    bool front_lean{};
+    u64 dispatch_program_id{};
+    GPUVAddr written_gpu_page{~GPUVAddr{0}};
+    u64 written_map_serial{~u64{0}};
+    std::optional<u64> written_device_page;
     /// Returns how many words were processed: fewer than given when a semaphore acquire
     /// suspended the channel.
-    size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
+    size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0,
+                           bool owned_words = false);
+    size_t ProcessCommandsFront(std::span<const CommandHeader> commands, size_t word_offset,
+                                bool owned_words);
     size_t command_resume_offset{}; ///< Words of the current entry done before a suspension
 
     void SetState(const CommandHeader& command_header);

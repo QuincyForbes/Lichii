@@ -12,6 +12,7 @@
 #include <sstream>
 
 #include <boost/range/algorithm_ext/erase.hpp>
+#include <fmt/ranges.h>
 
 #include "common/assert.h"
 #include "common/common_funcs.h"
@@ -33,7 +34,7 @@
 namespace Service {
 
 SessionRequestHandler::SessionRequestHandler(Kernel::KernelCore& kernel_, const char* service_name_)
-    : kernel{kernel_} {}
+    : kernel{kernel_}, handler_name{service_name_ ? service_name_ : "?"} {}
 
 SessionRequestHandler::~SessionRequestHandler() = default;
 
@@ -49,7 +50,13 @@ bool SessionRequestManager::HasSessionRequestHandler(const HLERequestContext& co
         const auto object_id = message_header.object_id;
 
         if (object_id > DomainHandlerCount()) {
-            LOG_CRITICAL(IPC, "object_id {} is too big!", object_id);
+            LOG_CRITICAL(IPC,
+                         "object_id {} is too big! service={} domain_objects={} type={} "
+                         "command={} words {:08x}",
+                         object_id, session_handler ? session_handler->HandlerName() : "?",
+                         DomainHandlerCount(), static_cast<u32>(context.GetCommandType()),
+                         context.GetCommand(),
+                         fmt::join(context.CommandBuffer(), context.CommandBuffer() + 16, " "));
             return false;
         }
         return !DomainHandler(object_id - 1).expired();
