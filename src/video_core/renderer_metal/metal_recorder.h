@@ -672,9 +672,14 @@ private:
 }
 
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
+    return [self computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+}
+
+- (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)dispatchType {
     LichiiRecComputeEncoder* const encoder = [[LichiiRecComputeEncoder alloc] init];
     encoder->rec = rec;
     Metal::Rec::Cmd& cmd = rec->Push(Metal::Rec::Op::CbCompute, (__bridge_retained void*)encoder);
+    Metal::Rec::Put(cmd, static_cast<uint32_t>(dispatchType));
     LICHII_KEEP(obj, self);
     return (id<MTLComputeCommandEncoder>)encoder;
 }
@@ -1144,7 +1149,8 @@ inline void Recorder::Execute(const Cmd& c, const Chunk& chunk) {
     }
     case Op::CbCompute: {
         const id<MTLCommandBuffer> buffer = ((LichiiRecProxy*)obj)->real;
-        proxy->real = [buffer computeCommandEncoder];
+        proxy->real = [buffer
+            computeCommandEncoderWithDispatchType:static_cast<MTLDispatchType>(Get<uint32_t>(c))];
         return;
     }
     case Op::CbBlit: {

@@ -40,11 +40,15 @@ void InnerFence::Wait() {
         return;
     }
     if (FenceManagerParams::AsyncCheck()) {
-        // The fencing thread: waits for the completion handlers, never commits (Scheduler::Wait
-        // walks and commits the GPU thread's command buffers). FenceTick left the tick committed
-        // or pending for the GPU thread's next commit point, which WaitCompleted asks for after
-        // the fence batching window.
-        scheduler.WaitAnyThread(tick, CommitReason::Fence, true);
+        // The fencing thread: waits for GPU completion, never commits (Scheduler::Wait walks and
+        // commits the GPU thread's command buffers). Match Vulkan's FencePatience default (0 us:
+        // ask GPUBack to commit any deferred fence immediately unless EDEN_NX2_FENCE_PATIENCE_US
+        // is set).
+        static const bool allow_grace = [] {
+            const char* const value = std::getenv("EDEN_NX2_FENCE_PATIENCE_US");
+            return value != nullptr && std::atoll(value) > 0;
+        }();
+        scheduler.WaitAnyThread(tick, CommitReason::Fence, allow_grace);
     } else {
         scheduler.Wait(tick, CommitReason::Fence);
     }
@@ -78,18 +82,7 @@ void FenceManager::WaitPendingFences(bool force) {
         // at each command list end.
         scheduler.FlushDeferred();
     }
-    static const bool force_release_submit = [] {
-        const char* const value = std::getenv("EDEN_NX2_RELEASE_SUBMIT");
-        return value != nullptr && value[0] == '1';
-    }();
-    const bool skip_release_submit = !force_release_submit && force && AsyncFences() &&
-                                     VideoCommon::GpuSplit::OnBackThread() &&
-                                     !VideoCore::Nx2Debug::DelayedFences();
-    if (skip_release_submit) {
-        in_nonblocking_release_wait = true;
-    }
     GenericFenceManager::WaitPendingFences(force);
-    in_nonblocking_release_wait = false;
 }
 
 Fence FenceManager::CreateFence(bool is_stubbed) {
@@ -109,9 +102,6 @@ void FenceManager::WaitFence(Fence& fence) {
 }
 
 void FenceManager::SubmitDeferredWork() {
-    if (in_nonblocking_release_wait && !VideoCore::Nx2Debug::DelayedFences()) {
-        return;
-    }
     // Only the split's back leaves fence work pending (Scheduler::FenceTick) and commits; with
     // asynchronous fences, the GPU thread without the split too (RequestCommit).
     if (VideoCommon::GpuSplit::OnBackThread() ||

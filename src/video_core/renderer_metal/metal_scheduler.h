@@ -543,7 +543,8 @@ public:
     void BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset) {
         BindBuffer(stage, slot, buffer, offset, stage == ShaderStage::Compute);
     }
-    void BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset, bool write);
+    void BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset, bool write,
+                    u64 hazard_read_size = ~u64{0}, u64 hazard_write_size = ~u64{0});
     void BindBytes(ShaderStage stage, u32 slot, const void* data, u32 size);
     /// Makes `buffer` resident for `stage`'s next draws or dispatches without binding it (a
     /// program reads it through an address: ShaderTranslate::Options::spill_buffers); returns the
@@ -551,7 +552,9 @@ public:
     [[nodiscard]] u64 UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset) {
         return UseBuffer(stage, buffer, offset, stage == ShaderStage::Compute);
     }
-    [[nodiscard]] u64 UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset, bool write);
+    [[nodiscard]] u64 UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset, bool write,
+                                u64 known_gpu_address = 0, u64 hazard_read_size = ~u64{0},
+                                u64 hazard_write_size = ~u64{0});
     /// on_buffer=false: `texture` is known not to be a view of a buffer (a texture cache image
     /// view or a placeholder): render stages skip noting a buffer under it for the segment
     /// (EDEN_NX2_METAL_IMAGE_NOTE_SKIP).
@@ -564,13 +567,19 @@ public:
     void BindTexture(ShaderStage stage, u32 slot, TextureHandle texture, bool on_buffer,
                      bool write);
     void BindSampler(ShaderStage stage, u32 slot, void* sampler);
+    /// Flushes contiguous dirty binding runs and batched read-only residency declarations for
+    /// `stage` onto the active encoder. Also flushed automatically before draws and dispatches.
+    void FlushStageBindings(ShaderStage stage);
+    /// Cached Tier-2 GPU address / MTLResourceID queries (0 for null).
+    [[nodiscard]] static u64 BufferGpuAddress(BufferHandle buffer) noexcept;
+    [[nodiscard]] static u64 TextureResourceId(TextureHandle texture) noexcept;
     /// The sampler's MTLResourceID, what a program reads from a table of spilled samplers
     /// (ShaderTranslate::Result::sampler_spill_slot). 0 for none.
     [[nodiscard]] static u64 SamplerResourceId(void* sampler) noexcept;
     /// A texture read (or written) through a table of resource IDs: made resident for the stage
     /// on the current encoder, its MTLResourceID returned (0 for none).
     [[nodiscard]] u64 UseTexture(ShaderStage stage, TextureHandle texture, bool write,
-                                 bool on_buffer = true);
+                                 bool on_buffer = true, u64 known_gpu_resource_id = 0);
 
     /// primitive: MTLPrimitiveType.
     void Draw(u32 primitive, u32 first_vertex, u32 vertex_count, u32 instance_count,
@@ -642,6 +651,10 @@ public:
     /// kernels recorded ahead (EDEN_NX2_METAL_AHEAD), fences that took no command buffer
     /// (EDEN_NX2_METAL_FENCE_IDLE).
     [[nodiscard]] std::array<u64, 11> TakeCounts() noexcept;
+
+    /// Since the last call: multi-slot range bind calls (`set*Buffers/Textures/SamplerStates:`)
+    /// and multi-resource read-only residency batches (`useResources:count:`).
+    [[nodiscard]] std::array<u64, 2> TakeBatchCounts() noexcept;
 
     /// Since the last call, per frame (`frames`): command buffers committed by reason
     /// ("Metal commits:"), and render passes ended by what ended them plus those begun by kind

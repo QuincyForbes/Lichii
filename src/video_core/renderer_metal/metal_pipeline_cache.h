@@ -169,6 +169,26 @@ public:
         return flat_inputs;
     }
 
+    /// Bitmask of generic varyings (0..31) loaded with flat interpolation by the pixel program.
+    [[nodiscard]] u32 FlatGenericMask() const noexcept {
+        return flat_generic_mask;
+    }
+
+    /// Whether a flat generic input may vary within a primitive regardless of vertex stream divisors
+    /// (for example [[vertex_id]] dependence, loops, or non-vertex pre-rasterization stages).
+    [[nodiscard]] bool FlatAlwaysVaries() const noexcept {
+        return flat_always_varies;
+    }
+
+    /// Bitmask of [[attribute(0..31)]] inputs that can flow into any flat generic output of Vertex().
+    [[nodiscard]] u32 FlatAttrDepsMask() const noexcept {
+        return flat_attr_deps_mask;
+    }
+
+    /// Whether any stage of the pipeline may write guest memory (SSBOs, storage images, XFB,
+    /// global stores/atomics, or task/mesh shaders).
+    [[nodiscard]] bool Nx2MayWriteMemory() const noexcept;
+
     /// Whether any render vertex or fragment stage has a separate sampler-reduction variant.
     [[nodiscard]] bool HasReductionVariants() const noexcept {
         return vertex.reduction_variants || fragment.reduction_variants ||
@@ -289,6 +309,9 @@ private:
     PipelineFiles* recorder{};
     bool used{};
     bool flat_inputs{};
+    bool flat_always_varies{true};
+    u32 flat_generic_mask{};
+    u32 flat_attr_deps_mask{};
     u64 last_use{};
     std::optional<VertexProgramUse> cached_vertex_use;
     CachedRenderState cached_render_state;
@@ -343,6 +366,16 @@ public:
     /// The pipeline of the current draw, or null when it can't be made (unsupported stages,
     /// translation errors).
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
+    [[nodiscard]] bool IsIndirectResetShader() const;
+    [[nodiscard]] u64 Nx2ResolvedEpoch() const noexcept {
+        return nx2_resolved_epoch;
+    }
+    [[nodiscard]] u64 Nx2ResolvedMap() const noexcept {
+        return nx2_resolved_map;
+    }
+    [[nodiscard]] const auto& Nx2CodeRanges() const noexcept {
+        return nx2_code_ranges;
+    }
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline(u64* out_native_key = nullptr);
 

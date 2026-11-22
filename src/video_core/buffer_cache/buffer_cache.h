@@ -1577,6 +1577,14 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     }
     channel_state->compute_storage_buffers[ssbo_index] = binding;
 
+    u64 access_size = binding.size;
+    if (native_mode && nvn_declared_size != 0 && resolved_pointer != 0) {
+        const u64 pad =
+            resolved_pointer >= binding.gpu_addr ? resolved_pointer - binding.gpu_addr : 0;
+        access_size = std::min<u64>(access_size, pad + nvn_declared_size);
+    }
+    channel_state->compute_storage_access_sizes[ssbo_index] = static_cast<u32>(access_size);
+
     // How much of the binding the dispatch marks GPU-written. A native pointer has no size, so the
     // binding is up to 8 MiB past it, and marking all of it defers the CPU's later writes to those
     // pages until the next fence and has fences copy the over-marked range back.
@@ -3352,6 +3360,18 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         if constexpr (NEEDS_BIND_STORAGE_INDEX) {
             runtime.BindComputeStorageBuffer(binding_index, buffer, offset, size, is_written);
             ++binding_index;
+        } else if constexpr (requires {
+                                 runtime.BindStorageBuffer(buffer, offset, size, is_written, size,
+                                                           size);
+                             }) {
+            const u32 access_size =
+                native && channel_state->compute_storage_access_sizes[index] != 0
+                    ? std::min<u32>(size, channel_state->compute_storage_access_sizes[index])
+                    : size;
+            const u32 hazard_write_size =
+                is_written ? static_cast<u32>(std::min<u64>(size, write_mark_limit)) : 0;
+            runtime.BindStorageBuffer(buffer, offset, size, is_written, access_size,
+                                      hazard_write_size);
         } else {
             runtime.BindStorageBuffer(buffer, offset, size, is_written);
         }

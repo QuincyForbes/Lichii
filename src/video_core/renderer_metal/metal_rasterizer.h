@@ -297,6 +297,7 @@ private:
 
     /// Vulkan's TryNx2IndirectReset; true when the draw was done as writes to guest memory.
     bool TryIndirectReset(bool is_indexed, u32 instance_count);
+    void Nx2ProveNonWriterDraw(const GraphicsPipeline& pipeline);
 
     /// Vulkan's TrackOotTonemappedImage: render target 0 of a tonemap draw is what replaces the
     /// anti-aliasing network's output (oot_network.h).
@@ -460,7 +461,8 @@ private:
     /// `handle`, or with the pipeline check a texture of zeros of `type` in its place when the
     /// view has none (refused by the checks, or a null descriptor); counted as a guard.
     [[nodiscard]] TextureHandle OrPlaceholder(const ImageView& view, TextureHandle handle,
-                                              Shader::TextureType type, bool is_depth = false);
+                                              Shader::TextureType type, bool is_depth = false,
+                                              u64* inout_gpu_resource_id = nullptr);
 
     /// The zero textures OrPlaceholder binds, made once outside a render pass.
     void MakePlaceholders();
@@ -837,7 +839,11 @@ private:
         Object buffer;
         u32 max_guest_count{};
     };
+    static constexpr size_t ConvertedIndexPageFilterSlots = 8192;
     std::unordered_map<BufferHandle, std::vector<ConvertedIndexEntry>> converted_index_cache;
+    std::unordered_map<u64, std::vector<BufferHandle>> converted_index_blocks;
+    std::array<u16, ConvertedIndexPageFilterSlots> converted_index_page_counts{};
+    u32 converted_index_large_entries{};
     std::vector<ConvertedIndexSlab> converted_index_slabs;
     std::array<GeneratedIndexPattern, 18> generated_index_patterns{};
     size_t converted_index_count{};
@@ -845,12 +851,13 @@ private:
     u64 converted_index_clock{};
     DAddr converted_index_min_addr{~DAddr{0}};
     DAddr converted_index_max_addr{};
+    void NoteConvertedIndexAdded(BufferHandle buffer, DAddr addr, u64 size);
     void ReleaseConvertedIndexStorage(ConvertedIndexEntry& entry) noexcept;
     [[nodiscard]] u8* AllocateConvertedIndexStorage(ConvertedIndexEntry& entry,
                                                     u64 needed_bytes);
     void InvalidateConvertedIndices(BufferHandle buffer, u64 offset, u64 size);
     void InvalidateConvertedIndicesAddr(DAddr addr, u64 size);
-    void RefreshConvertedIndexAddrBounds() noexcept;
+    void RefreshConvertedIndexAddrBounds();
     void EvictConvertedIndexEntry();
     [[nodiscard]] bool MakeRoomForConvertedIndexBytes(u64 needed_bytes,
                                                       const ConvertedIndexEntry* keep) noexcept;
@@ -1017,7 +1024,9 @@ private:
     u64 barrier_pass_ends{};
     /// One 1x1 RGBA8 / Depth32Float texture of zeros per shader texture type (OrPlaceholder).
     std::array<Object, Shader::NUM_TEXTURE_TYPES> placeholders;
+    std::array<u64, Shader::NUM_TEXTURE_TYPES> placeholder_resource_ids{};
     std::array<Object, Shader::NUM_TEXTURE_TYPES> depth_placeholders;
+    std::array<u64, Shader::NUM_TEXTURE_TYPES> depth_placeholder_resource_ids{};
     Object placeholder_zeros;
     bool placeholders_made{};
     bool graphics_report_logged{};

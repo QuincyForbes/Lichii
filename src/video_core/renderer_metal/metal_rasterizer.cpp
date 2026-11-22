@@ -1236,19 +1236,56 @@ std::vector<TextureHandle> RasterizerMetal::PrepareTexelBuffers(std::span<const 
     return result;
 }
 
-void RasterizerMetal::RefreshConvertedIndexAddrBounds() noexcept {
+namespace {
+constexpr size_t ConvertedIndexPageSlot(u64 page) noexcept {
+    const u64 mixed = (page ^ (page >> 13) ^ (page >> 26)) * 0x9e3779b97f4a7c15ULL;
+    return static_cast<size_t>((mixed >> 51) & 8191U);
+}
+constexpr u64 ConvertedIndexBlockShift = 20; ///< 1 MiB blocks
+} // Anonymous namespace
+
+void RasterizerMetal::NoteConvertedIndexAdded(BufferHandle buf, DAddr addr, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    converted_index_min_addr = (std::min)(converted_index_min_addr, addr);
+    const DAddr end = size > ~DAddr{0} - addr ? ~DAddr{0} : addr + size;
+    converted_index_max_addr = (std::max)(converted_index_max_addr, end);
+    const u64 first_page = addr >> 12;
+    const u64 last_page = (end - 1) >> 12;
+    if (last_page - first_page <= 256) {
+        for (u64 page = first_page; page <= last_page; ++page) {
+            u16& slot = converted_index_page_counts[ConvertedIndexPageSlot(page)];
+            if (slot != 0xFFFFU) {
+                ++slot;
+            }
+        }
+    } else {
+        ++converted_index_large_entries;
+    }
+    const u64 first_block = addr >> ConvertedIndexBlockShift;
+    const u64 last_block = (end - 1) >> ConvertedIndexBlockShift;
+    if (last_block - first_block <= 16) {
+        for (u64 b = first_block; b <= last_block; ++b) {
+            auto& vec = converted_index_blocks[b];
+            if (std::find(vec.begin(), vec.end(), buf) == vec.end()) {
+                vec.push_back(buf);
+            }
+        }
+    } else {
+        ++converted_index_large_entries;
+    }
+}
+
+void RasterizerMetal::RefreshConvertedIndexAddrBounds() {
     converted_index_min_addr = ~DAddr{0};
     converted_index_max_addr = 0;
+    converted_index_page_counts.fill(0);
+    converted_index_large_entries = 0;
+    converted_index_blocks.clear();
     for (const auto& [buf, entries] : converted_index_cache) {
         for (const ConvertedIndexEntry& entry : entries) {
-            if (entry.size == 0) {
-                continue;
-            }
-            converted_index_min_addr = (std::min)(converted_index_min_addr, entry.device_addr);
-            const DAddr end = entry.size > ~DAddr{0} - entry.device_addr
-                                  ? ~DAddr{0}
-                                  : entry.device_addr + entry.size;
-            converted_index_max_addr = (std::max)(converted_index_max_addr, end);
+            NoteConvertedIndexAdded(buf, entry.device_addr, entry.size);
         }
     }
 }
@@ -1392,7 +1429,61 @@ void RasterizerMetal::InvalidateConvertedIndicesAddr(DAddr addr, u64 size) {
     if (end <= converted_index_min_addr || addr >= converted_index_max_addr) {
         return;
     }
+    const u64 first_page = addr >> 12;
+    const u64 last_page = (end - 1) >> 12;
+    if (converted_index_large_entries == 0 && last_page - first_page <= 64) {
+        bool any_page = false;
+        for (u64 page = first_page; page <= last_page; ++page) {
+            if (converted_index_page_counts[ConvertedIndexPageSlot(page)] != 0) {
+                any_page = true;
+                break;
+            }
+        }
+        if (!any_page) {
+            return;
+        }
+    }
     size_t total_removed = 0;
+    const u64 first_block = addr >> ConvertedIndexBlockShift;
+    const u64 last_block = (end - 1) >> ConvertedIndexBlockShift;
+    if (converted_index_large_entries == 0 && last_block - first_block <= 16) {
+        boost::container::small_vector<BufferHandle, 4> candidates;
+        for (u64 b = first_block; b <= last_block; ++b) {
+            const auto bit = converted_index_blocks.find(b);
+            if (bit == converted_index_blocks.end()) {
+                continue;
+            }
+            for (BufferHandle buf : bit->second) {
+                if (std::find(candidates.begin(), candidates.end(), buf) == candidates.end()) {
+                    candidates.push_back(buf);
+                }
+            }
+        }
+        for (BufferHandle buf : candidates) {
+            const auto it = converted_index_cache.find(buf);
+            if (it == converted_index_cache.end()) {
+                continue;
+            }
+            const size_t removed = std::erase_if(it->second, [&](ConvertedIndexEntry& entry) {
+                const bool overlaps =
+                    entry.size != 0 && (entry.device_addr < addr ? addr - entry.device_addr < entry.size
+                                                                 : entry.device_addr - addr < size);
+                if (overlaps) {
+                    ReleaseConvertedIndexStorage(entry);
+                }
+                return overlaps;
+            });
+            total_removed += removed;
+            if (it->second.empty()) {
+                converted_index_cache.erase(it);
+            }
+        }
+        if (total_removed != 0) {
+            converted_index_count -= total_removed;
+            RefreshConvertedIndexAddrBounds();
+        }
+        return;
+    }
     std::erase_if(converted_index_cache, [&](auto& item) {
         const size_t removed = std::erase_if(item.second, [&](ConvertedIndexEntry& entry) {
             const bool overlaps = entry.size != 0 &&
@@ -2199,7 +2290,8 @@ std::string RasterizerMetal::GraphicsMemoryReport() const {
 }
 
 TextureHandle RasterizerMetal::OrPlaceholder(const ImageView& view, TextureHandle handle,
-                                             Shader::TextureType type, bool is_depth) {
+                                             Shader::TextureType type, bool is_depth,
+                                             u64* inout_gpu_resource_id) {
     if (handle != nullptr || !PipelineCheckEnabled() || type == Shader::TextureType::Buffer) {
         return handle;
     }
@@ -2211,9 +2303,21 @@ TextureHandle RasterizerMetal::OrPlaceholder(const ImageView& view, TextureHandl
     }
     const size_t index = static_cast<size_t>(type);
     if (is_depth && index < depth_placeholders.size() && depth_placeholders[index]) {
+        if (inout_gpu_resource_id != nullptr) {
+            *inout_gpu_resource_id = depth_placeholder_resource_ids[index];
+        }
         return depth_placeholders[index].Get();
     }
-    return index < placeholders.size() ? placeholders[index].Get() : nullptr;
+    if (index < placeholders.size()) {
+        if (inout_gpu_resource_id != nullptr) {
+            *inout_gpu_resource_id = placeholder_resource_ids[index];
+        }
+        return placeholders[index].Get();
+    }
+    if (inout_gpu_resource_id != nullptr) {
+        *inout_gpu_resource_id = 0;
+    }
+    return nullptr;
 }
 
 void RasterizerMetal::MakePlaceholders() {
@@ -2231,6 +2335,7 @@ void RasterizerMetal::MakePlaceholders() {
         const TextureDesc desc = PlaceholderTexture(static_cast<u32>(index));
         const u32 layers = desc.layers;
         placeholder = CreateTexture(device, desc);
+        placeholder_resource_ids[index] = Scheduler::TextureResourceId(placeholder.Get());
         if (!placeholder_zeros) {
             u8* zeros = nullptr;
             placeholder_zeros = CreateBuffer(device, 256, true, &zeros);
@@ -2251,6 +2356,8 @@ void RasterizerMetal::MakePlaceholders() {
             depth_desc.shader_write = false;
             depth_desc.pixel_format_view = false;
             depth_placeholder = CreateTexture(device, depth_desc);
+            depth_placeholder_resource_ids[index] =
+                Scheduler::TextureResourceId(depth_placeholder.Get());
             for (u32 layer = 0; layer < layers && depth_placeholder; ++layer) {
                 ClearPass clear{};
                 clear.depth = {.texture = depth_placeholder.Get(), .level = 0, .slice = layer};
@@ -2416,12 +2523,12 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
     array_table.assign(program.array_spill_slot != ~0U ? program.array_spill_entries : 0U, 0);
     // on_buffer=false: a texture cache view or placeholder, never a view of a buffer.
     const auto bind_texture = [&](u32 slot_value, TextureHandle texture, bool write,
-                                  bool on_buffer) {
+                                  bool on_buffer, u64 known_res_id = 0) {
         if ((slot_value & ArrayEntryFlag) != 0) {
             const u32 entry = slot_value & ~ArrayEntryFlag;
             if (entry < array_table.size()) {
                 array_table[entry] =
-                    scheduler.UseTexture(metal_stage, texture, write, on_buffer);
+                    scheduler.UseTexture(metal_stage, texture, write, on_buffer, known_res_id);
             }
             return;
         }
@@ -2462,8 +2569,13 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                 if (is_ssbo && force_ssbo_write && !b.is_written && b.size != 0) {
                     InvalidateConvertedIndices(b.buffer, b.offset, b.size);
                 }
-                spill_table[bslot.spill] =
-                    scheduler.UseBuffer(metal_stage, b.buffer, b.offset, write);
+                const u64 read_sz = b.hazard_read_size != 0 ? b.hazard_read_size : b.size;
+                const u64 write_sz = !write ? 0
+                                     : (is_ssbo && force_ssbo_write)
+                                         ? b.size
+                                         : (b.hazard_write_size != 0 ? b.hazard_write_size : b.size);
+                spill_table[bslot.spill] = scheduler.UseBuffer(
+                    metal_stage, b.buffer, b.offset, write, b.gpu_address, read_sz, write_sz);
             }
             continue;
         }
@@ -2497,7 +2609,13 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
             if (is_ssbo && force_ssbo_write && !b.is_written && b.size != 0) {
                 InvalidateConvertedIndices(b.buffer, b.offset, b.size);
             }
-            scheduler.BindBuffer(metal_stage, bslot.slot_index, b.buffer, b.offset, write);
+            const u64 read_sz = b.hazard_read_size != 0 ? b.hazard_read_size : b.size;
+            const u64 write_sz = !write ? 0
+                                 : (is_ssbo && force_ssbo_write)
+                                     ? b.size
+                                     : (b.hazard_write_size != 0 ? b.hazard_write_size : b.size);
+            scheduler.BindBuffer(metal_stage, bslot.slot_index, b.buffer, b.offset, write, read_sz,
+                                 write_sz);
         }
     }
 
@@ -2564,15 +2682,17 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
             }
             ImageView& image_view = texture_cache.GetImageView(view_id);
             if (texture_slot < texture_slots.size()) {
+                u64 tex_res_id = 0;
                 const TextureHandle sampled =
                     desc.is_depth && !IsDepth(image_view.HostClass())
                         ? nullptr
-                        : image_view.SampledHandle(desc.type, desc.is_multisample);
+                        : image_view.SampledHandle(desc.type, desc.is_multisample, &tex_res_id);
                 const TextureHandle tex_handle =
-                    OrPlaceholder(image_view, sampled, desc.type, desc.is_depth);
+                    OrPlaceholder(image_view, sampled, desc.type, desc.is_depth, &tex_res_id);
                 if (tex_in_array) {
                     const u32 entry = texture_slots[texture_slot] & ~ArrayEntryFlag;
-                    prev_tex_res = scheduler.UseTexture(metal_stage, tex_handle, false, false);
+                    prev_tex_res =
+                        scheduler.UseTexture(metal_stage, tex_handle, false, false, tex_res_id);
                     prev_view_id = view_id;
                     have_prev_tex = true;
                     if (entry < array_table.size()) {
@@ -2585,11 +2705,13 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
             }
             ++texture_slot;
             if (has_sampler_slot) {
-                void* const handle =
-                    texture_cache.GetSampler(samp_id).HandleFor(image_view, desc.is_depth);
+                u64 samp_res_id = 0;
+                void* const handle = texture_cache.GetSampler(samp_id).HandleFor(
+                    image_view, desc.is_depth, &samp_res_id);
                 if (samp_in_array) {
                     const u32 entry = sampler_slots[sampler] & ~ArrayEntryFlag;
-                    prev_samp_res = Scheduler::SamplerResourceId(handle);
+                    prev_samp_res = samp_res_id != 0 ? samp_res_id
+                                                     : Scheduler::SamplerResourceId(handle);
                     prev_sampler_id = samp_id;
                     have_prev_samp = true;
                     if (entry < array_table.size()) {
@@ -2597,7 +2719,8 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                     }
                 } else if ((sampler_slots[sampler] & SpilledSamplerFlag) != 0) {
                     const u32 entry = sampler_slots[sampler] & ~SpilledSamplerFlag;
-                    sampler_table[entry] = Scheduler::SamplerResourceId(handle);
+                    sampler_table[entry] = samp_res_id != 0 ? samp_res_id
+                                                            : Scheduler::SamplerResourceId(handle);
                 } else {
                     scheduler.BindSampler(metal_stage, sampler_slots[sampler], handle);
                 }
@@ -2624,18 +2747,24 @@ void RasterizerMetal::BindStageResources(StageProgram& program, ShaderStage meta
                 texture_cache.MarkModification(image_view.image_id);
             }
             if (texture_slot < texture_slots.size()) {
-                bind_texture(texture_slots[texture_slot],
-                             view_index == byte_shadow_view
-                                 ? byte_shadow_texture
-                                 : OrPlaceholder(image_view,
-                                                 image_view.StorageHandle(desc.type, desc.format),
-                                                 desc.type),
-                             desc.is_written, false);
+                if (view_index == byte_shadow_view) {
+                    bind_texture(texture_slots[texture_slot], byte_shadow_texture, desc.is_written,
+                                 false);
+                } else {
+                    u64 img_res_id = 0;
+                    const TextureHandle storage_h =
+                        image_view.StorageHandle(desc.type, desc.format, &img_res_id);
+                    bind_texture(texture_slots[texture_slot],
+                                 OrPlaceholder(image_view, storage_h, desc.type, false,
+                                               &img_res_id),
+                                 desc.is_written, false, img_res_id);
+                }
             }
             ++texture_slot;
         }
     }
     bind_u64_table(program.array_spill_slot, array_table);
+    scheduler.FlushStageBindings(metal_stage);
 }
 
 template <typename CbufAddrFn>
@@ -2836,8 +2965,47 @@ void RasterizerMetal::AppendSampledDump(u32 stage, const Shader::Info& info,
     }
 }
 
+void RasterizerMetal::Nx2ProveNonWriterDraw(const GraphicsPipeline& pipeline) {
+    const u64 epoch = pipeline_cache.Nx2ResolvedEpoch();
+    const u64 map = pipeline_cache.Nx2ResolvedMap();
+    if (epoch == 0 || map != gpu_memory->GetMapSerial()) {
+        return;
+    }
+    Tegra::Nx2DrawPrograms programs;
+    if (!Tegra::Engines::Maxwell3D::Nx2DrawProgramsOf(
+            maxwell3d->regs, maxwell3d->GetNativeMacroEngine().native_turing, gpu_memory->GetID(),
+            map, programs) ||
+        Tegra::Nx2IsNonWriterDraw(programs, epoch)) {
+        return;
+    }
+    if (pipeline.IsMeshPipeline() || pipeline.Nx2MayWriteMemory() ||
+        pipeline_cache.IsIndirectResetShader()) {
+        return;
+    }
+    const auto& ranges = pipeline_cache.Nx2CodeRanges();
+    for (const auto& [address, size] : ranges) {
+        if (size != 0 && buffer_cache.IsRegionGpuModified(address, size)) {
+            return;
+        }
+    }
+    for (const auto& [address, size] : ranges) {
+        Tegra::Nx2MarkProvenCode(address, size);
+    }
+    if (Tegra::g_nx2_code_epoch.load(std::memory_order_acquire) != epoch) {
+        return;
+    }
+    Tegra::Nx2InsertNonWriterDraw(programs, epoch);
+}
+
 bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u32 mesh_workgroups,
                                   TessellationDraw* tess_draw) {
+    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::MacroReadWriterSet)) {
+        Nx2ProveNonWriterDraw(pipeline);
+    }
+    if (buffer_cache.HasPendingNx2ListCopies() &&
+        !Tegra::Engines::Maxwell3D::FrontIsWriterDraw(maxwell3d->regs)) {
+        SubmitListCopies(0);
+    }
     // Buffer cache stage indices and the translated programs: the vertex program (or a mesh
     // pipeline's task or mesh kernel, or a tessellation pipeline's vertex kernel), a second kernel
     // (the mesh program after a task program, the tessellation control program), the render
@@ -3597,12 +3765,8 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                                 .no_u16_restart = true,
                             });
                             ++converted_index_count;
-                            converted_index_min_addr =
-                                (std::min)(converted_index_min_addr, index_rewrite.device_addr);
-                            const DAddr end = src_size > ~DAddr{0} - index_rewrite.device_addr
-                                                  ? ~DAddr{0}
-                                                  : index_rewrite.device_addr + src_size;
-                            converted_index_max_addr = (std::max)(converted_index_max_addr, end);
+                            NoteConvertedIndexAdded(idx.buffer, index_rewrite.device_addr,
+                                                    src_size);
                         }
                     }
                 }
@@ -3680,13 +3844,8 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                                 .hits = 1,
                             });
                             ++converted_index_count;
-                            converted_index_min_addr =
-                                (std::min)(converted_index_min_addr, index_rewrite.device_addr);
-                            const DAddr end =
-                                src_size > ~DAddr{0} - index_rewrite.device_addr
-                                    ? ~DAddr{0}
-                                    : index_rewrite.device_addr + src_size;
-                            converted_index_max_addr = (std::max)(converted_index_max_addr, end);
+                            NoteConvertedIndexAdded(idx.buffer, index_rewrite.device_addr,
+                                                    src_size);
                         }
                     }
                     if (gpu_indices != '0' && params.count >= 256 && record_ahead(false)) {
@@ -6158,9 +6317,39 @@ bool RasterizerMetal::ProvokingLastWanted(const GraphicsPipeline& pipeline) {
     // last vertex convention takes them from, as Vulkan draws them on a desktop GPU.
     // EDEN_NX2_METAL_PROVOKING_LAST=0: they take the first vertex, as MoltenVK draws them.
     static const bool enabled = EnvironmentOn("EDEN_NX2_METAL_PROVOKING_LAST");
-    return enabled && maxwell3d->regs.provoking_vertex == Maxwell::ProvokingVertex::Last &&
-           IndexConvert::RotatesForProvokingVertex(DrawTopology(*maxwell3d)) &&
-           pipeline.HasFlatInputs();
+    static const bool flat_invariance = EnvironmentOn("EDEN_NX2_METAL_FLAT_INVARIANCE");
+    if (!enabled || maxwell3d->regs.provoking_vertex != Maxwell::ProvokingVertex::Last ||
+        !IndexConvert::RotatesForProvokingVertex(DrawTopology(*maxwell3d)) ||
+        !pipeline.HasFlatInputs()) {
+        return false;
+    }
+    if (!flat_invariance || pipeline.FlatAlwaysVaries()) {
+        return true;
+    }
+    u32 deps = pipeline.FlatAttrDepsMask();
+    while (deps != 0) {
+        const u32 attr = static_cast<u32>(std::countr_zero(deps));
+        deps &= deps - 1U;
+        if (attr >= Maxwell::NumVertexAttributes) {
+            continue;
+        }
+        const auto& fmt = maxwell3d->regs.vertex_attrib_format[attr];
+        if (fmt.constant != 0 || fmt.size == Maxwell::VertexAttribute::Size::Invalid) {
+            continue;
+        }
+        const u32 stream = fmt.buffer;
+        if (stream >= Maxwell::NumVertexArrays ||
+            !maxwell3d->regs.vertex_streams[stream].IsEnabled() ||
+            maxwell3d->regs.vertex_streams[stream].stride == 0) {
+            continue;
+        }
+        if (maxwell3d->regs.vertex_stream_instances.IsInstancingEnabled(stream) &&
+            maxwell3d->regs.vertex_streams[stream].frequency != 0) {
+            continue;
+        }
+        return true;
+    }
+    return false;
 }
 
 bool RasterizerMetal::RestartOffWidens(bool is_indexed) {
@@ -6681,11 +6870,6 @@ void RasterizerMetal::DispatchCompute() {
     }
     for (const auto& desc : info.image_buffer_descriptors) {
         add_buffer(desc, true);
-    }
-    const bool any_byte_image = std::ranges::any_of(
-        info.image_descriptors, [](const auto& desc) { return desc.is_byte_addressed; });
-    if (!any_byte_image) {
-        scheduler.PrepareCompute();
     }
     const u64 dispatch_segment = scheduler.SegmentSerial();
     buffer_cache.UpdateComputeBuffers();

@@ -76,6 +76,8 @@
 #include "video_core/renderer_metal/metal_indirect.h"
 #include "video_core/renderer_metal/metal_ocarina.h"
 #include "video_core/renderer_metal/metal_build_job.h"
+#include "video_core/renderer_metal/metal_buffer_cache.h"
+#include "video_core/renderer_metal/metal_pipeline_cache.h"
 #include "video_core/renderer_metal/metal_pipeline_files.h"
 #include "video_core/renderer_metal/metal_pipeline_translate.h"
 #include "video_core/renderer_metal/metal_present.h"
@@ -6074,15 +6076,27 @@ int RunEncoderAndIndexOpt() {
                            Near(scene.At(0, Size - 4, mid), {0, 255, 0, 255});
     const bool pass_ok = untracked_clean && still_open_after_clear && still_open_after_upload &&
                          pass_counts[3] == 1 && pass_counts[4] == 1 && pass_counts[8] == 1;
-    const bool comp_ok = comp_counts[0] == 1 && comp_counts[6] >= 1 &&
-                         pattern_word == 0x11223344U && mark_word == 1U;
-    const bool passed = scan_ok && pixels_ok && pass_ok && comp_ok;
-    std::printf("metal-smoke: encoder & index opt: scan %d, pass (%llu passes, %llu folded, %llu "
-                "ahead) %d, compute (%llu enc, pattern %08x, mark %u) %d, pixels %d: %s\n",
-                scan_ok ? 1 : 0, static_cast<unsigned long long>(pass_counts[3]),
+    const char* const cc_env = std::getenv("EDEN_NX2_METAL_COMPUTE_COPY");
+    const bool compute_copy_on = cc_env == nullptr || cc_env[0] != '0';
+    const bool comp_enc_ok = compute_copy_on ? (comp_counts[0] == 1 && comp_counts[2] == 0)
+                                             : (comp_counts[0] == 3 && comp_counts[2] == 1);
+    const bool comp_ok = comp_enc_ok && comp_counts[6] >= 1 && pattern_word == 0x11223344U &&
+                         mark_word == 1U;
+    bool child_ok = true;
+    if (cc_env == nullptr) {
+        std::fflush(stdout);
+        child_ok = RunChildWith("encoder-index-opt", {"EDEN_NX2_METAL_COMPUTE_COPY=0"}) == 0;
+    }
+    const bool passed = scan_ok && pixels_ok && pass_ok && comp_ok && child_ok;
+    std::printf("metal-smoke: encoder & index opt (compute_copy=%s): scan %d, pass (%llu passes, "
+                "%llu folded, %llu ahead) %d, compute (%llu enc, %llu blits, pattern %08x, mark "
+                "%u) %d, pixels %d: %s\n",
+                compute_copy_on ? "on" : "dma", scan_ok ? 1 : 0,
+                static_cast<unsigned long long>(pass_counts[3]),
                 static_cast<unsigned long long>(pass_counts[4]),
                 static_cast<unsigned long long>(pass_counts[8]), pass_ok ? 1 : 0,
-                static_cast<unsigned long long>(comp_counts[0]), pattern_word, mark_word,
+                static_cast<unsigned long long>(comp_counts[0]),
+                static_cast<unsigned long long>(comp_counts[2]), pattern_word, mark_word,
                 comp_ok ? 1 : 0, pixels_ok ? 1 : 0, passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }
@@ -7370,6 +7384,517 @@ int RunPipelineJobs() {
     return passed ? 0 : 1;
 }
 
+/// Multi-target deferred clears table (`pending_clears`): 4 independent clears (rt0, rt1, rt2,
+/// depth) fold into an MRT pass on {rt0, rt1, depth} while keeping rt2 deferred across the pass
+/// into its own pass (`2` total render passes, `2` clears folded), and sampling a deferred target
+/// mid-pass flushes only that target onto AheadBuffer() without disturbing other deferred clears.
+int RunMultiTargetClears() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    const uint32_t d32 = static_cast<uint32_t>(MTLPixelFormatDepth32Float);
+    const auto make_color = [&] {
+        return Metal::CreateTexture(device, {.kind = Metal::TextureKind::e2D,
+                                             .format = rgba8,
+                                             .width = Size,
+                                             .height = Size,
+                                             .render_target = true});
+    };
+    const Metal::Object rt0 = make_color();
+    const Metal::Object rt1 = make_color();
+    const Metal::Object rt2 = make_color();
+    const Metal::Object rt3 = make_color();
+    const Metal::Object depth = Metal::CreateTexture(device, {.kind = Metal::TextureKind::e2D,
+                                                              .format = d32,
+                                                              .width = Size,
+                                                              .height = Size,
+                                                              .render_target = true});
+    std::array<uint8_t*, 3> rb_ptrs{};
+    std::array<Metal::Object, 3> rbs{
+        Metal::CreateBuffer(device, Size * Size * 4, true, &rb_ptrs[0]),
+        Metal::CreateBuffer(device, Size * Size * 4, true, &rb_ptrs[1]),
+        Metal::CreateBuffer(device, Size * Size * 4, true, &rb_ptrs[2]),
+    };
+    constexpr const char* SampleQuadMsl = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct Out { float4 pos [[position]]; float2 uv; };
+vertex Out vs_main(uint vid [[vertex_id]]) {
+    const float2 c = float2(float((vid << 1) & 2), float(vid & 2));
+    Out o;
+    o.pos = float4(c * 2.0 - 1.0, 0.0, 1.0);
+    o.uv = c;
+    return o;
+}
+fragment float4 fs_sample(Out in [[stage_in]], texture2d<float> tex [[texture(0)]]) {
+    return tex.read(uint2(4, 4));
+}
+)";
+    std::string error;
+    const Metal::Object lib = Metal::CreateLibrary(device, SampleQuadMsl, error);
+    const Metal::Object vs = lib ? Metal::CreateFunction(lib.Get(), "vs_main") : Metal::Object{};
+    const Metal::Object fs = lib ? Metal::CreateFunction(lib.Get(), "fs_sample") : Metal::Object{};
+    auto pdesc = Metal::Zeroed<Metal::RenderPipelineDesc>();
+    pdesc.vertex_function = vs.Get();
+    pdesc.fragment_function = fs.Get();
+    pdesc.color_formats[0] = rgba8;
+    pdesc.blend[0].write_mask = 0xF;
+    pdesc.samples = 1;
+    pdesc.topology_class = 2;
+    pdesc.rasterize = 1;
+    const Metal::Object sample_pso = Metal::CreateRenderPipelineState(device, pdesc, error);
+    const Metal::Object ds =
+        Metal::CreateDepthStencilState(device, Metal::Zeroed<Metal::DepthStencilDesc>());
+    if (!rt0 || !rt1 || !rt2 || !rt3 || !depth || !sample_pso || !ds || !rbs[0] || !rbs[1] ||
+        !rbs[2]) {
+        std::printf("metal-smoke: FAIL multi-target clears setup: %s\n", error.c_str());
+        return 1;
+    }
+
+    const auto clear_color = [&](const Metal::Object& tex, uint32_t slot,
+                                 std::array<double, 4> col) {
+        Metal::ClearPass pass{};
+        pass.color[slot] = {.texture = tex.Get()};
+        pass.clear_color[slot] = true;
+        pass.color_value[slot] = col;
+        pass.width = Size;
+        pass.height = Size;
+        scheduler.Clear(pass);
+    };
+    const auto clear_depth = [&](const Metal::Object& tex, double val) {
+        Metal::ClearPass pass{};
+        pass.depth = {.texture = tex.Get()};
+        pass.clear_depth = true;
+        pass.depth_value = val;
+        pass.width = Size;
+        pass.height = Size;
+        scheduler.Clear(pass);
+    };
+
+    (void)scheduler.TakeCounts();
+    // 1. Defer 4 separate clears on distinct root textures (rt0@slot0, rt1@slot1, rt2@slot0, depth).
+    clear_color(rt0, 0, {1.0, 0.0, 0.0, 1.0}); // Red
+    clear_color(rt1, 1, {0.0, 1.0, 0.0, 1.0}); // Green
+    clear_color(rt2, 0, {0.0, 0.0, 1.0, 1.0}); // Blue (deferred across pass 1!)
+    clear_depth(depth, 0.25);
+
+    Metal::RenderTargetSet mrt{};
+    mrt.color[0] = {.texture = rt0.Get()};
+    mrt.color[1] = {.texture = rt1.Get()};
+    mrt.depth = {.texture = depth.Get()};
+    mrt.has_depth = true;
+    mrt.width = Size;
+    mrt.height = Size;
+    scheduler.BeginRendering(mrt);
+    scheduler.EndRendering();
+
+    Metal::RenderTargetSet pass2{};
+    pass2.color[0] = {.texture = rt2.Get()};
+    pass2.width = Size;
+    pass2.height = Size;
+    scheduler.BeginRendering(pass2);
+    scheduler.EndRendering();
+
+    const auto counts_mrt = scheduler.TakeCounts();
+    scheduler.CopyTextureToBuffer(rt0.Get(), 0, 0, {}, {Size, Size, 1}, rbs[0].Get(), 0, Size * 4,
+                                  0);
+    scheduler.CopyTextureToBuffer(rt1.Get(), 0, 0, {}, {Size, Size, 1}, rbs[1].Get(), 0, Size * 4,
+                                  0);
+    scheduler.CopyTextureToBuffer(rt2.Get(), 0, 0, {}, {Size, Size, 1}, rbs[2].Get(), 0, Size * 4,
+                                  0);
+    scheduler.Finish();
+
+    const auto px = [&](size_t idx) { return reinterpret_cast<const Texel*>(rb_ptrs[idx])[0]; };
+    const bool mrt_ok = counts_mrt[3] == 2 && counts_mrt[4] == 2 &&
+                        Near(px(0), {255, 0, 0, 255}) && Near(px(1), {0, 255, 0, 255}) &&
+                        Near(px(2), {0, 0, 255, 255});
+
+    // 2. Selective mid-pass ahead flush: clear rt3 (Yellow) + rt2 (Magenta) in a fresh segment,
+    // open pass on rt0, sample rt3 -> flushes only rt3 ahead while rt2 folds into its next pass.
+    (void)scheduler.TakeCounts();
+    clear_color(rt3, 0, {1.0, 1.0, 0.0, 1.0}); // Yellow
+    clear_color(rt2, 0, {1.0, 0.0, 1.0, 1.0}); // Magenta (stays deferred!)
+    Metal::RenderTargetSet sample_targets{};
+    sample_targets.color[0] = {.texture = rt0.Get()};
+    sample_targets.width = Size;
+    sample_targets.height = Size;
+    scheduler.BeginRendering(sample_targets);
+    Metal::DrawState dstate{};
+    dstate.pipeline = sample_pso.Get();
+    dstate.depth_stencil = ds.Get();
+    dstate.viewport = {0.0f, 0.0f, float(Size), float(Size), 0.0f, 1.0f};
+    dstate.scissor = {0, 0, Size, Size};
+    scheduler.SetDrawState(dstate);
+    scheduler.BindTexture(Metal::ShaderStage::Fragment, 0, rt3.Get(), false, false);
+    scheduler.Draw(static_cast<uint32_t>(MTLPrimitiveTypeTriangle), 0, 3, 1, 0);
+    scheduler.EndRendering();
+    // Fold rt2's Magenta clear into pass on rt2:
+    scheduler.BeginRendering(pass2);
+    scheduler.EndRendering();
+    const auto counts_ahead = scheduler.TakeCounts();
+    scheduler.CopyTextureToBuffer(rt0.Get(), 0, 0, {}, {Size, Size, 1}, rbs[0].Get(), 0, Size * 4,
+                                  0);
+    scheduler.CopyTextureToBuffer(rt2.Get(), 0, 0, {}, {Size, Size, 1}, rbs[2].Get(), 0, Size * 4,
+                                  0);
+    scheduler.Finish();
+
+    // 3 render passes total (1 Ahead Clear for rt3 + 1 draw pass on rt0 + 1 folded pass on rt2).
+    const bool ahead_ok = counts_ahead[3] == 3 && counts_ahead[4] == 1 &&
+                          Near(px(0), {255, 255, 0, 255}) && Near(px(2), {255, 0, 255, 255});
+    const bool passed = mrt_ok && ahead_ok;
+    std::printf("metal-smoke: multi-target clears: mrt (%llu passes, %llu folded) %d, selective "
+                "ahead (%llu passes, %llu folded) %d: %s\n",
+                static_cast<unsigned long long>(counts_mrt[3]),
+                static_cast<unsigned long long>(counts_mrt[4]), mrt_ok ? 1 : 0,
+                static_cast<unsigned long long>(counts_ahead[3]),
+                static_cast<unsigned long long>(counts_ahead[4]), ahead_ok ? 1 : 0,
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// Batched range setters (`set*Buffers/Textures/SamplerStates:withRange:`), plural read-only
+/// residency (`useResources:count:usage:`), and cached GPU addresses / resource IDs.
+int RunBatchedRangeBinds() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr const char* RangeMsl = R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void sum_range(const device uint* b0 [[buffer(0)]],
+                      const device uint* b1 [[buffer(1)]],
+                      const device uint* b2 [[buffer(2)]],
+                      device uint* out [[buffer(4)]],
+                      const constant ulong* indirect [[buffer(5)]],
+                      texture2d<float> t0 [[texture(0)]],
+                      texture2d<float> t1 [[texture(1)]],
+                      sampler s0 [[sampler(0)]],
+                      sampler s1 [[sampler(1)]]) {
+    const device uint* ind0 = reinterpret_cast<const device uint*>(indirect[0]);
+    const device uint* ind1 = reinterpret_cast<const device uint*>(indirect[1]);
+    const uint tex_sum = uint(rint(t0.sample(s0, float2(0.5)).r * 255.0)) +
+                         uint(rint(t1.sample(s1, float2(0.5)).g * 255.0));
+    out[0] = b0[0] + b1[0] + b2[0] + ind0[0] + ind1[0] + tex_sum;
+}
+)";
+    std::string error;
+    const Metal::Object lib = Metal::CreateLibrary(device, RangeMsl, error);
+    const Metal::Object fn = lib ? Metal::CreateFunction(lib.Get(), "sum_range") : Metal::Object{};
+    const Metal::Object pso =
+        fn ? Metal::CreateComputePipelineState(device, fn.Get(), error) : Metal::Object{};
+    std::array<uint8_t*, 6> bptrs{};
+    std::array<Metal::Object, 6> bufs{};
+    for (size_t i = 0; i < bufs.size(); ++i) {
+        bufs[i] = Metal::CreateBuffer(device, 64, true, &bptrs[i]);
+    }
+    const uint32_t rgba8 = static_cast<uint32_t>(MTLPixelFormatRGBA8Unorm);
+    const Metal::Object tex0 = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D, .format = rgba8, .width = 4, .height = 4});
+    const Metal::Object tex1 = Metal::CreateTexture(
+        device, {.kind = Metal::TextureKind::e2D, .format = rgba8, .width = 4, .height = 4});
+    Tegra::Texture::TSCEntry tsc{};
+    const Metal::Object smp0 = Metal::CreateSampler(device, tsc, {.plain = true});
+    const Metal::Object smp1 = Metal::CreateSampler(device, tsc, {.plain = true});
+    if (!pso || !tex0 || !tex1 || !smp0 || !smp1 || !bufs[0] || !bufs[5]) {
+        std::printf("metal-smoke: FAIL batched range binds setup: %s\n", error.c_str());
+        return 1;
+    }
+
+    const uint32_t v0 = 10, v1_wrong = 999, v1_zero = 777, v1_right = 20, v2 = 30;
+    const uint32_t vi0 = 40, vi1 = 50;
+    std::memcpy(bptrs[0], &v0, 4);
+    std::memcpy(bptrs[1], &v1_wrong, 4);
+    std::memcpy(bptrs[2], &v1_zero, 4);
+    std::memcpy(bptrs[2] + 16, &v1_right, 4);
+    std::memcpy(bptrs[3], &v2, 4);
+    std::memcpy(bptrs[4], &vi0, 4);
+    std::memcpy(bptrs[5], &vi1, 4);
+    // Fill 4x4 textures via staging buffer: tex0.r = 7, tex1.g = 13.
+    uint8_t* stage_px = nullptr;
+    const Metal::Object stage_tex = Metal::CreateBuffer(device, 128, true, &stage_px);
+    for (size_t p = 0; p < 16; ++p) {
+        stage_px[p * 4 + 0] = 7;
+        stage_px[64 + p * 4 + 1] = 13;
+    }
+    scheduler.CopyBufferToTexture(stage_tex.Get(), 0, 16, 64, tex0.Get(), 0, 0, {}, {4, 4, 1});
+    scheduler.CopyBufferToTexture(stage_tex.Get(), 64, 16, 64, tex1.Get(), 0, 0, {}, {4, 4, 1});
+
+    const uint64_t known_a0 = Metal::Scheduler::BufferGpuAddress(bufs[4].Get());
+    const uint64_t known_a1 = Metal::Scheduler::BufferGpuAddress(bufs[5].Get());
+    const uint64_t known_t0 = Metal::Scheduler::TextureResourceId(tex0.Get());
+    const uint64_t known_s0 = Metal::Scheduler::SamplerResourceId(smp0.Get());
+
+    uint8_t* out_ptr = nullptr;
+    const Metal::Object out_buf = Metal::CreateBuffer(device, 64, true, &out_ptr);
+
+    (void)scheduler.TakeBatchCounts();
+    scheduler.BeginCompute(pso.Get(), false);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, bufs[0].Get(), 0, false);
+    // Rebind slot 1 from bufs[1]@0 -> bufs[2]@0 -> bufs[2]@16 before flush to test dirty-offset guard:
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, bufs[1].Get(), 0, false);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, bufs[2].Get(), 0, false);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, bufs[2].Get(), 16, false);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 2, bufs[3].Get(), 0, false);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 4, out_buf.Get(), 0, true);
+    const std::array<uint64_t, 2> ptrs{
+        scheduler.UseBuffer(Metal::ShaderStage::Compute, bufs[4].Get(), 0, false, known_a0),
+        scheduler.UseBuffer(Metal::ShaderStage::Compute, bufs[5].Get(), 0, false, known_a1),
+    };
+    (void)scheduler.UseTexture(Metal::ShaderStage::Compute, tex0.Get(), false, false, known_t0);
+    scheduler.BindBytes(Metal::ShaderStage::Compute, 5, ptrs.data(), sizeof(ptrs));
+    scheduler.BindTexture(Metal::ShaderStage::Compute, 0, tex0.Get(), false, false);
+    scheduler.BindTexture(Metal::ShaderStage::Compute, 1, tex1.Get(), false, false);
+    scheduler.BindSampler(Metal::ShaderStage::Compute, 0, smp0.Get());
+    scheduler.BindSampler(Metal::ShaderStage::Compute, 1, smp1.Get());
+    scheduler.Dispatch({1, 1, 1}, {1, 1, 1});
+    const auto batch_counts = scheduler.TakeBatchCounts();
+    scheduler.Finish();
+
+    uint32_t sum = 0;
+    std::memcpy(&sum, out_ptr, 4);
+    const uint32_t expected = 10 + 20 + 30 + 40 + 50 + 7 + 13; // 170
+    const bool ids_ok = known_a0 != 0 && known_a1 != 0 && known_t0 != 0 && known_s0 != 0 &&
+                        ptrs[0] == known_a0 && ptrs[1] == known_a1;
+    // 3 range calls on compute: buffers [0..2], textures [0..1], samplers [0..1]; 1 plural useResources (3 reads).
+    const bool counts_ok = batch_counts[0] == 3 && batch_counts[1] == 1;
+    const bool passed = ids_ok && counts_ok && sum == expected;
+    std::printf("metal-smoke: batched range binds: sum %u (expected %u), %llu range calls, %llu "
+                "residency batches, ids %d: %s\n",
+                sum, expected, static_cast<unsigned long long>(batch_counts[0]),
+                static_cast<unsigned long long>(batch_counts[1]), ids_ok ? 1 : 0,
+                passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// Per-primitive flat-varying invariance analysis (`AnalyzeVertexOutputInvariance` &
+/// `GraphicsPipeline::FlatAlwaysVaries` / `FlatAttrDepsMask`).
+int RunFlatInvariance() {
+    constexpr std::string_view InstancedFlatMsl = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct Ubo0 { float4 tint; uint count; };
+struct main0_out {
+    float4 m_flat [[user(locn0)]];
+    float4 m_smooth [[user(locn1)]];
+    float4 gl_Position [[position]];
+};
+struct main0_in {
+    float4 m_pos [[attribute(0)]];
+    float4 m_inst_col [[attribute(2)]];
+};
+vertex main0_out main0(main0_in in [[stage_in]],
+                       constant Ubo0& ubo [[buffer(0)]],
+                       uint vid [[vertex_id]],
+                       uint iid [[instance_id]]) {
+    main0_out out = {};
+    float4 base = ubo.tint + float4(float(iid));
+    out.m_flat = base + in.m_inst_col;
+    out.m_smooth = in.m_pos * float(vid);
+    out.gl_Position = in.m_pos + float4(float(vid) * 0.01);
+    return out;
+}
+)";
+    constexpr std::string_view VertexIdBranchMsl = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct main0_out {
+    uint m_flat [[user(locn0)]];
+    float4 gl_Position [[position]];
+};
+struct main0_in { float4 m_pos [[attribute(0)]]; };
+vertex main0_out main0(main0_in in [[stage_in]], uint vid [[vertex_id]]) {
+    main0_out out = {};
+    if (vid == 2u) {
+        out.m_flat = 7u;
+    }
+    out.gl_Position = in.m_pos;
+    return out;
+}
+)";
+    constexpr std::string_view LoopTaintMsl = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct Ubo0 { uint n; };
+struct main0_out {
+    float m_flat [[user(locn3)]];
+    float4 gl_Position [[position]];
+};
+struct main0_in { float4 m_pos [[attribute(0)]]; };
+vertex main0_out main0(main0_in in [[stage_in]], constant Ubo0& ubo [[buffer(0)]]) {
+    main0_out out = {};
+    float acc = 0.0;
+    for (uint i = 0u; i < ubo.n; ++i) {
+        acc += 1.0;
+    }
+    out.m_flat = acc;
+    out.gl_Position = in.m_pos;
+    return out;
+}
+)";
+    constexpr std::string_view UnknownHelperMsl = R"(
+#include <metal_stdlib>
+using namespace metal;
+inline void mutate(thread float4& v) { v = float4(1.0); }
+struct main0_out {
+    float4 m_flat [[user(locn0)]];
+    float4 gl_Position [[position]];
+};
+struct main0_in { float4 m_pos [[attribute(0)]]; };
+vertex main0_out main0(main0_in in [[stage_in]]) {
+    main0_out out = {};
+    float4 tmp = float4(0.0);
+    mutate(tmp);
+    out.m_flat = tmp;
+    out.gl_Position = in.m_pos;
+    return out;
+}
+)";
+
+    const Metal::VertexOutputInvariance inv_inst =
+        Metal::AnalyzeVertexOutputInvariance(InstancedFlatMsl, "main0");
+    const Metal::VertexOutputInvariance inv_vid =
+        Metal::AnalyzeVertexOutputInvariance(VertexIdBranchMsl, "main0");
+    const Metal::VertexOutputInvariance inv_loop =
+        Metal::AnalyzeVertexOutputInvariance(LoopTaintMsl, "main0");
+    const Metal::VertexOutputInvariance inv_helper =
+        Metal::AnalyzeVertexOutputInvariance(UnknownHelperMsl, "main0");
+
+    // In InstancedFlatMsl: locn0 is independent of vertex_id and depends ONLY on attribute(2),
+    // while locn1 depends on vertex_id and attribute(0).
+    const bool inst_ok = (inv_inst.uses_vertex_id_mask & (1U << 0)) == 0 &&
+                         inv_inst.attr_deps[0] == (1U << 2) &&
+                         (inv_inst.uses_vertex_id_mask & (1U << 1)) != 0 &&
+                         inv_inst.attr_deps[1] == (1U << 0);
+    const bool vid_ok = (inv_vid.uses_vertex_id_mask & (1U << 0)) != 0;
+    const bool loop_ok = (inv_loop.uses_vertex_id_mask & (1U << 3)) != 0;
+    const bool helper_ok = (inv_helper.uses_vertex_id_mask & (1U << 0)) != 0;
+
+    // Verify GraphicsPipeline wiring (works from StageProgram::msl alone, as on StageMslCache hit).
+    const auto make_fs = [] {
+        Metal::StageProgram fs{};
+        fs.msl = "// stub";
+        fs.entry_point = "main0";
+        fs.info.loads.Set(Shader::IR::Attribute::Generic0X);
+        fs.info.loads.Set(Shader::IR::Attribute::Generic1X);
+        fs.info.interpolation[0] = Shader::Interpolation::Flat;
+        fs.info.interpolation[1] = Shader::Interpolation::Smooth;
+        return fs;
+    };
+    Metal::StageProgram vs_prog{};
+    vs_prog.msl = std::string{InstancedFlatMsl};
+    vs_prog.entry_point = "main0";
+    vs_prog.info.stores.Set(Shader::IR::Attribute::Generic0X);
+    vs_prog.info.stores.Set(Shader::IR::Attribute::Generic1X);
+    Metal::GraphicsPipeline pipe_inst{Metal::Zeroed<Metal::GraphicsPipelineKey>(),
+                                      std::move(vs_prog), make_fs()};
+
+    Metal::StageProgram vs_vid{};
+    vs_vid.msl = std::string{VertexIdBranchMsl};
+    vs_vid.entry_point = "main0";
+    vs_vid.info.stores.Set(Shader::IR::Attribute::Generic0X);
+    Metal::GraphicsPipeline pipe_vid{Metal::Zeroed<Metal::GraphicsPipelineKey>(), std::move(vs_vid),
+                                     make_fs()};
+
+    const bool pipe_ok = pipe_inst.HasFlatInputs() && !pipe_inst.FlatAlwaysVaries() &&
+                         pipe_inst.FlatGenericMask() == 1U &&
+                         pipe_inst.FlatAttrDepsMask() == (1U << 2) &&
+                         pipe_vid.HasFlatInputs() && pipe_vid.FlatAlwaysVaries();
+    const bool passed = inst_ok && vid_ok && loop_ok && helper_ok && pipe_ok;
+    std::printf("metal-smoke: flat invariance: inst %d, vid_branch %d, loop %d, helper %d, "
+                "pipeline %d: %s\n",
+                inst_ok ? 1 : 0, vid_ok ? 1 : 0, loop_ok ? 1 : 0, helper_ok ? 1 : 0,
+                pipe_ok ? 1 : 0, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+/// Concurrent compute encoder byte-range hazard tracking: disjoint writes into one MTLBuffer emit
+/// 0 barriers, while RAW and WAR overlapping byte ranges emit scoped barriers and preserve order.
+int RunConcurrentComputeHazards() {
+    Metal::Device device;
+    Metal::Scheduler scheduler(device);
+    constexpr const char* Source = R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void write_val(device uint* dst [[buffer(0)]], constant uint& val [[buffer(1)]],
+                      uint tid [[thread_position_in_grid]]) {
+    if (tid < 16) {
+        dst[tid] = val + tid;
+    }
+}
+kernel void sum_pair(const device uint* a [[buffer(0)]], const device uint* b [[buffer(1)]],
+                     device uint* out [[buffer(2)]], uint tid [[thread_position_in_grid]]) {
+    if (tid < 16) {
+        out[tid] = a[tid] + b[tid];
+    }
+}
+)";
+    std::string error;
+    const Metal::Object lib = Metal::CreateLibrary(device, Source, error);
+    const Metal::Object fn_w = lib ? Metal::CreateFunction(lib.Get(), "write_val") : Metal::Object{};
+    const Metal::Object fn_s = lib ? Metal::CreateFunction(lib.Get(), "sum_pair") : Metal::Object{};
+    const Metal::Object pipe_w =
+        fn_w ? Metal::CreateComputePipelineState(device, fn_w.Get(), error) : Metal::Object{};
+    const Metal::Object pipe_s =
+        fn_s ? Metal::CreateComputePipelineState(device, fn_s.Get(), error) : Metal::Object{};
+    u8* mapped = nullptr;
+    const Metal::Object slab = Metal::CreateBuffer(device, 256, true, &mapped);
+    if (!pipe_w || !pipe_s || !slab || mapped == nullptr) {
+        std::printf("metal-smoke: FAIL concurrent compute setup: %s\n", error.c_str());
+        return 1;
+    }
+    std::memset(mapped, 0, 256);
+    (void)scheduler.TakePassEndLine(1.0);
+
+    // Dispatches 1 & 2 write disjoint slices [0, 64) and [64, 128) of the same buffer: 0 barriers.
+    const u32 v0 = 100U;
+    const u32 v1 = 200U;
+    scheduler.BeginCompute(pipe_w.Get());
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, slab.Get(), 0, true, 64, 64);
+    scheduler.BindBytes(Metal::ShaderStage::Compute, 1, &v0, sizeof(v0));
+    scheduler.Dispatch({1, 1, 1}, {16, 1, 1});
+
+    scheduler.BeginCompute(pipe_w.Get());
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, slab.Get(), 64, true, 64, 64);
+    scheduler.BindBytes(Metal::ShaderStage::Compute, 1, &v1, sizeof(v1));
+    scheduler.Dispatch({1, 1, 1}, {16, 1, 1});
+
+    const std::string line_disjoint = scheduler.TakePassEndLine(1.0);
+    const bool disjoint_no_barrier =
+        line_disjoint.find("compute barriers=0.0/frame") != std::string::npos;
+
+    // Dispatch 3 reads [0, 64) + [64, 128) and writes [128, 192): RAW hazard -> 1 barrier.
+    scheduler.BeginCompute(pipe_s.Get());
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, slab.Get(), 0, false, 64, 0);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 1, slab.Get(), 64, false, 64, 0);
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 2, slab.Get(), 128, true, 64, 64);
+    scheduler.Dispatch({1, 1, 1}, {16, 1, 1});
+
+    // Dispatch 4 overwrites [0, 64) after Dispatch 3 read [0, 64): WAR hazard -> +1 barrier.
+    const u32 v2 = 900U;
+    scheduler.BeginCompute(pipe_w.Get());
+    scheduler.BindBuffer(Metal::ShaderStage::Compute, 0, slab.Get(), 0, true, 64, 64);
+    scheduler.BindBytes(Metal::ShaderStage::Compute, 1, &v2, sizeof(v2));
+    scheduler.Dispatch({1, 1, 1}, {16, 1, 1});
+
+    const std::string line_hazards = scheduler.TakePassEndLine(1.0);
+    const bool raw_war_barriers =
+        line_hazards.find("compute barriers=2.0/frame") != std::string::npos;
+
+    scheduler.Finish();
+    u32 out_first = 0;
+    u32 sum_first = 0;
+    u32 sum_last = 0;
+    std::memcpy(&out_first, mapped, sizeof(u32));
+    std::memcpy(&sum_first, mapped + 128, sizeof(u32));
+    std::memcpy(&sum_last, mapped + 128 + 15 * sizeof(u32), sizeof(u32));
+    const bool values_ok = out_first == 900U && sum_first == 300U && sum_last == 330U;
+    const bool passed = disjoint_no_barrier && raw_war_barriers && values_ok;
+    std::printf("metal-smoke: concurrent compute hazards: disjoint_0_barrier %d, raw_war_2 %d, "
+                "values %u/%u/%u: %s\n",
+                disjoint_no_barrier ? 1 : 0, raw_war_barriers ? 1 : 0, out_first, sum_first,
+                sum_last, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
 } // Anonymous namespace
 
 int main(int argc, char** argv) {
@@ -7393,6 +7918,21 @@ int main(int argc, char** argv) {
             if (std::strcmp(argv[2], "pass-times") == 0) {
                 return RunPassTimes();
             }
+            if (std::strcmp(argv[2], "encoder-index-opt") == 0) {
+                return RunEncoderAndIndexOpt();
+            }
+            if (std::strcmp(argv[2], "multi-target-clears") == 0) {
+                return RunMultiTargetClears();
+            }
+            if (std::strcmp(argv[2], "batched-range-binds") == 0) {
+                return RunBatchedRangeBinds();
+            }
+            if (std::strcmp(argv[2], "flat-invariance") == 0) {
+                return RunFlatInvariance();
+            }
+            if (std::strcmp(argv[2], "concurrent-compute") == 0) {
+                return RunConcurrentComputeHazards();
+            }
             return 4;
         }
         const int draw = Run();
@@ -7412,6 +7952,8 @@ int main(int argc, char** argv) {
                                  RunClearRect,
                                  RunClearFold, RunStateCache, RunAhead, RunFenceIdle,
                                  RunInlineAndResidencyMemo, RunEncoderAndIndexOpt, RunStagingBound, RunPipelineFiles, RunOcarinaTemporal,
+                                 RunMultiTargetClears, RunBatchedRangeBinds, RunFlatInvariance,
+                                 RunConcurrentComputeHazards,
                                  RunProvokingVertex, RunCondition, RunIndirectArguments, RunPipelineJobs,
                                  RunOcarinaActorEffects, RunOcarinaDepthJitter, RunCameraMotionUpscale,
                                  RunTemporalStandIn, RunForceLod0,

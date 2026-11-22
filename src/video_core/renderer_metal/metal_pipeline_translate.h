@@ -391,6 +391,19 @@ private:
         pending_entries;
 };
 
+/// Per-generic taint summary of a Stage::Vertex MSL program's [[user(locnG)]] outputs (G in 0..31).
+struct VertexOutputInvariance {
+    /// Bit G: generic G may depend on [[vertex_id]], SIMD lane, loop mutation, or unknown constructs.
+    u32 uses_vertex_id_mask{~0U};
+    /// Per generic G (0..31): bitmask of [[attribute(0..31)]] inputs that can flow into generic G.
+    std::array<u32, 32> attr_deps{};
+};
+
+/// Conservatively analyzes a Stage::Vertex MSL program (`msl`, `entry_point`), returning per-generic
+/// [[vertex_id]] and [[attribute(A)]] dependencies (safe even on StageMslCache hits without IR).
+[[nodiscard]] VertexOutputInvariance AnalyzeVertexOutputInvariance(std::string_view msl,
+                                                                   std::string_view entry_point);
+
 class PipelineTranslator {
 public:
     /// `ios`: MSL for iOS (ShaderTranslate::Options::ios). `apple_family`: the GPU's

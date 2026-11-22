@@ -2318,12 +2318,19 @@ struct ResolvedViewShape {
 
 } // Anonymous namespace
 
-TextureHandle ImageView::Handle(Shader::TextureType texture_type) {
+TextureHandle ImageView::Handle(Shader::TextureType texture_type, u64* out_gpu_resource_id) {
+    if (out_gpu_resource_id != nullptr) {
+        *out_gpu_resource_id = 0;
+    }
     if (image_texture == nullptr || texture_type == Shader::TextureType::Buffer) {
         return nullptr;
     }
-    Object& view = views[static_cast<size_t>(texture_type)];
+    const size_t slot = static_cast<size_t>(texture_type);
+    Object& view = views[slot];
     if (view) {
+        if (out_gpu_resource_id != nullptr) {
+            *out_gpu_resource_id = view_resource_ids[slot];
+        }
         return view.Get();
     }
     const auto shape = ResolveViewShape(texture_type, image_kind, range);
@@ -2334,15 +2341,23 @@ TextureHandle ImageView::Handle(Shader::TextureType texture_type) {
                              static_cast<u32>(range.base.level),
                              static_cast<u32>(range.extent.levels), shape->base_layer,
                              shape->layers, swizzle);
+    view_resource_ids[slot] = Scheduler::TextureResourceId(view.Get());
+    if (out_gpu_resource_id != nullptr) {
+        *out_gpu_resource_id = view_resource_ids[slot];
+    }
     return view.Get();
 }
 
 TextureHandle ImageView::StorageHandle(Shader::TextureType texture_type,
-                                       Shader::ImageFormat image_format) {
+                                       Shader::ImageFormat image_format,
+                                       u64* out_gpu_resource_id) {
     if (!FormatsExpanded()) {
-        return Handle(texture_type);
+        return Handle(texture_type, out_gpu_resource_id);
     }
     if (image_texture == nullptr || texture_type == Shader::TextureType::Buffer) {
+        if (out_gpu_resource_id != nullptr) {
+            *out_gpu_resource_id = 0;
+        }
         return nullptr;
     }
     u32 view_format = StorageFormat(image_format);
@@ -2351,27 +2366,44 @@ TextureHandle ImageView::StorageHandle(Shader::TextureType texture_type,
         view_format = linear != 0 ? linear : host_format;
     }
     if (view_format == host_format && swizzle == IdentitySwizzle) {
-        return Handle(texture_type);
+        return Handle(texture_type, out_gpu_resource_id);
     }
     for (const StorageVariant& existing : storage_views) {
         if (existing.type == texture_type && existing.format == view_format) {
-            return existing.view ? existing.view.Get() : Handle(texture_type);
+            if (!existing.view) {
+                return Handle(texture_type, out_gpu_resource_id);
+            }
+            if (out_gpu_resource_id != nullptr) {
+                *out_gpu_resource_id = existing.gpu_resource_id;
+            }
+            return existing.view.Get();
         }
     }
     const auto shape = ResolveViewShape(texture_type, image_kind, range);
     if (!shape) {
+        if (out_gpu_resource_id != nullptr) {
+            *out_gpu_resource_id = 0;
+        }
         return nullptr;
     }
     Object storage = CreateTextureView(image_texture, view_format, shape->kind,
                                        static_cast<u32>(range.base.level),
                                        static_cast<u32>(range.extent.levels), shape->base_layer,
                                        shape->layers, IdentitySwizzle);
-    const TextureHandle result = storage ? storage.Get() : Handle(texture_type);
+    const u64 storage_res_id = Scheduler::TextureResourceId(storage.Get());
+    u64 fallback_res_id = 0;
+    const TextureHandle result =
+        storage ? storage.Get() : Handle(texture_type, &fallback_res_id);
+    const u64 final_res_id = storage ? storage_res_id : fallback_res_id;
     storage_views.push_back(StorageVariant{
         .type = texture_type,
         .format = view_format,
         .view = std::move(storage),
+        .gpu_resource_id = storage_res_id,
     });
+    if (out_gpu_resource_id != nullptr) {
+        *out_gpu_resource_id = final_res_id;
+    }
     return result;
 }
 
@@ -2386,25 +2418,32 @@ bool ImageView::PrepareSampleGrid() {
     if (const TextureHandle grid = image.SampleGrid(); grid != sample_grid) {
         sample_grid = grid;
         grid_views = {};
+        grid_view_resource_ids = {};
     }
     return true;
 }
 
-TextureHandle ImageView::SampledHandle(Shader::TextureType texture_type, bool multisample_read) {
+TextureHandle ImageView::SampledHandle(Shader::TextureType texture_type, bool multisample_read,
+                                       u64* out_gpu_resource_id) {
     if (samples == 1 || multisample_read || sample_grid == nullptr || !MsaaEnabled()) {
-        return Handle(texture_type);
+        return Handle(texture_type, out_gpu_resource_id);
     }
     const bool array = texture_type == Shader::TextureType::ColorArray2D;
     if (texture_type != Shader::TextureType::Color2D &&
         texture_type != Shader::TextureType::Color2DRect && !array) {
-        return Handle(texture_type);
+        return Handle(texture_type, out_gpu_resource_id);
     }
-    Object& view = grid_views[array ? 1 : 0];
+    const size_t slot = array ? 1 : 0;
+    Object& view = grid_views[slot];
     if (!view) {
         view = CreateTextureView(sample_grid, host_format,
                                  array ? TextureKind::e2DArray : TextureKind::e2D, 0, 1,
                                  static_cast<u32>(range.base.layer),
                                  array ? static_cast<u32>(range.extent.layers) : 1U, swizzle);
+        grid_view_resource_ids[slot] = Scheduler::TextureResourceId(view.Get());
+    }
+    if (out_gpu_resource_id != nullptr) {
+        *out_gpu_resource_id = grid_view_resource_ids[slot];
     }
     return view.Get();
 }
@@ -2454,6 +2493,7 @@ Sampler::Sampler(TextureCacheRuntime& runtime_, const Tegra::Texture::TSCEntry& 
     using Tegra::Texture::TextureMipmapFilter;
     if (!SamplersEnabled()) {
         sampler = CreateSampler(*device, tsc, SamplerOptions{.plain = true});
+        gpu_resource_id = Scheduler::SamplerResourceId(sampler.Get());
         return;
     }
     if (const f32 bias = runtime->OcarinaLodBias();
@@ -2468,6 +2508,7 @@ Sampler::Sampler(TextureCacheRuntime& runtime_, const Tegra::Texture::TSCEntry& 
     has_depth_comparison = tsc.depth_compare_enabled != 0;
     has_srgb_border = tsc.srgb_conversion != 0 && tsc.SrgbBorderColor() != tsc.BorderColor();
     sampler = CreateSampler(*device, tsc, SamplerOptions{.added_lod_bias = added_lod_bias});
+    gpu_resource_id = Scheduler::SamplerResourceId(sampler.Get());
     with_variants = true;
     if (!SamplerBiasSupported(*device) &&
         (tsc.LodBias() != 0.0f || added_lod_bias != 0.0f ||
@@ -2478,8 +2519,11 @@ Sampler::Sampler(TextureCacheRuntime& runtime_, const Tegra::Texture::TSCEntry& 
     }
 }
 
-void* Sampler::HandleFor(const ImageView& view, bool is_depth) {
+void* Sampler::HandleFor(const ImageView& view, bool is_depth, u64* out_gpu_resource_id) {
     if (!with_variants) {
+        if (out_gpu_resource_id != nullptr) {
+            *out_gpu_resource_id = gpu_resource_id;
+        }
         return sampler.Get();
     }
     using Tegra::Texture::TextureMipmapFilter;
@@ -2528,9 +2572,15 @@ void* Sampler::HandleFor(const ImageView& view, bool is_depth) {
         key |= RedOnlyBorder;
     }
     if (key == 0) {
+        if (out_gpu_resource_id != nullptr) {
+            *out_gpu_resource_id = gpu_resource_id;
+        }
         return sampler.Get();
     }
     if (const auto it = std::ranges::find(variants, key, &Variant::key); it != variants.end()) {
+        if (out_gpu_resource_id != nullptr) {
+            *out_gpu_resource_id = it->gpu_resource_id;
+        }
         return it->state.Get();
     }
     const u16 temporal_steps = key >> TemporalBiasShift;
@@ -2547,7 +2597,12 @@ void* Sampler::HandleFor(const ImageView& view, bool is_depth) {
                                      .red_only_border = (key & RedOnlyBorder) != 0,
                                  });
     void* const handle = state.Get();
-    variants.push_back(Variant{.key = key, .state = std::move(state)});
+    const u64 var_res_id = Scheduler::SamplerResourceId(handle);
+    variants.push_back(
+        Variant{.key = key, .state = std::move(state), .gpu_resource_id = var_res_id});
+    if (out_gpu_resource_id != nullptr) {
+        *out_gpu_resource_id = var_res_id;
+    }
     return handle;
 }
 

@@ -32,6 +32,7 @@ Buffer::Buffer(BufferCacheRuntime& runtime_, VAddr cpu_addr_, u64 size_bytes_, b
       bytes{Common::AlignUp((std::max)(size_bytes_, u64{16}), 16) + 65536},
       tracker{size_bytes_} {
     buffer = CreateBuffer(runtime_.device, bytes, runtime_.shared_buffers, &host_ptr);
+    gpu_address = Scheduler::BufferGpuAddress(buffer.Get());
     freshly_zeroed_ = buffer.Get() != nullptr;
     runtime->allocated_bytes += bytes;
 }
@@ -40,6 +41,7 @@ Buffer::Buffer(Buffer&& other) noexcept
     : VideoCommon::BufferBase(std::move(other)),
       runtime{std::exchange(other.runtime, nullptr)},
       buffer{std::move(other.buffer)},
+      gpu_address{std::exchange(other.gpu_address, 0)},
       host_ptr{std::exchange(other.host_ptr, nullptr)},
       bytes{std::exchange(other.bytes, 0)},
       tracker{std::move(other.tracker)},
@@ -65,6 +67,7 @@ Buffer& Buffer::operator=(Buffer&& other) noexcept {
     VideoCommon::BufferBase::operator=(std::move(other));
     runtime = std::exchange(other.runtime, nullptr);
     buffer = std::move(other.buffer);
+    gpu_address = std::exchange(other.gpu_address, 0);
     host_ptr = std::exchange(other.host_ptr, nullptr);
     bytes = std::exchange(other.bytes, 0);
     tracker = std::move(other.tracker);
@@ -166,6 +169,7 @@ bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {
         allocated_bytes -= entry.size;
         entry.size = Common::AlignUp(multi_range_total, u64{256});
         entry.buffer = CreateBuffer(device, entry.size, false, nullptr);
+        entry.gpu_address = Scheduler::BufferGpuAddress(entry.buffer.Get());
         if (!entry.buffer) {
             entry.size = 0;
             return false;
@@ -185,8 +189,9 @@ bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {
         CopyBuffer(entry.buffer.Get(), source.buffer, copy, false);
         dst_offset += source.size;
     }
-    bindings.push_back({Binding::Kind::Buffer, is_written, entry.buffer.Get(), 0,
-                        static_cast<u32>(multi_range_total), {}, nullptr});
+    const u32 gathered_size = static_cast<u32>(multi_range_total);
+    bindings.push_back({Binding::Kind::Buffer, is_written, entry.buffer.Get(), 0, gathered_size, {},
+                        nullptr, entry.gpu_address, gathered_size, is_written ? gathered_size : 0U});
     Coverage::NoteGuard("storage buffer gathered from several mappings");
     return true;
 }
@@ -546,8 +551,13 @@ std::span<u8> BufferCacheRuntime::BindMappedUniformBuffer(size_t, u32, u32 size)
     if (alloc_size > size) {
         std::memset(ref.mapped_span.data() + size, 0, alloc_size - size);
     }
+    if (ref.buffer != cached_stream_buffer) {
+        cached_stream_buffer = ref.buffer;
+        cached_stream_gpu_address = Scheduler::BufferGpuAddress(ref.buffer);
+    }
     last_stream_uniform = StreamUniformRef{
         .buffer = ref.buffer,
+        .gpu_address = cached_stream_gpu_address,
         .offset = static_cast<u32>(ref.offset),
     };
     RebindStreamUniform(last_stream_uniform, size);

@@ -41,6 +41,10 @@ public:
         return buffer.Get();
     }
 
+    [[nodiscard]] u64 GpuAddress() const noexcept {
+        return gpu_address;
+    }
+
     operator BufferHandle() const noexcept {
         return buffer.Get();
     }
@@ -81,6 +85,7 @@ private:
 
     BufferCacheRuntime* runtime{};
     Object buffer;
+    u64 gpu_address{};
     u8* host_ptr{};
     u64 bytes{};
     VideoCommon::UsageTracker tracker;
@@ -100,6 +105,9 @@ struct Binding {
     u32 size{};
     VideoCore::Surface::PixelFormat format{};
     Buffer* buffer_obj{};
+    u64 gpu_address{};
+    u32 hazard_read_size{};
+    u32 hazard_write_size{};
 };
 
 class BufferCacheRuntime {
@@ -230,6 +238,7 @@ public:
 
     struct StreamUniformRef {
         BufferHandle buffer{};
+        u64 gpu_address{};
         u32 offset{};
     };
     static_assert(std::is_trivially_copyable_v<StreamUniformRef>);
@@ -254,31 +263,37 @@ public:
     void RebindStreamUniform(const StreamUniformRef& ref, u32 size) {
         stream_uniform_readable_bytes = 0;
         bindings.push_back({Binding::Kind::Buffer, false, ref.buffer, ref.offset, size, {},
-                            nullptr});
+                            nullptr, ref.gpu_address, size, 0});
     }
 
     void BindUniformBuffer(const Buffer& buffer, u32 offset, u32 size) {
         buffer.NoteUsed();
         Buffer* const obj = buffer.Handle() != nullptr ? const_cast<Buffer*>(&buffer) : nullptr;
-        bindings.push_back({Binding::Kind::Buffer, false, buffer.Handle(), offset, size, {}, obj});
+        bindings.push_back({Binding::Kind::Buffer, false, buffer.Handle(), offset, size, {}, obj,
+                            buffer.GpuAddress(), size, 0});
     }
 
     void BindStorageBuffer(const Buffer& buffer, u32 offset, u32 size, bool is_written) {
+        BindStorageBuffer(buffer, offset, size, is_written, size, is_written ? size : 0);
+    }
+
+    void BindStorageBuffer(const Buffer& buffer, u32 offset, u32 size, bool is_written,
+                           u32 hazard_read_size, u32 hazard_write_size) {
         buffer.NoteUsed();
         if (is_written && write_hook != nullptr && size != 0) {
             write_hook(write_hook_user, buffer.Handle(), offset, size);
         }
         Buffer* const obj = buffer.Handle() != nullptr ? const_cast<Buffer*>(&buffer) : nullptr;
-        bindings.push_back(
-            {Binding::Kind::Buffer, is_written, buffer.Handle(), offset, size, {}, obj});
+        bindings.push_back({Binding::Kind::Buffer, is_written, buffer.Handle(), offset, size, {},
+                            obj, buffer.GpuAddress(), hazard_read_size, hazard_write_size});
     }
 
     void BindTextureBuffer(Buffer& buffer, u32 offset, u32 size,
                            VideoCore::Surface::PixelFormat format) {
         buffer.NoteUsed();
         Buffer* const obj = buffer.Handle() != nullptr ? &buffer : nullptr;
-        bindings.push_back(
-            {Binding::Kind::TexelBuffer, false, buffer.Handle(), offset, size, format, obj});
+        bindings.push_back({Binding::Kind::TexelBuffer, false, buffer.Handle(), offset, size,
+                            format, obj, buffer.GpuAddress(), size, 0});
     }
 
     /// A storage buffer whose guest range spans several mappings (BufferCache's multi-range
@@ -367,6 +382,7 @@ private:
     };
     struct MultiRangeBuffer {
         Object buffer;
+        u64 gpu_address{};
         u64 size{};
         u64 frame{};
     };
@@ -386,6 +402,8 @@ private:
     std::vector<u8> upload_scratch;
     size_t upload_scratch_size{};
     u64 upload_scratch_large_frame{};
+    BufferHandle cached_stream_buffer{};
+    u64 cached_stream_gpu_address{};
     StreamUniformRef last_stream_uniform{};
     u32 stream_uniform_readable_bytes{};
     WriteHook write_hook{};

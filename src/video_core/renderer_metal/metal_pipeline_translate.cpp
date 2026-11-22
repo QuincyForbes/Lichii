@@ -5,6 +5,7 @@
 #include <atomic>
 #include <bit>
 #include <bitset>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -14,6 +15,8 @@
 #include <mutex>
 #include <system_error>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <boost/container/small_vector.hpp>
 
@@ -2549,6 +2552,1750 @@ std::optional<StageProgram> PipelineTranslator::WarmSingleStage(const GraphicsPi
     return Translate(program, msl_stage, bindings, runtime_info, &options);
 } catch (const Shader::Exception&) {
     return std::nullopt;
+}
+
+namespace {
+
+struct Taint {
+    bool uses_vertex_id{};
+    u32 attr_mask{};
+
+    constexpr Taint operator|(const Taint& other) const noexcept {
+        return {uses_vertex_id || other.uses_vertex_id, attr_mask | other.attr_mask};
+    }
+
+    constexpr Taint& operator|=(const Taint& other) noexcept {
+        uses_vertex_id = uses_vertex_id || other.uses_vertex_id;
+        attr_mask |= other.attr_mask;
+        return *this;
+    }
+
+    static constexpr Taint Varying() noexcept {
+        return {true, 0};
+    }
+};
+
+[[nodiscard]] bool IsIdentStartChar(char c) noexcept {
+    return std::isalpha(static_cast<unsigned char>(c)) != 0 || c == '_';
+}
+
+[[nodiscard]] bool IsIdentContChar(char c) noexcept {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+}
+
+[[nodiscard]] std::string_view TrimWs(std::string_view s) noexcept {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())) != 0) {
+        s.remove_prefix(1);
+    }
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())) != 0) {
+        s.remove_suffix(1);
+    }
+    return s;
+}
+
+[[nodiscard]] size_t SkipMslCommentOrLit(std::string_view src, size_t i) noexcept {
+    const size_t n = src.size();
+    if (i + 1 < n && src[i] == '/' && src[i + 1] == '/') {
+        i += 2;
+        while (i < n && src[i] != '\n') {
+            ++i;
+        }
+        return i;
+    }
+    if (i + 1 < n && src[i] == '/' && src[i + 1] == '*') {
+        i += 2;
+        while (i + 1 < n && !(src[i] == '*' && src[i + 1] == '/')) {
+            ++i;
+        }
+        return i + 1 < n ? i + 2 : n;
+    }
+    if (src[i] == '"' || src[i] == '\'') {
+        const char q = src[i++];
+        while (i < n && src[i] != q) {
+            i += (src[i] == '\\' && i + 1 < n) ? 2 : 1;
+        }
+        return i < n ? i + 1 : n;
+    }
+    return i;
+}
+
+[[nodiscard]] size_t SkipMslTrivia(std::string_view src, size_t i, size_t end) noexcept {
+    while (i < end) {
+        if (std::isspace(static_cast<unsigned char>(src[i])) != 0) {
+            ++i;
+            continue;
+        }
+        if (i + 1 < end && src[i] == '/' && (src[i + 1] == '/' || src[i + 1] == '*')) {
+            i = (std::min)(SkipMslCommentOrLit(src, i), end);
+            continue;
+        }
+        break;
+    }
+    return i;
+}
+
+[[nodiscard]] std::vector<u32> BuildMslBracketTable(std::string_view src) {
+    if (src.size() >= ~0U) {
+        return {};
+    }
+    std::vector<u32> match(src.size(), ~0U);
+    std::vector<std::pair<char, u32>> stack;
+    stack.reserve(128);
+    for (size_t i = 0; i < src.size();) {
+        const size_t next = SkipMslCommentOrLit(src, i);
+        if (next != i) {
+            i = next;
+            continue;
+        }
+        const char c = src[i];
+        if (c == '(' || c == '[' || c == '{') {
+            stack.emplace_back(c, static_cast<u32>(i));
+        } else if (c == ')' || c == ']' || c == '}') {
+            const char want = c == ')' ? '(' : c == ']' ? '[' : '{';
+            if (stack.empty() || stack.back().first != want) {
+                return {};
+            }
+            const u32 open = stack.back().second;
+            stack.pop_back();
+            match[open] = static_cast<u32>(i);
+            match[i] = open;
+        }
+        ++i;
+    }
+    if (!stack.empty()) {
+        return {};
+    }
+    return match;
+}
+
+[[nodiscard]] bool ParseUnsignedUint(std::string_view s, u32& out) noexcept {
+    s = TrimWs(s);
+    if (s.empty()) {
+        return false;
+    }
+    size_t pos = 0;
+    u64 val = 0;
+    while (pos < s.size() && std::isdigit(static_cast<unsigned char>(s[pos])) != 0) {
+        val = val * 10 + static_cast<u64>(s[pos] - '0');
+        if (val > 0xFFFFFFFFULL) {
+            return false;
+        }
+        ++pos;
+    }
+    if (pos == 0) {
+        return false;
+    }
+    while (pos < s.size() && (s[pos] == 'u' || s[pos] == 'U' || s[pos] == 'l' || s[pos] == 'L')) {
+        ++pos;
+    }
+    if (pos != s.size()) {
+        return false;
+    }
+    out = static_cast<u32>(val);
+    return true;
+}
+
+[[nodiscard]] std::vector<std::string_view> SplitTopCommas(std::string_view text) {
+    std::vector<std::string_view> parts;
+    int depth = 0;
+    int angles = 0;
+    size_t begin = 0;
+    for (size_t i = 0; i < text.size();) {
+        const size_t skipped = SkipMslCommentOrLit(text, i);
+        if (skipped != i) {
+            i = skipped;
+            continue;
+        }
+        const char c = text[i];
+        const char before = i != 0 ? text[i - 1] : ' ';
+        const char after = i + 1 < text.size() ? text[i + 1] : ' ';
+        if (c == '<') {
+            if (IsIdentContChar(before) && after != '=' && after != '<') {
+                ++angles;
+            }
+        } else if (c == '>') {
+            if (angles > 0 && before != '-' && before != ' ' && after != '=') {
+                --angles;
+            }
+        } else if (c == '(' || c == '[' || c == '{') {
+            ++depth;
+        } else if (c == ')' || c == ']' || c == '}') {
+            --depth;
+        } else if (c == ',' && depth == 0 && angles == 0) {
+            parts.push_back(TrimWs(text.substr(begin, i - begin)));
+            begin = i + 1;
+        }
+        ++i;
+    }
+    if (!TrimWs(text.substr(begin)).empty()) {
+        parts.push_back(TrimWs(text.substr(begin)));
+    }
+    return parts;
+}
+
+[[nodiscard]] bool ContainsStandaloneIdent(std::string_view text, std::string_view want) noexcept {
+    if (want.empty()) {
+        return false;
+    }
+    for (size_t i = 0; i < text.size();) {
+        const size_t skipped = SkipMslCommentOrLit(text, i);
+        if (skipped != i) {
+            i = skipped;
+            continue;
+        }
+        if (IsIdentStartChar(text[i])) {
+            size_t end = i + 1;
+            while (end < text.size() && IsIdentContChar(text[end])) {
+                ++end;
+            }
+            if (text.substr(i, end - i) == want) {
+                size_t back = i;
+                while (back > 0 && std::isspace(static_cast<unsigned char>(text[back - 1])) != 0) {
+                    --back;
+                }
+                const bool member = back > 0 && (text[back - 1] == '.' ||
+                                                 (back >= 2 && text[back - 2] == '-' &&
+                                                  text[back - 1] == '>'));
+                if (!member) {
+                    return true;
+                }
+            }
+            i = end;
+            continue;
+        }
+        ++i;
+    }
+    return false;
+}
+
+[[nodiscard]] bool IsTemplateCallName(std::string_view id) noexcept {
+    return id == "as_type" || id == "static_cast" || id == "reinterpret_cast" ||
+           id == "const_cast" || id == "vec" || id == "matrix" || id == "array" ||
+           id == "spvUnsafeArray" || id == "spvFAdd" || id == "spvFSub" || id == "spvFMul" ||
+           id == "spvFMulVectorMatrix" || id == "spvFMulMatrixVector" ||
+           id == "spvFMulMatrixMatrix";
+}
+
+[[nodiscard]] bool IsTypeOrQualifier(std::string_view id) noexcept {
+    static const std::unordered_set<std::string_view> kTypes{
+        "const",    "constant", "device",  "thread",      "threadgroup", "constexpr", "inline",
+        "signed",   "unsigned", "void",    "bool",        "bool2",       "bool3",     "bool4",
+        "char",     "char2",    "char3",   "char4",       "uchar",       "uchar2",    "uchar3",
+        "uchar4",   "short",    "short2",  "short3",      "short4",      "ushort",    "ushort2",
+        "ushort3",  "ushort4",  "int",     "int2",        "int3",        "int4",      "uint",
+        "uint2",    "uint3",    "uint4",   "long",        "long2",       "long3",     "long4",
+        "ulong",    "ulong2",   "ulong3",  "ulong4",      "half",        "half2",     "half3",
+        "half4",    "float",    "float2",  "float3",      "float4",      "half2x2",   "half2x3",
+        "half2x4",  "half3x2",  "half3x3", "half3x4",     "half4x2",     "half4x3",   "half4x4",
+        "float2x2", "float2x3", "float2x4","float3x2",    "float3x3",    "float3x4",  "float4x2",
+        "float4x3", "float4x4", "size_t",  "ptrdiff_t",   "intptr_t",    "uintptr_t", "sampler",
+        "packed_char2", "packed_char3", "packed_char4", "packed_uchar2", "packed_uchar3",
+        "packed_uchar4", "packed_short2", "packed_short3", "packed_short4", "packed_ushort2",
+        "packed_ushort3", "packed_ushort4", "packed_int2", "packed_int3", "packed_int4",
+        "packed_uint2", "packed_uint3", "packed_uint4", "packed_half2", "packed_half3",
+        "packed_half4", "packed_float2", "packed_float3", "packed_float4",
+    };
+    return kTypes.contains(id);
+}
+
+[[nodiscard]] bool IsPureBuiltinOrCtor(std::string_view id) noexcept {
+    if (IsTypeOrQualifier(id) || IsTemplateCallName(id)) {
+        return true;
+    }
+    static const std::unordered_set<std::string_view> kPureBuiltins{
+        "sizeof", "alignof", "level", "bias", "gradient2d", "gradient3d", "gradientcube",
+        "min_lod_clamp", "abs", "acos", "acosh", "asin", "asinh", "atan", "atan2", "atanh",
+        "ceil", "clamp", "copysign", "cos", "cosh", "cospi", "degrees", "exp", "exp2", "exp10",
+        "fabs", "fdim", "floor", "fma", "fmax", "fmax3", "fmed3", "fmin", "fmin3", "fmod",
+        "fract", "ilogb", "ldexp", "log", "log2", "log10", "mad", "max", "max3", "median3",
+        "min", "min3", "mix", "pow", "powr", "pown", "radians", "rint", "rootn", "round",
+        "rsqrt", "saturate", "sign", "sin", "sinh", "sinpi", "smoothstep", "sqrt", "step",
+        "tan", "tanh", "tanpi", "trunc", "cross", "distance", "dot", "fast_distance",
+        "fast_length", "fast_normalize", "faceforward", "length", "length_squared",
+        "distance_squared", "normalize", "reflect", "refract", "determinant", "transpose",
+        "all", "any", "isfinite", "isinf", "isnan", "isnormal", "isordered", "isunordered",
+        "not", "select", "signbit", "abs_diff", "add_sat", "clz", "ctz", "extract_bits", "hadd",
+        "insert_bits", "mad24", "mad_hi", "mad_sat", "mul24", "mul_hi", "popcount",
+        "reverse_bits", "rhadd", "rotate", "sub_sat", "pack_float_to_snorm2x16",
+        "pack_float_to_unorm2x16", "pack_float_to_snorm4x8", "pack_float_to_unorm4x8",
+        "unpack_snorm2x16_to_float", "unpack_unorm2x16_to_float", "unpack_snorm4x8_to_float",
+        "unpack_unorm4x8_to_float", "as_float", "as_half", "as_int", "as_uint", "as_short",
+        "as_ushort", "as_char", "as_uchar", "as_long", "as_ulong",
+        // Pure SPIRV-Cross & Lichii per-lane MSL helpers (no out-params, no cross-lane state):
+        "spvReducing", "spvReduceTaps", "spvReducedSample", "spvSMod", "spvUMod",
+        "spvInverse4x4", "spvInverse3x3", "spvInverse2x2", "spvPackFloat2x16",
+        "spvUnpackFloat2x16", "spvPackUnorm2x16", "spvUnpackUnorm2x16", "spvPackSnorm2x16",
+        "spvUnpackSnorm2x16", "spvPackUnorm4x8", "spvUnpackUnorm4x8", "spvPackSnorm4x8",
+        "spvUnpackSnorm4x8", "spvFindLSB", "spvFindSMSB", "spvFindUMSB", "spvBitCount",
+        "spvBitFieldInsert", "spvBitFieldSExtract", "spvBitFieldUExtract", "spvBitReverse",
+        "spvTextureSwizzle", "spvGatherSwizzle", "spvGatherCompareSwizzle",
+        "spvCubemapTo2DArrayFace",
+    };
+    return kPureBuiltins.contains(id);
+}
+
+[[nodiscard]] bool IsPureMemberMethod(std::string_view id) noexcept {
+    static const std::unordered_set<std::string_view> kPureMethods{
+        "sample", "sample_compare", "read", "gather", "gather_compare",
+        "calculate_clamped_lod", "calculate_unclamped_lod", "get_width", "get_height",
+        "get_depth", "get_array_size", "get_num_mip_levels", "get_num_samples",
+        "is_null_texture",
+    };
+    return kPureMethods.contains(id);
+}
+
+struct ParsedStructMember {
+    std::string name;
+    std::string type;
+    u32 array_count{1};
+    std::vector<std::string> attrs;
+};
+
+[[nodiscard]] bool ParseMslStruct(std::string_view msl, const std::vector<u32>& match,
+                                  std::string_view struct_name,
+                                  std::vector<ParsedStructMember>& out_members) {
+    out_members.clear();
+    for (size_t pos = 0; pos < msl.size();) {
+        const size_t skipped = SkipMslCommentOrLit(msl, pos);
+        if (skipped != pos) {
+            pos = skipped;
+            continue;
+        }
+        if (IsIdentStartChar(msl[pos])) {
+            size_t end = pos + 1;
+            while (end < msl.size() && IsIdentContChar(msl[end])) {
+                ++end;
+            }
+            if (msl.substr(pos, end - pos) == "struct") {
+                const size_t name_start = SkipMslTrivia(msl, end, msl.size());
+                size_t name_end = name_start;
+                while (name_end < msl.size() && IsIdentContChar(msl[name_end])) {
+                    ++name_end;
+                }
+                if (msl.substr(name_start, name_end - name_start) == struct_name) {
+                    const size_t brace = SkipMslTrivia(msl, name_end, msl.size());
+                    if (brace < msl.size() && msl[brace] == '{' && match[brace] != ~0U) {
+                        const size_t close = match[brace];
+                        size_t cur = brace + 1;
+                        while (cur < close) {
+                            cur = SkipMslTrivia(msl, cur, close);
+                            if (cur >= close) {
+                                break;
+                            }
+                            size_t semi = cur;
+                            while (semi < close && msl[semi] != ';') {
+                                const size_t s2 = SkipMslCommentOrLit(msl, semi);
+                                if (s2 != semi) {
+                                    semi = s2;
+                                    continue;
+                                }
+                                if ((msl[semi] == '(' || msl[semi] == '[' || msl[semi] == '{') &&
+                                    match[semi] < close) {
+                                    semi = size_t{match[semi]} + 1;
+                                    continue;
+                                }
+                                ++semi;
+                            }
+                            if (semi >= close) {
+                                return false;
+                            }
+                            std::string decl{msl.substr(cur, semi - cur)};
+                            cur = semi + 1;
+                            ParsedStructMember member{};
+                            for (size_t attr_at = decl.find("[["); attr_at != std::string::npos;
+                                 attr_at = decl.find("[[")) {
+                                const size_t attr_end = decl.find("]]", attr_at + 2);
+                                if (attr_end == std::string::npos) {
+                                    return false;
+                                }
+                                member.attrs.emplace_back(
+                                    TrimWs(std::string_view{decl}.substr(attr_at + 2,
+                                                                         attr_end - attr_at - 2)));
+                                decl.erase(attr_at, attr_end + 2 - attr_at);
+                            }
+                            std::string_view clean = TrimWs(decl);
+                            if (clean.empty()) {
+                                continue;
+                            }
+                            while (!clean.empty() && clean.back() == ']') {
+                                const size_t open_b = clean.rfind('[');
+                                if (open_b == std::string_view::npos) {
+                                    return false;
+                                }
+                                u32 count = 0;
+                                if (!ParseUnsignedUint(
+                                        clean.substr(open_b + 1, clean.size() - open_b - 2),
+                                        count) ||
+                                    count == 0) {
+                                    return false;
+                                }
+                                member.array_count *= count;
+                                clean = TrimWs(clean.substr(0, open_b));
+                            }
+                            size_t n_start = clean.size();
+                            while (n_start > 0 && IsIdentContChar(clean[n_start - 1])) {
+                                --n_start;
+                            }
+                            if (n_start == clean.size() || n_start == 0) {
+                                return false;
+                            }
+                            member.name = std::string{clean.substr(n_start)};
+                            member.type = std::string{TrimWs(clean.substr(0, n_start))};
+                            if (member.type.empty()) {
+                                return false;
+                            }
+                            out_members.push_back(std::move(member));
+                        }
+                        return true;
+                    }
+                }
+            }
+            pos = end;
+            continue;
+        }
+        ++pos;
+    }
+    return false;
+}
+
+[[nodiscard]] bool IsMatrixOrArrayType(std::string_view type) noexcept {
+    if (type.find("matrix<") != std::string_view::npos ||
+        type.find("array<") != std::string_view::npos) {
+        return true;
+    }
+    return type.find("2x") != std::string_view::npos ||
+           type.find("3x") != std::string_view::npos ||
+           type.find("4x") != std::string_view::npos;
+}
+
+[[nodiscard]] bool FindTopLevelAssign(std::string_view stmt, size_t& eq_begin,
+                                      size_t& eq_end) noexcept {
+    int depth = 0;
+    int angles = 0;
+    for (size_t i = 0; i < stmt.size();) {
+        const size_t skipped = SkipMslCommentOrLit(stmt, i);
+        if (skipped != i) {
+            i = skipped;
+            continue;
+        }
+        const char c = stmt[i];
+        const char before = i != 0 ? stmt[i - 1] : ' ';
+        const char after = i + 1 < stmt.size() ? stmt[i + 1] : ' ';
+        if (c == '<') {
+            if (depth == 0 && IsIdentContChar(before) && after != '=' && after != '<') {
+                ++angles;
+            }
+        } else if (c == '>') {
+            if (depth == 0 && angles > 0 && before != '-' && before != ' ' && after != '=') {
+                --angles;
+            }
+        } else if (c == '(' || c == '[' || c == '{') {
+            ++depth;
+        } else if (c == ')' || c == ']' || c == '}') {
+            --depth;
+        } else if (c == '=' && depth == 0 && angles == 0) {
+            if (after == '=') {
+                i += 2;
+                continue;
+            }
+            if (before == '!') {
+                ++i;
+                continue;
+            }
+            if (before == '<' || before == '>') {
+                if (i >= 2 && stmt[i - 2] == before) {
+                    eq_begin = i - 2;
+                    eq_end = i + 1;
+                    return true;
+                }
+                ++i;
+                continue;
+            }
+            if (before == '+' || before == '-' || before == '*' || before == '/' ||
+                before == '%' || before == '&' || before == '|' || before == '^') {
+                eq_begin = i - 1;
+                eq_end = i + 1;
+                return true;
+            }
+            eq_begin = i;
+            eq_end = i + 1;
+            return true;
+        }
+        ++i;
+    }
+    return false;
+}
+
+class VertexMslAnalyzer {
+public:
+    VertexMslAnalyzer(std::string_view msl_, const std::vector<u32>& match_)
+        : msl{msl_}, match{match_} {}
+
+    std::string stage_in_var;
+    std::string out_struct_name;
+    std::string out_var;
+    std::unordered_map<std::string_view, Taint> in_field_taint;
+    std::unordered_map<std::string_view, u32> out_field_locations;
+    std::unordered_map<std::string_view, Taint> out_builtin_taint;
+    std::unordered_map<std::string_view, Taint> var_taint;
+    std::array<Taint, 32> generic_taint{};
+    Taint post_return_taint{};
+    bool seen_return{};
+    bool alias_hazard{};
+
+    [[nodiscard]] Taint EvalExpr(std::string_view expr) {
+        Taint res{};
+        bool prev_was_value = false;
+        for (size_t i = 0; i < expr.size() && !alias_hazard;) {
+            const size_t ws = SkipMslTrivia(expr, i, expr.size());
+            if (ws != i) {
+                i = ws;
+                continue;
+            }
+            const char c = expr[i];
+            if (c == '"' || c == '\'') {
+                i = SkipMslCommentOrLit(expr, i);
+                prev_was_value = true;
+                continue;
+            }
+            if (std::isdigit(static_cast<unsigned char>(c)) != 0 ||
+                (c == '.' && i + 1 < expr.size() &&
+                 std::isdigit(static_cast<unsigned char>(expr[i + 1])) != 0)) {
+                ++i;
+                while (i < expr.size() &&
+                       (IsIdentContChar(expr[i]) || expr[i] == '.' ||
+                        ((expr[i] == '+' || expr[i] == '-') && i > 0 &&
+                         (expr[i - 1] == 'e' || expr[i - 1] == 'E' || expr[i - 1] == 'p' ||
+                          expr[i - 1] == 'P')))) {
+                    ++i;
+                }
+                prev_was_value = true;
+                continue;
+            }
+            if (c == '&') {
+                if (i + 1 < expr.size() && expr[i + 1] == '&') {
+                    prev_was_value = false;
+                    i += 2;
+                    continue;
+                }
+                if (!prev_was_value) {
+                    alias_hazard = true;
+                    return Taint::Varying();
+                }
+                prev_was_value = false;
+                ++i;
+                continue;
+            }
+            if ((c == '+' && i + 1 < expr.size() && expr[i + 1] == '+') ||
+                (c == '-' && i + 1 < expr.size() && expr[i + 1] == '-')) {
+                // Side-effecting increment / decrement inside an expression.
+                alias_hazard = true;
+                return Taint::Varying();
+            }
+            if (c == '=') {
+                const char prev = i > 0 ? expr[i - 1] : ' ';
+                const char next = i + 1 < expr.size() ? expr[i + 1] : ' ';
+                if (next == '=') {
+                    prev_was_value = false;
+                    i += 2;
+                    continue;
+                }
+                if (prev == '!' || prev == '<' || prev == '>') {
+                    if (i >= 2 && expr[i - 2] == prev) {
+                        alias_hazard = true;
+                        return Taint::Varying();
+                    }
+                    prev_was_value = false;
+                    ++i;
+                    continue;
+                }
+                alias_hazard = true;
+                return Taint::Varying();
+            }
+            if (c == '(' || c == '[' || c == '{') {
+                const size_t abs_open = static_cast<size_t>(expr.data() - msl.data()) + i;
+                if (abs_open >= match.size() || match[abs_open] == ~0U) {
+                    alias_hazard = true;
+                    return Taint::Varying();
+                }
+                const size_t close = match[abs_open] - static_cast<size_t>(expr.data() - msl.data());
+                if (close >= expr.size()) {
+                    alias_hazard = true;
+                    return Taint::Varying();
+                }
+                res |= EvalExpr(expr.substr(i + 1, close - i - 1));
+                prev_was_value = (c == '(' || c == ']');
+                if (c == '[' || c == '(') {
+                    prev_was_value = true;
+                }
+                i = close + 1;
+                continue;
+            }
+            if (IsIdentStartChar(c)) {
+                size_t back = i;
+                while (back > 0 && std::isspace(static_cast<unsigned char>(expr[back - 1])) != 0) {
+                    --back;
+                }
+                const bool after_member =
+                    back > 0 && (expr[back - 1] == '.' ||
+                                 (back >= 2 && expr[back - 2] == '-' && expr[back - 1] == '>'));
+                size_t id_end = i + 1;
+                while (id_end < expr.size() && IsIdentContChar(expr[id_end])) {
+                    ++id_end;
+                }
+                std::string_view id = expr.substr(i, id_end - i);
+                size_t cursor = id_end;
+                if (!after_member && (id == "fast" || id == "precise" || id == "metal")) {
+                    const size_t ns_pos = SkipMslTrivia(expr, cursor, expr.size());
+                    if (ns_pos + 1 < expr.size() && expr[ns_pos] == ':' &&
+                        expr[ns_pos + 1] == ':') {
+                        const size_t fn_start = SkipMslTrivia(expr, ns_pos + 2, expr.size());
+                        if (fn_start < expr.size() && IsIdentStartChar(expr[fn_start])) {
+                            size_t fn_end = fn_start + 1;
+                            while (fn_end < expr.size() && IsIdentContChar(expr[fn_end])) {
+                                ++fn_end;
+                            }
+                            id = expr.substr(fn_start, fn_end - fn_start);
+                            cursor = fn_end;
+                        }
+                    }
+                }
+                size_t after_id = SkipMslTrivia(expr, cursor, expr.size());
+                if (!after_member && IsTemplateCallName(id) && after_id < expr.size() &&
+                    expr[after_id] == '<') {
+                    int angles = 0;
+                    size_t t = after_id;
+                    while (t < expr.size()) {
+                        const size_t sk = SkipMslCommentOrLit(expr, t);
+                        if (sk != t) {
+                            t = sk;
+                            continue;
+                        }
+                        if (expr[t] == '(' || expr[t] == '[' || expr[t] == '{') {
+                            const size_t ao = static_cast<size_t>(expr.data() - msl.data()) + t;
+                            if (ao >= match.size() || match[ao] == ~0U) {
+                                alias_hazard = true;
+                                return Taint::Varying();
+                            }
+                            t = match[ao] - static_cast<size_t>(expr.data() - msl.data()) + 1;
+                            continue;
+                        }
+                        if (expr[t] == '<') {
+                            ++angles;
+                        } else if (expr[t] == '>') {
+                            if (--angles == 0) {
+                                ++t;
+                                break;
+                            }
+                        }
+                        ++t;
+                    }
+                    if (angles != 0) {
+                        alias_hazard = true;
+                        return Taint::Varying();
+                    }
+                    after_id = SkipMslTrivia(expr, t, expr.size());
+                }
+                if (after_id < expr.size() && expr[after_id] == '(') {
+                    const size_t abs_open =
+                        static_cast<size_t>(expr.data() - msl.data()) + after_id;
+                    if (abs_open >= match.size() || match[abs_open] == ~0U) {
+                        alias_hazard = true;
+                        return Taint::Varying();
+                    }
+                    const size_t close =
+                        match[abs_open] - static_cast<size_t>(expr.data() - msl.data());
+                    if (close >= expr.size()) {
+                        alias_hazard = true;
+                        return Taint::Varying();
+                    }
+                    const std::string_view args_slice =
+                        expr.substr(after_id + 1, close - after_id - 1);
+                    const Taint args_taint = EvalExpr(args_slice);
+                    if (after_member) {
+                        if (IsPureMemberMethod(id)) {
+                            res |= args_taint;
+                        } else {
+                            res |= Taint::Varying();
+                        }
+                    } else if (IsPureBuiltinOrCtor(id)) {
+                        res |= args_taint;
+                    } else {
+                        res |= Taint::Varying();
+                        TaintCallArguments(args_slice);
+                    }
+                    prev_was_value = true;
+                    i = close + 1;
+                    continue;
+                }
+                if (after_member) {
+                    prev_was_value = true;
+                    i = cursor;
+                    continue;
+                }
+                if (!stage_in_var.empty() && id == stage_in_var) {
+                    if (after_id < expr.size() && expr[after_id] == '.') {
+                        const size_t f_start = SkipMslTrivia(expr, after_id + 1, expr.size());
+                        if (f_start < expr.size() && IsIdentStartChar(expr[f_start])) {
+                            size_t f_end = f_start + 1;
+                            while (f_end < expr.size() && IsIdentContChar(expr[f_end])) {
+                                ++f_end;
+                            }
+                            const std::string_view field = expr.substr(f_start, f_end - f_start);
+                            const auto it = in_field_taint.find(field);
+                            res |= it != in_field_taint.end() ? it->second : Taint::Varying();
+                            prev_was_value = true;
+                            i = f_end;
+                            continue;
+                        }
+                    }
+                    res |= Taint::Varying();
+                    prev_was_value = true;
+                    i = cursor;
+                    continue;
+                }
+                if (!out_var.empty() && id == out_var) {
+                    if (after_id < expr.size() && expr[after_id] == '.') {
+                        const size_t f_start = SkipMslTrivia(expr, after_id + 1, expr.size());
+                        if (f_start < expr.size() && IsIdentStartChar(expr[f_start])) {
+                            size_t f_end = f_start + 1;
+                            while (f_end < expr.size() && IsIdentContChar(expr[f_end])) {
+                                ++f_end;
+                            }
+                            const std::string_view field = expr.substr(f_start, f_end - f_start);
+                            const auto it = out_field_locations.find(field);
+                            if (it == out_field_locations.end()) {
+                                alias_hazard = true;
+                                return Taint::Varying();
+                            }
+                            u32 loc_mask = it->second;
+                            if (loc_mask == 0) {
+                                if (const auto bit_it = out_builtin_taint.find(field);
+                                    bit_it != out_builtin_taint.end()) {
+                                    res |= bit_it->second;
+                                }
+                            } else {
+                                while (loc_mask != 0) {
+                                    const u32 g = static_cast<u32>(std::countr_zero(loc_mask));
+                                    loc_mask &= loc_mask - 1U;
+                                    res |= generic_taint[g];
+                                }
+                            }
+                            prev_was_value = true;
+                            i = f_end;
+                            continue;
+                        }
+                    }
+                    alias_hazard = true;
+                    return Taint::Varying();
+                }
+                if (const auto it = var_taint.find(id); it != var_taint.end()) {
+                    res |= it->second;
+                    prev_was_value = true;
+                } else {
+                    prev_was_value = !IsTypeOrQualifier(id);
+                }
+                i = cursor;
+                continue;
+            }
+            prev_was_value = false;
+            ++i;
+        }
+        return res;
+    }
+
+    void TaintCallArguments(std::string_view args) {
+        for (size_t i = 0; i < args.size();) {
+            const size_t sk = SkipMslCommentOrLit(args, i);
+            if (sk != i) {
+                i = sk;
+                continue;
+            }
+            if (IsIdentStartChar(args[i])) {
+                size_t back = i;
+                while (back > 0 && std::isspace(static_cast<unsigned char>(args[back - 1])) != 0) {
+                    --back;
+                }
+                const bool member =
+                    back > 0 && (args[back - 1] == '.' ||
+                                 (back >= 2 && args[back - 2] == '-' && args[back - 1] == '>'));
+                size_t end = i + 1;
+                while (end < args.size() && IsIdentContChar(args[end])) {
+                    ++end;
+                }
+                if (!member) {
+                    const std::string_view tok = args.substr(i, end - i);
+                    if ((!out_var.empty() && tok == out_var) ||
+                        (!stage_in_var.empty() && tok == stage_in_var)) {
+                        alias_hazard = true;
+                        return;
+                    }
+                    if (const auto it = var_taint.find(tok); it != var_taint.end()) {
+                        it->second = Taint::Varying();
+                    }
+                }
+                i = end;
+                continue;
+            }
+            ++i;
+        }
+    }
+
+    void PreTaintLoopRange(size_t begin, size_t end) {
+        const std::string_view span = msl.substr(begin, end - begin);
+        if (ContainsStandaloneIdent(span, "return")) {
+            post_return_taint = Taint::Varying();
+        }
+        for (size_t i = begin; i < end && !alias_hazard;) {
+            const size_t sk = SkipMslCommentOrLit(msl, i);
+            if (sk != i) {
+                i = sk;
+                continue;
+            }
+            if ((msl[i] == '+' && i + 1 < end && msl[i + 1] == '+') ||
+                (msl[i] == '-' && i + 1 < end && msl[i + 1] == '-')) {
+                const size_t after = SkipMslTrivia(msl, i + 2, end);
+                if (after < end && IsIdentStartChar(msl[after])) {
+                    size_t id_end = after + 1;
+                    while (id_end < end && IsIdentContChar(msl[id_end])) {
+                        ++id_end;
+                    }
+                    const std::string_view id = msl.substr(after, id_end - after);
+                    if (!out_var.empty() && id == out_var) {
+                        alias_hazard = true;
+                        return;
+                    }
+                    var_taint[id] = Taint::Varying();
+                }
+                i += 2;
+                continue;
+            }
+            if (IsIdentStartChar(msl[i])) {
+                size_t back = i;
+                while (back > begin &&
+                       std::isspace(static_cast<unsigned char>(msl[back - 1])) != 0) {
+                    --back;
+                }
+                const bool member =
+                    back > begin && (msl[back - 1] == '.' ||
+                                     (back >= begin + 2 && msl[back - 2] == '-' &&
+                                      msl[back - 1] == '>'));
+                size_t id_end = i + 1;
+                while (id_end < end && IsIdentContChar(msl[id_end])) {
+                    ++id_end;
+                }
+                const std::string_view id = msl.substr(i, id_end - i);
+                if (!member && id != "if" && id != "for" && id != "while" && id != "switch" &&
+                    id != "return" && id != "break" && id != "continue" &&
+                    !IsTypeOrQualifier(id)) {
+                    size_t cur = id_end;
+                    while (cur < end) {
+                        cur = SkipMslTrivia(msl, cur, end);
+                        if (cur < end && msl[cur] == '[' && match[cur] < end) {
+                            cur = size_t{match[cur]} + 1;
+                            continue;
+                        }
+                        if (cur < end && msl[cur] == '.') {
+                            cur = SkipMslTrivia(msl, cur + 1, end);
+                            while (cur < end && IsIdentContChar(msl[cur])) {
+                                ++cur;
+                            }
+                            continue;
+                        }
+                        break;
+                    }
+                    bool mutated = false;
+                    if (cur + 1 < end &&
+                        ((msl[cur] == '+' && msl[cur + 1] == '+') ||
+                         (msl[cur] == '-' && msl[cur + 1] == '-'))) {
+                        mutated = true;
+                    } else if (cur < end && msl[cur] == '=' &&
+                               (cur + 1 >= end || msl[cur + 1] != '=')) {
+                        mutated = true;
+                    } else if (cur + 1 < end && msl[cur + 1] == '=' &&
+                               (msl[cur] == '+' || msl[cur] == '-' || msl[cur] == '*' ||
+                                msl[cur] == '/' || msl[cur] == '%' || msl[cur] == '&' ||
+                                msl[cur] == '|' || msl[cur] == '^')) {
+                        mutated = true;
+                    } else if (cur + 2 < end && msl[cur + 2] == '=' &&
+                               ((msl[cur] == '<' && msl[cur + 1] == '<') ||
+                                (msl[cur] == '>' && msl[cur + 1] == '>'))) {
+                        mutated = true;
+                    } else if (cur < end && msl[cur] == ';') {
+                        // Potentially a declaration `Type id;` inside the loop.
+                        if (back > begin && IsIdentContChar(msl[back - 1])) {
+                            mutated = true;
+                        }
+                    }
+                    if (mutated && (out_var.empty() || id != out_var)) {
+                        var_taint[id] = Taint::Varying();
+                    }
+                }
+                i = id_end;
+                continue;
+            }
+            ++i;
+        }
+    }
+
+    bool AnalyzeSingleStmt(size_t& pos, size_t limit, Taint control_taint, bool is_top_level,
+                           Taint* switch_break_taint) {
+        pos = SkipMslTrivia(msl, pos, limit);
+        if (pos >= limit) {
+            return true;
+        }
+        if (msl[pos] == ';') {
+            ++pos;
+            return true;
+        }
+        if (msl[pos] == '#') {
+            if (msl.substr(pos).starts_with("#pragma")) {
+                const size_t nl = msl.find('\n', pos);
+                pos = nl == std::string_view::npos ? limit : (std::min)(nl + 1, limit);
+                return true;
+            }
+            alias_hazard = true;
+            return false;
+        }
+        if (msl[pos] == '{') {
+            if (match[pos] >= limit) {
+                alias_hazard = true;
+                return false;
+            }
+            const size_t close = match[pos];
+            if (!AnalyzeBlock(pos + 1, close, control_taint, false, switch_break_taint)) {
+                return false;
+            }
+            pos = close + 1;
+            return true;
+        }
+        if (IsIdentStartChar(msl[pos])) {
+            size_t kw_end = pos + 1;
+            while (kw_end < limit && IsIdentContChar(msl[kw_end])) {
+                ++kw_end;
+            }
+            const std::string_view kw = msl.substr(pos, kw_end - pos);
+            if (kw == "if") {
+                const size_t p_open = SkipMslTrivia(msl, kw_end, limit);
+                if (p_open >= limit || msl[p_open] != '(' || match[p_open] >= limit) {
+                    alias_hazard = true;
+                    return false;
+                }
+                const size_t p_close = match[p_open];
+                const Taint eff_ctrl =
+                    control_taint | post_return_taint |
+                    (switch_break_taint != nullptr ? *switch_break_taint : Taint{});
+                const Taint cond_t =
+                    EvalExpr(msl.substr(p_open + 1, p_close - p_open - 1)) | eff_ctrl;
+                if (alias_hazard) {
+                    return false;
+                }
+                pos = p_close + 1;
+                if (!AnalyzeSingleStmt(pos, limit, cond_t, false, switch_break_taint)) {
+                    return false;
+                }
+                const size_t after_then = SkipMslTrivia(msl, pos, limit);
+                if (after_then + 4 <= limit && msl.substr(after_then, 4) == "else" &&
+                    (after_then + 4 == limit || !IsIdentContChar(msl[after_then + 4]))) {
+                    pos = after_then + 4;
+                    if (!AnalyzeSingleStmt(pos, limit, cond_t, false, switch_break_taint)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            if (kw == "switch") {
+                const size_t p_open = SkipMslTrivia(msl, kw_end, limit);
+                if (p_open >= limit || msl[p_open] != '(' || match[p_open] >= limit) {
+                    alias_hazard = true;
+                    return false;
+                }
+                const size_t p_close = match[p_open];
+                const size_t b_open = SkipMslTrivia(msl, p_close + 1, limit);
+                if (b_open >= limit || msl[b_open] != '{' || match[b_open] >= limit) {
+                    alias_hazard = true;
+                    return false;
+                }
+                const size_t b_close = match[b_open];
+                const Taint eff_ctrl =
+                    control_taint | post_return_taint |
+                    (switch_break_taint != nullptr ? *switch_break_taint : Taint{});
+                const Taint sw_t =
+                    EvalExpr(msl.substr(p_open + 1, p_close - p_open - 1)) | eff_ctrl;
+                Taint local_break{};
+                if (!AnalyzeBlock(b_open + 1, b_close, sw_t, false, &local_break)) {
+                    return false;
+                }
+                pos = b_close + 1;
+                return true;
+            }
+            if (kw == "for" || kw == "while") {
+                const size_t p_open = SkipMslTrivia(msl, kw_end, limit);
+                if (p_open >= limit || msl[p_open] != '(' || match[p_open] >= limit) {
+                    alias_hazard = true;
+                    return false;
+                }
+                const size_t p_close = match[p_open];
+                size_t body_pos = SkipMslTrivia(msl, p_close + 1, limit);
+                if (body_pos >= limit) {
+                    alias_hazard = true;
+                    return false;
+                }
+                size_t loop_end = 0;
+                if (msl[body_pos] == '{') {
+                    if (match[body_pos] >= limit) {
+                        alias_hazard = true;
+                        return false;
+                    }
+                    loop_end = size_t{match[body_pos]} + 1;
+                } else {
+                    size_t scan = body_pos;
+                    while (scan < limit && msl[scan] != ';') {
+                        const size_t sk = SkipMslCommentOrLit(msl, scan);
+                        if (sk != scan) {
+                            scan = sk;
+                            continue;
+                        }
+                        if ((msl[scan] == '(' || msl[scan] == '[' || msl[scan] == '{') &&
+                            match[scan] < limit) {
+                            scan = size_t{match[scan]} + 1;
+                            continue;
+                        }
+                        ++scan;
+                    }
+                    if (scan >= limit) {
+                        alias_hazard = true;
+                        return false;
+                    }
+                    loop_end = scan + 1;
+                }
+                PreTaintLoopRange(pos, loop_end);
+                if (alias_hazard) {
+                    return false;
+                }
+                pos = body_pos;
+                if (!AnalyzeSingleStmt(pos, loop_end, Taint::Varying(), false, nullptr)) {
+                    return false;
+                }
+                pos = loop_end;
+                return true;
+            }
+            if (kw == "do") {
+                const size_t b_open = SkipMslTrivia(msl, kw_end, limit);
+                if (b_open >= limit || msl[b_open] != '{' || match[b_open] >= limit) {
+                    alias_hazard = true;
+                    return false;
+                }
+                const size_t b_close = match[b_open];
+                const size_t while_kw = SkipMslTrivia(msl, b_close + 1, limit);
+                if (while_kw + 5 > limit || msl.substr(while_kw, 5) != "while" ||
+                    (while_kw + 5 < limit && IsIdentContChar(msl[while_kw + 5]))) {
+                    alias_hazard = true;
+                    return false;
+                }
+                const size_t p_open = SkipMslTrivia(msl, while_kw + 5, limit);
+                if (p_open >= limit || msl[p_open] != '(' || match[p_open] >= limit) {
+                    alias_hazard = true;
+                    return false;
+                }
+                const size_t semi = SkipMslTrivia(msl, size_t{match[p_open]} + 1, limit);
+                if (semi >= limit || msl[semi] != ';') {
+                    alias_hazard = true;
+                    return false;
+                }
+                const size_t loop_end = semi + 1;
+                PreTaintLoopRange(pos, loop_end);
+                if (alias_hazard) {
+                    return false;
+                }
+                if (!AnalyzeBlock(b_open + 1, b_close, Taint::Varying(), false, nullptr)) {
+                    return false;
+                }
+                static_cast<void>(EvalExpr(msl.substr(p_open + 1, match[p_open] - p_open - 1)));
+                pos = loop_end;
+                return !alias_hazard;
+            }
+            if ((kw == "case" || kw == "default") && switch_break_taint != nullptr) {
+                size_t colon = kw_end;
+                while (colon < limit && msl[colon] != ':') {
+                    const size_t sk = SkipMslCommentOrLit(msl, colon);
+                    if (sk != colon) {
+                        colon = sk;
+                        continue;
+                    }
+                    if ((msl[colon] == '(' || msl[colon] == '[' || msl[colon] == '{') &&
+                        match[colon] < limit) {
+                        colon = size_t{match[colon]} + 1;
+                        continue;
+                    }
+                    ++colon;
+                }
+                if (colon >= limit) {
+                    alias_hazard = true;
+                    return false;
+                }
+                if (kw == "case") {
+                    *switch_break_taint |= EvalExpr(msl.substr(kw_end, colon - kw_end));
+                }
+                pos = colon + 1;
+                return !alias_hazard;
+            }
+        }
+
+        // Scan to terminating `;` at current bracket depth.
+        size_t semi = pos;
+        while (semi < limit && msl[semi] != ';') {
+            const size_t sk = SkipMslCommentOrLit(msl, semi);
+            if (sk != semi) {
+                semi = sk;
+                continue;
+            }
+            if ((msl[semi] == '(' || msl[semi] == '[' || msl[semi] == '{') &&
+                match[semi] < limit) {
+                semi = size_t{match[semi]} + 1;
+                continue;
+            }
+            ++semi;
+        }
+        if (semi >= limit) {
+            alias_hazard = true;
+            return false;
+        }
+        const std::string_view stmt = TrimWs(msl.substr(pos, semi - pos));
+        pos = semi + 1;
+        if (stmt.empty()) {
+            return true;
+        }
+
+        const Taint eff_ctrl =
+            control_taint | post_return_taint |
+            (switch_break_taint != nullptr ? *switch_break_taint : Taint{});
+
+        if (stmt == "break") {
+            if (switch_break_taint != nullptr) {
+                *switch_break_taint |= eff_ctrl;
+            }
+            return true;
+        }
+        if (stmt == "continue") {
+            return true;
+        }
+        if (stmt.starts_with("return") &&
+            (stmt.size() == 6 || !IsIdentContChar(stmt[6]))) {
+            const std::string_view ret_expr = TrimWs(stmt.substr(6));
+            if (out_var.empty() || ret_expr != out_var) {
+                alias_hazard = true;
+                return false;
+            }
+            seen_return = true;
+            post_return_taint |= eff_ctrl;
+            return true;
+        }
+
+        // Output struct variable declaration: `<out_struct> <out_var> = {};`
+        if (stmt.starts_with(out_struct_name) && stmt.size() > out_struct_name.size() &&
+            !IsIdentContChar(stmt[out_struct_name.size()])) {
+            size_t eq_b = 0;
+            size_t eq_e = 0;
+            if (!out_var.empty() || !FindTopLevelAssign(stmt, eq_b, eq_e) ||
+                stmt.substr(eq_b, eq_e - eq_b) != "=") {
+                alias_hazard = true;
+                return false;
+            }
+            const std::string_view decl_name =
+                TrimWs(stmt.substr(out_struct_name.size(), eq_b - out_struct_name.size()));
+            const std::string_view init_rhs = TrimWs(stmt.substr(eq_e));
+            if (decl_name.empty() || init_rhs != "{}") {
+                alias_hazard = true;
+                return false;
+            }
+            for (const char ch : decl_name) {
+                if (!IsIdentContChar(ch)) {
+                    alias_hazard = true;
+                    return false;
+                }
+            }
+            out_var = std::string{decl_name};
+            return true;
+        }
+
+        // Spilled read-only resource binding at entry prologue (`constant ...` / `const device ...`).
+        if (stmt.starts_with("constant ") || stmt.starts_with("const device ")) {
+            size_t eq_b = 0;
+            size_t eq_e = 0;
+            if (!FindTopLevelAssign(stmt, eq_b, eq_e) ||
+                stmt.substr(eq_b, eq_e - eq_b) != "=") {
+                alias_hazard = true;
+                return false;
+            }
+            const std::string_view lhs = TrimWs(stmt.substr(0, eq_b));
+            const std::string_view rhs = TrimWs(stmt.substr(eq_e));
+            size_t ns = lhs.size();
+            while (ns > 0 && IsIdentContChar(lhs[ns - 1])) {
+                --ns;
+            }
+            if (ns == lhs.size() || ns == 0) {
+                alias_hazard = true;
+                return false;
+            }
+            const std::string_view vname = lhs.substr(ns);
+            var_taint[vname] = EvalExpr(rhs) | eff_ctrl;
+            return !alias_hazard;
+        }
+
+        size_t eq_b = 0;
+        size_t eq_e = 0;
+        if (FindTopLevelAssign(stmt, eq_b, eq_e)) {
+            const std::string_view lhs = TrimWs(stmt.substr(0, eq_b));
+            const std::string_view op = stmt.substr(eq_b, eq_e - eq_b);
+            const std::string_view rhs = TrimWs(stmt.substr(eq_e));
+            size_t rhs_eq_b = 0;
+            size_t rhs_eq_e = 0;
+            if (FindTopLevelAssign(rhs, rhs_eq_b, rhs_eq_e)) {
+                alias_hazard = true;
+                return false;
+            }
+            // Write to `out.<field>[...].swizzle <op> <rhs>`
+            if (!out_var.empty() && lhs.starts_with(out_var) &&
+                (lhs.size() == out_var.size() || !IsIdentContChar(lhs[out_var.size()]))) {
+                size_t cur = SkipMslTrivia(lhs, out_var.size(), lhs.size());
+                if (cur >= lhs.size() || lhs[cur] != '.') {
+                    alias_hazard = true;
+                    return false;
+                }
+                cur = SkipMslTrivia(lhs, cur + 1, lhs.size());
+                size_t f_end = cur;
+                while (f_end < lhs.size() && IsIdentContChar(lhs[f_end])) {
+                    ++f_end;
+                }
+                if (f_end == cur) {
+                    alias_hazard = true;
+                    return false;
+                }
+                const std::string_view field = lhs.substr(cur, f_end - cur);
+                const auto loc_it = out_field_locations.find(field);
+                if (loc_it == out_field_locations.end()) {
+                    alias_hazard = true;
+                    return false;
+                }
+                Taint idx_taint{};
+                cur = f_end;
+                while (cur < lhs.size()) {
+                    cur = SkipMslTrivia(lhs, cur, lhs.size());
+                    if (cur >= lhs.size()) {
+                        break;
+                    }
+                    if (lhs[cur] == '[') {
+                        const size_t ao = static_cast<size_t>(lhs.data() - msl.data()) + cur;
+                        if (ao >= match.size() || match[ao] == ~0U) {
+                            alias_hazard = true;
+                            return false;
+                        }
+                        const size_t close =
+                            match[ao] - static_cast<size_t>(lhs.data() - msl.data());
+                        if (close >= lhs.size()) {
+                            alias_hazard = true;
+                            return false;
+                        }
+                        idx_taint |= EvalExpr(lhs.substr(cur + 1, close - cur - 1));
+                        cur = close + 1;
+                        continue;
+                    }
+                    if (lhs[cur] == '.') {
+                        cur = SkipMslTrivia(lhs, cur + 1, lhs.size());
+                        size_t sw_end = cur;
+                        while (sw_end < lhs.size() && IsIdentContChar(lhs[sw_end])) {
+                            ++sw_end;
+                        }
+                        if (sw_end == cur) {
+                            alias_hazard = true;
+                            return false;
+                        }
+                        cur = sw_end;
+                        continue;
+                    }
+                    alias_hazard = true;
+                    return false;
+                }
+                const Taint val_taint = EvalExpr(rhs) | idx_taint | eff_ctrl;
+                if (alias_hazard) {
+                    return false;
+                }
+                u32 loc_mask = loc_it->second;
+                if (loc_mask == 0) {
+                    out_builtin_taint[field] |= val_taint;
+                } else {
+                    while (loc_mask != 0) {
+                        const u32 g = static_cast<u32>(std::countr_zero(loc_mask));
+                        loc_mask &= loc_mask - 1U;
+                        generic_taint[g] |= val_taint;
+                    }
+                }
+                return true;
+            }
+            if (!out_var.empty() && ContainsStandaloneIdent(lhs, out_var)) {
+                alias_hazard = true;
+                return false;
+            }
+            // Check for multi-declarator `Type a = e1, b = e2` vs single LHS.
+            const std::vector<std::string_view> comma_parts = SplitTopCommas(stmt);
+            if (comma_parts.size() > 1) {
+                if (!out_var.empty() && ContainsStandaloneIdent(stmt, out_var)) {
+                    alias_hazard = true;
+                    return false;
+                }
+                for (const std::string_view part : comma_parts) {
+                    if (part.find('&') != std::string_view::npos ||
+                        part.find('*') != std::string_view::npos) {
+                        alias_hazard = true;
+                        return false;
+                    }
+                    size_t peq_b = 0;
+                    size_t peq_e = 0;
+                    if (FindTopLevelAssign(part, peq_b, peq_e)) {
+                        std::string_view plhs = TrimWs(part.substr(0, peq_b));
+                        while (!plhs.empty() && plhs.back() == ']') {
+                            const size_t ob = plhs.rfind('[');
+                            if (ob == std::string_view::npos) {
+                                alias_hazard = true;
+                                return false;
+                            }
+                            plhs = TrimWs(plhs.substr(0, ob));
+                        }
+                        size_t ns = plhs.size();
+                        while (ns > 0 && IsIdentContChar(plhs[ns - 1])) {
+                            --ns;
+                        }
+                        if (ns == plhs.size()) {
+                            alias_hazard = true;
+                            return false;
+                        }
+                        var_taint[plhs.substr(ns)] |= EvalExpr(part.substr(peq_e)) | eff_ctrl;
+                    } else {
+                        std::string_view plhs = TrimWs(part);
+                        while (!plhs.empty() && plhs.back() == ']') {
+                            const size_t ob = plhs.rfind('[');
+                            if (ob == std::string_view::npos) {
+                                alias_hazard = true;
+                                return false;
+                            }
+                            plhs = TrimWs(plhs.substr(0, ob));
+                        }
+                        size_t ns = plhs.size();
+                        while (ns > 0 && IsIdentContChar(plhs[ns - 1])) {
+                            --ns;
+                        }
+                        if (ns < plhs.size()) {
+                            var_taint[plhs.substr(ns)] |= eff_ctrl;
+                        }
+                    }
+                }
+                return !alias_hazard;
+            }
+
+            // Distinguish local declaration `Type var[N] = rhs` from assignment `var[idx].swiz = rhs`.
+            std::string_view stripped_lhs = lhs;
+            Taint lhs_idx_taint{};
+            while (!stripped_lhs.empty() && stripped_lhs.back() == ']') {
+                const size_t close_pos =
+                    static_cast<size_t>(stripped_lhs.data() - msl.data()) + stripped_lhs.size() - 1;
+                if (close_pos >= match.size() || match[close_pos] == ~0U) {
+                    alias_hazard = true;
+                    return false;
+                }
+                const size_t open_off =
+                    match[close_pos] - static_cast<size_t>(stripped_lhs.data() - msl.data());
+                if (open_off >= stripped_lhs.size()) {
+                    alias_hazard = true;
+                    return false;
+                }
+                lhs_idx_taint |= EvalExpr(
+                    stripped_lhs.substr(open_off + 1, stripped_lhs.size() - open_off - 2));
+                stripped_lhs = TrimWs(stripped_lhs.substr(0, open_off));
+            }
+            if (stripped_lhs.find('.') == std::string_view::npos &&
+                stripped_lhs.find("->") == std::string_view::npos && op == "=") {
+                size_t ns = stripped_lhs.size();
+                while (ns > 0 && IsIdentContChar(stripped_lhs[ns - 1])) {
+                    --ns;
+                }
+                if (ns > 0 && ns < stripped_lhs.size()) {
+                    const std::string_view prefix = TrimWs(stripped_lhs.substr(0, ns));
+                    if (!prefix.empty()) {
+                        if (prefix.find('&') != std::string_view::npos ||
+                            prefix.find('*') != std::string_view::npos) {
+                            alias_hazard = true;
+                            return false;
+                        }
+                        const std::string_view vname = stripped_lhs.substr(ns);
+                        var_taint[vname] = EvalExpr(rhs) | lhs_idx_taint | eff_ctrl;
+                        return !alias_hazard;
+                    }
+                }
+            }
+
+            // Assignment to existing variable `root_var[...].swiz <op> rhs`.
+            if (!IsIdentStartChar(lhs[0])) {
+                alias_hazard = true;
+                return false;
+            }
+            size_t r_end = 1;
+            while (r_end < lhs.size() && IsIdentContChar(lhs[r_end])) {
+                ++r_end;
+            }
+            const std::string_view root_var = lhs.substr(0, r_end);
+            Taint idx_taint{};
+            size_t cur = r_end;
+            while (cur < lhs.size()) {
+                cur = SkipMslTrivia(lhs, cur, lhs.size());
+                if (cur >= lhs.size()) {
+                    break;
+                }
+                if (lhs[cur] == '[') {
+                    const size_t ao = static_cast<size_t>(lhs.data() - msl.data()) + cur;
+                    if (ao >= match.size() || match[ao] == ~0U) {
+                        alias_hazard = true;
+                        return false;
+                    }
+                    const size_t close =
+                        match[ao] - static_cast<size_t>(lhs.data() - msl.data());
+                    if (close >= lhs.size()) {
+                        alias_hazard = true;
+                        return false;
+                    }
+                    idx_taint |= EvalExpr(lhs.substr(cur + 1, close - cur - 1));
+                    cur = close + 1;
+                    continue;
+                }
+                if (lhs[cur] == '.') {
+                    cur = SkipMslTrivia(lhs, cur + 1, lhs.size());
+                    size_t f_end = cur;
+                    while (f_end < lhs.size() && IsIdentContChar(lhs[f_end])) {
+                        ++f_end;
+                    }
+                    if (f_end == cur) {
+                        alias_hazard = true;
+                        return false;
+                    }
+                    cur = f_end;
+                    continue;
+                }
+                alias_hazard = true;
+                return false;
+            }
+            const Taint val_taint = EvalExpr(rhs) | idx_taint | eff_ctrl;
+            if (alias_hazard) {
+                return false;
+            }
+            const bool full_overwrite = is_top_level && !eff_ctrl.uses_vertex_id &&
+                                        eff_ctrl.attr_mask == 0 && op == "=" && lhs == root_var;
+            if (full_overwrite) {
+                var_taint[root_var] = val_taint;
+            } else {
+                var_taint[root_var] |= val_taint;
+            }
+            return true;
+        }
+
+        // Non-assignment statement (`Type x;`, `++i;`, `foo();`, etc.).
+        if (!out_var.empty() && ContainsStandaloneIdent(stmt, out_var)) {
+            alias_hazard = true;
+            return false;
+        }
+        // Check for standalone `++v` / `v++` / `--v` / `v--`.
+        if (stmt.find("++") != std::string_view::npos ||
+            stmt.find("--") != std::string_view::npos) {
+            for (size_t i = 0; i < stmt.size();) {
+                if (IsIdentStartChar(stmt[i])) {
+                    size_t e = i + 1;
+                    while (e < stmt.size() && IsIdentContChar(stmt[e])) {
+                        ++e;
+                    }
+                    var_taint[stmt.substr(i, e - i)] |= eff_ctrl;
+                    i = e;
+                } else {
+                    ++i;
+                }
+            }
+            return true;
+        }
+        // Uninitialized declaration `Type var[N];` (no top-level `(`).
+        bool has_paren = false;
+        for (size_t i = 0; i < stmt.size(); ++i) {
+            if (stmt[i] == '(') {
+                has_paren = true;
+                break;
+            }
+        }
+        if (!has_paren) {
+            if (stmt.find('&') != std::string_view::npos ||
+                stmt.find('*') != std::string_view::npos) {
+                alias_hazard = true;
+                return false;
+            }
+            for (const std::string_view part : SplitTopCommas(stmt)) {
+                std::string_view p = part;
+                while (!p.empty() && p.back() == ']') {
+                    const size_t ob = p.rfind('[');
+                    if (ob == std::string_view::npos) {
+                        alias_hazard = true;
+                        return false;
+                    }
+                    p = TrimWs(p.substr(0, ob));
+                }
+                size_t ns = p.size();
+                while (ns > 0 && IsIdentContChar(p[ns - 1])) {
+                    --ns;
+                }
+                if (ns < p.size()) {
+                    var_taint[p.substr(ns)] |= eff_ctrl;
+                }
+            }
+            return true;
+        }
+        static_cast<void>(EvalExpr(stmt));
+        return !alias_hazard;
+    }
+
+    bool AnalyzeBlock(size_t begin, size_t end, Taint control_taint, bool is_top_level,
+                      Taint* switch_break_taint) {
+        size_t pos = begin;
+        while (pos < end) {
+            pos = SkipMslTrivia(msl, pos, end);
+            if (pos >= end) {
+                break;
+            }
+            if (!AnalyzeSingleStmt(pos, end, control_taint, is_top_level, switch_break_taint)) {
+                return false;
+            }
+        }
+        return !alias_hazard;
+    }
+
+private:
+    std::string_view msl;
+    const std::vector<u32>& match;
+};
+
+} // Anonymous namespace
+
+VertexOutputInvariance AnalyzeVertexOutputInvariance(std::string_view msl,
+                                                     std::string_view entry_point) {
+    VertexOutputInvariance conservative{};
+    conservative.uses_vertex_id_mask = ~0U;
+    if (msl.empty() || entry_point.empty()) {
+        return conservative;
+    }
+    const std::vector<u32> match = BuildMslBracketTable(msl);
+    if (match.empty()) {
+        return conservative;
+    }
+
+    // Locate `vertex <out_struct> <entry_point>(<params>) { <body> }`.
+    size_t params_open = ~size_t{0};
+    size_t params_close = ~size_t{0};
+    size_t body_open = ~size_t{0};
+    size_t body_close = ~size_t{0};
+    std::string out_struct;
+    for (size_t pos = 0; pos < msl.size();) {
+        const size_t sk = SkipMslCommentOrLit(msl, pos);
+        if (sk != pos) {
+            pos = sk;
+            continue;
+        }
+        if (IsIdentStartChar(msl[pos])) {
+            size_t end = pos + 1;
+            while (end < msl.size() && IsIdentContChar(msl[end])) {
+                ++end;
+            }
+            if (msl.substr(pos, end - pos) == "vertex") {
+                const size_t ret_start = SkipMslTrivia(msl, end, msl.size());
+                size_t ret_end = ret_start;
+                while (ret_end < msl.size() && IsIdentContChar(msl[ret_end])) {
+                    ++ret_end;
+                }
+                const size_t fn_start = SkipMslTrivia(msl, ret_end, msl.size());
+                size_t fn_end = fn_start;
+                while (fn_end < msl.size() && IsIdentContChar(msl[fn_end])) {
+                    ++fn_end;
+                }
+                const size_t p_open = SkipMslTrivia(msl, fn_end, msl.size());
+                if (ret_end > ret_start && msl.substr(fn_start, fn_end - fn_start) == entry_point &&
+                    p_open < msl.size() && msl[p_open] == '(' && match[p_open] != ~0U) {
+                    const size_t p_close = match[p_open];
+                    size_t after_p = SkipMslTrivia(msl, p_close + 1, msl.size());
+                    while (after_p + 1 < msl.size() && msl[after_p] == '[' &&
+                           msl[after_p + 1] == '[' && match[after_p] != ~0U) {
+                        after_p = SkipMslTrivia(msl, size_t{match[after_p]} + 1, msl.size());
+                    }
+                    if (after_p < msl.size() && msl[after_p] == '{' && match[after_p] != ~0U) {
+                        out_struct = std::string{msl.substr(ret_start, ret_end - ret_start)};
+                        params_open = p_open;
+                        params_close = p_close;
+                        body_open = after_p;
+                        body_close = match[after_p];
+                        break;
+                    }
+                }
+            }
+            pos = end;
+            continue;
+        }
+        ++pos;
+    }
+    if (body_open == ~size_t{0} || out_struct.empty() || out_struct == "void") {
+        return conservative;
+    }
+
+    VertexMslAnalyzer analyzer{msl, match};
+    analyzer.out_struct_name = out_struct;
+
+    // Parse entry parameters and their `[[...]]` attributes.
+    std::string stage_in_struct;
+    for (const std::string_view raw_param :
+         SplitTopCommas(msl.substr(params_open + 1, params_close - params_open - 1))) {
+        std::string param_copy{raw_param};
+        std::vector<std::string> attrs;
+        for (size_t a = param_copy.find("[["); a != std::string::npos;
+             a = param_copy.find("[[")) {
+            const size_t ae = param_copy.find("]]", a + 2);
+            if (ae == std::string::npos) {
+                return conservative;
+            }
+            attrs.emplace_back(
+                TrimWs(std::string_view{param_copy}.substr(a + 2, ae - a - 2)));
+            param_copy.erase(a, ae + 2 - a);
+        }
+        if (attrs.empty()) {
+            return conservative;
+        }
+        const std::string_view decl = TrimWs(param_copy);
+        size_t ns = decl.size();
+        while (ns > 0 && IsIdentContChar(decl[ns - 1])) {
+            --ns;
+        }
+        if (ns == decl.size() || ns == 0) {
+            return conservative;
+        }
+        const std::string_view param_name = decl.substr(ns);
+        const std::string_view param_type = TrimWs(decl.substr(0, ns));
+        const std::string_view raw_name =
+            raw_param.substr(raw_param.rfind(param_name), param_name.size());
+
+        bool is_stage_in = false;
+        bool is_uniform_or_inst = false;
+        for (const std::string& attr : attrs) {
+            if (attr == "stage_in") {
+                is_stage_in = true;
+            } else if (attr == "instance_id" || attr == "base_instance" || attr == "base_vertex" ||
+                       attr.starts_with("buffer(") || attr.starts_with("texture(") ||
+                       attr.starts_with("sampler(")) {
+                is_uniform_or_inst = true;
+            } else {
+                is_uniform_or_inst = false;
+                break;
+            }
+        }
+        if (is_stage_in) {
+            if (!analyzer.stage_in_var.empty()) {
+                return conservative;
+            }
+            analyzer.stage_in_var = std::string{param_name};
+            std::string_view st = param_type;
+            if (!st.empty() && st.back() == '&') {
+                st = TrimWs(st.substr(0, st.size() - 1));
+            }
+            while (st.starts_with("const ") || st.starts_with("thread ")) {
+                const size_t sp = st.find(' ');
+                st = TrimWs(st.substr(sp + 1));
+            }
+            stage_in_struct = std::string{st};
+        } else if (is_uniform_or_inst) {
+            analyzer.var_taint[raw_name] = Taint{false, 0};
+        } else {
+            analyzer.var_taint[raw_name] = Taint::Varying();
+        }
+    }
+
+    // Parse `main0_in` (`stage_in` struct) if present.
+    std::vector<ParsedStructMember> in_members;
+    if (!stage_in_struct.empty()) {
+        if (!ParseMslStruct(msl, match, stage_in_struct, in_members)) {
+            return conservative;
+        }
+        for (const ParsedStructMember& m : in_members) {
+            Taint field_t = Taint::Varying();
+            if (m.array_count == 1 && !IsMatrixOrArrayType(m.type)) {
+                for (const std::string& attr : m.attrs) {
+                    if (attr.starts_with("attribute(") && attr.back() == ')') {
+                        u32 idx = 0;
+                        if (ParseUnsignedUint(
+                                std::string_view{attr}.substr(10, attr.size() - 11), idx) &&
+                            idx < 32) {
+                            field_t = Taint{false, 1U << idx};
+                        }
+                    }
+                }
+            }
+            // Key by string_view into `in_members` (kept alive until function return).
+            analyzer.in_field_taint[m.name] = field_t;
+        }
+    }
+
+    // Parse `main0_out` (`out_struct`).
+    std::vector<ParsedStructMember> out_members;
+    if (!ParseMslStruct(msl, match, out_struct, out_members)) {
+        return conservative;
+    }
+    for (const ParsedStructMember& m : out_members) {
+        if (IsMatrixOrArrayType(m.type)) {
+            return conservative;
+        }
+        bool recognized = false;
+        u32 loc_mask = 0;
+        for (const std::string& attr : m.attrs) {
+            for (const std::string_view sub : SplitTopCommas(attr)) {
+                if (sub.starts_with("user(locn") && sub.back() == ')') {
+                    u32 loc = 0;
+                    if (!ParseUnsignedUint(sub.substr(9, sub.size() - 10), loc)) {
+                        return conservative;
+                    }
+                    recognized = true;
+                    for (u32 k = 0; k < m.array_count; ++k) {
+                        if (loc + k < 32) {
+                            loc_mask |= 1U << (loc + k);
+                        }
+                    }
+                } else if (sub == "position" || sub == "point_size" || sub == "clip_distance" ||
+                           sub == "cull_distance" || sub == "render_target_array_index" ||
+                           sub == "viewport_array_index" || sub == "invariant" || sub == "flat" ||
+                           sub == "center_no_perspective" || sub == "centroid_perspective" ||
+                           sub == "centroid_no_perspective" || sub == "sample_perspective" ||
+                           sub == "sample_no_perspective") {
+                    recognized = true;
+                }
+            }
+        }
+        if (!recognized) {
+            return conservative;
+        }
+        analyzer.out_field_locations[m.name] = loc_mask;
+    }
+
+    if (!analyzer.AnalyzeBlock(body_open + 1, body_close, Taint{}, true, nullptr) ||
+        analyzer.alias_hazard || analyzer.out_var.empty() || !analyzer.seen_return) {
+        return conservative;
+    }
+
+    VertexOutputInvariance out{};
+    out.uses_vertex_id_mask = 0;
+    for (u32 g = 0; g < 32; ++g) {
+        out.attr_deps[g] = analyzer.generic_taint[g].attr_mask;
+        if (analyzer.generic_taint[g].uses_vertex_id) {
+            out.uses_vertex_id_mask |= 1U << g;
+        }
+    }
+    return out;
 }
 
 } // namespace Metal

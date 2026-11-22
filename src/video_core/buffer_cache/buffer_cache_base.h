@@ -184,6 +184,8 @@ public:
     u64 native_compute_storage_buffers = 0;
     // Bytes from each compute storage binding's start that a dispatch marks GPU-written.
     std::array<u32, NUM_STORAGE_BUFFERS> compute_storage_write_marks{};
+    // Declared NVN byte span from each compute storage binding's start for hazard tracking.
+    std::array<u32, NUM_STORAGE_BUFFERS> compute_storage_access_sizes{};
 
     u32 total_graphics_storage_buffers = 0;
     u32 total_compute_storage_buffers = 0;

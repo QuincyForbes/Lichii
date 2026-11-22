@@ -353,10 +353,30 @@ GraphicsPipeline::GraphicsPipeline(const GraphicsPipelineKey& key_, StageProgram
                                                  : nullptr;
     if (!frag.entry_point.empty()) {
         for (size_t index = 0; index < frag.info.interpolation.size(); ++index) {
-            flat_inputs = flat_inputs ||
-                          (frag.info.loads.Generic(index) &&
-                           frag.info.interpolation[index] == Shader::Interpolation::Flat &&
-                           (pre_info == nullptr || pre_info->stores.Generic(index)));
+            if (frag.info.loads.Generic(index) &&
+                frag.info.interpolation[index] == Shader::Interpolation::Flat &&
+                (pre_info == nullptr || pre_info->stores.Generic(index))) {
+                flat_inputs = true;
+                if (index < 32) {
+                    flat_generic_mask |= 1U << index;
+                }
+            }
+        }
+    }
+    if (!flat_inputs) {
+        flat_always_varies = false;
+    } else if (!native_mesh && !mesh && !tessellation && !geometry && !(xfb && xfb->expand) &&
+               flat_generic_mask != 0 && !vertex.entry_point.empty() && !vertex.msl.empty()) {
+        const VertexOutputInvariance inv =
+            AnalyzeVertexOutputInvariance(vertex.msl, vertex.entry_point);
+        if ((inv.uses_vertex_id_mask & flat_generic_mask) == 0) {
+            flat_always_varies = false;
+            u32 mask = flat_generic_mask;
+            while (mask != 0) {
+                const u32 g = static_cast<u32>(std::countr_zero(mask));
+                mask &= mask - 1U;
+                flat_attr_deps_mask |= inv.attr_deps[g];
+            }
         }
     }
 
@@ -2330,6 +2350,85 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
              state.compute, state.refused,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
              num_workers, unlisted, counts.hits, counts.misses);
+}
+
+namespace {
+bool StageInfoMayWriteMemory(const Shader::Info& info) noexcept {
+    if (info.stores_global_memory || info.uses_global_increment || info.uses_global_decrement ||
+        info.uses_int64_bit_atomics || info.uses_atomic_f32_add || info.uses_atomic_f16x2_add ||
+        info.uses_atomic_f16x2_min || info.uses_atomic_f16x2_max || info.uses_atomic_f32x2_add ||
+        info.uses_atomic_f32x2_min || info.uses_atomic_f32x2_max || info.uses_atomic_s32_min ||
+        info.uses_atomic_s32_max || info.uses_atomic_image_u32 || info.uses_typeless_image_writes ||
+        info.is_task || info.is_mesh) {
+        return true;
+    }
+    for (const auto& desc : info.storage_buffers_descriptors) {
+        if (desc.is_written) {
+            return true;
+        }
+    }
+    for (const auto& desc : info.image_buffer_descriptors) {
+        if (desc.is_written) {
+            return true;
+        }
+    }
+    for (const auto& desc : info.image_descriptors) {
+        if (desc.is_written) {
+            return true;
+        }
+    }
+    return false;
+}
+} // Anonymous namespace
+
+bool GraphicsPipeline::Nx2MayWriteMemory() const noexcept {
+    if (IsMeshPipeline() || xfb.has_value()) {
+        return true;
+    }
+    if (!vertex.entry_point.empty() && StageInfoMayWriteMemory(vertex.info)) {
+        return true;
+    }
+    if (!fragment.entry_point.empty() && StageInfoMayWriteMemory(fragment.info)) {
+        return true;
+    }
+    if (tessellation) {
+        for (const StageProgram& v : tessellation->vertex) {
+            if (!v.entry_point.empty() && StageInfoMayWriteMemory(v.info)) {
+                return true;
+            }
+        }
+        if (!tessellation->control.program.entry_point.empty() &&
+            StageInfoMayWriteMemory(tessellation->control.program.info)) {
+            return true;
+        }
+        if (tessellation->domain &&
+            !tessellation->domain->evaluate.program.entry_point.empty() &&
+            StageInfoMayWriteMemory(tessellation->domain->evaluate.program.info)) {
+            return true;
+        }
+    }
+    if (geometry) {
+        for (const StageProgram& c : geometry->capture) {
+            if (!c.entry_point.empty() && StageInfoMayWriteMemory(c.info)) {
+                return true;
+            }
+        }
+        if (!geometry->kernel.program.entry_point.empty() &&
+            StageInfoMayWriteMemory(geometry->kernel.program.info)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool PipelineCache::IsIndirectResetShader() const {
+    constexpr size_t vertex_b =
+        static_cast<size_t>(Tegra::Engines::Maxwell3D::Regs::ShaderType::VertexB);
+    constexpr u64 reset_key = 0x72fd62555e7196cdULL;
+    const auto* const info = shader_infos[vertex_b];
+    return maxwell3d->regs.IsShaderConfigEnabled(vertex_b) && info != nullptr &&
+           info->lowered_native && info->lowered_native->source_size == 128 + 11 * 16 &&
+           info->lowered_native->native_program_key == reset_key;
 }
 
 std::array<u64, 3> PipelineCache::TakeCounts() noexcept {

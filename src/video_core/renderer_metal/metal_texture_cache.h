@@ -455,18 +455,28 @@ public:
     ImageView& operator=(ImageView&&) = default;
 
     /// The view shaders sample as `texture_type`, made on first use. Null for null views.
-    [[nodiscard]] TextureHandle Handle(Shader::TextureType texture_type);
+    [[nodiscard]] TextureHandle Handle(Shader::TextureType texture_type,
+                                       u64* out_gpu_resource_id = nullptr);
+
+    /// Cached MTLResourceID of `Handle(texture_type)` (0 for null views).
+    [[nodiscard]] u64 GpuResourceId(Shader::TextureType texture_type) {
+        u64 res_id = 0;
+        static_cast<void>(Handle(texture_type, &res_id));
+        return res_id;
+    }
 
     /// The view shaders read/write as a storage image (`info.image_descriptors`), using a linear
     /// format for sRGB images and the declared `image_format` when typed, with identity swizzle.
     [[nodiscard]] TextureHandle StorageHandle(Shader::TextureType texture_type,
-                                              Shader::ImageFormat image_format);
+                                              Shader::ImageFormat image_format,
+                                              u64* out_gpu_resource_id = nullptr);
 
     /// What a program reads as `texture_type`: a multisampled image read as a plain texture
     /// (`multisample_read` false) reads the grid of its samples (UseSampleGrid) with
     /// EDEN_NX2_METAL_MSAA, as the guest sees it.
     [[nodiscard]] TextureHandle SampledHandle(Shader::TextureType texture_type,
-                                              bool multisample_read);
+                                              bool multisample_read,
+                                              u64* out_gpu_resource_id = nullptr);
 
     /// Fills the image's sample grid (Image::SampleGrid) for a draw that reads this
     /// multisampled view as a plain texture; false when it can't (the view is bound as it is).
@@ -514,6 +524,7 @@ private:
         Shader::TextureType type{};
         u32 format{};
         Object view;
+        u64 gpu_resource_id{};
     };
 
     SlotVector<Image>* slot_images{};
@@ -524,9 +535,11 @@ private:
     u32 host_format{};
     std::array<u8, 4> swizzle{IdentitySwizzle};
     std::array<Object, Shader::NUM_TEXTURE_TYPES> views;
+    std::array<u64, Shader::NUM_TEXTURE_TYPES> view_resource_ids{};
     std::vector<StorageVariant> storage_views;
     TextureHandle sample_grid{};
     std::array<Object, 2> grid_views; ///< 2D and 2D array views of sample_grid
+    std::array<u64, 2> grid_view_resource_ids{};
     Object render_view; ///< Only when the view's format is not its image's
     bool is_render_target{};
     bool is_3d_slice{};
@@ -550,22 +563,29 @@ public:
         return sampler.Get();
     }
 
+    [[nodiscard]] u64 GpuResourceId() const noexcept {
+        return gpu_resource_id;
+    }
+
     /// The sampler state for sampling `view` (`is_depth`: a depth comparison), as Vulkan's
     /// Sampler::HandleFor picks its variants: no added anisotropy where the view takes none, no
     /// filtering of integer views, no comparison for a plain sample, no Ocarina upscaler bias for
     /// images the GPU wrote, the sRGB border colour for sRGB views.
-    [[nodiscard]] void* HandleFor(const ImageView& view, bool is_depth);
+    [[nodiscard]] void* HandleFor(const ImageView& view, bool is_depth,
+                                  u64* out_gpu_resource_id = nullptr);
 
 private:
     struct Variant {
         u16 key{};
         Object state;
+        u64 gpu_resource_id{};
     };
 
     const Device* device{};
     TextureCacheRuntime* runtime{};
     Tegra::Texture::TSCEntry tsc{};
     Object sampler;
+    u64 gpu_resource_id{};
     std::vector<Variant> variants;
     f32 added_lod_bias{};
     bool has_added_anisotropy{};
