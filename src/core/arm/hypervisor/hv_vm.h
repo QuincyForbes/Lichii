@@ -76,8 +76,13 @@ public:
     /// guest code.
     void RequestFlush(bool icache = true);
 
+    /// Defers ProtectAccess() flushes on the calling thread until the matching EndProtectBatch()
+    /// so multi-range cache updates emit a single TLB flush / hv_vcpus_exit syscall.
+    void BeginProtectBatch() noexcept;
+    void EndProtectBatch();
+
     u64 FlushGeneration() const {
-        return m_flush_generation.load(std::memory_order_acquire);
+        return m_flush_generation.load(std::memory_order_seq_cst);
     }
 
     u64 IcacheGeneration() const {
@@ -85,6 +90,7 @@ public:
     }
 
     void SetRunning(size_t core, hv_vcpu_t vcpu, bool running);
+    void SetActive(size_t core, bool active) noexcept;
 
     static constexpr u64 VectorsVa = 0x1000;
     /// Offset of the "hvc" in each vector slot; the guest's x0 is in TPIDR_EL1 once it is reached.
@@ -134,6 +140,7 @@ private:
 
     std::atomic<u64> m_flush_generation{1};
     std::atomic<u64> m_icache_generation{1};
+    std::atomic<u32> m_active_mask{0};
     std::mutex m_running_mutex;
     std::array<hv_vcpu_t, Hardware::NUM_CPU_CORES> m_vcpus{};
     std::array<bool, Hardware::NUM_CPU_CORES> m_running{};

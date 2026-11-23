@@ -1809,6 +1809,7 @@ HaltReason ArmHypervisor::RunThread(Kernel::KThread* thread) {
     ArmHeartbeat();
     t_svc_args.valid = false;
     m_running.store(true, std::memory_order_release);
+    m_vm.SetActive(m_core_index, true);
 
     HaltReason hr{};
     bool in_vector = false;
@@ -1908,6 +1909,7 @@ HaltReason ArmHypervisor::RunThread(Kernel::KThread* thread) {
         }
     }
 
+    m_vm.SetActive(m_core_index, false);
     m_running.store(false, std::memory_order_release);
     FinishTrackedAccess();
     if (m_excl_valid || m_excl_rearm_page != 0) {

@@ -265,7 +265,7 @@ private:
     inline void MemoryOperation(GPUVAddr gpu_src_addr, std::size_t size, bool is_big_page, FuncMapped&& func_mapped, FuncReserved&& func_reserved, FuncUnmapped&& func_unmapped) const;
 
     /// Immutable copy of the device-contiguous runs and the kind map that readers query without
-    /// a lock; each thread swaps its copy when map_serial changes.
+    /// a lock; each thread swaps its copy when runs_serial / kind_serial changes.
     struct MappingSnapshot {
         struct Run {
             GPUVAddr begin;
@@ -273,6 +273,8 @@ private:
             DAddr device_addr; ///< Where begin is mapped; the run is contiguous there too.
         };
         std::vector<Run> runs;
+    };
+    struct KindsSnapshot {
         std::vector<std::pair<s64, PTEKind>> kinds;
     };
 
@@ -291,6 +293,7 @@ private:
     /// Rebuilds the runs through the big pages a page table operation touched.
     void UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size);
     const MappingSnapshot& CurrentSnapshot() const;
+    const KindsSnapshot& CurrentKindsSnapshot() const;
 
     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe) const;
     void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
@@ -378,6 +381,7 @@ private:
     [[nodiscard]] bool TryLockPageTableShared() const;
     /// Bumped after each page table change; readers keep their MappingSnapshot until then.
     std::atomic<u64> map_serial{};
+    std::atomic<u64> kind_serial{};
 
     struct ContinuousRun {
         GPUVAddr end;
@@ -389,6 +393,9 @@ private:
     mutable std::shared_ptr<const MappingSnapshot> snapshot;
     mutable u64 snapshot_serial{};
     mutable std::mutex runs_guard;
+    mutable std::shared_ptr<const KindsSnapshot> kinds_snapshot;
+    mutable u64 kinds_snapshot_serial{};
+    mutable std::mutex kinds_guard;
 
     static constexpr size_t continuous_bits = 64;
 

@@ -4812,7 +4812,17 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick, u64 writer) {
             if (begin >= end) {
                 continue;
             }
-            Nx2Staging staging = runtime.DownloadStagingBuffer(page_size, true);
+            std::optional<Nx2Staging> reused_staging;
+            {
+                std::scoped_lock lock{nx2_list_mutex};
+                const auto it = nx2_list_pages.find(page);
+                if (it != nx2_list_pages.end() && it->second.copy &&
+                    it->second.copy_tick == tick && !it->second.copy_read) {
+                    reused_staging = *it->second.copy;
+                }
+            }
+            Nx2Staging staging =
+                reused_staging ? *reused_staging : runtime.DownloadStagingBuffer(page_size, true);
             const BufferCopy copy{
                 .src_offset = buffer.Offset(begin),
                 .dst_offset = staging.offset + (begin - page),
@@ -4828,7 +4838,9 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick, u64 writer) {
                 nx2_list_copy_stats.bytes += copy.size;
                 nx2_list_copy_stats.replaced_unread += entry.copy && !entry.copy_read;
             }
-            if (entry.copy) {
+            const bool same_staging = reused_staging && entry.copy &&
+                                      entry.copy->mapped_span.data() == staging.mapped_span.data();
+            if (entry.copy && !same_staging) {
                 if (nx2_writer_trace) {
                     nx2_writer_trace->FreezeCopy(
                         reinterpret_cast<uintptr_t>(entry.copy->mapped_span.data()), entry.copy_writes);

@@ -529,7 +529,7 @@ private:
             u64 page{~0ULL};
             const u8* host{};
         };
-        std::array<Page, 4> pages{};
+        std::array<Page, 16> pages{};
     };
 
     template <typename CbufAddrFn>

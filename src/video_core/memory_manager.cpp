@@ -192,6 +192,7 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
     {
         std::unique_lock<std::mutex> lock(guard);
         kind_map.Map(gpu_addr, gpu_addr + size, kind);
+        kind_serial.fetch_add(1, std::memory_order_release);
     }
     if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Bounds)) {
         UpdateContinuousRuns(gpu_addr, size);
@@ -258,6 +259,7 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
     {
         std::unique_lock<std::mutex> lock(guard);
         kind_map.Map(gpu_addr, gpu_addr + size, kind);
+        kind_serial.fetch_add(1, std::memory_order_release);
     }
     if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Bounds)) {
         UpdateContinuousRuns(gpu_addr, size);
@@ -1080,15 +1082,38 @@ const MemoryManager::MappingSnapshot& MemoryManager::CurrentSnapshot() const {
         for (const auto& [begin, run] : continuous_runs) {
             next->runs.push_back({begin, run.end, run.device_addr});
         }
+        snapshot = std::move(next);
+        snapshot_serial = serial;
+    }
+    view = {unique_identifier + 1, serial, snapshot};
+    return *view.snapshot;
+}
+
+const MemoryManager::KindsSnapshot& MemoryManager::CurrentKindsSnapshot() const {
+    struct View {
+        size_t owner;
+        u64 serial;
+        std::shared_ptr<const KindsSnapshot> snapshot;
+    };
+    thread_local std::array<View, 4> views{};
+    View& view = views[unique_identifier % views.size()];
+    u64 serial = kind_serial.load(std::memory_order_acquire);
+    if (view.owner == unique_identifier + 1 && view.serial == serial) {
+        return *view.snapshot;
+    }
+    std::scoped_lock lock{kinds_guard};
+    serial = kind_serial.load(std::memory_order_acquire);
+    if (!kinds_snapshot || kinds_snapshot_serial != serial) {
+        auto next = std::make_shared<KindsSnapshot>();
         {
             std::unique_lock<std::mutex> kind_lock(guard);
             kind_map.ForEachRange(
                 [&](s64 start, PTEKind kind) { next->kinds.emplace_back(start, kind); });
         }
-        snapshot = std::move(next);
-        snapshot_serial = serial;
+        kinds_snapshot = std::move(next);
+        kinds_snapshot_serial = serial;
     }
-    view = {unique_identifier + 1, serial, snapshot};
+    view = {unique_identifier + 1, serial, kinds_snapshot};
     return *view.snapshot;
 }
 
@@ -1146,7 +1171,7 @@ size_t MemoryManager::GetMemoryLayoutSize(GPUVAddr gpu_addr,
     // RangeMap::GetContinuousSizeFrom on the snapshot's copy of the kind map, without its lock.
     size_t result = 0;
     const s64 address = static_cast<s64>(gpu_addr);
-    const auto& kinds = CurrentSnapshot().kinds;
+    const auto& kinds = CurrentKindsSnapshot().kinds;
     struct KindHint {
         const std::vector<std::pair<s64, PTEKind>>* kinds{};
         size_t index{};

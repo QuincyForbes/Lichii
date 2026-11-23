@@ -1493,6 +1493,14 @@ u64 ComputeCopyMax() {
     return max_bytes;
 }
 
+// EDEN_NX2_METAL_MESH_WAVE_BATCH=0: ahead emulated task-mesh draws emit task->dist->mesh per draw
+// instead of batching all wave-0 tasks, then all distributions, then all mesh kernels.
+bool MeshWaveBatchEnabled() {
+    static const bool enabled =
+        SwitchOn("EDEN_NX2_METAL_MESH_WAVE_BATCH", "ahead emulated mesh wave batching");
+    return enabled;
+}
+
 constexpr std::array<const char*, static_cast<size_t>(CommitReason::Count)> CommitReasonNames{
     "other",  "present",   "list_end",  "fence", "fence_deferred", "idle",  "wait", "finish",
     "staging", "draw_budget", "list_copy", "query", "condition",      "split", "ahead",
@@ -1531,6 +1539,7 @@ struct ComputeBind {
     u64 hazard_read_size{~u64{0}};
     u64 hazard_write_size{~u64{0}};
     bool track_hazard{true};
+    bool disjoint_write{false};
 };
 
 /// What one stage of an encoder has bound; a new encoder has nothing bound, as this starts.
@@ -1695,6 +1704,7 @@ struct HazardSlotBufferSpan {
     u64 read_end{};
     u64 write_begin{};
     u64 write_end{};
+    bool disjoint_write{};
 };
 
 struct HazardSlotTextureEntry {
@@ -1710,6 +1720,7 @@ struct ComputeHazardState {
 
     std::vector<BufferSpan> read_buffers;
     std::vector<BufferSpan> written_buffers;
+    std::vector<BufferSpan> disjoint_written_buffers;
     std::vector<const void*> read_textures;
     std::vector<const void*> written_textures;
     std::array<SlotBufferSpan, BufferSlots> slot_buffers{};
@@ -1726,6 +1737,7 @@ struct ComputeHazardState {
     void Reset() noexcept {
         read_buffers.clear();
         written_buffers.clear();
+        disjoint_written_buffers.clear();
         read_textures.clear();
         written_textures.clear();
         has_dispatch_since_buffer_barrier = false;
@@ -1796,6 +1808,7 @@ struct ComputeHazardState {
     void ClearBufferHazards() noexcept {
         read_buffers.clear();
         written_buffers.clear();
+        disjoint_written_buffers.clear();
         has_dispatch_since_buffer_barrier = false;
     }
 
@@ -1806,7 +1819,8 @@ struct ComputeHazardState {
     }
 
     void BindSlotBuffer(u32 slot, const void* buffer, bool write, u64 offset = 0,
-                        u64 read_size = ~u64{0}, u64 write_size = ~u64{0}) {
+                        u64 read_size = ~u64{0}, u64 write_size = ~u64{0},
+                        bool disjoint_write = false) {
         if (slot >= BufferSlots) {
             NoteBuffer(buffer, write, offset, read_size, write_size);
             return;
@@ -1822,7 +1836,7 @@ struct ComputeHazardState {
             slot_buffers_mask &= ~(1U << slot);
             return;
         }
-        slot_buffers[slot] = {buffer, offset, r_end, offset, w_end};
+        slot_buffers[slot] = {buffer, offset, r_end, offset, w_end, disjoint_write};
         slot_buffers_mask |= (1U << slot);
     }
 
@@ -1844,13 +1858,18 @@ struct ComputeHazardState {
                                      u64 dst_offset) const noexcept {
         const BufferSpan src_span{src, src_offset, SaturatingEnd(src_offset, size)};
         const BufferSpan dst_span{dst, dst_offset, SaturatingEnd(dst_offset, size)};
-        return OverlapsAny(written_buffers, src_span) || OverlapsAny(written_buffers, dst_span) ||
+        return OverlapsAny(written_buffers, src_span) ||
+               OverlapsAny(disjoint_written_buffers, src_span) ||
+               OverlapsAny(written_buffers, dst_span) ||
+               OverlapsAny(disjoint_written_buffers, dst_span) ||
                OverlapsAny(read_buffers, dst_span);
     }
 
     [[nodiscard]] bool HasFillHazard(const void* dst, u64 dst_offset, u64 size) const noexcept {
         const BufferSpan dst_span{dst, dst_offset, SaturatingEnd(dst_offset, size)};
-        return OverlapsAny(written_buffers, dst_span) || OverlapsAny(read_buffers, dst_span);
+        return OverlapsAny(written_buffers, dst_span) ||
+               OverlapsAny(disjoint_written_buffers, dst_span) ||
+               OverlapsAny(read_buffers, dst_span);
     }
 
     static BufferSpan BackingBufferSpan(const void* raw_root) noexcept {
@@ -1921,9 +1940,12 @@ struct ComputeHazardState {
             return;
         }
         MTLBarrierScope scope = 0;
-        const bool have_buf_history = !written_buffers.empty() || !read_buffers.empty();
+        const bool have_buf_history =
+            !written_buffers.empty() || !disjoint_written_buffers.empty() || !read_buffers.empty();
         if (have_buf_history) {
-            if (extra_read.buffer != nullptr && OverlapsAny(written_buffers, extra_read)) {
+            if (extra_read.buffer != nullptr &&
+                (OverlapsAny(written_buffers, extra_read) ||
+                 OverlapsAny(disjoint_written_buffers, extra_read))) {
                 scope |= MTLBarrierScopeBuffers;
             }
             u32 bmask = slot_buffers_mask;
@@ -1931,15 +1953,19 @@ struct ComputeHazardState {
                 const u32 s = static_cast<u32>(std::countr_zero(bmask));
                 bmask &= bmask - 1U;
                 const SlotBufferSpan& entry = slot_buffers[s];
-                if (entry.read_end > entry.read_begin &&
-                    OverlapsAny(written_buffers,
-                                {entry.buffer, entry.read_begin, entry.read_end})) {
-                    scope |= MTLBarrierScopeBuffers;
-                    break;
+                if (entry.read_end > entry.read_begin) {
+                    const BufferSpan rspan{entry.buffer, entry.read_begin, entry.read_end};
+                    if (OverlapsAny(written_buffers, rspan) ||
+                        OverlapsAny(disjoint_written_buffers, rspan)) {
+                        scope |= MTLBarrierScopeBuffers;
+                        break;
+                    }
                 }
                 if (entry.write_end > entry.write_begin) {
                     const BufferSpan wspan{entry.buffer, entry.write_begin, entry.write_end};
-                    if (OverlapsAny(written_buffers, wspan) || OverlapsAny(read_buffers, wspan)) {
+                    if (OverlapsAny(written_buffers, wspan) ||
+                        (!entry.disjoint_write && OverlapsAny(disjoint_written_buffers, wspan)) ||
+                        OverlapsAny(read_buffers, wspan)) {
                         scope |= MTLBarrierScopeBuffers;
                         break;
                     }
@@ -1947,7 +1973,8 @@ struct ComputeHazardState {
             }
             if ((scope & MTLBarrierScopeBuffers) == 0) {
                 for (const BufferSpan& r : pending_read_buffers) {
-                    if (OverlapsAny(written_buffers, r)) {
+                    if (OverlapsAny(written_buffers, r) ||
+                        OverlapsAny(disjoint_written_buffers, r)) {
                         scope |= MTLBarrierScopeBuffers;
                         break;
                     }
@@ -1955,7 +1982,8 @@ struct ComputeHazardState {
             }
             if ((scope & MTLBarrierScopeBuffers) == 0) {
                 for (const BufferSpan& w : pending_write_buffers) {
-                    if (OverlapsAny(written_buffers, w) || OverlapsAny(read_buffers, w)) {
+                    if (OverlapsAny(written_buffers, w) ||
+                        OverlapsAny(disjoint_written_buffers, w) || OverlapsAny(read_buffers, w)) {
                         scope |= MTLBarrierScopeBuffers;
                         break;
                     }
@@ -1977,6 +2005,7 @@ struct ComputeHazardState {
                     }
                     if (entry.backing.buffer != nullptr && have_buf_history &&
                         (OverlapsAny(written_buffers, entry.backing) ||
+                         OverlapsAny(disjoint_written_buffers, entry.backing) ||
                          (entry.write && OverlapsAny(read_buffers, entry.backing)))) {
                         scope |= MTLBarrierScopeBuffers | MTLBarrierScopeTextures;
                     }
@@ -2028,7 +2057,8 @@ struct ComputeHazardState {
                 AddSpan(read_buffers, {entry.buffer, entry.read_begin, entry.read_end});
             }
             if (entry.write_end > entry.write_begin) {
-                AddSpan(written_buffers, {entry.buffer, entry.write_begin, entry.write_end});
+                AddSpan(entry.disjoint_write ? disjoint_written_buffers : written_buffers,
+                        {entry.buffer, entry.write_begin, entry.write_end});
             }
         }
         for (const BufferSpan& r : pending_read_buffers) {
@@ -2593,6 +2623,7 @@ struct Scheduler::Impl {
           image_note_skip_enabled{ImageNoteSkipEnabled()},
           segment_note_cache_enabled{SegmentNoteCacheEnabled()},
           concurrent_compute_enabled{ConcurrentComputeEnabled()},
+          mesh_wave_batch_enabled{MeshWaveBatchEnabled()},
           compute_copy_mode{ComputeCopyMode()},
           compute_copy_enabled{ComputeCopyEnabled()},
           compute_copy_max{ComputeCopyMax()} {
@@ -2773,6 +2804,9 @@ struct Scheduler::Impl {
     }
 
     void EndKernelEncoder() {
+        if (!ahead_wave_flushing && (!ahead_waves[0].Empty() || !ahead_waves[1].Empty())) {
+            FlushAheadComputeWaves();
+        }
         if (kernel_compute == nil) {
             return;
         }
@@ -3293,9 +3327,10 @@ struct Scheduler::Impl {
 
     void LogComputeBind(ComputeBind::Kind kind, u32 slot, void* object, u32 offset, bool write,
                         bool on_buffer = true, u64 hazard_read_size = ~u64{0},
-                        u64 hazard_write_size = ~u64{0}, bool track_hazard = true) {
+                        u64 hazard_write_size = ~u64{0}, bool track_hazard = true,
+                        bool disjoint_write = false) {
         compute_binds.push_back({kind, on_buffer, write, slot, object, offset, 0, hazard_read_size,
-                                 hazard_write_size, track_hazard});
+                                 hazard_write_size, track_hazard, disjoint_write});
     }
 
     void LogComputeBytes(u32 slot, const void* data, u32 size) {
@@ -3305,8 +3340,8 @@ struct Scheduler::Impl {
         compute_binds.push_back({ComputeBind::Kind::Bytes, false, false, slot, nullptr, at, size});
     }
 
-    /// Sets the kernel's pipeline and binds again on the active compute encoder (a new one).
-    void ReplayComputeBinds(const void** bound_pipeline, bool in_order) {
+    void ReplayComputeBindList(std::span<const ComputeBind> binds, std::span<const u8> bytes,
+                               void* pipeline, const void** bound_pipeline, bool in_order) {
         const id<MTLComputeCommandEncoder> __unsafe_unretained enc = active_compute;
         if (enc == nil) {
             return;
@@ -3314,18 +3349,21 @@ struct Scheduler::Impl {
         if (active_hazards != nullptr) {
             active_hazards->ResetPending();
         }
-        if (!state_cache_enabled || *bound_pipeline != compute_bind_pipeline) {
-            *bound_pipeline = compute_bind_pipeline;
+        if (!state_cache_enabled || *bound_pipeline != pipeline) {
+            *bound_pipeline = pipeline;
             ++state_sets;
             [enc setComputePipelineState:(__bridge __unsafe_unretained id<MTLComputePipelineState>)
-                                             compute_bind_pipeline];
+                                             pipeline];
+        } else {
+            ++state_skips;
         }
-        for (const ComputeBind& bind : compute_binds) {
+        for (const ComputeBind& bind : binds) {
             switch (bind.kind) {
             case ComputeBind::Kind::Buffer:
                 if (active_hazards != nullptr) {
                     active_hazards->BindSlotBuffer(bind.slot, bind.object, bind.write, bind.offset,
-                                                   bind.hazard_read_size, bind.hazard_write_size);
+                                                   bind.hazard_read_size, bind.hazard_write_size,
+                                                   bind.disjoint_write);
                 }
                 SetBuffer(ShaderStage::Compute, bind.slot, bind.object, bind.offset);
                 if (in_order && bind.write) {
@@ -3343,9 +3381,7 @@ struct Scheduler::Impl {
                     active_bound->ClearBufferDirty(bind.slot);
                 }
                 ++state_sets;
-                [enc setBytes:compute_bind_bytes.data() + bind.offset
-                       length:bind.size
-                      atIndex:bind.slot];
+                [enc setBytes:bytes.data() + bind.offset length:bind.size atIndex:bind.slot];
                 break;
             case ComputeBind::Kind::Texture: {
                 const void* const known_root =
@@ -3391,7 +3427,7 @@ struct Scheduler::Impl {
                 if (!bind.write && bind.object != nullptr && range_binds_enabled &&
                     recorder == nullptr) {
                     ActiveComputeReadUse().push_back(bind.object);
-                } else {
+                } else if (bind.object != nullptr) {
                     [enc useResource:UnretainedBuffer(bind.object)
                                usage:bind.write ? (MTLResourceUsageRead | MTLResourceUsageWrite)
                                                 : MTLResourceUsageRead];
@@ -3415,7 +3451,7 @@ struct Scheduler::Impl {
                     AppendTextureReadResources(ActiveComputeReadUse(),
                                                UnretainedTexture(bind.object), bind.on_buffer,
                                                known_root);
-                } else {
+                } else if (bind.object != nullptr) {
                     UseTextureResources(enc, UnretainedTexture(bind.object),
                                         bind.write ? (MTLResourceUsageRead | MTLResourceUsageWrite)
                                                    : MTLResourceUsageRead,
@@ -3436,6 +3472,86 @@ struct Scheduler::Impl {
             }
         }
         FlushComputeBindings();
+    }
+
+    /// Sets the kernel's pipeline and binds again on the active compute encoder (a new one).
+    void ReplayComputeBinds(const void** bound_pipeline, bool in_order) {
+        ReplayComputeBindList(compute_binds, compute_bind_bytes, compute_bind_pipeline,
+                              bound_pipeline, in_order);
+    }
+
+    void FlushAheadComputeWaves() {
+        if (ahead_wave_flushing || (ahead_waves[0].Empty() && ahead_waves[1].Empty())) {
+            return;
+        }
+        ahead_wave_flushing = true;
+        const id<MTLComputeCommandEncoder> __unsafe_unretained enc = KernelEncoder();
+        active_compute = enc;
+        active_bound = &kernel_bound;
+        active_hazards = &kernel_hazards;
+        compute_clobbered_by_copy = false;
+        kernel_resume = false;
+        for (size_t w = 0; w < ahead_waves.size(); ++w) {
+            AheadWaveQueue& q = ahead_waves[w];
+            for (const DeferredAheadDispatch& d : q.dispatches) {
+                ReplayComputeBindList(
+                    std::span<const ComputeBind>(q.binds.data() + d.bind_begin, d.bind_count),
+                    q.bytes, d.pipeline, &kernel_pipeline, false);
+                if (d.indirect) {
+                    const ComputeHazardState::BufferSpan ind_span{
+                        d.indirect_buffer, d.indirect_offset,
+                        ComputeHazardState::SaturatingEnd(d.indirect_offset, 12)};
+                    kernel_hazards.BeforeDispatch(enc, concurrent_compute_enabled, ind_span);
+                    [enc dispatchThreadgroupsWithIndirectBuffer:UnretainedBuffer(d.indirect_buffer)
+                                           indirectBufferOffset:d.indirect_offset
+                                          threadsPerThreadgroup:MTLSizeMake(d.group_size[0],
+                                                                            d.group_size[1],
+                                                                            d.group_size[2])];
+                    kernel_hazards.AfterDispatch(concurrent_compute_enabled, ind_span);
+                } else {
+                    kernel_hazards.BeforeDispatch(enc, concurrent_compute_enabled);
+                    [enc dispatchThreadgroups:MTLSizeMake(d.groups[0], d.groups[1], d.groups[2])
+                        threadsPerThreadgroup:MTLSizeMake(d.group_size[0], d.group_size[1],
+                                                          d.group_size[2])];
+                    kernel_hazards.AfterDispatch(concurrent_compute_enabled);
+                }
+                CountDispatch();
+            }
+            q.Clear();
+        }
+        ahead_wave_read_spans.clear();
+        ahead_wave_flushing = false;
+    }
+
+    void AbortRecordingAheadWave(TextureHandle conflict_texture) {
+        const int w = recording_ahead_wave;
+        if (w < 0 || w >= static_cast<int>(ahead_waves.size())) {
+            return;
+        }
+        AheadWaveQueue& q = ahead_waves[static_cast<size_t>(w)];
+        compute_binds.clear();
+        compute_bind_bytes.clear();
+        compute_bind_pipeline = recording_wave_pipeline;
+        if (recording_wave_bytes_start < q.bytes.size()) {
+            compute_bind_bytes.insert(compute_bind_bytes.end(),
+                                      q.bytes.begin() + recording_wave_bytes_start, q.bytes.end());
+        }
+        for (size_t i = recording_wave_bind_start; i < q.binds.size(); ++i) {
+            ComputeBind b = q.binds[i];
+            if (b.kind == ComputeBind::Kind::Bytes) {
+                b.offset -= recording_wave_bytes_start;
+            }
+            compute_binds.push_back(b);
+        }
+        q.binds.resize(recording_wave_bind_start);
+        q.bytes.resize(recording_wave_bytes_start);
+        recording_ahead_wave = -1;
+        ahead_wave_checked = false;
+        FlushAheadComputeWaves();
+        active_compute = kernel_compute;
+        active_bound = &kernel_bound;
+        active_hazards = &kernel_hazards;
+        LeaveChecked(conflict_texture);
     }
 
     /// EDEN_NX2_METAL_COMPUTE_COPY: a buffer copy as a dispatch on the open compute encoder
@@ -3460,6 +3576,13 @@ struct Scheduler::Impl {
                 LOG_ERROR(Render_Metal, "Metal: buffer copy kernel failed: {}",
                           error != nil ? error.localizedDescription.UTF8String : "no function");
                 return false;
+            }
+        }
+        if (encoder == kernel_compute && !ahead_wave_read_spans.empty()) {
+            const ComputeHazardState::BufferSpan dst_span{
+                dst, dst_offset, ComputeHazardState::SaturatingEnd(dst_offset, size)};
+            if (ComputeHazardState::OverlapsAny(ahead_wave_read_spans, dst_span)) {
+                FlushAheadComputeWaves();
             }
         }
         if (concurrent_compute_enabled &&
@@ -3563,6 +3686,13 @@ struct Scheduler::Impl {
                 LOG_ERROR(Render_Metal, "Metal: buffer fill kernel failed: {}",
                           error != nil ? error.localizedDescription.UTF8String : "no function");
                 return false;
+            }
+        }
+        if (encoder == kernel_compute && !ahead_wave_read_spans.empty()) {
+            const ComputeHazardState::BufferSpan dst_span{
+                dst, dst_offset, ComputeHazardState::SaturatingEnd(dst_offset, size)};
+            if (ComputeHazardState::OverlapsAny(ahead_wave_read_spans, dst_span)) {
+                FlushAheadComputeWaves();
             }
         }
         if (concurrent_compute_enabled && hazards.HasFillHazard(dst, dst_offset, size)) {
@@ -3728,7 +3858,7 @@ struct Scheduler::Impl {
     /// Before a compute bind of `buffer`: checks the checked kernel, notes in-order binds.
     void ComputeBuffer(std::optional<u32> slot, const void* buffer, bool writes = true,
                        u64 offset = 0, u64 read_size = ~u64{0}, u64 write_size = ~u64{0},
-                       bool add_to_pending = true) {
+                       bool add_to_pending = true, bool disjoint_write = false) {
         ResumeKernel();
         const u64 eff_write = write_size != 0 ? write_size : read_size;
         const u64 conflict_size = writes ? (std::max)(read_size, eff_write) : read_size;
@@ -3748,7 +3878,7 @@ struct Scheduler::Impl {
         if (add_to_pending && active_hazards != nullptr) {
             if (slot) {
                 active_hazards->BindSlotBuffer(*slot, buffer, writes, offset, read_size,
-                                               write_size);
+                                               write_size, disjoint_write);
             } else {
                 active_hazards->NoteBuffer(buffer, writes, offset, read_size, write_size);
             }
@@ -6586,6 +6716,7 @@ struct Scheduler::Impl {
     const bool image_note_skip_enabled;
     const bool segment_note_cache_enabled;
     const bool concurrent_compute_enabled;
+    const bool mesh_wave_batch_enabled;
     const u32 compute_copy_mode;
     const bool compute_copy_enabled;
     const u64 compute_copy_max;
@@ -6688,6 +6819,40 @@ struct Scheduler::Impl {
     std::vector<ComputeBind> compute_binds;
     std::vector<u8> compute_bind_bytes;
     void* compute_bind_pipeline{};
+    /// EDEN_NX2_METAL_MESH_WAVE_BATCH: deferred dependent waves on KernelEncoder() (0 = dist,
+    /// 1 = mesh) so all wave-0 task dispatches in a batch run before one barrier, then all
+    /// distributions, then one barrier, then all mesh kernels.
+    struct DeferredAheadDispatch {
+        void* pipeline{};
+        u32 bind_begin{};
+        u32 bind_count{};
+        bool indirect{};
+        std::array<u32, 3> groups{};
+        std::array<u32, 3> group_size{};
+        BufferHandle indirect_buffer{};
+        u64 indirect_offset{};
+    };
+    struct AheadWaveQueue {
+        std::vector<DeferredAheadDispatch> dispatches;
+        std::vector<ComputeBind> binds;
+        std::vector<u8> bytes;
+        void Clear() noexcept {
+            dispatches.clear();
+            binds.clear();
+            bytes.clear();
+        }
+        [[nodiscard]] bool Empty() const noexcept {
+            return dispatches.empty();
+        }
+    };
+    std::array<AheadWaveQueue, 2> ahead_waves;
+    std::vector<ComputeHazardState::BufferSpan> ahead_wave_read_spans;
+    int recording_ahead_wave{-1};
+    bool ahead_wave_checked{};
+    bool ahead_wave_flushing{};
+    void* recording_wave_pipeline{};
+    u32 recording_wave_bind_start{};
+    u32 recording_wave_bytes_start{};
     /// EDEN_NX2_METAL_AHEAD_ANY: buffers modified in order in the segment, root textures
     /// written or touched in the segment, and whether in-order work did something not tracked.
     Common::unordered_set<const void*> segment_bound;
@@ -7380,18 +7545,19 @@ bool Scheduler::FlushDeferredFromIdle(bool requested) {
         Flush(CommitReason::FenceDeferred);
         return true;
     }
-    if (!impl->flush_pending && !idle_all) {
-        if (!impl->list_end_pending) {
+    if (!idle_all) {
+        if (!impl->flush_pending && !impl->list_end_pending) {
             return false;
         }
-        const s64 pass_hold_us = (std::max)(FenceFlushIntervalUs(), s64{250});
-        const bool pass_fresh =
-            impl->render != nil &&
-            std::chrono::steady_clock::now() - impl->list_end_pending_since <
-                std::chrono::microseconds{pass_hold_us};
+        const s64 hold_us = (std::max)(FenceFlushIntervalUs(), s64{250});
+        const auto since =
+            impl->flush_pending ? impl->flush_pending_since : impl->list_end_pending_since;
+        const bool within_window =
+            std::chrono::steady_clock::now() - since < std::chrono::microseconds{hold_us};
         if (on_back && !urgent &&
             impl->completion->submit_waiters.load(std::memory_order_relaxed) == 0 &&
-            (GpuBehind() || pass_fresh)) {
+            ((within_window && (GpuBehind() || impl->render != nil)) ||
+             (!impl->flush_pending && GpuBehind()))) {
             return false;
         }
     }
@@ -9803,15 +9969,45 @@ void Scheduler::BindVertexBuffer(u32 slot, BufferHandle buffer, u32 offset) {
 }
 
 void Scheduler::BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset, bool write,
-                           u64 hazard_read_size, u64 hazard_write_size) {
+                           u64 hazard_read_size, u64 hazard_write_size, bool disjoint_write) {
     if (SlotFits(slot, BufferSlots, "buffer")) {
         if (stage == ShaderStage::Compute) {
-            impl->ComputeBuffer(slot, buffer, write, offset, hazard_read_size, hazard_write_size);
+            if (impl->recording_ahead_wave >= 0) {
+                const u64 eff_write =
+                    hazard_write_size != 0 ? hazard_write_size : hazard_read_size;
+                const u64 conflict_size =
+                    write ? (std::max)(hazard_read_size, eff_write) : hazard_read_size;
+                if (impl->ahead_wave_checked &&
+                    impl->CheckedConflict(buffer, offset, conflict_size, write)) {
+                    impl->AbortRecordingAheadWave(nullptr);
+                } else {
+                    if (buffer != nullptr) {
+                        impl->NoteActiveBuffer(buffer);
+                        impl->NoteAheadReadSpan(buffer, offset, hazard_read_size);
+                        if (hazard_read_size != 0) {
+                            ComputeHazardState::AddSpan(
+                                impl->ahead_wave_read_spans,
+                                {buffer, offset,
+                                 ComputeHazardState::SaturatingEnd(offset, hazard_read_size)});
+                        }
+                        if (write) {
+                            impl->NoteAheadWriteSpan(buffer, offset, eff_write);
+                        }
+                    }
+                    auto& q = impl->ahead_waves[static_cast<size_t>(impl->recording_ahead_wave)];
+                    q.binds.push_back({ComputeBind::Kind::Buffer, true, write, slot, buffer, offset,
+                                       0, hazard_read_size, hazard_write_size, true,
+                                       disjoint_write});
+                    return;
+                }
+            }
+            impl->ComputeBuffer(slot, buffer, write, offset, hazard_read_size, hazard_write_size,
+                                true, disjoint_write);
             if (impl->active_compute != nil && impl->active_compute == impl->kernel_compute) {
                 impl->kernel_binding = true;
             }
             impl->LogComputeBind(ComputeBind::Kind::Buffer, slot, buffer, offset, write, true,
-                                 hazard_read_size, hazard_write_size);
+                                 hazard_read_size, hazard_write_size, true, disjoint_write);
         } else if (write && impl->render != nil) {
             const u64 eff_write =
                 hazard_write_size != 0 ? hazard_write_size : hazard_read_size;
@@ -9832,6 +10028,35 @@ u64 Scheduler::UseBuffer(ShaderStage stage, BufferHandle buffer, u32 offset, boo
     const MTLResourceUsage usage =
         write ? (MTLResourceUsageRead | MTLResourceUsageWrite) : MTLResourceUsageRead;
     if (stage == ShaderStage::Compute) {
+        if (impl->recording_ahead_wave >= 0) {
+            const u64 eff_write = hazard_write_size != 0 ? hazard_write_size : hazard_read_size;
+            const u64 conflict_size =
+                write ? (std::max)(hazard_read_size, eff_write) : hazard_read_size;
+            if (impl->ahead_wave_checked &&
+                impl->CheckedConflict(buffer, offset, conflict_size, write)) {
+                impl->AbortRecordingAheadWave(nullptr);
+            } else {
+                impl->NoteActiveBuffer(buffer);
+                impl->NoteAheadReadSpan(buffer, offset, hazard_read_size);
+                if (hazard_read_size != 0) {
+                    ComputeHazardState::AddSpan(
+                        impl->ahead_wave_read_spans,
+                        {buffer, offset,
+                         ComputeHazardState::SaturatingEnd(offset, hazard_read_size)});
+                }
+                if (write) {
+                    impl->NoteAheadWriteSpan(buffer, offset, eff_write);
+                }
+                auto& q = impl->ahead_waves[static_cast<size_t>(impl->recording_ahead_wave)];
+                q.binds.push_back({ComputeBind::Kind::UseBuffer, true, write, 0, buffer, offset, 0,
+                                   hazard_read_size, hazard_write_size, true, false});
+                const u64 base_addr =
+                    known_gpu_address != 0
+                        ? known_gpu_address
+                        : static_cast<u64>(UnretainedBuffer(buffer).gpuAddress);
+                return base_addr + offset;
+            }
+        }
         impl->ComputeBuffer(std::nullopt, buffer, write, offset, hazard_read_size,
                             hazard_write_size);
         if (impl->active_compute != nil && impl->active_compute == impl->kernel_compute) {
@@ -9999,6 +10224,15 @@ void Scheduler::BindBytes(ShaderStage stage, u32 slot, const void* data, u32 siz
         [r_enc setMeshBytes:data length:size atIndex:slot];
         break;
     case ShaderStage::Compute: {
+        if (impl->recording_ahead_wave >= 0) {
+            auto& q = impl->ahead_waves[static_cast<size_t>(impl->recording_ahead_wave)];
+            const u32 at = static_cast<u32>(q.bytes.size());
+            const u8* const bytes = static_cast<const u8*>(data);
+            q.bytes.insert(q.bytes.end(), bytes, bytes + size);
+            q.binds.push_back(
+                {ComputeBind::Kind::Bytes, false, false, slot, nullptr, at, size});
+            return;
+        }
         impl->ResumeKernel();
         if (impl->active_hazards != nullptr) {
             impl->active_hazards->ClearSlotBuffer(slot);
@@ -10032,6 +10266,48 @@ void Scheduler::BindTexture(ShaderStage stage, u32 slot, TextureHandle texture, 
         return;
     }
     if (stage == ShaderStage::Compute) {
+        if (impl->recording_ahead_wave >= 0) {
+            bool conflict = false;
+            if (texture != nullptr && track_hazard) {
+                const void* const raw_root = impl->CachedRootTexture(texture);
+                const u64 restored_before = impl->samples_restored;
+                if (write) {
+                    impl->WrittenRoot(texture, raw_root);
+                } else {
+                    impl->RestoreSamplesIfDropped(texture, raw_root);
+                }
+                const bool restored = impl->samples_restored != restored_before;
+                const ComputeHazardState::BufferSpan bspan =
+                    on_buffer ? ComputeHazardState::BackingBufferSpan(raw_root)
+                              : ComputeHazardState::BufferSpan{};
+                const u64 bsz = bspan.end == ~u64{0} ? ~u64{0} : (bspan.end - bspan.begin);
+                if (restored || impl->PendingClearOnRoot(raw_root) ||
+                    (impl->ahead_wave_checked &&
+                     ((write ? impl->segment_touched_textures : impl->segment_written_textures)
+                          .contains(raw_root) ||
+                      (bspan.buffer != nullptr &&
+                       impl->CheckedConflict(bspan.buffer, bspan.begin, bsz, write))))) {
+                    conflict = true;
+                    impl->AbortRecordingAheadWave(texture);
+                } else {
+                    impl->NoteAheadTexture(raw_root, write);
+                    if (bspan.buffer != nullptr && bspan.end > bspan.begin) {
+                        impl->NoteActiveBuffer(bspan.buffer);
+                        impl->NoteAheadReadSpan(bspan.buffer, bspan.begin, bsz);
+                        ComputeHazardState::AddSpan(impl->ahead_wave_read_spans, bspan);
+                        if (write) {
+                            impl->NoteAheadWriteSpan(bspan.buffer, bspan.begin, bsz);
+                        }
+                    }
+                }
+            }
+            if (!conflict) {
+                auto& q = impl->ahead_waves[static_cast<size_t>(impl->recording_ahead_wave)];
+                q.binds.push_back({ComputeBind::Kind::Texture, on_buffer, write, slot, texture, 0,
+                                   0, ~u64{0}, ~u64{0}, track_hazard, false});
+                return;
+            }
+        }
         impl->ComputeTexture(slot, texture, on_buffer, write, track_hazard);
         if (impl->active_compute != nil && impl->active_compute == impl->kernel_compute) {
             impl->kernel_binding = true;
@@ -10114,6 +10390,50 @@ u64 Scheduler::UseTexture(ShaderStage stage, TextureHandle texture, bool write, 
     const MTLResourceUsage usage =
         write ? (MTLResourceUsageRead | MTLResourceUsageWrite) : MTLResourceUsageRead;
     if (stage == ShaderStage::Compute) {
+        if (impl->recording_ahead_wave >= 0) {
+            bool conflict = false;
+            if (track_hazard) {
+                const void* const raw_root = impl->CachedRootTexture(texture);
+                const u64 restored_before = impl->samples_restored;
+                if (write) {
+                    impl->WrittenRoot(texture, raw_root);
+                } else {
+                    impl->RestoreSamplesIfDropped(texture, raw_root);
+                }
+                const bool restored = impl->samples_restored != restored_before;
+                const ComputeHazardState::BufferSpan bspan =
+                    on_buffer ? ComputeHazardState::BackingBufferSpan(raw_root)
+                              : ComputeHazardState::BufferSpan{};
+                const u64 bsz = bspan.end == ~u64{0} ? ~u64{0} : (bspan.end - bspan.begin);
+                if (restored || impl->PendingClearOnRoot(raw_root) ||
+                    (impl->ahead_wave_checked &&
+                     ((write ? impl->segment_touched_textures : impl->segment_written_textures)
+                          .contains(raw_root) ||
+                      (bspan.buffer != nullptr &&
+                       impl->CheckedConflict(bspan.buffer, bspan.begin, bsz, write))))) {
+                    conflict = true;
+                    impl->AbortRecordingAheadWave(texture);
+                } else {
+                    impl->NoteAheadTexture(raw_root, write);
+                    if (bspan.buffer != nullptr && bspan.end > bspan.begin) {
+                        impl->NoteActiveBuffer(bspan.buffer);
+                        impl->NoteAheadReadSpan(bspan.buffer, bspan.begin, bsz);
+                        ComputeHazardState::AddSpan(impl->ahead_wave_read_spans, bspan);
+                        if (write) {
+                            impl->NoteAheadWriteSpan(bspan.buffer, bspan.begin, bsz);
+                        }
+                    }
+                }
+            }
+            if (!conflict) {
+                auto& q = impl->ahead_waves[static_cast<size_t>(impl->recording_ahead_wave)];
+                q.binds.push_back({ComputeBind::Kind::UseTexture, on_buffer, write, 0, texture, 0,
+                                   0, ~u64{0}, ~u64{0}, track_hazard, false});
+                return known_gpu_resource_id != 0
+                           ? known_gpu_resource_id
+                           : UnretainedTexture(texture).gpuResourceID._impl;
+            }
+        }
         const void* const raw_root =
             impl->ComputeTexture(std::nullopt, texture, on_buffer, write, track_hazard);
         if (impl->active_compute != nil && impl->active_compute == impl->kernel_compute) {
@@ -10278,6 +10598,11 @@ void Scheduler::BindSampler(ShaderStage stage, u32 slot, void* sampler) {
         return;
     }
     if (stage == ShaderStage::Compute) {
+        if (impl->recording_ahead_wave >= 0) {
+            auto& q = impl->ahead_waves[static_cast<size_t>(impl->recording_ahead_wave)];
+            q.binds.push_back({ComputeBind::Kind::Sampler, false, false, slot, sampler, 0, 0});
+            return;
+        }
         impl->ResumeKernel();
         if (impl->active_compute != nil && impl->active_compute == impl->kernel_compute) {
             impl->kernel_binding = true;
@@ -10384,8 +10709,10 @@ void Scheduler::PrepareCompute() {
     impl->want_in_order_compute = true;
 }
 
-void Scheduler::BeginCompute(void* pipeline, bool ahead) {
+void Scheduler::BeginCompute(void* pipeline, bool ahead, bool keep_ahead_waves) {
     Impl& state = *impl;
+    state.recording_ahead_wave = -1;
+    state.ahead_wave_checked = false;
     state.kernel_resume = false;
     state.kernel_checked = false;
     state.kernel_binding = false;
@@ -10395,8 +10722,8 @@ void Scheduler::BeginCompute(void* pipeline, bool ahead) {
     state.compute_bind_pipeline = pipeline;
     bool goes_ahead =
         ahead && state.ahead_enabled &&
-        (state.render != nil || state.ahead_buffer != nil || state.upload_buffer != nil ||
-         state.kernel_buffer != nil);
+        (keep_ahead_waves || state.render != nil || state.ahead_buffer != nil ||
+         state.upload_buffer != nil || state.kernel_buffer != nil);
     bool checked = false;
     if (goes_ahead && state.ahead_any_enabled) {
         // Past what CanRecordAhead allowed before EDEN_NX2_METAL_AHEAD_ANY: checked by its binds.
@@ -10410,6 +10737,9 @@ void Scheduler::BeginCompute(void* pipeline, bool ahead) {
     }
     const void** bound_pipeline = &state.compute_pipeline;
     if (goes_ahead) {
+        if (!keep_ahead_waves && (!state.ahead_waves[0].Empty() || !state.ahead_waves[1].Empty())) {
+            state.FlushAheadComputeWaves();
+        }
         state.active_compute = state.KernelEncoder();
         state.active_bound = &state.kernel_bound;
         state.active_hazards = &state.kernel_hazards;
@@ -10442,7 +10772,52 @@ void Scheduler::BeginCompute(void* pipeline, bool ahead) {
         setComputePipelineState:(__bridge __unsafe_unretained id<MTLComputePipelineState>)pipeline];
 }
 
+bool Scheduler::ActiveComputeIsAhead() const noexcept {
+    return impl->active_compute != nil && impl->active_compute == impl->kernel_compute &&
+           impl->recording_ahead_wave < 0;
+}
+
+bool Scheduler::BeginAheadWave(u32 wave_index, void* pipeline) {
+    Impl& state = *impl;
+    if (!state.mesh_wave_batch_enabled || !state.concurrent_compute_enabled ||
+        wave_index >= state.ahead_waves.size() || state.kernel_compute == nil ||
+        pipeline == nullptr) {
+        return false;
+    }
+    state.recording_ahead_wave = static_cast<int>(wave_index);
+    const bool plain =
+        !state.ahead_query_relaxed && state.deferred_downloads.empty() &&
+        (state.segment_encoders == 0 || (state.segment_encoders == 1 && state.render != nil));
+    state.ahead_wave_checked = state.ahead_any_enabled && !plain;
+    state.recording_wave_pipeline = pipeline;
+    const auto& q = state.ahead_waves[wave_index];
+    state.recording_wave_bind_start = static_cast<u32>(q.binds.size());
+    state.recording_wave_bytes_start = static_cast<u32>(q.bytes.size());
+    return true;
+}
+
 void Scheduler::Dispatch(std::array<u32, 3> groups, std::array<u32, 3> group_size) {
+    if (impl->recording_ahead_wave >= 0) {
+        const size_t w = static_cast<size_t>(impl->recording_ahead_wave);
+        impl->recording_ahead_wave = -1;
+        impl->ahead_wave_checked = false;
+        if (groups[0] == 0 || groups[1] == 0 || groups[2] == 0) {
+            impl->ahead_waves[w].binds.resize(impl->recording_wave_bind_start);
+            impl->ahead_waves[w].bytes.resize(impl->recording_wave_bytes_start);
+            return;
+        }
+        auto& q = impl->ahead_waves[w];
+        q.dispatches.push_back({
+            .pipeline = impl->recording_wave_pipeline,
+            .bind_begin = impl->recording_wave_bind_start,
+            .bind_count = static_cast<u32>(q.binds.size()) - impl->recording_wave_bind_start,
+            .indirect = false,
+            .groups = groups,
+            .group_size = group_size,
+        });
+        ++impl->ahead_kernels;
+        return;
+    }
     impl->ResumeKernel();
     impl->kernel_binding = false;
     const id<MTLComputeCommandEncoder> __unsafe_unretained encoder = impl->active_compute;
@@ -10462,6 +10837,37 @@ void Scheduler::Dispatch(std::array<u32, 3> groups, std::array<u32, 3> group_siz
 }
 
 void Scheduler::DispatchIndirect(BufferHandle buffer, u64 offset, std::array<u32, 3> group_size) {
+    if (impl->recording_ahead_wave >= 0) {
+        if (impl->ahead_wave_checked && impl->CheckedConflict(buffer, offset, 12, false)) {
+            impl->AbortRecordingAheadWave(nullptr);
+        } else {
+            const size_t w = static_cast<size_t>(impl->recording_ahead_wave);
+            impl->recording_ahead_wave = -1;
+            impl->ahead_wave_checked = false;
+            if (buffer == nullptr) {
+                impl->ahead_waves[w].binds.resize(impl->recording_wave_bind_start);
+                impl->ahead_waves[w].bytes.resize(impl->recording_wave_bytes_start);
+                return;
+            }
+            impl->NoteActiveBuffer(buffer);
+            impl->NoteAheadReadSpan(buffer, offset, 12);
+            ComputeHazardState::AddSpan(
+                impl->ahead_wave_read_spans,
+                {buffer, offset, ComputeHazardState::SaturatingEnd(offset, 12)});
+            auto& q = impl->ahead_waves[w];
+            q.dispatches.push_back({
+                .pipeline = impl->recording_wave_pipeline,
+                .bind_begin = impl->recording_wave_bind_start,
+                .bind_count = static_cast<u32>(q.binds.size()) - impl->recording_wave_bind_start,
+                .indirect = true,
+                .group_size = group_size,
+                .indirect_buffer = buffer,
+                .indirect_offset = offset,
+            });
+            ++impl->ahead_kernels;
+            return;
+        }
+    }
     impl->ComputeBuffer(std::nullopt, buffer, false, offset, 12, 0, false);
     impl->kernel_binding = false;
     const id<MTLComputeCommandEncoder> __unsafe_unretained encoder = impl->active_compute;

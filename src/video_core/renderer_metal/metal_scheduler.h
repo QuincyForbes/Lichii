@@ -606,7 +606,8 @@ public:
         BindBuffer(stage, slot, buffer, offset, stage == ShaderStage::Compute);
     }
     void BindBuffer(ShaderStage stage, u32 slot, BufferHandle buffer, u32 offset, bool write,
-                    u64 hazard_read_size = ~u64{0}, u64 hazard_write_size = ~u64{0});
+                    u64 hazard_read_size = ~u64{0}, u64 hazard_write_size = ~u64{0},
+                    bool disjoint_write = false);
     void BindBytes(ShaderStage stage, u32 slot, const void* data, u32 size);
     /// Makes `buffer` resident for `stage`'s next draws or dispatches without binding it (a
     /// program reads it through an address: ShaderTranslate::Options::spill_buffers); returns the
@@ -665,7 +666,15 @@ public:
     /// (an id<MTLComputePipelineState>). ahead: the encoder of the kernels recorded ahead of
     /// the segment (see CanRecordAhead); the binds and dispatches up to the next BeginCompute
     /// go to it.
-    void BeginCompute(void* pipeline, bool ahead = false);
+    void BeginCompute(void* pipeline, bool ahead = false, bool keep_ahead_waves = false);
+
+    /// True while the active compute encoder is the ahead KernelEncoder (not fallen back in order).
+    [[nodiscard]] bool ActiveComputeIsAhead() const noexcept;
+
+    /// Queues a dependent ahead compute stage (0 = mesh distribution, 1 = mesh kernel) to execute
+    /// in waves on KernelEncoder() after all wave-0 task dispatches in the batch, collapsing
+    /// per-draw MTLBarrierScopeBuffers barriers across consecutive ahead task-mesh draws.
+    [[nodiscard]] bool BeginAheadWave(u32 wave_index, void* pipeline);
 
     void Dispatch(std::array<u32, 3> groups, std::array<u32, 3> group_size);
 

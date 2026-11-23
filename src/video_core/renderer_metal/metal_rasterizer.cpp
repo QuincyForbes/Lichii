@@ -2528,10 +2528,12 @@ void RasterizerMetal::BindMeshBuffers(const StageProgram& program, ShaderStage m
         }
         const u64 span_bytes = buffer.mapped_span.empty() ? ~u64{0} : buffer.mapped_span.size_bytes();
         const bool write = is_task_stage ? (idx == 1) : (idx == 0);
+        const bool disjoint_write = !is_task_stage && idx == 0 && mesh.has_task;
         const u64 read_sz = write ? 0 : span_bytes;
         const u64 write_sz = write ? span_bytes : 0;
         scheduler.BindBuffer(metal_stage, slot.index, buffer.buffer,
-                             static_cast<u32>(buffer.offset), write, read_sz, write_sz);
+                             static_cast<u32>(buffer.offset), write, read_sz, write_sz,
+                             disjoint_write);
     }
 }
 
@@ -3683,7 +3685,24 @@ void RasterizerMetal::CollectStageDescriptors(
             bool spans_ok = true;
             for (u8 i = 0; i < m.num_spans; ++i) {
                 const auto& sp = m.spans[i];
-                if (std::memcmp(sp.host, m.snapshot.data() + sp.snap_offset, sp.size) != 0) {
+                const u8* const snap_ptr = m.snapshot.data() + sp.snap_offset;
+                if (sp.size == 4) {
+                    u32 a, b;
+                    std::memcpy(&a, sp.host, 4);
+                    std::memcpy(&b, snap_ptr, 4);
+                    if (a != b) {
+                        spans_ok = false;
+                        break;
+                    }
+                } else if (sp.size == 8) {
+                    u64 a, b;
+                    std::memcpy(&a, sp.host, 8);
+                    std::memcpy(&b, snap_ptr, 8);
+                    if (a != b) {
+                        spans_ok = false;
+                        break;
+                    }
+                } else if (std::memcmp(sp.host, snap_ptr, sp.size) != 0) {
                     spans_ok = false;
                     break;
                 }
@@ -3709,9 +3728,9 @@ void RasterizerMetal::CollectStageDescriptors(
     u8 num_cbuf_checks = 0;
     u8 num_spans = 0;
     u16 snap_bytes = 0;
-    std::array<StageCollectMemo::CbufCheck, MaxCollectCbufChecks> local_cbufs{};
-    std::array<StageCollectMemo::ReadSpan, MaxCollectReadSpans> local_spans{};
-    std::array<u8, MaxCollectSnapshotBytes> local_snapshot{};
+    std::array<StageCollectMemo::CbufCheck, MaxCollectCbufChecks> local_cbufs;
+    std::array<StageCollectMemo::ReadSpan, MaxCollectReadSpans> local_spans;
+    std::array<u8, MaxCollectSnapshotBytes> local_snapshot;
 
     const auto tracked_cbuf_addr = [&](u32 cbuf, bool check_enabled) -> GPUVAddr {
         const GPUVAddr addr = cbuf_addr_of(cbuf, check_enabled);
@@ -3778,7 +3797,7 @@ void RasterizerMetal::CollectStageDescriptors(
     const auto lookup_page = [&](GPUVAddr addr) noexcept -> const u8* {
         constexpr u64 page_mask = 0xfffULL;
         const u64 page = addr >> 12;
-        const size_t page_slot = static_cast<size_t>(page ^ (page >> 4)) & 3U;
+        const size_t page_slot = static_cast<size_t>(page ^ (page >> 4)) & 15U;
         const u8* host = page_cache.pages[page_slot].host;
         if (page_cache.pages[page_slot].page != page) {
             const GPUVAddr page_addr = addr & ~page_mask;
@@ -3823,8 +3842,8 @@ void RasterizerMetal::CollectStageDescriptors(
             return read_word(addr);
         }
     } const handle_reader{read_handle_word};
-    std::array<GPUVAddr, Shader::Info::MAX_CBUFS> cbuf_addrs{};
-    std::array<GPUVAddr, Shader::Info::MAX_SSBOS> ssbo_addrs{};
+    std::array<GPUVAddr, Shader::Info::MAX_CBUFS> cbuf_addrs;
+    std::array<GPUVAddr, Shader::Info::MAX_SSBOS> ssbo_addrs;
     const size_t num_ssbos =
         (std::min)(info.storage_buffers_descriptors.size(), ssbo_addrs.size());
     bool handle_addrs_ready = false;
@@ -3833,6 +3852,8 @@ void RasterizerMetal::CollectStageDescriptors(
             return;
         }
         handle_addrs_ready = true;
+        cbuf_addrs.fill(0);
+        ssbo_addrs.fill(0);
         const u64 storage_alignment = buffer_cache_runtime.GetStorageBufferAlignment();
         const GPUVAddr storage_mask = ~(GPUVAddr{(std::max)(storage_alignment, u64{1})} - 1);
         u32 cm = meta.hp_cbuf_mask;
@@ -5589,9 +5610,18 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             const char* const value = std::getenv("EDEN_NX2_METAL_MESH_TASK_IN_ORDER");
             return value != nullptr && value[0] == '1';
         }();
-        bool mesh_ahead = !(has_task && task_in_order) && record_ahead(true);
-        if (!mesh_ahead && !scheduler.IsRenderingTo(targets) && scheduler.IsRendering()) {
+        if (!scheduler.IsRenderingTo(targets) && scheduler.IsRendering()) {
             scheduler.EndRendering();
+        }
+        bool mesh_ahead = false;
+        if (!(has_task && task_in_order)) {
+            if (scheduler.IsRenderingTo(targets)) {
+                mesh_ahead = record_ahead(true);
+            } else if (has_task && !scheduler.IsRendering() &&
+                       scheduler.SegmentSerial() == draw_segment && !kernel_writes_storage &&
+                       !kernels_sample_written_target() && scheduler.CanRecordAhead(targets)) {
+                mesh_ahead = true;
+            }
         }
         mesh_buffers = {};
         u32 capacity_words = 0;
@@ -5692,8 +5722,7 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                 }
             }
         }
-        const auto begin_kernel = [&](size_t index, MeshKernel& kernel, void* kernel_state) {
-            scheduler.BeginCompute(kernel_state, mesh_ahead);
+        const auto bind_kernel_resources = [&](size_t index, MeshKernel& kernel) {
             BindStageResources(kernel.program, *stage_metas[index], ShaderStage::Compute,
                                stage_bindings[index], texel_views[index],
                                std::span(views).subspan(first_view[index]),
@@ -5701,7 +5730,8 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                                render_area_width, render_area_height);
             BindMeshBuffers(kernel.program, ShaderStage::Compute, *mesh, has_task && index == 0);
         };
-        begin_kernel(0, mesh->first, first);
+        scheduler.BeginCompute(first, mesh_ahead, mesh_ahead && has_task);
+        bind_kernel_resources(0, mesh->first);
         scheduler.Dispatch({mesh_workgroups, 1, 1}, mesh->first.workgroup_size);
         if (has_task) {
             // The distribution pass: payload, offsets, arguments and the arena counter at
@@ -5718,7 +5748,11 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
             const std::array<const StagingBufferRef*, 4> distribution_buffers{
                 &mesh_buffers.payload, &mesh_buffers.offsets, &mesh_buffers.args,
                 &mesh_buffers.counter};
-            scheduler.BeginCompute(distribution, mesh_ahead);
+            const bool wave_batch = mesh_ahead && scheduler.ActiveComputeIsAhead() &&
+                                    scheduler.BeginAheadWave(0, distribution);
+            if (!wave_batch) {
+                scheduler.BeginCompute(distribution, mesh_ahead);
+            }
             for (const ShaderTranslate::ResourceSlot& slot : mesh->distribution.program.slots) {
                 if (slot.kind != ShaderTranslate::ResourceKind::Buffer) {
                     continue;
@@ -5729,17 +5763,21 @@ bool RasterizerMetal::PrepareDraw(GraphicsPipeline& pipeline, bool is_indexed, u
                 } else if (slot.binding < distribution_buffers.size()) {
                     const StagingBufferRef& buffer = *distribution_buffers[slot.binding];
                     const bool is_read_only = slot.binding == 0;
-                    const u64 sz = slot.binding == 3 ? sizeof(u32)
+                    const bool is_counter = slot.binding == 3;
+                    const u64 sz = is_counter ? sizeof(u32)
                                    : buffer.mapped_span.empty() ? ~u64{0}
                                                                 : buffer.mapped_span.size_bytes();
                     scheduler.BindBuffer(ShaderStage::Compute, slot.index, buffer.buffer,
                                          static_cast<u32>(buffer.offset), !is_read_only,
-                                         slot.binding == 0 || slot.binding == 3 ? sz : 0U,
-                                         is_read_only ? 0U : sz);
+                                         is_read_only ? sz : 0U, is_read_only ? 0U : sz,
+                                         is_counter);
                 }
             }
             scheduler.Dispatch({1, 1, 1}, {1, 1, 1});
-            begin_kernel(1, mesh->mesh, mesh_kernel);
+            if (!wave_batch || !scheduler.BeginAheadWave(1, mesh_kernel)) {
+                scheduler.BeginCompute(mesh_kernel, mesh_ahead);
+            }
+            bind_kernel_resources(1, mesh->mesh);
             scheduler.DispatchIndirect(mesh_buffers.args.buffer, mesh_buffers.args.offset,
                                        mesh->mesh.workgroup_size);
         }

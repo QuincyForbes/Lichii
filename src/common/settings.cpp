@@ -233,19 +233,54 @@ bool IsNceEnabled() {
     return is_nce_enabled;
 }
 
+namespace {
+enum class CpuBackendEnvOverride : u8 {
+    None,
+    CachedInterpreter,
+    Hypervisor,
+    Other,
+};
+
+CpuBackendEnvOverride GetCpuBackendEnvOverride() noexcept {
+    static const CpuBackendEnvOverride override_val = [] {
+        const char* env = std::getenv("EDEN_NX2_CPU_BACKEND");
+        if (env == nullptr || env[0] == '\0') {
+            return CpuBackendEnvOverride::None;
+        }
+        const std::string_view sv{env};
+        if (sv == "cached" || sv == "interpreter") {
+            return CpuBackendEnvOverride::CachedInterpreter;
+        }
+        if (sv == "hypervisor" || sv == "hv") {
+            return CpuBackendEnvOverride::Hypervisor;
+        }
+        return CpuBackendEnvOverride::Other;
+    }();
+    return override_val;
+}
+} // Anonymous namespace
+
 bool IsCachedInterpreterEnabled() {
-    if (const char* env = std::getenv("EDEN_NX2_CPU_BACKEND"); env != nullptr && env[0] != '\0') {
-        return std::string_view{env} == "cached" || std::string_view{env} == "interpreter";
+    switch (GetCpuBackendEnvOverride()) {
+    case CpuBackendEnvOverride::None:
+        return values.cpu_backend.GetValue() == CpuBackend::CachedInterpreter;
+    case CpuBackendEnvOverride::CachedInterpreter:
+        return true;
+    default:
+        return false;
     }
-    return values.cpu_backend.GetValue() == CpuBackend::CachedInterpreter;
 }
 
 bool IsHypervisorEnabled() {
 #ifdef HAS_HYPERVISOR
-    if (const char* env = std::getenv("EDEN_NX2_CPU_BACKEND"); env != nullptr && env[0] != '\0') {
-        return std::string_view{env} == "hypervisor" || std::string_view{env} == "hv";
+    switch (GetCpuBackendEnvOverride()) {
+    case CpuBackendEnvOverride::None:
+        return values.cpu_backend.GetValue() == CpuBackend::Hypervisor;
+    case CpuBackendEnvOverride::Hypervisor:
+        return true;
+    default:
+        return false;
     }
-    return values.cpu_backend.GetValue() == CpuBackend::Hypervisor;
 #else
     return false;
 #endif

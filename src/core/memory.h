@@ -503,6 +503,22 @@ public:
      */
     void RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, bool cached);
 
+    /// Defers hypervisor TLB flush kicks across multiple protection updates on this thread.
+    static void BeginProtectBatch() noexcept;
+    static void EndProtectBatch();
+
+    class ProtectBatchGuard {
+    public:
+        ProtectBatchGuard() noexcept {
+            Memory::BeginProtectBatch();
+        }
+        ~ProtectBatchGuard() {
+            Memory::EndProtectBatch();
+        }
+        ProtectBatchGuard(const ProtectBatchGuard&) = delete;
+        ProtectBatchGuard& operator=(const ProtectBatchGuard&) = delete;
+    };
+
     /**
      * Makes the next guest read of each rasterizer cached page in the range take the slow path
      * (fastmem only), so that the read reaches the GPU's reactive flush once.

@@ -153,6 +153,12 @@ std::unique_ptr<HvVm> HvVm::CreateForTest(u8* dram_base, u64 dram_size) {
     return vm->InitializeForTest(dram_base, dram_size) ? std::move(vm) : nullptr;
 }
 
+namespace {
+thread_local HvVm* t_protect_batch_vm = nullptr;
+thread_local u32 t_protect_batch_depth = 0;
+thread_local bool t_protect_batch_flush = false;
+} // Anonymous namespace
+
 HvVm* HvVm::Create(System& system) {
     if (!g_vm) {
         g_vm.reset(new HvVm());
@@ -429,7 +435,11 @@ void HvVm::ProtectAccess(u64 vaddr, u64 size, Common::MemoryPermission perms) {
         }
     }
     if (tightened) {
-        RequestFlush(false);
+        if (t_protect_batch_vm == this && t_protect_batch_depth > 0) {
+            t_protect_batch_flush = true;
+        } else {
+            RequestFlush(false);
+        }
     }
 }
 
@@ -622,19 +632,52 @@ u32 HvVm::ActiveStepCount(u64 page, bool write) {
     return write ? grant->write_refs : (grant->read_refs + grant->write_refs);
 }
 
+void HvVm::BeginProtectBatch() noexcept {
+    if (t_protect_batch_depth == 0) {
+        t_protect_batch_vm = this;
+        t_protect_batch_flush = false;
+    }
+    if (t_protect_batch_vm == this) {
+        ++t_protect_batch_depth;
+    }
+}
+
+void HvVm::EndProtectBatch() {
+    if (t_protect_batch_vm != this || t_protect_batch_depth == 0) {
+        return;
+    }
+    if (--t_protect_batch_depth == 0) {
+        const bool need_flush = t_protect_batch_flush;
+        t_protect_batch_vm = nullptr;
+        t_protect_batch_flush = false;
+        if (need_flush) {
+            RequestFlush(false);
+        }
+    }
+}
+
 void HvVm::RequestFlush(bool icache) {
     if (icache) {
         m_icache_generation.fetch_add(1, std::memory_order_acq_rel);
     }
-    m_flush_generation.fetch_add(1, std::memory_order_acq_rel);
+    m_flush_generation.fetch_add(1, std::memory_order_seq_cst);
     if (!m_vm_created) {
         return;
     }
+    const u32 active_mask = m_active_mask.load(std::memory_order_seq_cst);
+    if (active_mask == 0) {
+        return;
+    }
     std::scoped_lock lk{m_running_mutex};
+    std::array<hv_vcpu_t, Hardware::NUM_CPU_CORES> to_exit{};
+    uint32_t count = 0;
     for (size_t i = 0; i < m_vcpus.size(); i++) {
-        if (m_running[i]) {
-            hv_vcpus_exit(&m_vcpus[i], 1);
+        if (((active_mask >> i) & 1U) != 0 && m_running[i]) {
+            to_exit[count++] = m_vcpus[i];
         }
+    }
+    if (count > 0) {
+        hv_vcpus_exit(to_exit.data(), count);
     }
 }
 
@@ -642,6 +685,18 @@ void HvVm::SetRunning(size_t core, hv_vcpu_t vcpu, bool running) {
     std::scoped_lock lk{m_running_mutex};
     m_vcpus[core] = vcpu;
     m_running[core] = running;
+    if (!running) {
+        m_active_mask.fetch_and(~(1U << core), std::memory_order_release);
+    }
+}
+
+void HvVm::SetActive(size_t core, bool active) noexcept {
+    const u32 bit = 1U << core;
+    if (active) {
+        m_active_mask.fetch_or(bit, std::memory_order_seq_cst);
+    } else {
+        m_active_mask.fetch_and(~bit, std::memory_order_release);
+    }
 }
 
 } // namespace Core

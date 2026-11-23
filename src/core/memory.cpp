@@ -1040,6 +1040,10 @@ struct Memory::Impl {
                 host_buffer->Protect(vaddr, size, perm);
             }
 #ifdef HAS_HYPERVISOR
+            const bool batch_hv = hv_vm != nullptr && cached && perm != Common::MemoryPermission{};
+            if (batch_hv) {
+                hv_vm->BeginProtectBatch();
+            }
             if (hv_vm) {
                 hv_vm->ProtectAccess(vaddr, size, perm);
             }
@@ -1084,6 +1088,11 @@ struct Memory::Impl {
             if (cached && perm != Common::MemoryPermission{}) {
                 ProtectArmedPages(vaddr, size);
             }
+#ifdef HAS_HYPERVISOR
+            if (batch_hv) {
+                hv_vm->EndProtectBatch();
+            }
+#endif
         }
 
         // Iterate over a contiguous CPU address space, which corresponds to the specified GPU
@@ -1196,6 +1205,11 @@ struct Memory::Impl {
         }
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
         std::scoped_lock lk{read_trap_mutex};
+#ifdef HAS_HYPERVISOR
+        if (hv_vm) {
+            hv_vm->BeginProtectBatch();
+        }
+#endif
         if (armed_trap_pages.words.load(std::memory_order_relaxed) == nullptr) {
             auto* const bits = armed_trap_pages.Words();
             jit_read_trap_state.store(reinterpret_cast<std::uintptr_t>(bits),
@@ -1228,6 +1242,11 @@ struct Memory::Impl {
             ++run_pages;
         }
         protect_run();
+#ifdef HAS_HYPERVISOR
+        if (hv_vm) {
+            hv_vm->EndProtectBatch();
+        }
+#endif
     }
 
     bool ReadTrapArmed(u64 vaddr, u64 size) {
@@ -2204,6 +2223,22 @@ void Memory::RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, 
     }
     impl->RefreshJitReadTrapState();
     impl->RasterizerMarkRegionCached(GetInteger(vaddr), size, cached);
+}
+
+void Memory::BeginProtectBatch() noexcept {
+#ifdef HAS_HYPERVISOR
+    if (HvVm* const vm = HvVm::Get()) {
+        vm->BeginProtectBatch();
+    }
+#endif
+}
+
+void Memory::EndProtectBatch() {
+#ifdef HAS_HYPERVISOR
+    if (HvVm* const vm = HvVm::Get()) {
+        vm->EndProtectBatch();
+    }
+#endif
 }
 
 void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {

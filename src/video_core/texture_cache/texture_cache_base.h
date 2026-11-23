@@ -1340,7 +1340,7 @@ private:
     std::vector<std::pair<DAddr, u64>> uploaded_ranges;
 
     std::deque<PendingUnswizzle> unswizzle_queue;
-    u8 current_unswizzle_frame;
+    u8 current_unswizzle_frame{};
 
     struct FeedbackShadow {
         ImageId id;

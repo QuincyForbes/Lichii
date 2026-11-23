@@ -737,6 +737,7 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
 template <typename Traits>
 void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size, s32 delta) {
     Common::ScopedRangeLock lk(counter_guard, addr, size);
+    Core::Memory::Memory::ProtectBatchGuard protect_batch;
     UpdatePagesCachedCountNoLock(addr, size, delta);
 }
 
@@ -757,6 +758,7 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
         const DAddr lock_end = ranges.back().first + ranges.back().second;
         Common::ScopedRangeLock lk(counter_guard, lock_begin,
                                    static_cast<size_t>(lock_end - lock_begin));
+        Core::Memory::Memory::ProtectBatchGuard protect_batch;
         for (const auto& [addr, size] : ranges) {
             UpdatePagesCachedCountNoLock(addr, size, delta);
         }
@@ -796,6 +798,7 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
     const DAddr lock_begin = coalesced.front().first;
     const DAddr lock_end = coalesced.back().first + coalesced.back().second;
     Common::ScopedRangeLock lk(counter_guard, lock_begin, static_cast<size_t>(lock_end - lock_begin));
+    Core::Memory::Memory::ProtectBatchGuard protect_batch;
 
     for (const auto& [addr, size] : coalesced) {
         UpdatePagesCachedCountNoLock(addr, size, delta);
