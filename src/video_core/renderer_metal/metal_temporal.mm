@@ -23,6 +23,7 @@ struct ScalerKey {
     MTLPixelFormat depth{};
     MTLPixelFormat motion{};
     MTLPixelFormat reactive{};
+    MTLPixelFormat output_format{OutputFormat};
     NSUInteger input_width{};
     NSUInteger input_height{};
     std::array<u32, 2> render{};
@@ -122,11 +123,21 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
             scale_y > max_scale) {
             return nullptr;
         }
+        const id<MTLTexture> requested_out = AsTexture(inputs.output);
+        const bool try_direct_out =
+            requested_out != nil && requested_out.storageMode == MTLStorageModePrivate &&
+            requested_out.textureType == MTLTextureType2D && requested_out.sampleCount == 1 &&
+            requested_out.mipmapLevelCount == 1 && requested_out.arrayLength == 1 &&
+            requested_out.width == inputs.output_size[0] &&
+            requested_out.height == inputs.output_size[1];
+        const MTLPixelFormat wanted_out_fmt =
+            try_direct_out ? requested_out.pixelFormat : OutputFormat;
         const ScalerKey key{
             .color = color.pixelFormat,
             .depth = depth.pixelFormat,
             .motion = motion.pixelFormat,
             .reactive = reactive != nil ? reactive.pixelFormat : MTLPixelFormatInvalid,
+            .output_format = wanted_out_fmt,
             .input_width = color.width,
             .input_height = color.height,
             .render = inputs.render_size,
@@ -148,7 +159,7 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
             descriptor.colorTextureFormat = key.color;
             descriptor.depthTextureFormat = key.depth;
             descriptor.motionTextureFormat = key.motion;
-            descriptor.outputTextureFormat = OutputFormat;
+            descriptor.outputTextureFormat = key.output_format;
             descriptor.inputWidth = key.input_width;
             descriptor.inputHeight = key.input_height;
             descriptor.outputWidth = key.output[0];
@@ -181,6 +192,11 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
                           reason != nullptr ? reason : "no reason given");
                 scaler = nil;
             }
+            if (scaler == nil && key.output_format != OutputFormat) {
+                Inputs fallback_inputs = inputs;
+                fallback_inputs.output = nullptr;
+                return Upscale(device, scheduler, fallback_inputs);
+            }
             if (scaler == nil) {
                 LOG_WARNING(Render_Metal, "MetalFX temporal: no scaler for {}x{} in {}x{} -> {}x{}",
                             inputs.render_size[0], inputs.render_size[1], key.input_width,
@@ -189,19 +205,28 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
                 state.has_failed_key = true;
                 return nullptr;
             }
-            MTLTextureDescriptor* output = [MTLTextureDescriptor
-                texture2DDescriptorWithPixelFormat:OutputFormat
-                                             width:key.output[0]
-                                            height:key.output[1]
-                                         mipmapped:NO];
-            // MTLFXTemporalScaler.outputTexture must be private.
-            output.storageMode = MTLStorageModePrivate;
-            output.usage = scaler.outputTextureUsage | MTLTextureUsageShaderRead;
-            state.output = [device.GetDevice() newTextureWithDescriptor:output];
-            if (state.output == nil) {
-                state.failed_key = key;
-                state.has_failed_key = true;
-                return nullptr;
+            const bool direct_ready =
+                try_direct_out && HasUsage(requested_out, scaler.outputTextureUsage);
+            if (!direct_ready) {
+                if (key.output_format != OutputFormat) {
+                    Inputs fallback_inputs = inputs;
+                    fallback_inputs.output = nullptr;
+                    return Upscale(device, scheduler, fallback_inputs);
+                }
+                MTLTextureDescriptor* output = [MTLTextureDescriptor
+                    texture2DDescriptorWithPixelFormat:OutputFormat
+                                                 width:key.output[0]
+                                                height:key.output[1]
+                                             mipmapped:NO];
+                // MTLFXTemporalScaler.outputTexture must be private.
+                output.storageMode = MTLStorageModePrivate;
+                output.usage = scaler.outputTextureUsage | MTLTextureUsageShaderRead;
+                state.output = [device.GetDevice() newTextureWithDescriptor:output];
+                if (state.output == nil) {
+                    state.failed_key = key;
+                    state.has_failed_key = true;
+                    return nullptr;
+                }
             }
             state.scaler = scaler;
             state.key = key;
@@ -231,10 +256,21 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
                 scaler.reactiveMaskTexture = nil;
             }
         }
+        id<MTLTexture> target_out = nil;
+        if (try_direct_out && requested_out.pixelFormat == state.key.output_format &&
+            HasUsage(requested_out, scaler.outputTextureUsage)) {
+            target_out = requested_out;
+        } else if (state.output != nil && state.key.output_format == OutputFormat) {
+            target_out = state.output;
+        } else {
+            Inputs fallback_inputs = inputs;
+            fallback_inputs.output = nullptr;
+            return Upscale(device, scheduler, fallback_inputs);
+        }
         scaler.colorTexture = color;
         scaler.depthTexture = depth;
         scaler.motionTexture = motion;
-        scaler.outputTexture = state.output;
+        scaler.outputTexture = target_out;
         // Every evaluation, as the steps of MTLFXTemporalScaler list them.
         scaler.inputContentWidth = inputs.render_size[0];
         scaler.inputContentHeight = inputs.render_size[1];
@@ -246,8 +282,11 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
         scaler.preExposure = 1.0f;
         scaler.reset = inputs.reset || state.first_evaluation;
         state.first_evaluation = false;
-        const id<MTLCommandBuffer> command_buffer =
-            (__bridge id<MTLCommandBuffer>)scheduler.CommandBuffer();
+        const std::array<TextureHandle, 4> read_textures{
+            inputs.color, inputs.depth, inputs.motion,
+            reactive != nil ? inputs.reactive : nullptr};
+        const id<MTLCommandBuffer> command_buffer = (__bridge id<MTLCommandBuffer>)
+            scheduler.CommandBufferForTextures(read_textures, (__bridge void*)target_out);
         @try {
             [scaler encodeToCommandBuffer:command_buffer];
         } @catch (NSException* exception) {
@@ -256,7 +295,7 @@ TextureHandle TemporalUpscaler::Upscale(const Device& device, Scheduler& schedul
                       reason != nullptr ? reason : "no reason given");
             return nullptr;
         }
-        return (__bridge void*)state.output;
+        return (__bridge void*)target_out;
     }
     return decline_permanent("needs iOS 16 or macOS 13");
 }

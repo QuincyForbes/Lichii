@@ -34,12 +34,18 @@ class KScopedDisableDispatch;
 class KScopedSchedulerLock;
 class KScopedSchedulerLockAndSleep;
 
-class KScheduler final {
+class alignas(128) KScheduler final {
 public:
     YUZU_NON_COPYABLE(KScheduler);
     YUZU_NON_MOVEABLE(KScheduler);
 
     using LockType = KAbstractSchedulerLock<KScheduler>;
+
+    static constexpr s32 kNoWaiterPriority = Svc::LowestThreadPriority + 1;
+    static constexpr u32 kYieldStateActiveHandoff = 1U << 16;
+    static constexpr u32 kYieldStateStarvedCandidate = 1U << 17;
+    static constexpr u32 kInitialYieldState =
+        static_cast<u32>(kNoWaiterPriority) | (static_cast<u32>(kNoWaiterPriority) << 8);
 
     explicit KScheduler(KernelCore& kernel);
     ~KScheduler();
@@ -76,6 +82,22 @@ public:
 
     s64 GetLastContextSwitchTime() const {
         return m_last_context_switch_time;
+    }
+
+    u64 GetHandoffExpiryNs() const noexcept {
+        return m_handoff_expiry_ns.load(std::memory_order_relaxed);
+    }
+
+    bool NeedsScheduling() const noexcept {
+        return m_state.needs_scheduling.load(std::memory_order_relaxed);
+    }
+
+    u32 GetYieldState() const noexcept {
+        return m_yield_state.load(std::memory_order_relaxed);
+    }
+
+    KThread* GetHighestPriorityThread() const noexcept {
+        return m_state.highest_priority_thread.load(std::memory_order_relaxed);
     }
 
     // Static public API.
@@ -115,6 +137,15 @@ public:
     static void YieldWithCoreMigration(KernelCore& kernel);
     static void YieldToAnyThread(KernelCore& kernel);
     static u32 GetCoreScheduledCount(KernelCore& kernel, s32 core_id);
+    static u32 GetCoreSuggestedCount(KernelCore& kernel, s32 core_id);
+    static u64 GetCoreScheduledQueueVersion(KernelCore& kernel, s32 core_id);
+    static bool HasStarvedRunnableForCore(KernelCore& kernel, s32 core_id);
+    static bool IsYieldUncontended(KernelCore& kernel, const KProcess& process, s32 core_id);
+    static bool IsCoreYieldFutile(KernelCore& kernel, const KProcess& process,
+                                  const KThread& thread, s32 core_id, Svc::YieldType yield_type,
+                                  u32* out_yield_state = nullptr);
+    static bool TryHandoffStarvedOnYield(KernelCore& kernel, u64 lease_ns);
+    static void RefreshExpiredHandoff(KernelCore& kernel);
 
 private:
     // Static private API.
@@ -147,7 +178,7 @@ private:
         bool interrupt_task_runnable{false};
         bool should_count_idle{false};
         u64 idle_count{0};
-        KThread* highest_priority_thread{nullptr};
+        std::atomic<KThread*> highest_priority_thread{nullptr};
         void* idle_thread_stack{nullptr};
         std::atomic<KThread*> prev_thread{nullptr};
         KInterruptTaskManager* interrupt_task_manager{nullptr};
@@ -155,14 +186,16 @@ private:
 
     SchedulingState m_state;
     bool m_is_active{false};
+    bool m_switch_from_schedule{};
     s32 m_core_id{0};
     s64 m_last_context_switch_time{0};
     KThread* m_idle_thread{nullptr};
     std::atomic<KThread*> m_current_thread{nullptr};
+    std::atomic<u64> m_handoff_expiry_ns{};
+    std::atomic<u32> m_yield_state{kInitialYieldState};
     std::shared_ptr<Common::Fiber> m_switch_fiber{};
     KThread* m_switch_cur_thread{};
     KThread* m_switch_highest_priority_thread{};
-    bool m_switch_from_schedule{};
 };
 
 class KScopedSchedulerLock : public KScopedLock<KScheduler::LockType> {

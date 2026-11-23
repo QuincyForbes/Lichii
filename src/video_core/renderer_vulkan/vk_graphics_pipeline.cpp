@@ -845,7 +845,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     const auto& target_regs = maxwell3d->regs;
     const u64 target_key =
-        (target_regs.rt[0].Address() ^
+        ((target_regs.rt_control.count != 0 ? target_regs.rt[0].Address() : 0ULL) ^
          ((target_regs.zeta_enable ? target_regs.zeta.Address() : 0ULL) *
           0x9e3779b97f4a7c15ULL)) |
         1ULL;
@@ -1459,16 +1459,49 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             texture_cache.BoundTargetlessFramebuffer(TargetlessDrawReach(
                 maxwell3d->regs, selects_viewport, texture_cache.IsRescaling()));
         }
+        const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
-        mesh_samples_targets = mesh_emulation && texture_cache.SamplesRenderTarget(view_span);
-        if ((scheduler.HasFragmentBarrier() || scheduler.HasDeferredWaitForIdle()) &&
-            (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+        const auto samples_attachment = [&](bool include_unwritten_depth) {
+            if (!texture_cache.SamplesRenderTarget(view_span)) {
+                return false;
+            }
+            if (include_unwritten_depth || framebuffer == nullptr ||
+                scheduler.RenderPassWroteDepthStencil()) {
+                return true;
+            }
+            const u32 num_colors = framebuffer->NumColorBuffers();
+            if (num_colors == 0) {
+                return false;
+            }
+            const auto& fb_images = framebuffer->Images();
+            for (const auto& entry : view_span) {
+                if (!entry.id || entry.id == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                    continue;
+                }
+                const ImageView& iv = texture_cache.GetImageView(entry.id);
+                if (iv.IsBuffer() || iv.BackingImage() == nullptr) {
+                    continue;
+                }
+                const VkImage sampled_img = iv.ImageHandle();
+                for (u32 slot = 0; slot < num_colors; ++slot) {
+                    if (fb_images[slot] == sampled_img) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+        const bool own_pass_active =
+            framebuffer != nullptr && scheduler.RenderPassMatches(framebuffer);
+        mesh_samples_targets = mesh_emulation && samples_attachment(!own_pass_active);
+        if (own_pass_active &&
+            (scheduler.HasFragmentBarrier() || scheduler.HasDeferredWaitForIdle()) &&
+            (scheduler.RenderPassHasStores() || samples_attachment(false))) {
             scheduler.RequestOutsideRenderPassOperationContext();
         }
         // The draw leaves the open pass for another target (or a barrier ended it): its pass may
         // still get a command buffer of its own, with the draw's geometry bound again there.
-        const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
         if (framebuffer != nullptr && (scheduler.SplitBeforeTargetSwitch(framebuffer) ||
             (!scheduler.IsRenderPassActive() &&
              scheduler.SplitBeforeNextPass(u64{framebuffer->RenderArea().width} *
@@ -1569,22 +1602,31 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         Common::PerfReport::Add(Common::PerfReport::MeshEmulatedDraws);
         const Framebuffer* const framebuffer{texture_cache.GetFramebuffer()};
         const bool own_pass{framebuffer != nullptr && scheduler.RenderPassMatches(framebuffer)};
-        const bool before_pass{own_pass && MeshBeforePassEnabled() &&
-                               scheduler.CanRecordBeforePass() &&
-                               !scheduler.RenderPassHasStores() && !writes_storage &&
-                               !mesh_samples_targets};
+        const VkFramebuffer deferred_fb{scheduler.DeferredClearFramebufferHandle()};
+        const bool clear_matches{framebuffer != nullptr &&
+                                 (deferred_fb == VK_NULL_HANDLE ||
+                                  deferred_fb == framebuffer->Handle())};
+        const bool before_pass{
+            MeshBeforePassEnabled() && !writes_storage && !mesh_samples_targets &&
+            (own_pass ? (scheduler.CanRecordBeforePass() && !scheduler.RenderPassHasStores())
+                      : (!scheduler.IsRenderPassActive() && clear_matches &&
+                         scheduler.CanRecordBeforeNextPass()))};
         if (!before_pass) {
+            if (MeshBeforePassEnabled() && framebuffer != nullptr) {
+                scheduler.WantSplitBeforeCurrentPass();
+                scheduler.WantSplitBefore(framebuffer->Handle(), scheduler.PendingTargetKey());
+            }
             if (own_pass) {
                 Common::PerfReport::Add(Common::PerfReport::MeshPassBreaks);
-                if (MeshBeforePassEnabled()) {
-                    // Next time this target's pass begins on a command buffer of its own.
-                    scheduler.WantSplitBeforeCurrentPass();
-                    scheduler.WantSplitBefore(framebuffer->Handle());
-                }
+                scheduler.RequestOutsideRenderPassOperationContext();
             } else if (scheduler.IsRenderPassActive()) {
                 Common::PerfReport::Add(Common::PerfReport::MeshPassLeaves);
+                scheduler.RequestOutsideRenderPassOperationContext();
+            } else if (!mesh_samples_targets && clear_matches) {
+                scheduler.RequestOutsideRenderPassKeepClear();
+            } else {
+                scheduler.RequestOutsideRenderPassOperationContext();
             }
-            scheduler.RequestOutsideRenderPassOperationContext();
         }
         if (!IsBuilt()) {
             auto wait_build = [this](vk::CommandBuffer) {
@@ -1767,6 +1809,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             scheduler.RecordBeforePass(std::move(emulate), Common::PerfReport::MeshBeforePass);
         } else {
             scheduler.Record(std::move(emulate));
+            if (!scheduler.IsRenderPassActive() && MeshBeforePassEnabled() &&
+                framebuffer != nullptr && !writes_storage && !scheduler.HasDeferredWaitForIdle()) {
+                (void)scheduler.SplitBeforeNextPass(
+                    u64{framebuffer->RenderArea().width} * framebuffer->RenderArea().height,
+                    framebuffer->Handle(), scheduler.PendingTargetKey());
+            }
         }
     }
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());

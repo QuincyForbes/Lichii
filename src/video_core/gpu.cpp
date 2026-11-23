@@ -74,6 +74,10 @@ struct GPU::Impl {
     std::shared_ptr<Control::ChannelState> CreateChannel(s32 channel_id) {
         auto channel_state = std::make_shared<Tegra::Control::ChannelState>(channel_id);
         channels.emplace(channel_id, channel_state);
+        {
+            std::scoped_lock lk{channel_list_mutex};
+            channel_list.push_back(channel_state);
+        }
         scheduler.DeclareChannel(channel_state);
         return channel_state;
     }
@@ -298,6 +302,10 @@ struct GPU::Impl {
             sync_requests_dropped = true;
         }
         sync_request_cv.notify_all();
+        {
+            std::scoped_lock channels_lock{channel_list_mutex};
+            channel_list.clear();
+        }
         std::unique_lock lk{sync_mutex};
         shutting_down.store(true, std::memory_order::relaxed);
         sync_cv.notify_all();
@@ -322,21 +330,182 @@ struct GPU::Impl {
             LOG_INFO(HW_GPU, "Boot: first GPU command list, channel {}, {} entries", channel,
                      entries.command_lists.size());
         }
+        // Only drain queued maps before front-side command parsing when an entry's pushbuffer
+        // words were deferred behind a pending map, or when snapshots may re-read memory.
+        const bool uncopied_overlap =
+            !entries.command_lists.empty() && entries.submitted_offsets.empty() &&
+            std::ranges::any_of(entries.command_lists, [this](const auto& entry) {
+                return entry.size != 0 &&
+                       pending_maps.Overlaps(entry.addr, u64{entry.size} * sizeof(u32));
+            });
+        if (!entries.deferred_entries.empty() || uncopied_overlap ||
+            (!entries.command_lists.empty() &&
+             Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+             !Tegra::DmaPusher::TrustSubmitted() &&
+             pending_maps.Overlaps(0, ~u64{0}))) {
+            gpu_thread.Run([] {}, true, true, false);
+        }
         gpu_thread.SubmitList(channel, std::move(entries), is_async);
+    }
+
+    void AdvanceRetiredReleaseGen(u64 gen) {
+        u64 prev = retired_release_gen.load(std::memory_order_relaxed);
+        while (prev < gen &&
+               !retired_release_gen.compare_exchange_weak(prev, gen, std::memory_order_release)) {
+        }
+    }
+
+    // Sparse tile updates, idempotent re-maps, fresh VA mappings and VA remaps run on GPUBack in
+    // ring order without stalling GPUFront on DrainSite::Map; pending_maps and PushGPUEntries
+    // drain before parsing any command list whose pushbuffer overlaps a queued map, and
+    // Nx2CommandMemoryReleases keeps earlier lists on their submit-time snapshots.
+    bool CanOrderMapWithoutFrontDrain(GPUVAddr gpu_addr, u64 size, bool& already_mapped) {
+        already_mapped = false;
+        static const bool force_drain = [] {
+            const char* value = std::getenv("EDEN_NX2_MAP_DRAIN");
+            return value != nullptr && value[0] != '0';
+        }();
+        if (force_drain) {
+            return false;
+        }
+        if (size == 0 || Tegra::Nx2InSparseRegion(gpu_addr, size)) {
+            already_mapped = true;
+            return true;
+        }
+        if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+            !Tegra::Nx2CommandMemoryReleases::Enabled()) {
+            return false;
+        }
+        boost::container::small_vector<const Tegra::MemoryManager*, 4> spaces;
+        {
+            std::scoped_lock lk{channel_list_mutex};
+            for (const auto& ch : channel_list) {
+                if (const auto* mm = ch->memory_manager; mm != nullptr &&
+                    std::ranges::find(spaces, mm) == spaces.end()) {
+                    spaces.push_back(mm);
+                }
+            }
+        }
+        if (spaces.empty()) {
+            return true;
+        }
+        bool all_unmapped = true;
+        bool all_continuous = true;
+        bool had_proven_code = false;
+        for (const auto* mm : spaces) {
+            const auto submapped = mm->GetSubmappedDeviceRange(gpu_addr, size);
+            if (!submapped.empty()) {
+                all_unmapped = false;
+                for (const auto& [dev_addr, dev_bytes] : submapped) {
+                    if (Tegra::Nx2IsProvenCode(dev_addr, dev_bytes)) {
+                        had_proven_code = true;
+                        break;
+                    }
+                }
+            }
+            if (submapped.size() != 1 || submapped[0].second != size) {
+                all_continuous = false;
+            }
+        }
+        if (had_proven_code) {
+            Tegra::Nx2BumpCodeEpoch();
+        }
+        if (all_unmapped) {
+            return true;
+        }
+        if (all_continuous && !pending_maps.Overlaps(gpu_addr, size)) {
+            auto& releases = Tegra::Nx2CommandMemoryReleases::Get();
+            const u64 now = releases.Generation();
+            const u64 since = retired_release_gen.load(std::memory_order_acquire);
+            if (now <= since) {
+                already_mapped = true;
+                return true;
+            }
+            thread_local std::vector<Tegra::Nx2CommandMemoryReleases::Range> overlapped;
+            if (releases.Collect(since, now, gpu_addr, gpu_addr + size, overlapped) &&
+                overlapped.empty()) {
+                already_mapped = true;
+                return true;
+            }
+        }
+        return true;
     }
 
     // Queued without waiting, also with synchronous GPU: callers hold nx2:gpu locks that the GPU
     // back thread takes while running the map (flushes write back into sparse regions).
-    void RunInOrder(std::function<void()>&& func) {
-        gpu_thread.Run(std::move(func), true);
+    void RunInOrder(std::function<void()>&& func, bool changes_mappings) {
+        if (!changes_mappings || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+            gpu_thread.Run(std::move(func), true, false, changes_mappings);
+            return;
+        }
+        const u64 gen = Tegra::Nx2CommandMemoryReleases::Get().Generation();
+        gpu_thread.Run(
+            [this, gen, func = std::move(func)] {
+                func();
+                AdvanceRetiredReleaseGen(gen);
+            },
+            true, false, false);
+    }
+
+    void NotifySyncpointWait() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_SYNCPT_WAIT_FLUSH");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (!enabled || shutting_down.load(std::memory_order_relaxed) || !system.IsPoweredOn()) {
+            return;
+        }
+        auto& split = VideoCommon::GpuSplit::Get();
+        if (split.BackRunning()) {
+            split.RequestIdleHook();
+        }
+        if (!syncpt_flush_queued.exchange(true, std::memory_order_acq_rel)) {
+            RunInOrder(
+                [this] {
+                    syncpt_flush_queued.store(false, std::memory_order_release);
+                    if (shutting_down.load(std::memory_order_relaxed) || renderer == nullptr) {
+                        return;
+                    }
+                    auto& gpu_split = VideoCommon::GpuSplit::Get();
+                    if (gpu_split.BackRunning()) {
+                        gpu_split.RequestIdleHook();
+                    } else if (VideoCommon::GpuSplit::OwnsScheduler()) {
+                        renderer->ReadRasterizer()->ReleaseFences(false);
+                    }
+                },
+                false);
+        }
     }
 
     void MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {
+        const u64 gen = Tegra::Nx2CommandMemoryReleases::Get().Generation();
+        bool already_mapped = false;
+        if (CanOrderMapWithoutFrontDrain(gpu_addr, size, already_mapped)) {
+            if (already_mapped) {
+                gpu_thread.Run(
+                    [this, gen, func = std::move(func)] {
+                        func();
+                        AdvanceRetiredReleaseGen(gen);
+                    },
+                    true, false, false);
+                return;
+            }
+            const u64 id = pending_maps.Add(gpu_addr, size);
+            gpu_thread.Run(
+                [this, id, gen, func = std::move(func)] {
+                    func();
+                    pending_maps.Remove(id);
+                    AdvanceRetiredReleaseGen(gen);
+                },
+                true, false, false);
+            return;
+        }
         const u64 id = pending_maps.Add(gpu_addr, size);
         gpu_thread.Run(
-            [this, id, func = std::move(func)] {
+            [this, id, gen, func = std::move(func)] {
                 func();
                 pending_maps.Remove(id);
+                AdvanceRetiredReleaseGen(gen);
             },
             true, true); // not waited for, as in RunInOrder
     }
@@ -399,6 +568,23 @@ struct GPU::Impl {
         WaitForSyncOperation(fence);
         ReadStats::Add(stats.waits[cause], 1);
         return raster_area;
+    }
+
+    bool IsCleanReadTrapPage(DAddr page_addr) const {
+        return renderer->ReadRasterizer()->IsCleanReadTrapPage(page_addr);
+    }
+
+    std::optional<VideoCore::RasterizerDownloadArea> TryFastCleanRead(DAddr page_begin,
+                                                                      u64 page_bytes) {
+        namespace ReadStats = VideoCommon::CpuReadStats;
+        const u64 ask_begin = ReadStats::NowNs();
+        auto area = renderer->ReadRasterizer()->TryFastCleanRead(page_begin, page_bytes);
+        if (area) {
+            auto& stats = ReadStats::g_counters;
+            ReadStats::Add(stats.asks, 1);
+            ReadStats::Add(stats.ask_ns, ReadStats::NowNs() - ask_begin);
+        }
+        return area;
     }
 
     /// Notify rasterizer that any caches of the specified region should be invalidated
@@ -572,6 +758,10 @@ struct GPU::Impl {
     u64 last_sync_fence{};
 
     VideoCommon::PendingMaps pending_maps;
+    std::mutex channel_list_mutex;
+    std::vector<std::shared_ptr<Tegra::Control::ChannelState>> channel_list;
+    std::atomic<u64> retired_release_gen{Tegra::Nx2CommandMemoryReleases::Get().Generation()};
+    std::atomic<bool> syncpt_flush_queued{};
     std::mutex sync_request_mutex;
     std::condition_variable sync_request_cv;
     /// The GPU threads stopped and the requests were dropped (NotifyShutdown, under the mutex).
@@ -796,12 +986,25 @@ VideoCore::RasterizerDownloadArea GPU::OnCPURead(PAddr addr, u64 size) {
     return impl->OnCPURead(addr, size);
 }
 
+bool GPU::IsCleanReadTrapPage(DAddr page_addr) const {
+    return impl->IsCleanReadTrapPage(page_addr);
+}
+
+std::optional<VideoCore::RasterizerDownloadArea> GPU::TryFastCleanRead(DAddr page_begin,
+                                                                       u64 page_bytes) {
+    return impl->TryFastCleanRead(page_begin, page_bytes);
+}
+
 void GPU::FlushRegion(DAddr addr, u64 size) {
     impl->FlushRegion(addr, size);
 }
 
-void GPU::RunInOrder(std::function<void()>&& func) {
-    impl->RunInOrder(std::move(func));
+void GPU::RunInOrder(std::function<void()>&& func, bool changes_mappings) {
+    impl->RunInOrder(std::move(func), changes_mappings);
+}
+
+void GPU::NotifySyncpointWait() {
+    impl->NotifySyncpointWait();
 }
 
 void GPU::MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {

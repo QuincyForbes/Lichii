@@ -69,14 +69,38 @@ bool HasHandlers() {
     return !macros.empty();
 }
 
+namespace {
+
+constexpr std::size_t LookupSlots = 64;
+constexpr std::size_t LookupMask = LookupSlots - 1;
+
+constexpr std::size_t HashSlot(u64 hash) {
+    return static_cast<std::size_t>((hash ^ (hash >> 32)) & LookupMask);
+}
+
+constexpr auto macro_lookup = [] {
+    static_assert(macros.size() < LookupSlots);
+    std::array<u8, LookupSlots> table{};
+    for (std::size_t i = 0; i < macros.size(); ++i) {
+        std::size_t slot = HashSlot(macros[i].hash);
+        while (table[slot] != 0) {
+            slot = (slot + 1) & LookupMask;
+        }
+        table[slot] = static_cast<u8>(i + 1);
+    }
+    return table;
+}();
+
+} // Anonymous namespace
+
 u64 HashMacro(std::span<const u32> code, u32 start) {
     // FNV-1a over the words, plus the instruction count.
     u64 hash = 0xcbf29ce484222325ULL;
     const auto mix = [&hash](u32 word) {
-        for (u32 byte = 0; byte < 4; ++byte) {
-            hash ^= (word >> (byte * 8)) & 0xff;
-            hash *= 0x100000001b3ULL;
-        }
+        hash = (hash ^ (word & 0xffU)) * 0x100000001b3ULL;
+        hash = (hash ^ ((word >> 8) & 0xffU)) * 0x100000001b3ULL;
+        hash = (hash ^ ((word >> 16) & 0xffU)) * 0x100000001b3ULL;
+        hash = (hash ^ (word >> 24)) * 0x100000001b3ULL;
     };
     u32 count = 0;
     bool end_next = false;
@@ -96,12 +120,15 @@ u64 HashMacro(std::span<const u32> code, u32 start) {
 }
 
 const Macro* Find(u64 hash) {
-    for (const Macro& macro : macros) {
-        if (macro.hash == hash) {
-            return &macro;
+    for (std::size_t slot = HashSlot(hash);; slot = (slot + 1) & LookupMask) {
+        const u8 entry = macro_lookup[slot];
+        if (entry == 0) {
+            return nullptr;
+        }
+        if (macros[entry - 1].hash == hash) {
+            return &macros[entry - 1];
         }
     }
-    return nullptr;
 }
 
 bool DumpEnabled() {

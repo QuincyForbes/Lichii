@@ -326,6 +326,12 @@ FormatInfo SurfaceFormat(const Device& device, PixelFormat format, bool converte
     return SurfaceFormat(format, converted);
 }
 
+u32 TextureFormat(TextureHandle texture) {
+    const id<MTLTexture> __unsafe_unretained mtl =
+        (__bridge __unsafe_unretained id<MTLTexture>)texture;
+    return mtl != nil ? static_cast<u32>(mtl.pixelFormat) : 0U;
+}
+
 u32 DrawableFormat() {
     return static_cast<u32>(MTLPixelFormatBGRA8Unorm);
 }
@@ -431,13 +437,13 @@ Object CreateTextureView(TextureHandle texture, u32 format, TextureKind kind, u3
     if (base == nil) {
         return {};
     }
+    const bool cube = base.textureType == MTLTextureTypeCube ||
+                      base.textureType == MTLTextureTypeCubeArray;
+    const u64 slices =
+        base.textureType == MTLTextureType3D ? 1 : u64{base.arrayLength} * (cube ? 6 : 1);
     if (PipelineCheckEnabled()) {
         // A range of levels or slices the texture doesn't have, a view of another family of
         // texture types and a format Metal doesn't cast to abort the process.
-        const bool cube = base.textureType == MTLTextureTypeCube ||
-                          base.textureType == MTLTextureTypeCubeArray;
-        const u64 slices =
-            base.textureType == MTLTextureType3D ? 1 : u64{base.arrayLength} * (cube ? 6 : 1);
         std::string reason;
         if (levels == 0 || layers == 0 || u64{base_level} + levels > base.mipmapLevelCount ||
             u64{base_layer} + layers > slices) {
@@ -464,6 +470,13 @@ Object CreateTextureView(TextureHandle texture, u32 format, TextureKind kind, u3
             }
             return {};
         }
+    }
+    if (base.parentTexture == nil &&
+        base.pixelFormat == static_cast<MTLPixelFormat>(format) &&
+        base.textureType == TextureType(kind) && base_level == 0 &&
+        levels == base.mipmapLevelCount && base_layer == 0 && u64{layers} == slices &&
+        swizzle == IdentitySwizzle) {
+        return Retain(base);
     }
     @autoreleasepool {
         const MTLTextureSwizzleChannels channels = MTLTextureSwizzleChannelsMake(

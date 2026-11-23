@@ -52,12 +52,16 @@ struct ClearPass {
     u32 stencil_value{};
     u32 width{};
     u32 height{};
+    u32 min_width{};
+    u32 min_height{};
+    bool from_bound_mismatch{};
 };
 
 /// A clear drawn as a triangle: what a load action can't do (a rectangle of the target, some
 /// colour channels, some stencil bits).
 struct ClearRect {
     Attachment color{};
+    u8 color_index{};                ///< Colour attachment index (0..7)
     u8 color_mask{};                 ///< R 1, G 2, B 4, A 8; 0: colour stays
     std::array<f64, 4> color_value{}; ///< Integers for integer formats
     Attachment depth{};              ///< The depth (and stencil) texture, if either is cleared
@@ -355,11 +359,20 @@ public:
     /// Commits work a fence left pending (FenceManager::SubmitDeferredWork).
     void FlushDeferred();
 
+    /// Commits deferred work once its coalescing window has expired.
+    void FlushExpiredDeferred();
+
     /// The back's idle check: whether pending fence work may wait a little longer for more.
     [[nodiscard]] bool DeferredFlushMayWait() const;
 
     /// Whether the GPU has more than one command buffer of earlier work left to run.
     [[nodiscard]] bool GpuBehind() const noexcept;
+
+    /// Whether the GPU has finished every committed command buffer so far.
+    [[nodiscard]] bool GpuCaughtUp() const noexcept;
+
+    /// Draws recorded since the last Flush.
+    [[nodiscard]] u64 DrawsSinceCommit() const noexcept;
 
     /// Since the last call: fences whose work was left pending, and the commits of such work by
     /// the idle hook.
@@ -369,7 +382,17 @@ public:
     /// open encoder as it is. `range_tracked`: the caller tracks exact byte ranges in
     /// Buffer::tracker so whole-buffer untracked serialization is not needed.
     void CopyBuffer(BufferHandle src, u64 src_offset, BufferHandle dst, u64 dst_offset, u64 size,
-                    bool ahead = false, bool range_tracked = false);
+                    bool ahead = false, bool range_tracked = false,
+                    bool src_range_tracked = false);
+
+    /// Staging readback copy whose destination is only read on the host after CurrentTick()
+    /// completes: batched to segment end (or flushed before an overlapping GPU write to `src`)
+    /// so fence downloads never break an open render pass or drain a concurrent compute burst.
+    void DownloadBuffer(BufferHandle src, u64 src_offset, BufferHandle dst, u64 dst_offset,
+                        u64 size);
+
+    /// Flushes any deferred staging download whose source overlaps `[offset, offset + size)`.
+    void FlushDeferredDownloadsFor(BufferHandle buffer, u64 offset = 0, u64 size = ~u64{0});
 
     /// EDEN_NX2_METAL_AHEAD: a segment is what one command buffer of a tick records in order.
     /// Uploads and kernels that do not depend on it go into one command buffer of their own in
@@ -384,14 +407,41 @@ public:
     /// Whether CopyBuffer(..., ahead = true) will actually record ahead of the segment.
     [[nodiscard]] bool CanCopyBufferAhead() const noexcept;
 
+    /// Whether `[offset, offset + size)` of `dst` can be written ahead of the segment without
+    /// conflicting with in-order or adopted spans.
+    [[nodiscard]] bool CanWriteBufferAhead(BufferHandle dst, u64 offset = 0,
+                                           u64 size = ~u64{0}) const noexcept;
+
+    /// Whether `[offset, offset + size)` of `src` can be read ahead of the segment without
+    /// missing earlier in-order or adopted writes.
+    [[nodiscard]] bool CanReadBufferAhead(BufferHandle src, u64 offset = 0,
+                                          u64 size = ~u64{0}) const noexcept;
+
+    /// Whether all ahead copies and kernels share one ordered ahead command buffer.
+    [[nodiscard]] bool CanOrderAheadCopies() const noexcept;
+
+    /// Monotonic count of ahead buffer copies/fills recorded so far.
+    [[nodiscard]] u64 AheadCopyEpoch() const noexcept;
+
+    /// Latest ahead copy/fill serial recorded into `buffer` (0 if none).
+    [[nodiscard]] u64 BufferAheadWriteSerial(BufferHandle buffer) const noexcept;
+
+    /// Whether the segment's in-order compute encoder is currently open.
+    [[nodiscard]] bool HasOpenInOrderCompute() const noexcept;
+
     /// Whether `buffer` is referenced by any uncommitted command buffer of the current tick.
     [[nodiscard]] bool IsBufferActiveInOpenCommands(BufferHandle buffer) const;
 
-    /// Whether a staging buffer upload into `texture` may go ahead of the open render pass.
+    /// Whether a texture upload or copy into `texture` may go ahead of the segment.
     [[nodiscard]] bool CanUploadTextureAhead(TextureHandle texture) const noexcept;
 
     /// Whether a copy, fill or texture copy of the segment reads or writes `buffer` in order.
-    [[nodiscard]] bool UsedInOrder(BufferHandle buffer) const noexcept;
+    [[nodiscard]] bool UsedInOrder(BufferHandle buffer, u64 offset = 0,
+                                   u64 size = ~u64{0}) const noexcept;
+
+    /// Whether in-order GPU work of the segment writes `[offset, offset + size)` of `buffer`.
+    [[nodiscard]] bool WrittenInOrder(BufferHandle buffer, u64 offset = 0,
+                                      u64 size = ~u64{0}) const noexcept;
 
     /// Whether an in-order operation without per-range Buffer::tracker coverage touched `buffer`.
     [[nodiscard]] bool UsedUntrackedInOrder(BufferHandle buffer) const noexcept;
@@ -410,6 +460,7 @@ public:
     /// A render pass on `targets` was ended by a kernel that could have gone ahead of it, had
     /// the pass begun its segment: SplitBefore gives the next one a segment of its own.
     void WantSplitBefore(const RenderTargetSet& targets);
+    void WantSplitBeforeCurrentPass();
 
     /// Before the first draw of a render pass on `targets`: when such a pass was wanted at the
     /// start of a segment, commits what was recorded (same tick) and starts the next segment.
@@ -422,15 +473,16 @@ public:
 
     void CopyBufferToTexture(BufferHandle src, u64 offset, u32 bytes_per_row, u32 bytes_per_image,
                              TextureHandle dst, u32 level, u32 slice, Offset3D origin,
-                             Extent3D extent, bool ahead = false);
+                             Extent3D extent, bool ahead = false,
+                             bool src_range_tracked = false);
 
     void CopyTextureToBuffer(TextureHandle src, u32 level, u32 slice, Offset3D origin,
                              Extent3D extent, BufferHandle dst, u64 offset, u32 bytes_per_row,
-                             u32 bytes_per_image);
+                             u32 bytes_per_image, bool dst_range_tracked = false);
 
     void CopyTexture(TextureHandle src, u32 src_level, u32 src_slice, Offset3D src_origin,
                      Extent3D extent, TextureHandle dst, u32 dst_level, u32 dst_slice,
-                     Offset3D dst_origin);
+                     Offset3D dst_origin, bool ahead = false);
 
     /// Ends the blit encoder, so the next copy sees the writes of the ones before it.
     void BreakBlits();
@@ -470,6 +522,9 @@ public:
     /// the samples later gets them restored from the shadow. A null shadow removes it.
     void SetResolveShadow(TextureHandle msaa, TextureHandle shadow);
 
+    /// Drops any unconsumed deferred clear referencing `texture` before it is pooled or freed.
+    void DropPendingClears(TextureHandle texture);
+
     /// The shadow of `msaa` while it holds the resolve of its samples (nothing wrote them since
     /// its last pass), else null.
     [[nodiscard]] TextureHandle ResolveShadow(TextureHandle msaa) const noexcept;
@@ -508,6 +563,12 @@ public:
     /// Whether a render encoder for draws is open.
     [[nodiscard]] bool IsRendering() const noexcept;
 
+    [[nodiscard]] const RenderTargetSet& OpenRenderTargets() const noexcept;
+    [[nodiscard]] bool HasPendingClearFor(const RenderTargetSet& targets) const noexcept;
+    [[nodiscard]] bool HasPendingClears() const noexcept;
+    void PrepareSampledTextureForPass(TextureHandle texture);
+    void FlushPendingClearsForTargets(const RenderTargetSet& targets);
+
     /// Ends the open render encoder: the next BeginRendering loads what it stored.
     void EndRendering();
 
@@ -515,6 +576,7 @@ public:
     /// load-action clear, or a draw with depth writes or a writing stencil test); true when no
     /// encoder is open.
     [[nodiscard]] bool RenderPassWroteDepthStencil() const noexcept;
+    [[nodiscard]] u8 RenderPassWroteColorMask() const noexcept;
 
     /// Slots of the visibility result buffer every draw render pass carries (occlusion queries).
     static constexpr u32 VisibilitySlots = 16384;
@@ -565,7 +627,7 @@ public:
         BindTexture(stage, slot, texture, on_buffer, stage == ShaderStage::Compute);
     }
     void BindTexture(ShaderStage stage, u32 slot, TextureHandle texture, bool on_buffer,
-                     bool write);
+                     bool write, bool track_hazard = true);
     void BindSampler(ShaderStage stage, u32 slot, void* sampler);
     /// Flushes contiguous dirty binding runs and batched read-only residency declarations for
     /// `stage` onto the active encoder. Also flushed automatically before draws and dispatches.
@@ -579,7 +641,8 @@ public:
     /// A texture read (or written) through a table of resource IDs: made resident for the stage
     /// on the current encoder, its MTLResourceID returned (0 for none).
     [[nodiscard]] u64 UseTexture(ShaderStage stage, TextureHandle texture, bool write,
-                                 bool on_buffer = true, u64 known_gpu_resource_id = 0);
+                                 bool on_buffer = true, u64 known_gpu_resource_id = 0,
+                                 bool track_hazard = true);
 
     /// primitive: MTLPrimitiveType.
     void Draw(u32 primitive, u32 first_vertex, u32 vertex_count, u32 instance_count,
@@ -637,6 +700,12 @@ public:
     /// id<MTLCommandBuffer>, for presentDrawable and MetalFX). `allow_proxy`: keeps the recorder
     /// proxy when presentDrawable can be recorded on it without draining.
     [[nodiscard]] void* CommandBuffer(bool allow_proxy = false);
+
+    /// Like CommandBuffer(false), for external encoders (such as MTLFXTemporalScaler) whose
+    /// accessed textures are explicitly known and touch no guest MTLBuffers, keeping ahead
+    /// uploads, clears, and checked kernels enabled for the rest of the segment.
+    [[nodiscard]] void* CommandBufferForTextures(std::span<const TextureHandle> read_textures,
+                                                 TextureHandle write_texture);
 
     /// The shared event signalled with each committed tick's number (id<MTLSharedEvent>).
     [[nodiscard]] void* SharedEvent() const noexcept;

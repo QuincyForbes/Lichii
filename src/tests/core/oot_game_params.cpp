@@ -265,5 +265,5 @@ TEST_CASE("Ocarina graphics presets set their companions", "[file_sys]") {
     Settings::values.oot_graphics_preset.SetValue(prev);
     CHECK(balanced.preset == "Balanced");
     CHECK(balanced.foliage == 0);
-    CHECK(balanced.edits.size() == 4);
+    CHECK(balanced.edits.size() == 18);
 }

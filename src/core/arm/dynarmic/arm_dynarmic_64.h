@@ -70,6 +70,7 @@ public:
     Dynarmic::A64::Vector Read128Value(u64 vaddr);
     void WriteValue(u64 vaddr, u64 value, std::size_t size);
     void Write128Value(u64 vaddr, Dynarmic::A64::Vector value);
+    void WriteBytesInPage(u64 vaddr, u64 page, u64 offset, const u8* src, std::size_t size);
     template <typename T>
     bool WriteExclusive(u64 vaddr, T value, T expected);
     Common::PerfReport::SlowAccess ClassifySlowAccess(u64 vaddr, size_t size) const;
@@ -84,7 +85,11 @@ public:
     u64 m_hot_read_page{~u64{0}};
     const u8* m_hot_read_ptr{};
     u64 m_hot_read_gen{};
-    Core::Memory::Memory::HotWritePage m_hot_write{};
+    u64 m_hot_write_page{~u64{0}};
+    u8* m_hot_write_ptr{};
+    u64 m_hot_write_gen{};
+    Core::Memory::Memory::HotCoreState* m_hot_core{};
+    Core::Memory::Memory::JitHotWriteContext m_jit_hot_write_ctx{};
     ArmDynarmic64& m_parent;
     Core::Memory::Memory& m_memory;
     u64 m_tpidrro_el0{};

@@ -163,6 +163,15 @@ public:
 
     virtual RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) = 0;
 
+    [[nodiscard]] virtual bool IsCleanReadTrapPage([[maybe_unused]] DAddr page_addr) {
+        return false;
+    }
+
+    [[nodiscard]] virtual std::optional<RasterizerDownloadArea> TryFastCleanRead(
+        [[maybe_unused]] DAddr page_begin, [[maybe_unused]] u64 page_bytes) {
+        return std::nullopt;
+    }
+
     /// A guest core (EDEN_NX2_GPU_READ_LAND=2): waits for the fence download recorded in
     /// submission tick and lands it over the range. False when the GPU thread has to do it.
     virtual bool LandDownloadForCpuRead([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size,

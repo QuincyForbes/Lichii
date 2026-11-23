@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <bit>
 
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
@@ -50,6 +52,143 @@ u32 KScheduler::GetCoreScheduledCount(KernelCore& kernel, s32 core_id) {
         return 0;
     }
     return GetPriorityQueue(kernel).GetScheduledCount(core_id);
+}
+
+u32 KScheduler::GetCoreSuggestedCount(KernelCore& kernel, s32 core_id) {
+    if (core_id < 0 || core_id >= static_cast<s32>(Core::Hardware::NUM_CPU_CORES)) {
+        return 0;
+    }
+    return GetPriorityQueue(kernel).GetSuggestedCount(core_id);
+}
+
+u64 KScheduler::GetCoreScheduledQueueVersion(KernelCore& kernel, s32 core_id) {
+    if (core_id < 0 || core_id >= static_cast<s32>(Core::Hardware::NUM_CPU_CORES)) {
+        return 0;
+    }
+    return GetPriorityQueue(kernel).GetScheduledQueueVersion(core_id);
+}
+
+bool KScheduler::HasStarvedRunnableForCore(KernelCore& kernel, s32 core_id) {
+    if (core_id < 0 || core_id >= static_cast<s32>(Core::Hardware::NUM_CPU_CORES)) {
+        return false;
+    }
+    return (kernel.Scheduler(static_cast<size_t>(core_id)).GetYieldState() &
+            kYieldStateStarvedCandidate) != 0;
+}
+
+bool KScheduler::IsYieldUncontended(KernelCore& kernel, const KProcess& process, s32 core_id) {
+    if (core_id < 0 || core_id >= static_cast<s32>(Core::Hardware::NUM_CPU_CORES)) {
+        return false;
+    }
+    if (process.HasAnyPinnedThread()) {
+        return false;
+    }
+    const u32 ys = kernel.Scheduler(static_cast<size_t>(core_id)).GetYieldState();
+    return ys == kInitialYieldState;
+}
+
+bool KScheduler::IsCoreYieldFutile(KernelCore& kernel, const KProcess& process,
+                                   const KThread& thread, s32 core_id, Svc::YieldType yield_type,
+                                   u32* out_yield_state) {
+    if (core_id < 0 || core_id >= static_cast<s32>(Core::Hardware::NUM_CPU_CORES)) {
+        if (out_yield_state != nullptr) {
+            *out_yield_state = kInitialYieldState;
+        }
+        return false;
+    }
+    const auto& sched = kernel.Scheduler(static_cast<size_t>(core_id));
+    const u32 ys = sched.GetYieldState();
+    if (out_yield_state != nullptr) {
+        *out_yield_state = ys;
+    }
+    if (process.HasAnyPinnedThread() || sched.NeedsScheduling() ||
+        (ys & kYieldStateActiveHandoff) != 0 ||
+        sched.GetHighestPriorityThread() != std::addressof(thread)) {
+        return false;
+    }
+    const s32 prio = thread.GetPriority();
+    const s32 local_prio = static_cast<s32>(ys & 0xFFU);
+    const s32 mig_prio = static_cast<s32>((ys >> 8) & 0xFFU);
+    if (yield_type == Svc::YieldType::WithoutCoreMigration) {
+        return local_prio > prio;
+    }
+    if (yield_type == Svc::YieldType::WithCoreMigration) {
+        return local_prio > prio && mig_prio > prio;
+    }
+    return local_prio >= kNoWaiterPriority && mig_prio > prio;
+}
+
+bool KScheduler::TryHandoffStarvedOnYield(KernelCore& kernel, u64 lease_ns) {
+    ASSERT(CanSchedule(kernel));
+    KThread& cur_thread = GetCurrentThread(kernel);
+    const u64 now_ns = Common::PerfReport::NowNs();
+
+    KScopedSchedulerLock sl{kernel};
+    if (cur_thread.GetRawState() != ThreadState::Runnable ||
+        cur_thread.GetNumKernelWaiters() > 0 || cur_thread.IsTerminationRequested()) {
+        return false;
+    }
+    const s32 core_id = cur_thread.GetActiveCore();
+    if (core_id < 0) {
+        return false;
+    }
+    auto& pq = GetPriorityQueue(kernel);
+
+    bool has_local_waiter = false;
+    for (KThread* next = pq.GetScheduledNext(core_id, std::addressof(cur_thread)); next != nullptr;
+         next = pq.GetScheduledNext(core_id, next)) {
+        if (next->m_nx2_yield_handoff_until_ns <= now_ns) {
+            has_local_waiter = true;
+            break;
+        }
+    }
+
+    if (!has_local_waiter) {
+        KThread* migrated = nullptr;
+        for (KThread* s = pq.GetSuggestedFront(core_id); s != nullptr;
+             s = pq.GetSuggestedNext(core_id, s)) {
+            if (s->m_nx2_yield_handoff_until_ns > now_ns) {
+                continue;
+            }
+            const s32 s_core = s->GetActiveCore();
+            KThread* const running_on_s =
+                (s_core >= 0) ? kernel.Scheduler(static_cast<size_t>(s_core)).GetHighestPriorityThread()
+                              : nullptr;
+            if (running_on_s != s &&
+                (running_on_s == nullptr ||
+                 running_on_s->GetPriority() >= HighestCoreMigrationAllowedPriority)) {
+                s->SetActiveCore(core_id);
+                pq.ChangeCore(s_core, s);
+                IncrementScheduledCount(s);
+                migrated = s;
+                break;
+            }
+        }
+        if (migrated == nullptr) {
+            return false;
+        }
+    }
+
+    cur_thread.m_nx2_yield_handoff_until_ns = now_ns + lease_ns;
+    IncrementScheduledCount(std::addressof(cur_thread));
+    SetSchedulerUpdateNeeded(kernel);
+    return true;
+}
+
+void KScheduler::RefreshExpiredHandoff(KernelCore& kernel) {
+    auto* const sched = kernel.CurrentScheduler();
+    if (sched == nullptr) {
+        return;
+    }
+    const u64 exp = sched->GetHandoffExpiryNs();
+    if (exp == 0 || Common::PerfReport::NowNs() < exp) {
+        return;
+    }
+    KScopedSchedulerLock sl{kernel};
+    if (const u64 recheck = sched->GetHandoffExpiryNs();
+        recheck != 0 && Common::PerfReport::NowNs() >= recheck) {
+        SetSchedulerUpdateNeeded(kernel);
+    }
 }
 
 KScheduler::KScheduler(KernelCore& kernel) {
@@ -114,9 +253,22 @@ void KScheduler::RescheduleCurrentHLEThread(KernelCore& kernel) {
 u64 KScheduler::UpdateHighestPriorityThreads(KernelCore& kernel) {
     if (IsSchedulerUpdateNeeded(kernel)) {
         return UpdateHighestPriorityThreadsImpl(kernel);
-    } else {
-        return 0;
     }
+    const u32 mask =
+        kernel.GlobalSchedulerContext().m_active_handoff_mask.load(std::memory_order_relaxed);
+    if (mask != 0) {
+        const u64 now = Common::PerfReport::NowNs();
+        u32 bits = mask;
+        while (bits != 0) {
+            const u32 c = static_cast<u32>(std::countr_zero(bits));
+            bits &= bits - 1;
+            const u64 exp = kernel.Scheduler(c).GetHandoffExpiryNs();
+            if (exp != 0 && now >= exp) {
+                return UpdateHighestPriorityThreadsImpl(kernel);
+            }
+        }
+    }
+    return 0;
 }
 
 void KScheduler::Schedule(KernelCore& kernel) {
@@ -150,17 +302,17 @@ void KScheduler::RescheduleCurrentCore(KernelCore& kernel) {
 
     GetCurrentThread(kernel).EnableDispatch(kernel);
 
-    if (m_state.needs_scheduling.load()) {
+    if (m_state.needs_scheduling.load(std::memory_order_acquire)) {
         // Disable interrupts, and then check again if rescheduling is needed.
         // KScopedInterruptDisable intr_disable;
 
-        kernel.CurrentScheduler()->RescheduleCurrentCoreImpl(kernel);
+        this->RescheduleCurrentCoreImpl(kernel);
     }
 }
 
 void KScheduler::RescheduleCurrentCoreImpl(KernelCore& kernel) {
     // Check that scheduling is needed.
-    if (m_state.needs_scheduling.load()) [[likely]] {
+    if (m_state.needs_scheduling.load(std::memory_order_acquire)) [[likely]] {
         GetCurrentThread(kernel).DisableDispatch(kernel);
         Schedule(kernel);
         GetCurrentThread(kernel).EnableDispatch(kernel);
@@ -203,7 +355,7 @@ void KScheduler::OnThreadStart(KernelCore& kernel) {
 }
 
 u64 KScheduler::UpdateHighestPriorityThread(KernelCore& kernel, KThread* highest_thread) {
-    if (KThread* prev_highest_thread = m_state.highest_priority_thread;
+    if (KThread* prev_highest_thread = GetHighestPriorityThread();
         prev_highest_thread != highest_thread) [[likely]] {
         if (prev_highest_thread != nullptr) [[likely]] {
             IncrementScheduledCount(prev_highest_thread);
@@ -220,8 +372,8 @@ u64 KScheduler::UpdateHighestPriorityThread(KernelCore& kernel, KThread* highest
             }
         }
 
-        m_state.highest_priority_thread = highest_thread;
-        m_state.needs_scheduling = true;
+        m_state.highest_priority_thread.store(highest_thread, std::memory_order_relaxed);
+        m_state.needs_scheduling.store(true, std::memory_order_relaxed);
         return (1ULL << m_core_id);
     } else {
         return 0;
@@ -235,14 +387,50 @@ u64 KScheduler::UpdateHighestPriorityThreadsImpl(KernelCore& kernel) {
     ClearSchedulerUpdateNeeded(kernel);
 
     u64 cores_needing_scheduling = 0, idle_cores = 0;
-    KThread* top_threads[Core::Hardware::NUM_CPU_CORES];
+    u32 new_handoff_mask = 0;
+    u64 now_ns = 0;
+    std::array<KThread*, Core::Hardware::NUM_CPU_CORES> top_threads{};
+    std::array<u64, Core::Hardware::NUM_CPU_CORES> core_expiries{};
     auto& priority_queue = GetPriorityQueue(kernel);
 
     // We want to go over all cores, finding the highest priority thread and determining if
     // scheduling is needed for that core.
     for (size_t core_id = 0; core_id < Core::Hardware::NUM_CPU_CORES; core_id++) {
         KThread* top_thread = priority_queue.GetScheduledFront(static_cast<s32>(core_id));
+        u64 core_expiry_ns = 0;
         if (top_thread != nullptr) {
+            if (top_thread->m_nx2_yield_handoff_until_ns != 0) {
+                if (now_ns == 0) {
+                    now_ns = Common::PerfReport::NowNs();
+                }
+                KThread* candidate = top_thread;
+                while (candidate != nullptr && candidate->m_nx2_yield_handoff_until_ns != 0) {
+                    if (now_ns >= candidate->m_nx2_yield_handoff_until_ns ||
+                        candidate->GetNumKernelWaiters() > 0 ||
+                        candidate->IsTerminationRequested()) {
+                        candidate->m_nx2_yield_handoff_until_ns = 0;
+                        break;
+                    }
+                    KThread* const next =
+                        priority_queue.GetScheduledNext(static_cast<s32>(core_id), candidate);
+                    if (next == nullptr) {
+                        for (KThread* clr = top_thread; clr != nullptr;
+                             clr = priority_queue.GetScheduledNext(static_cast<s32>(core_id), clr)) {
+                            clr->m_nx2_yield_handoff_until_ns = 0;
+                        }
+                        candidate = top_thread;
+                        core_expiry_ns = 0;
+                        break;
+                    }
+                    if (core_expiry_ns == 0 ||
+                        candidate->m_nx2_yield_handoff_until_ns < core_expiry_ns) {
+                        core_expiry_ns = candidate->m_nx2_yield_handoff_until_ns;
+                    }
+                    candidate = next;
+                }
+                top_thread = candidate;
+            }
+
             // We need to check if the thread's process has a pinned thread.
             if (KProcess* parent = top_thread->GetOwnerProcess()) {
                 // Check that there's a pinned thread other than the current top thread.
@@ -264,15 +452,20 @@ u64 KScheduler::UpdateHighestPriorityThreadsImpl(KernelCore& kernel) {
             idle_cores |= (1ULL << core_id);
         }
 
+        core_expiries[core_id] = core_expiry_ns;
+        if (core_expiry_ns != 0) {
+            new_handoff_mask |= (1U << core_id);
+        }
         top_threads[core_id] = top_thread;
-        cores_needing_scheduling |= kernel.Scheduler(core_id).UpdateHighestPriorityThread(kernel, top_threads[core_id]);
     }
 
     // Idle cores are bad. We're going to try to migrate threads to each idle core in turn,
     // preferring higher core IDs first so multi-core background workers stay off Core 0 when
-    // higher cores are also idle (Djihads80/Eglantine#910).
+    // higher cores are also idle (Djihads80/Eglantine#910), while reusing the thread's last
+    // physical core when it is also among the non-zero idle cores.
     while (idle_cores != 0) {
         const s32 core_id = static_cast<s32>(Common::BitSize<u64>() - 1 - std::countl_zero(idle_cores));
+        bool retry_core = false;
 
         if (KThread* suggested = priority_queue.GetSuggestedFront(core_id); suggested != nullptr) {
             s32 migration_candidates[Core::Hardware::NUM_CPU_CORES];
@@ -283,7 +476,8 @@ u64 KScheduler::UpdateHighestPriorityThreadsImpl(KernelCore& kernel) {
                 // Check if the suggested thread is the top thread on its core.
                 const s32 suggested_core = suggested->GetActiveCore();
                 if (KThread* top_thread =
-                        (suggested_core >= 0) ? top_threads[suggested_core] : nullptr;
+                        (suggested_core >= 0) ? top_threads[static_cast<size_t>(suggested_core)]
+                                              : nullptr;
                     top_thread != suggested) {
                     // Make sure we're not dealing with threads too high priority for migration.
                     if (top_thread != nullptr &&
@@ -291,11 +485,24 @@ u64 KScheduler::UpdateHighestPriorityThreadsImpl(KernelCore& kernel) {
                         break;
                     }
 
+                    s32 target_core = core_id;
+                    if (const s32 last_core = suggested->GetCurrentCore();
+                        last_core > 0 && last_core != core_id &&
+                        (idle_cores & (1ULL << last_core)) != 0 &&
+                        suggested->GetAffinityMask().GetAffinity(last_core) &&
+                        priority_queue.GetSuggestedFront(last_core) == suggested) {
+                        target_core = last_core;
+                    }
+
                     // The suggested thread isn't bound to its core, so we can migrate it!
-                    suggested->SetActiveCore(core_id);
+                    suggested->m_nx2_yield_handoff_until_ns = 0;
+                    suggested->SetActiveCore(target_core);
                     priority_queue.ChangeCore(suggested_core, suggested);
-                    top_threads[core_id] = suggested;
-                    cores_needing_scheduling |= kernel.Scheduler(core_id).UpdateHighestPriorityThread(kernel, top_threads[core_id]);
+                    top_threads[static_cast<size_t>(target_core)] = suggested;
+                    if (target_core != core_id) {
+                        idle_cores &= ~(1ULL << target_core);
+                        retry_core = true;
+                    }
                     break;
                 }
 
@@ -311,27 +518,186 @@ u64 KScheduler::UpdateHighestPriorityThreadsImpl(KernelCore& kernel) {
                 for (size_t i = 0; i < num_candidates; i++) {
                     // Check if there's some other thread that can run on the candidate core.
                     const s32 candidate_core = migration_candidates[i];
-                    suggested = top_threads[candidate_core];
-                    if (KThread* next_on_candidate_core =
-                            priority_queue.GetScheduledNext(candidate_core, suggested);
-                        next_on_candidate_core != nullptr) {
+                    suggested = top_threads[static_cast<size_t>(candidate_core)];
+                    KThread* const front_on_candidate =
+                        priority_queue.GetScheduledFront(candidate_core);
+                    KThread* next_on_candidate_core =
+                        (front_on_candidate != suggested)
+                            ? front_on_candidate
+                            : priority_queue.GetScheduledNext(candidate_core, suggested);
+                    if (next_on_candidate_core != nullptr) {
+                        if (front_on_candidate != suggested) {
+                            for (KThread* clr = front_on_candidate;
+                                 clr != nullptr && clr != suggested;
+                                 clr = priority_queue.GetScheduledNext(candidate_core, clr)) {
+                                clr->m_nx2_yield_handoff_until_ns = 0;
+                            }
+                            core_expiries[static_cast<size_t>(candidate_core)] = 0;
+                            new_handoff_mask &= ~(1U << candidate_core);
+                        }
                         // The candidate core can run some other thread! We'll migrate its current
                         // top thread to us.
-                        top_threads[candidate_core] = next_on_candidate_core;
-                        cores_needing_scheduling |= kernel.Scheduler(candidate_core).UpdateHighestPriorityThread(kernel, top_threads[candidate_core]);
+                        top_threads[static_cast<size_t>(candidate_core)] = next_on_candidate_core;
 
                         // Perform the migration.
                         suggested->SetActiveCore(core_id);
                         priority_queue.ChangeCore(candidate_core, suggested);
-                        top_threads[core_id] = suggested;
-                        cores_needing_scheduling |= kernel.Scheduler(core_id).UpdateHighestPriorityThread(kernel, top_threads[core_id]);
+                        top_threads[static_cast<size_t>(core_id)] = suggested;
                         break;
                     }
                 }
             }
         }
 
-        idle_cores &= ~(1ULL << core_id);
+        if (!retry_core) {
+            idle_cores &= ~(1ULL << core_id);
+        }
+    }
+
+    // Resolve cross-core priority inversions: if a runnable multi-core waiter is queued behind a
+    // higher-priority thread on src_core while another allowed unpinned core runs a strictly
+    // lower-priority thread, migrate the waiter to preempt that lower-priority core.
+    for (s32 src_core = 0; src_core < static_cast<s32>(Core::Hardware::NUM_CPU_CORES); ++src_core) {
+        if (priority_queue.GetScheduledCount(src_core) <= 1) {
+            continue;
+        }
+        KThread* const src_top = top_threads[static_cast<size_t>(src_core)];
+        if (src_top == nullptr || src_top->GetPriority() < HighestCoreMigrationAllowedPriority) {
+            continue;
+        }
+        for (KThread* waiter = priority_queue.GetScheduledFront(src_core); waiter != nullptr;) {
+            KThread* const next_waiter = priority_queue.GetScheduledNext(src_core, waiter);
+            if (waiter == src_top || waiter->m_nx2_yield_handoff_until_ns != 0) {
+                waiter = next_waiter;
+                continue;
+            }
+            const u64 mask = waiter->GetAffinityMask().GetAffinityMask() & ~(1ULL << src_core);
+            if (mask != 0) {
+                const s32 preferred_core = waiter->GetCurrentCore();
+                s32 best_dst = -1;
+                s32 worst_prio = waiter->GetPriority();
+                u64 avail = mask;
+                while (avail != 0) {
+                    const s32 dst = std::countr_zero(avail);
+                    avail &= avail - 1;
+                    KThread* const dst_top = top_threads[static_cast<size_t>(dst)];
+                    if (dst_top == nullptr) {
+                        continue;
+                    }
+                    if (KProcess* const parent = dst_top->GetOwnerProcess();
+                        parent != nullptr && parent->GetPinnedThread(dst) != nullptr) {
+                        continue;
+                    }
+                    const s32 dst_prio = dst_top->GetPriority();
+                    if (dst_prio > worst_prio ||
+                        (best_dst >= 0 && dst_prio == worst_prio &&
+                         (dst == preferred_core ||
+                          (best_dst != preferred_core && dst > best_dst)))) {
+                        worst_prio = dst_prio;
+                        best_dst = dst;
+                    }
+                }
+                if (best_dst >= 0) {
+                    waiter->SetActiveCore(best_dst);
+                    priority_queue.ChangeCore(src_core, waiter);
+                    IncrementScheduledCount(waiter);
+                    top_threads[static_cast<size_t>(best_dst)] = waiter;
+                }
+            }
+            waiter = next_waiter;
+        }
+    }
+
+    // Summarize non-running runnable waiters per core so uncontended yields and pre-wait spins
+    // check one L1D-local word on their own KScheduler instead of scanning queues across cores.
+    std::array<u8, Core::Hardware::NUM_CPU_CORES> local_waiter_prio{};
+    std::array<u8, Core::Hardware::NUM_CPU_CORES> migratable_prio{};
+    local_waiter_prio.fill(static_cast<u8>(kNoWaiterPriority));
+    migratable_prio.fill(static_cast<u8>(kNoWaiterPriority));
+    u32 starved_mask = 0;
+
+    for (s32 src_core = 0; src_core < static_cast<s32>(Core::Hardware::NUM_CPU_CORES); ++src_core) {
+        const u32 sched_count = priority_queue.GetScheduledCount(src_core);
+        if (sched_count == 0) {
+            continue;
+        }
+        KThread* const src_top = top_threads[static_cast<size_t>(src_core)];
+        if (sched_count == 1 && src_top == priority_queue.GetScheduledFront(src_core)) {
+            continue;
+        }
+        const bool src_allows_migration =
+            src_top == nullptr || src_top->GetPriority() >= HighestCoreMigrationAllowedPriority;
+        for (KThread* w = priority_queue.GetScheduledFront(src_core); w != nullptr;
+             w = priority_queue.GetScheduledNext(src_core, w)) {
+            if (w == src_top) {
+                continue;
+            }
+            const u8 prio =
+                static_cast<u8>(std::clamp<s32>(w->GetPriority(), 0, kNoWaiterPriority));
+            if (prio < local_waiter_prio[static_cast<size_t>(src_core)]) {
+                local_waiter_prio[static_cast<size_t>(src_core)] = prio;
+            }
+            const bool unleased = w->m_nx2_yield_handoff_until_ns == 0;
+            if (unleased) {
+                starved_mask |= (1U << src_core);
+            }
+            u64 dst_mask = w->GetAffinityMask().GetAffinityMask() & ~(1ULL << src_core);
+            if (dst_mask != 0) {
+                if (unleased && src_allows_migration) {
+                    starved_mask |= static_cast<u32>(dst_mask);
+                }
+                while (dst_mask != 0) {
+                    const size_t dst = static_cast<size_t>(std::countr_zero(dst_mask));
+                    dst_mask &= dst_mask - 1;
+                    if (prio < migratable_prio[dst]) {
+                        migratable_prio[dst] = prio;
+                    }
+                }
+            }
+        }
+    }
+
+    if (priority_queue.GetDetachedCount() > 0) {
+        for (s32 c = 0; c < static_cast<s32>(Core::Hardware::NUM_CPU_CORES); ++c) {
+            if (priority_queue.GetSuggestedCount(c) == 0) {
+                continue;
+            }
+            for (KThread* s = priority_queue.GetSuggestedFront(c); s != nullptr;
+                 s = priority_queue.GetSuggestedNext(c, s)) {
+                if (s->GetActiveCore() < 0) {
+                    const u8 prio =
+                        static_cast<u8>(std::clamp<s32>(s->GetPriority(), 0, kNoWaiterPriority));
+                    if (prio < migratable_prio[static_cast<size_t>(c)]) {
+                        migratable_prio[static_cast<size_t>(c)] = prio;
+                    }
+                    if (s->m_nx2_yield_handoff_until_ns == 0) {
+                        starved_mask |= (1U << c);
+                    }
+                }
+            }
+        }
+    }
+
+    for (size_t core_id = 0; core_id < Core::Hardware::NUM_CPU_CORES; ++core_id) {
+        auto& sched = kernel.Scheduler(core_id);
+        const u64 exp = core_expiries[core_id];
+        if (sched.m_handoff_expiry_ns.load(std::memory_order_relaxed) != exp) {
+            sched.m_handoff_expiry_ns.store(exp, std::memory_order_relaxed);
+        }
+        const u32 new_yield_state =
+            static_cast<u32>(local_waiter_prio[core_id]) |
+            (static_cast<u32>(migratable_prio[core_id]) << 8) |
+            (exp != 0 ? kYieldStateActiveHandoff : 0U) |
+            (((starved_mask >> core_id) & 1U) != 0 ? kYieldStateStarvedCandidate : 0U);
+        if (sched.m_yield_state.load(std::memory_order_relaxed) != new_yield_state) {
+            sched.m_yield_state.store(new_yield_state, std::memory_order_relaxed);
+        }
+        cores_needing_scheduling |= sched.UpdateHighestPriorityThread(kernel, top_threads[core_id]);
+    }
+
+    auto& active_handoff = kernel.GlobalSchedulerContext().m_active_handoff_mask;
+    if (active_handoff.load(std::memory_order_relaxed) != new_handoff_mask) {
+        active_handoff.store(new_handoff_mask, std::memory_order_relaxed);
     }
 
     // HACK: any waiting dummy threads can wake up now.
@@ -412,7 +778,7 @@ void KScheduler::ScheduleImpl(KernelCore& kernel) {
 
     // Load the appropriate thread pointers for scheduling.
     KThread* const cur_thread{GetCurrentThreadPointer(kernel)};
-    KThread* highest_priority_thread{m_state.highest_priority_thread};
+    KThread* highest_priority_thread{GetHighestPriorityThread()};
 
     // Check whether there are runnable interrupt tasks.
     if (m_state.interrupt_task_runnable) {
@@ -510,7 +876,7 @@ void KScheduler::ScheduleImplFiber(KernelCore& kernel) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
 
         // Refresh the highest priority thread.
-        highest_priority_thread = m_state.highest_priority_thread;
+        highest_priority_thread = GetHighestPriorityThread();
     }
 
     // Reload the guest thread context.
@@ -592,6 +958,9 @@ void KScheduler::OnThreadStateChanged(KernelCore& kernel, KThread* thread, Threa
         // Update the priority queues.
         if (old_state == ThreadState::Runnable) {
             // If we were previously runnable, then we're not runnable now, and we should remove.
+            thread->m_nx2_futile_yield_streak = 0;
+            thread->m_nx2_yield_spin_streak = 0;
+            thread->m_nx2_yield_handoff_until_ns = 0;
             GetPriorityQueue(kernel).Remove(thread);
             IncrementScheduledCount(thread);
             SetSchedulerUpdateNeeded(kernel);
@@ -651,6 +1020,7 @@ void KScheduler::RotateScheduledQueue(KernelCore& kernel, s32 core_id, s32 prior
 
     // Get a reference to the priority queue.
     auto& priority_queue = GetPriorityQueue(kernel);
+    bool queue_changed = false;
 
     // Rotate the front of the queue to the end.
     KThread* top_thread = priority_queue.GetScheduledFront(core_id, priority);
@@ -660,6 +1030,7 @@ void KScheduler::RotateScheduledQueue(KernelCore& kernel, s32 core_id, s32 prior
         if (next_thread != top_thread) {
             IncrementScheduledCount(top_thread);
             IncrementScheduledCount(next_thread);
+            queue_changed = true;
         }
     }
 
@@ -669,10 +1040,13 @@ void KScheduler::RotateScheduledQueue(KernelCore& kernel, s32 core_id, s32 prior
         while (suggested != nullptr) {
             // Check if the suggested thread is the top thread on its core.
             const s32 suggested_core = suggested->GetActiveCore();
-            if (KThread* top_on_suggested_core =
-                    (suggested_core >= 0) ? priority_queue.GetScheduledFront(suggested_core)
-                                          : nullptr;
-                top_on_suggested_core != suggested) {
+            KThread* const top_on_suggested_core =
+                (suggested_core >= 0) ? priority_queue.GetScheduledFront(suggested_core) : nullptr;
+            KThread* const running_on_suggested_core =
+                (suggested_core >= 0)
+                    ? kernel.Scheduler(static_cast<size_t>(suggested_core)).GetHighestPriorityThread()
+                    : nullptr;
+            if (top_on_suggested_core != suggested && running_on_suggested_core != suggested) {
                 // If the next thread is a new thread that has been waiting longer than our
                 // suggestion, we prefer it to our suggestion.
                 if (top_thread != next_thread && next_thread != nullptr &&
@@ -689,6 +1063,7 @@ void KScheduler::RotateScheduledQueue(KernelCore& kernel, s32 core_id, s32 prior
                     suggested->SetActiveCore(core_id);
                     priority_queue.ChangeCore(suggested_core, suggested, true);
                     IncrementScheduledCount(suggested);
+                    queue_changed = true;
                     break;
                 }
             }
@@ -699,7 +1074,7 @@ void KScheduler::RotateScheduledQueue(KernelCore& kernel, s32 core_id, s32 prior
     }
 
     // Now that we might have migrated a thread with the same priority, check if we can do better.
-    {
+    if (priority_queue.GetSuggestedCount(core_id) > 0) {
         KThread* best_thread = priority_queue.GetScheduledFront(core_id);
         if (best_thread == GetCurrentThreadPointer(kernel)) {
             best_thread = priority_queue.GetScheduledNext(core_id, best_thread);
@@ -717,10 +1092,14 @@ void KScheduler::RotateScheduledQueue(KernelCore& kernel, s32 core_id, s32 prior
 
                 // Check if the suggested thread is the top thread on its core.
                 const s32 suggested_core = suggested->GetActiveCore();
-                if (KThread* top_on_suggested_core =
-                        (suggested_core >= 0) ? priority_queue.GetScheduledFront(suggested_core)
-                                              : nullptr;
-                    top_on_suggested_core != suggested) {
+                KThread* const top_on_suggested_core =
+                    (suggested_core >= 0) ? priority_queue.GetScheduledFront(suggested_core)
+                                          : nullptr;
+                KThread* const running_on_suggested_core =
+                    (suggested_core >= 0)
+                        ? kernel.Scheduler(static_cast<size_t>(suggested_core)).GetHighestPriorityThread()
+                        : nullptr;
+                if (top_on_suggested_core != suggested && running_on_suggested_core != suggested) {
                     // If we're allowed to do a migration, do one.
                     // NOTE: Unlike migrations in UpdateHighestPriorityThread, this moves the
                     // suggestion to the front of the queue.
@@ -730,6 +1109,7 @@ void KScheduler::RotateScheduledQueue(KernelCore& kernel, s32 core_id, s32 prior
                         suggested->SetActiveCore(core_id);
                         priority_queue.ChangeCore(suggested_core, suggested, true);
                         IncrementScheduledCount(suggested);
+                        queue_changed = true;
                         break;
                     }
                 }
@@ -740,8 +1120,10 @@ void KScheduler::RotateScheduledQueue(KernelCore& kernel, s32 core_id, s32 prior
         }
     }
 
-    // After a rotation, we need a scheduler update.
-    SetSchedulerUpdateNeeded(kernel);
+    // After a rotation that changed a queue, we need a scheduler update.
+    if (queue_changed) {
+        SetSchedulerUpdateNeeded(kernel);
+    }
 }
 
 void KScheduler::YieldWithoutCoreMigration(KernelCore& kernel) {
@@ -766,8 +1148,10 @@ void KScheduler::YieldWithoutCoreMigration(KernelCore& kernel) {
     // cores cannot make another thread runnable here unless this core's scheduled queue changed.
     if (const s32 fast_core = cur_thread.GetActiveCore();
         fast_core >= 0 && cur_thread.GetRawState() == ThreadState::Runnable &&
-        cur_thread.GetYieldCoreId() == fast_core &&
-        cur_thread.GetYieldCoreSeq() == priority_queue.GetScheduledQueueVersion(fast_core)) {
+        (IsCoreYieldFutile(kernel, cur_process, cur_thread, fast_core,
+                           Svc::YieldType::WithoutCoreMigration) ||
+         (cur_thread.GetYieldCoreId() == fast_core &&
+          cur_thread.GetYieldCoreSeq() == priority_queue.GetScheduledQueueVersion(fast_core)))) {
         cur_thread.m_nx2_last_yield_futile = true;
         return;
     }
@@ -817,6 +1201,13 @@ void KScheduler::YieldWithCoreMigration(KernelCore& kernel) {
         cur_thread.m_nx2_last_yield_futile = true;
         return;
     }
+    if (const s32 fast_core = cur_thread.GetActiveCore();
+        fast_core >= 0 && cur_thread.GetRawState() == ThreadState::Runnable &&
+        IsCoreYieldFutile(kernel, cur_process, cur_thread, fast_core,
+                          Svc::YieldType::WithCoreMigration)) {
+        cur_thread.m_nx2_last_yield_futile = true;
+        return;
+    }
 
     // Get a reference to the priority queue.
     auto& priority_queue = GetPriorityQueue(kernel);
@@ -835,24 +1226,27 @@ void KScheduler::YieldWithCoreMigration(KernelCore& kernel) {
 
             // While we have a suggested thread, try to migrate it!
             bool recheck = false;
+            const s32 cur_prio = cur_thread.GetPriority();
             KThread* suggested = priority_queue.GetSuggestedFront(core_id);
             while (suggested != nullptr) {
+                if (suggested->GetPriority() > cur_prio) {
+                    suggested = nullptr;
+                    break;
+                }
+
                 // Check if the suggested thread is the thread running on its core.
                 const s32 suggested_core = suggested->GetActiveCore();
 
                 if (KThread* running_on_suggested_core =
                         (suggested_core >= 0)
-                            ? kernel.Scheduler(suggested_core).m_state.highest_priority_thread
+                            ? kernel.Scheduler(static_cast<size_t>(suggested_core)).GetHighestPriorityThread()
                             : nullptr;
                     running_on_suggested_core != suggested) {
-                    // If the current thread's priority is higher than our suggestion's we prefer
-                    // the next thread to the suggestion. We also prefer the next thread when the
-                    // current thread's priority is equal to the suggestions, but the next thread
-                    // has been waiting longer.
-                    if ((suggested->GetPriority() > cur_thread.GetPriority()) ||
-                        (suggested->GetPriority() == cur_thread.GetPriority() &&
-                         next_thread != std::addressof(cur_thread) &&
-                         next_thread->GetLastScheduledTick() < suggested->GetLastScheduledTick())) {
+                    // Prefer the next thread when the current thread's priority is equal to the
+                    // suggestion's, but the next thread has been waiting longer.
+                    if (suggested->GetPriority() == cur_prio &&
+                        next_thread != std::addressof(cur_thread) &&
+                        next_thread->GetLastScheduledTick() < suggested->GetLastScheduledTick()) {
                         suggested = nullptr;
                         break;
                     }
@@ -912,6 +1306,13 @@ void KScheduler::YieldToAnyThread(KernelCore& kernel) {
         cur_thread.m_nx2_last_yield_futile = true;
         return;
     }
+    if (const s32 fast_core = cur_thread.GetActiveCore();
+        fast_core >= 0 && cur_thread.GetRawState() == ThreadState::Runnable &&
+        IsCoreYieldFutile(kernel, cur_process, cur_thread, fast_core,
+                          Svc::YieldType::ToAnyThread)) {
+        cur_thread.m_nx2_last_yield_futile = true;
+        return;
+    }
 
     // Get a reference to the priority queue.
     auto& priority_queue = GetPriorityQueue(kernel);
@@ -938,7 +1339,11 @@ void KScheduler::YieldToAnyThread(KernelCore& kernel) {
                     const s32 probe_core = probe->GetActiveCore();
                     KThread* const top_on_probe =
                         (probe_core >= 0) ? priority_queue.GetScheduledFront(probe_core) : nullptr;
-                    if (top_on_probe != probe) {
+                    KThread* const running_on_probe =
+                        (probe_core >= 0)
+                            ? kernel.Scheduler(static_cast<size_t>(probe_core)).GetHighestPriorityThread()
+                            : nullptr;
+                    if (top_on_probe != probe && running_on_probe != probe) {
                         has_candidate = true;
                         break;
                     }
@@ -962,10 +1367,15 @@ void KScheduler::YieldToAnyThread(KernelCore& kernel) {
                 while (suggested != nullptr) {
                     // Check if the suggested thread is the top thread on its core.
                     const s32 suggested_core = suggested->GetActiveCore();
-                    if (KThread* top_on_suggested_core =
-                            (suggested_core >= 0) ? priority_queue.GetScheduledFront(suggested_core)
-                                                  : nullptr;
-                        top_on_suggested_core != suggested) {
+                    KThread* const top_on_suggested_core =
+                        (suggested_core >= 0) ? priority_queue.GetScheduledFront(suggested_core)
+                                              : nullptr;
+                    KThread* const running_on_suggested_core =
+                        (suggested_core >= 0)
+                            ? kernel.Scheduler(static_cast<size_t>(suggested_core)).GetHighestPriorityThread()
+                            : nullptr;
+                    if (top_on_suggested_core != suggested &&
+                        running_on_suggested_core != suggested) {
                         // If we're allowed to do a migration, do one.
                         if (top_on_suggested_core == nullptr ||
                             top_on_suggested_core->GetPriority() >=
@@ -1013,10 +1423,11 @@ void KScheduler::RescheduleOtherCores(KernelCore& kernel, u64 cores_needing_sche
 
 void KScheduler::RescheduleCores(KernelCore& kernel, u64 core_mask) {
     // Send IPI
-    for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
-        if (core_mask & (1ULL << i)) {
-            kernel.PhysicalCore(i).Interrupt();
-        }
+    core_mask &= (1ULL << Core::Hardware::NUM_CPU_CORES) - 1;
+    while (core_mask != 0) {
+        const size_t i = static_cast<size_t>(std::countr_zero(core_mask));
+        core_mask &= core_mask - 1;
+        kernel.PhysicalCore(i).Interrupt();
     }
 }
 

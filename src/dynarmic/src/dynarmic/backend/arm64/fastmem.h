@@ -47,15 +47,13 @@ public:
     explicit FastmemManager(ExceptionHandler& eh)
             : exception_handler(eh) {}
 
+    static void SetDefaultStoreFaultLimit(unsigned limit) noexcept;
+
     /// shared: markers any guest core sets apply to every core's translations (they all run the
     /// same code). block_after_faults != 0: once that many accesses of one block faulted, the
     /// whole block translates without fastmem, so it is translated again at most that many times.
     /// load_fault_limit > 1: a plain load gives up fastmem only on its load_fault_limit-th fault.
-    void Configure(bool shared, unsigned block_after_faults, unsigned load_fault_limit) {
-        shared_markers = shared;
-        faults_per_block_limit = block_after_faults;
-        load_faults_limit = load_fault_limit;
-    }
+    void Configure(bool shared, unsigned block_after_faults, unsigned load_fault_limit);
 
     bool SupportsFastmem() const {
         return exception_handler.SupportsFastmem();
@@ -65,6 +63,8 @@ public:
     void MarkDoNotFastmem(DoNotFastmemMarker marker, bool is_load = false);
     /// A fault of a plain load: whether it is the one that makes the load give up fastmem.
     bool LoadFaultRecompiles(DoNotFastmemMarker marker);
+    /// A fault of a store or atomic: whether it is the one that makes it give up fastmem.
+    bool StoreFaultRecompiles(DoNotFastmemMarker marker);
 
 private:
     ExceptionHandler& exception_handler;
@@ -76,7 +76,9 @@ private:
     bool shared_markers = false;
     unsigned faults_per_block_limit = 0;
     ::Common::unordered_map<DoNotFastmemMarker, unsigned, DoNotFastmemMarkerHash> load_faults;
+    ::Common::unordered_map<DoNotFastmemMarker, u64, DoNotFastmemMarkerHash> store_faults;
     unsigned load_faults_limit = 0;
+    unsigned store_faults_limit = 0;
 };
 
 }  // namespace Dynarmic::Backend::Arm64

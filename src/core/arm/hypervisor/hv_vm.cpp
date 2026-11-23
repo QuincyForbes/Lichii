@@ -33,13 +33,18 @@ constexpr u64 ShareInner = 3ULL << 8;
 constexpr u64 AccessFlag = 1ULL << 10;
 constexpr u64 PrivilegedExecuteNever = 1ULL << 53;
 constexpr u64 UserExecuteNever = 1ULL << 54;
+constexpr u64 SwGuestRead = 1ULL << 55;
+constexpr u64 SwGuestWrite = 1ULL << 56;
+constexpr u64 SwGuestAccessMask = SwGuestRead | SwGuestWrite;
 constexpr u64 AddressMask = 0x000000FFFFFFF000ULL;
-constexpr u64 PermissionMask = ApEl0ReadOnly | UserExecuteNever | DescValid;
+constexpr u64 AccessBitsMask = DescValid | ApEl0ReadOnly;
+constexpr u64 PermissionMask = ApEl0ReadOnly | UserExecuteNever | DescValid | SwGuestAccessMask;
 
 // Every exception vector traps to the host with "hvc #0". Hypervisor.framework services hvc calls
 // whose x0 looks like an SMCCC function ID itself (guest pointers such as 0x84xxxxxx do), so the
-// guest's x0 is parked in TPIDR_EL1 and cleared first. The flush stub at +0x800 invalidates the
-// TLB and instruction cache for the whole VM and returns with "hvc #1"; the host preserves x0.
+// guest's x0 is parked in TPIDR_EL1 and cleared first. The flush stubs at +0x800/+0x820/+0x840
+// invalidate VM TLB+ICache, VM TLB only, or a single 4K VA page (x0 = vaddr >> 12) and return
+// with "hvc #1"; the host preserves x0.
 constexpr std::array<u32, 3> VectorSlot{
     0xD518D080, // msr tpidr_el1, x0
     0xD2800000, // mov x0, #0
@@ -54,17 +59,73 @@ constexpr std::array<u32, 7> FlushStub{
     0xD4000022, // hvc #1
     0xD4000022,
 };
+constexpr std::array<u32, 6> FlushTlbStub{
+    0xD2800000, // mov x0, #0
+    0xD508831F, // tlbi vmalle1is
+    0xD5033B9F, // dsb ish
+    0xD5033FDF, // isb
+    0xD4000022, // hvc #1
+    0xD4000022,
+};
+constexpr std::array<u32, 6> FlushPageStub{
+    0xD5088360, // tlbi vaae1is, x0
+    0xD2800000, // mov x0, #0
+    0xD5033B9F, // dsb ish
+    0xD5033FDF, // isb
+    0xD4000022, // hvc #1
+    0xD4000022,
+};
+
+u64 GuestAccessBits(Common::MemoryPermission perms) noexcept {
+    if (True(perms & Common::MemoryPermission::Write)) {
+        return SwGuestRead | SwGuestWrite;
+    }
+    return True(perms & Common::MemoryPermission::Read) ? SwGuestRead : 0;
+}
+
+u64 DesiredAccessFromGuestBits(u64 guest_bits) noexcept {
+    if ((guest_bits & SwGuestWrite) != 0) {
+        return DescValid | ApEl0ReadWrite;
+    }
+    return (guest_bits & SwGuestRead) != 0 ? (DescValid | ApEl0ReadOnly) : 0;
+}
+
+u64 ClampToGuestAccess(u64 access_bits, u64 guest_bits) noexcept {
+    if ((guest_bits & SwGuestRead) == 0) {
+        return 0;
+    }
+    if (access_bits == (DescValid | ApEl0ReadWrite) && (guest_bits & SwGuestWrite) == 0) {
+        return DescValid | ApEl0ReadOnly;
+    }
+    return access_bits;
+}
 
 u64 PermissionBits(Common::MemoryPermission perms) {
     if (perms == Common::MemoryPermission{}) {
-        return 0;
+        return PrivilegedExecuteNever | UserExecuteNever;
     }
-    u64 bits = DescValid | PrivilegedExecuteNever;
-    bits |= True(perms & Common::MemoryPermission::Write) ? ApEl0ReadWrite : ApEl0ReadOnly;
+    const u64 guest_bits = GuestAccessBits(perms);
+    u64 bits = PrivilegedExecuteNever | guest_bits | DesiredAccessFromGuestBits(guest_bits);
     if (False(perms & Common::MemoryPermission::Execute)) {
         bits |= UserExecuteNever;
     }
     return bits;
+}
+
+bool IsAccessTightened(u64 old_pte, u64 new_pte) noexcept {
+    return ((old_pte & DescValid) != 0 && (new_pte & DescValid) == 0) ||
+           ((old_pte & AccessBitsMask) == (DescValid | ApEl0ReadWrite) &&
+            (new_pte & AccessBitsMask) == (DescValid | ApEl0ReadOnly));
+}
+
+u64 EffectiveStepAccess(u64 desired_access, u32 read_refs, u32 write_refs) noexcept {
+    if (read_refs == 0 && write_refs == 0) {
+        return desired_access;
+    }
+    if (write_refs > 0 || desired_access == (DescValid | ApEl0ReadWrite)) {
+        return DescValid | ApEl0ReadWrite;
+    }
+    return DescValid | ApEl0ReadOnly;
 }
 
 std::unique_ptr<HvVm> g_vm;
@@ -72,12 +133,24 @@ HvVm* g_active_vm{};
 
 } // Anonymous namespace
 
+HvVm::~HvVm() {
+    if (!m_vm_created && m_tables != nullptr && m_tables != MAP_FAILED) {
+        munmap(m_tables, m_tables_size);
+        m_tables = nullptr;
+    }
+}
+
 HvVm* HvVm::Get() {
     return g_active_vm;
 }
 
 void HvVm::Deactivate() {
     g_active_vm = nullptr;
+}
+
+std::unique_ptr<HvVm> HvVm::CreateForTest(u8* dram_base, u64 dram_size) {
+    std::unique_ptr<HvVm> vm{new HvVm()};
+    return vm->InitializeForTest(dram_base, dram_size) ? std::move(vm) : nullptr;
 }
 
 HvVm* HvVm::Create(System& system) {
@@ -120,17 +193,36 @@ bool HvVm::Initialize(System& system) {
         return false;
     }
 
+    m_tables_size = TableRegionSize;
     m_tables = static_cast<u8*>(
-        mmap(nullptr, TableRegionSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        mmap(nullptr, m_tables_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     if (m_tables == MAP_FAILED ||
-        hv_vm_map(m_tables, TableBaseIpa, TableRegionSize,
+        hv_vm_map(m_tables, TableBaseIpa, m_tables_size,
                   HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC) != HV_SUCCESS) {
         LOG_ERROR(Core_ARM, "Hypervisor: failed to map the page table region");
         return false;
     }
 
+    m_vm_created = true;
+    m_step_grants.reserve(64);
     Reset();
     LOG_INFO(Core_ARM, "Hypervisor: VM created, {:#x} bytes of DRAM mapped", m_dram_size);
+    return true;
+}
+
+bool HvVm::InitializeForTest(u8* dram_base, u64 dram_size) {
+    m_dram_base = dram_base;
+    m_dram_size = dram_size;
+    m_tables_size = TestTableRegionSize;
+    m_tables = static_cast<u8*>(
+        mmap(nullptr, m_tables_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (m_tables == MAP_FAILED) {
+        m_tables = nullptr;
+        return false;
+    }
+    m_vm_created = false;
+    m_step_grants.reserve(64);
+    Reset();
     return true;
 }
 
@@ -161,18 +253,22 @@ bool HvVm::MapDram(System& system) {
 void HvVm::Reset() {
     std::scoped_lock lk{m_table_mutex};
 
-    madvise(m_tables, TableRegionSize, MADV_FREE);
+    m_step_grants.clear();
+    madvise(m_tables, m_tables_size, MADV_FREE);
     std::memset(m_tables, 0, RootTableOffset + 0x1000);
     for (size_t i = 0; i < 16; i++) {
         std::memcpy(m_tables + i * 0x80, VectorSlot.data(), sizeof(VectorSlot));
     }
     std::memcpy(m_tables + 0x800, FlushStub.data(), sizeof(FlushStub));
+    std::memcpy(m_tables + 0x820, FlushTlbStub.data(), sizeof(FlushTlbStub));
+    std::memcpy(m_tables + 0x840, FlushPageStub.data(), sizeof(FlushPageStub));
     m_next_table_offset = RootTableOffset + 0x1000;
 
     u64* entry = EntryFor(VectorsVa, true);
     *entry = TableBaseIpa | DescValid | DescTableOrPage | AttrIndexNormal | ShareInner |
              AccessFlag | ApEl1ReadOnly | UserExecuteNever;
 
+    m_icache_generation.fetch_add(1, std::memory_order_release);
     m_flush_generation.fetch_add(1, std::memory_order_release);
 }
 
@@ -181,6 +277,9 @@ u64* HvVm::TableAt(u64 table_ipa) {
 }
 
 u64* HvVm::EntryFor(u64 vaddr, bool allocate) {
+    if ((vaddr >> VaBits) != 0) {
+        return nullptr;
+    }
     u64* table = TableAt(RootTableIpa());
     for (const u32 shift : {30U, 21U}) {
         u64& descriptor = table[(vaddr >> shift) & 511];
@@ -188,7 +287,7 @@ u64* HvVm::EntryFor(u64 vaddr, bool allocate) {
             if (!allocate) {
                 return nullptr;
             }
-            if (m_next_table_offset + 0x1000 > TableRegionSize) {
+            if (m_next_table_offset + 0x1000 > m_tables_size) {
                 LOG_CRITICAL(Core_ARM, "Hypervisor: out of page table memory");
                 return nullptr;
             }
@@ -209,22 +308,39 @@ void HvVm::SetPage(u64 vaddr, u64 entry) {
     }
 }
 
+HvVm::StepGrant* HvVm::FindStepGrant(u64 page) noexcept {
+    for (auto& grant : m_step_grants) {
+        if ((grant.read_refs != 0 || grant.write_refs != 0) && grant.page == page) {
+            return &grant;
+        }
+    }
+    return nullptr;
+}
+
 void HvVm::Map(u64 vaddr, u64 phys_offset, u64 size, Common::MemoryPermission perms) {
     const u64 perm_bits = PermissionBits(perms);
     bool replaced = false;
     {
         std::scoped_lock lk{m_table_mutex};
         for (u64 offset = 0; offset < size; offset += 0x1000) {
-            if (const u64* pte = EntryFor(vaddr + offset, false); pte && (*pte & DescValid)) {
+            const u64 cur = vaddr + offset;
+            u64 effective_perm_bits = perm_bits;
+            if (StepGrant* grant = FindStepGrant(cur)) {
+                grant->desired_access = perm_bits & AccessBitsMask;
+                const u64 step_access = ClampToGuestAccess(
+                    EffectiveStepAccess(grant->desired_access, grant->read_refs, grant->write_refs),
+                    perm_bits & SwGuestAccessMask);
+                effective_perm_bits = (perm_bits & ~AccessBitsMask) | step_access;
+            }
+            if (const u64* pte = EntryFor(cur, false); pte && (*pte & DescValid)) {
                 replaced = true;
             }
-            SetPage(vaddr + offset, ((phys_offset + offset) & AddressMask) | perm_bits |
-                                        DescTableOrPage | AttrIndexNormal | ShareInner |
-                                        AccessFlag);
+            SetPage(cur, ((phys_offset + offset) & AddressMask) | effective_perm_bits |
+                             DescTableOrPage | AttrIndexNormal | ShareInner | AccessFlag);
         }
     }
     if (replaced) {
-        RequestFlush();
+        RequestFlush(true);
     }
 }
 
@@ -232,77 +348,180 @@ void HvVm::Unmap(u64 vaddr, u64 size) {
     {
         std::scoped_lock lk{m_table_mutex};
         for (u64 offset = 0; offset < size; offset += 0x1000) {
-            if (u64* pte = EntryFor(vaddr + offset, false)) {
+            const u64 cur = vaddr + offset;
+            if (StepGrant* grant = FindStepGrant(cur)) {
+                *grant = {};
+            }
+            if (u64* pte = EntryFor(cur, false)) {
                 std::atomic_ref<u64>{*pte}.store(0, std::memory_order_release);
             }
         }
     }
-    RequestFlush();
+    RequestFlush(true);
 }
 
 void HvVm::Protect(u64 vaddr, u64 size, Common::MemoryPermission perms) {
     const u64 perm_bits = PermissionBits(perms);
+    const u64 guest_bits = perm_bits & SwGuestAccessMask;
     bool changed = false;
     {
         std::scoped_lock lk{m_table_mutex};
         for (u64 offset = 0; offset < size; offset += 0x1000) {
-            u64* pte = EntryFor(vaddr + offset, false);
-            if (pte == nullptr || (*pte & AddressMask) == 0) {
+            const u64 cur = vaddr + offset;
+            u64* pte = EntryFor(cur, false);
+            if (pte == nullptr || (*pte & AccessFlag) == 0) {
                 continue;
             }
-            const u64 entry = (*pte & ~PermissionMask) | perm_bits;
-            if (entry != *pte) {
+            u64 effective_perm_bits = perm_bits;
+            if (StepGrant* grant = FindStepGrant(cur)) {
+                grant->desired_access = perm_bits & AccessBitsMask;
+                const u64 step_access = ClampToGuestAccess(
+                    EffectiveStepAccess(grant->desired_access, grant->read_refs, grant->write_refs),
+                    guest_bits);
+                effective_perm_bits = (perm_bits & ~AccessBitsMask) | step_access;
+            }
+            const u64 old = *pte;
+            const u64 entry = (old & ~PermissionMask) | effective_perm_bits;
+            if (entry != old) {
                 std::atomic_ref<u64>{*pte}.store(entry, std::memory_order_release);
                 changed = true;
             }
         }
     }
     if (changed) {
-        RequestFlush();
+        RequestFlush(true);
     }
 }
 
 void HvVm::ProtectAccess(u64 vaddr, u64 size, Common::MemoryPermission perms) {
-    u64 access_bits = 0;
+    u64 requested_access = 0;
     if (True(perms & Common::MemoryPermission::Write)) {
-        access_bits = DescValid | ApEl0ReadWrite;
+        requested_access = DescValid | ApEl0ReadWrite;
     } else if (True(perms & Common::MemoryPermission::Read)) {
-        access_bits = DescValid | ApEl0ReadOnly;
+        requested_access = DescValid | ApEl0ReadOnly;
     }
     bool tightened = false;
     {
         std::scoped_lock lk{m_table_mutex};
         for (u64 offset = 0; offset < size; offset += 0x1000) {
-            u64* pte = EntryFor(vaddr + offset, false);
-            if (pte == nullptr || (*pte & AddressMask) == 0) {
+            const u64 cur = vaddr + offset;
+            u64* pte = EntryFor(cur, false);
+            if (pte == nullptr || (*pte & AccessFlag) == 0) {
                 continue;
             }
             const u64 old = *pte;
-            const u64 entry = (old & ~(DescValid | ApEl0ReadOnly)) | access_bits;
+            const u64 guest_bits = old & SwGuestAccessMask;
+            const u64 clamped_access = ClampToGuestAccess(requested_access, guest_bits);
+            u64 target_access = clamped_access;
+            if (StepGrant* grant = FindStepGrant(cur)) {
+                grant->desired_access = clamped_access;
+                target_access = ClampToGuestAccess(
+                    EffectiveStepAccess(clamped_access, grant->read_refs, grant->write_refs),
+                    guest_bits);
+            }
+            const u64 entry = (old & ~AccessBitsMask) | target_access;
             if (entry != old) {
                 std::atomic_ref<u64>{*pte}.store(entry, std::memory_order_release);
-                // Only flush remote vCPU TLBs when removing permissions; relaxing permissions
-                // resolves lazily on fault if a vCPU still holds a stale restrictive TLB entry!
-                if (((old & DescValid) != 0 && (entry & DescValid) == 0) ||
-                    ((old & ApEl0ReadOnly) == ApEl0ReadWrite &&
-                     (entry & ApEl0ReadOnly) == ApEl0ReadOnly)) {
+                if (IsAccessTightened(old, entry)) {
                     tightened = true;
                 }
             }
         }
     }
     if (tightened) {
-        RequestFlush();
+        RequestFlush(false);
     }
 }
 
-bool HvVm::MapFromPageTable(const Common::PageTable& page_table, u64 vaddr) {
+bool HvVm::BeginStepAccess(u64 page, bool write) {
+    page &= ~u64{0xFFF};
+    std::scoped_lock lk{m_table_mutex};
+    u64* pte = EntryFor(page, false);
+    if (pte == nullptr || (*pte & AccessFlag) == 0) {
+        return false;
+    }
+    const u64 guest_bits = *pte & SwGuestAccessMask;
+    if ((guest_bits & (write ? SwGuestWrite : SwGuestRead)) == 0) {
+        return false;
+    }
+    StepGrant* grant = FindStepGrant(page);
+    if (grant == nullptr) {
+        for (auto& candidate : m_step_grants) {
+            if (candidate.read_refs == 0 && candidate.write_refs == 0) {
+                grant = &candidate;
+                break;
+            }
+        }
+        if (grant == nullptr) {
+            m_step_grants.push_back(StepGrant{});
+            grant = &m_step_grants.back();
+        }
+        grant->page = page;
+        grant->desired_access = *pte & AccessBitsMask;
+    }
+    if (write) {
+        ++grant->write_refs;
+    } else {
+        ++grant->read_refs;
+    }
+    const u64 step_access = ClampToGuestAccess(
+        EffectiveStepAccess(grant->desired_access, grant->read_refs, grant->write_refs),
+        guest_bits);
+    const u64 entry = (*pte & ~AccessBitsMask) | step_access;
+    if (entry != *pte) {
+        std::atomic_ref<u64>{*pte}.store(entry, std::memory_order_release);
+    }
+    return true;
+}
+
+void HvVm::EndStepAccess(u64 page, bool write) {
+    page &= ~u64{0xFFF};
+    bool tightened = false;
+    {
+        std::scoped_lock lk{m_table_mutex};
+        StepGrant* grant = FindStepGrant(page);
+        if (grant == nullptr) {
+            return;
+        }
+        if (write) {
+            if (grant->write_refs > 0) {
+                --grant->write_refs;
+            }
+        } else {
+            if (grant->read_refs > 0) {
+                --grant->read_refs;
+            }
+        }
+        u64* pte = EntryFor(page, false);
+        if (pte != nullptr && (*pte & AccessFlag) != 0) {
+            const u64 old = *pte;
+            const u64 guest_bits = old & SwGuestAccessMask;
+            const u64 step_access = ClampToGuestAccess(
+                EffectiveStepAccess(grant->desired_access, grant->read_refs, grant->write_refs),
+                guest_bits);
+            const u64 entry = (old & ~AccessBitsMask) | step_access;
+            if (entry != old) {
+                std::atomic_ref<u64>{*pte}.store(entry, std::memory_order_release);
+                tightened = IsAccessTightened(old, entry);
+            }
+        }
+        if (grant->read_refs == 0 && grant->write_refs == 0) {
+            *grant = {};
+        }
+    }
+    if (tightened) {
+        RequestFlush(false);
+    }
+}
+
+bool HvVm::MapFromPageTable(const Common::PageTable& page_table, u64 vaddr, bool read_trap_armed) {
     vaddr &= ~u64{0xFFF};
-    if ((vaddr >> page_table.GetAddressSpaceBits()) != 0) {
+    if ((vaddr >> page_table.GetAddressSpaceBits()) != 0 || (vaddr >> VaBits) != 0) {
         return false;
     }
     const auto [pointer, type, block] = page_table.entries[vaddr >> 12].PointerTypeBlock(true);
-    if (type == Common::PageType::Unmapped || pointer == 0) {
+    if (type == Common::PageType::Unmapped || type == Common::PageType::DebugMemory ||
+        pointer == 0) {
         return false;
     }
     const u8* host = reinterpret_cast<const u8*>(pointer + vaddr);
@@ -312,18 +531,15 @@ bool HvVm::MapFromPageTable(const Common::PageTable& page_table, u64 vaddr) {
 
     const bool cached = type == Common::PageType::RasterizerCachedMemory;
     std::scoped_lock lk{m_table_mutex};
-    if (const u64* pte = EntryFor(vaddr, false); pte != nullptr) {
-        if ((*pte & DescValid) != 0 || (cached && (*pte & AddressMask) != 0)) {
-            return false;
-        }
+    if (const u64* pte = EntryFor(vaddr, false); pte != nullptr && (*pte & AccessFlag) != 0) {
+        return false;
     }
     u64 perm_bits =
         PermissionBits(Common::MemoryPermission::ReadWrite | Common::MemoryPermission::Execute);
     if (cached) {
-        perm_bits =
-            PermissionBits(Common::MemoryPermission::Read | Common::MemoryPermission::Execute);
-        if (Settings::values.use_reactive_flushing.GetValue()) {
-            perm_bits &= ~DescValid;
+        perm_bits = (perm_bits & ~AccessBitsMask) | (DescValid | ApEl0ReadOnly);
+        if (Settings::values.use_reactive_flushing.GetValue() || read_trap_armed) {
+            perm_bits &= ~AccessBitsMask;
         }
     }
     SetPage(vaddr, (static_cast<u64>(host - m_dram_base) & AddressMask) | perm_bits |
@@ -331,7 +547,53 @@ bool HvVm::MapFromPageTable(const Common::PageTable& page_table, u64 vaddr) {
     return (perm_bits & DescValid) != 0;
 }
 
+bool HvVm::RestoreGuestAccess(const Common::PageTable& page_table, u64 vaddr) {
+    vaddr &= ~u64{0xFFF};
+    if ((vaddr >> page_table.GetAddressSpaceBits()) != 0 || (vaddr >> VaBits) != 0 ||
+        page_table.entries[vaddr >> 12].Type() != Common::PageType::Memory) {
+        return false;
+    }
+    std::scoped_lock lk{m_table_mutex};
+    u64* pte = EntryFor(vaddr, false);
+    if (pte == nullptr || (*pte & AccessFlag) == 0) {
+        return false;
+    }
+    const u64 old = *pte;
+    const u64 guest_bits = old & SwGuestAccessMask;
+    const u64 desired = DesiredAccessFromGuestBits(guest_bits);
+    if (desired == 0) {
+        return false;
+    }
+    u64 target = desired;
+    if (StepGrant* grant = FindStepGrant(vaddr)) {
+        grant->desired_access = desired;
+        target = ClampToGuestAccess(
+            EffectiveStepAccess(desired, grant->read_refs, grant->write_refs), guest_bits);
+    }
+    const u64 entry = (old & ~AccessBitsMask) | target;
+    if (entry != old) {
+        std::atomic_ref<u64>{*pte}.store(entry, std::memory_order_release);
+    }
+    return true;
+}
+
 bool HvVm::Permits(u64 vaddr, bool write) {
+    vaddr &= ~u64{0xFFF};
+    std::scoped_lock lk{m_table_mutex};
+    const u64* pte = EntryFor(vaddr, false);
+    if (pte == nullptr || (*pte & AccessFlag) == 0) {
+        return false;
+    }
+    const StepGrant* grant = FindStepGrant(vaddr);
+    const u64 access = grant != nullptr ? grant->desired_access : (*pte & AccessBitsMask);
+    if ((access & DescValid) == 0) {
+        return false;
+    }
+    return !write || (access & ApEl0ReadOnly) == ApEl0ReadWrite;
+}
+
+bool HvVm::EffectivePermits(u64 vaddr, bool write) {
+    vaddr &= ~u64{0xFFF};
     std::scoped_lock lk{m_table_mutex};
     const u64* pte = EntryFor(vaddr, false);
     if (pte == nullptr || (*pte & DescValid) == 0) {
@@ -340,8 +602,34 @@ bool HvVm::Permits(u64 vaddr, bool write) {
     return !write || (*pte & ApEl0ReadOnly) == ApEl0ReadWrite;
 }
 
-void HvVm::RequestFlush() {
+bool HvVm::GuestPermits(u64 vaddr, bool write) {
+    vaddr &= ~u64{0xFFF};
+    std::scoped_lock lk{m_table_mutex};
+    const u64* pte = EntryFor(vaddr, false);
+    if (pte == nullptr || (*pte & AccessFlag) == 0) {
+        return false;
+    }
+    return (*pte & (write ? SwGuestWrite : SwGuestRead)) != 0;
+}
+
+u32 HvVm::ActiveStepCount(u64 page, bool write) {
+    page &= ~u64{0xFFF};
+    std::scoped_lock lk{m_table_mutex};
+    const StepGrant* grant = FindStepGrant(page);
+    if (grant == nullptr) {
+        return 0;
+    }
+    return write ? grant->write_refs : (grant->read_refs + grant->write_refs);
+}
+
+void HvVm::RequestFlush(bool icache) {
+    if (icache) {
+        m_icache_generation.fetch_add(1, std::memory_order_acq_rel);
+    }
     m_flush_generation.fetch_add(1, std::memory_order_acq_rel);
+    if (!m_vm_created) {
+        return;
+    }
     std::scoped_lock lk{m_running_mutex};
     for (size_t i = 0; i < m_vcpus.size(); i++) {
         if (m_running[i]) {

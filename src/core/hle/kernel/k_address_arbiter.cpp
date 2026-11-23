@@ -8,6 +8,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -19,6 +20,7 @@
 #include "common/spin_deadline.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_address_arbiter.h"
+#include "core/hle/kernel/k_memory_layout.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h"
@@ -32,22 +34,112 @@
 
 namespace Kernel {
 
-KAddressArbiter::KAddressArbiter(Core::System& system_)
-    : system{system_}
-{}
-KAddressArbiter::~KAddressArbiter() = default;
-
 namespace {
 
-bool ReadFromUser(KernelCore& kernel, s32* out, KProcessAddress address) {
-    *out = GetCurrentMemory(kernel).Read32(GetInteger(address));
+#if defined(_MSC_VER)
+#define NX2_ARB_NOINLINE __declspec(noinline)
+#else
+#define NX2_ARB_NOINLINE __attribute__((noinline))
+#endif
+
+constexpr size_t ArbiterStripeBits = 12;
+constexpr size_t NumArbiterWaiterStripes = size_t{1} << ArbiterStripeBits;
+static_assert(NumArbiterWaiterStripes == 4096);
+
+alignas(128) std::array<std::atomic<u32>, NumArbiterWaiterStripes> g_arb_waiter_stripes_a{};
+alignas(128) std::array<std::atomic<u32>, NumArbiterWaiterStripes> g_arb_waiter_stripes_b{};
+
+inline size_t ArbiterStripeIndexA(const KAddressArbiter* arb, uint64_t addr) noexcept {
+    uint64_t h = (addr >> 2) ^ (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(arb)) >> 4);
+    h ^= (h >> 23) ^ (h >> 41);
+    return static_cast<size_t>((h * uint64_t{0x9E3779B97F4A7C15ULL}) >> (64 - ArbiterStripeBits));
+}
+
+inline size_t ArbiterStripeIndexB(const KAddressArbiter* arb, uint64_t addr) noexcept {
+    uint64_t h = (addr >> 2) ^ (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(arb)) >> 9);
+    h ^= (h >> 17) ^ (h >> 35);
+    return static_cast<size_t>((h * uint64_t{0xBF58476D1CE4E5B9ULL}) >> (64 - ArbiterStripeBits));
+}
+
+inline bool MayHaveArbiterWaiters(const KAddressArbiter* arb, uint64_t addr) noexcept {
+    if (g_arb_waiter_stripes_a[ArbiterStripeIndexA(arb, addr)].load(std::memory_order_relaxed) ==
+        0) {
+        return false;
+    }
+    return g_arb_waiter_stripes_b[ArbiterStripeIndexB(arb, addr)].load(std::memory_order_relaxed) !=
+           0;
+}
+
+inline void NoteArbiterWaiterRemoved(const KAddressArbiter* arb, uint64_t addr) noexcept {
+    g_arb_waiter_stripes_a[ArbiterStripeIndexA(arb, addr)].fetch_sub(1, std::memory_order_relaxed);
+    g_arb_waiter_stripes_b[ArbiterStripeIndexB(arb, addr)].fetch_sub(1, std::memory_order_relaxed);
+}
+
+struct ScopedStripePreparing {
+    std::atomic<u32>& stripe_a;
+    std::atomic<u32>& stripe_b;
+    bool inserted = false;
+
+    ScopedStripePreparing(const KAddressArbiter* arb, uint64_t addr) noexcept
+        : stripe_a{g_arb_waiter_stripes_a[ArbiterStripeIndexA(arb, addr)]},
+          stripe_b{g_arb_waiter_stripes_b[ArbiterStripeIndexB(arb, addr)]} {
+        stripe_a.fetch_add(1, std::memory_order_relaxed);
+        stripe_b.fetch_add(1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+
+    ~ScopedStripePreparing() {
+        if (!inserted) {
+            stripe_a.fetch_sub(1, std::memory_order_relaxed);
+            stripe_b.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
+    YUZU_NON_COPYABLE(ScopedStripePreparing);
+    YUZU_NON_MOVEABLE(ScopedStripePreparing);
+};
+
+u8* TryGetPlainUserPointer(const KProcess& process, uint64_t addr, size_t size) noexcept {
+    if (IsKernelAddress(addr) || (addr & (size - 1)) != 0) {
+        return nullptr;
+    }
+    const auto& pt = process.GetPageTable().GetImpl();
+    const uint64_t masked = addr & uint64_t{0xffffffffffffULL};
+    if ((masked >> pt.GetAddressSpaceBits()) != 0) {
+        return nullptr;
+    }
+    const uintptr_t base = pt.entries[masked >> Core::Memory::YUZU_PAGEBITS].Pointer();
+    return base != 0 ? reinterpret_cast<u8*>(base + masked) : nullptr;
+}
+
+bool ReadFromUser(KProcess& process, u8* plain_ptr, s32* out, KProcessAddress address) {
+    if (plain_ptr != nullptr) {
+        *out =
+            std::atomic_ref<s32>{*reinterpret_cast<s32*>(plain_ptr)}.load(std::memory_order_acquire);
+        return true;
+    }
+    const u64 raw_addr = GetInteger(address);
+    if (u8* const ptr = TryGetPlainUserPointer(process, raw_addr, sizeof(s32)); ptr != nullptr) {
+        *out = std::atomic_ref<s32>{*reinterpret_cast<s32*>(ptr)}.load(std::memory_order_acquire);
+        return true;
+    }
+    *out = static_cast<s32>(process.GetMemory().Read32(raw_addr));
     return true;
 }
 
-bool ReadFromUser(KernelCore& kernel, s64* out, KProcessAddress address) {
-    auto& memory = GetCurrentMemory(kernel);
+bool ReadFromUser(KProcess& process, u8* plain_ptr, s64* out, KProcessAddress address) {
+    if (plain_ptr != nullptr) {
+        *out =
+            std::atomic_ref<s64>{*reinterpret_cast<s64*>(plain_ptr)}.load(std::memory_order_acquire);
+        return true;
+    }
     const u64 addr = GetInteger(address);
+    if (u8* const ptr = TryGetPlainUserPointer(process, addr, sizeof(s64)); ptr != nullptr) {
+        *out = std::atomic_ref<s64>{*reinterpret_cast<s64*>(ptr)}.load(std::memory_order_acquire);
+        return true;
+    }
 
+    auto& memory = process.GetMemory();
     // Reject ranges that wrap past the end of the address space; the range check accepts them.
     if (addr + sizeof(s64) < addr || !memory.IsValidVirtualAddressRange(addr, sizeof(s64))) {
         return false;
@@ -57,13 +149,29 @@ bool ReadFromUser(KernelCore& kernel, s64* out, KProcessAddress address) {
     return true;
 }
 
-bool DecrementIfLessThan(KernelCore& kernel, s32* out, KProcessAddress address, s32 value) {
-    auto& memory = GetCurrentMemory(kernel);
+bool DecrementIfLessThan(KProcess& process, u8* plain_ptr, s32* out, KProcessAddress address,
+                         s32 value) {
     const u64 raw_addr = GetInteger(address);
+    u8* const ptr =
+        plain_ptr != nullptr ? plain_ptr : TryGetPlainUserPointer(process, raw_addr, sizeof(s32));
+    if (ptr != nullptr) {
+        std::atomic_ref<s32> word{*reinterpret_cast<s32*>(ptr)};
+        s32 current_value = word.load(std::memory_order_acquire);
+        while (current_value < value) {
+            const s32 decrement_value = static_cast<s32>(static_cast<u32>(current_value) - 1U);
+            if (word.compare_exchange_weak(current_value, decrement_value,
+                                           std::memory_order_acq_rel, std::memory_order_acquire)) {
+                break;
+            }
+        }
+        *out = current_value;
+        return true;
+    }
 
+    auto& memory = process.GetMemory();
     s32 current_value = static_cast<s32>(memory.Read32(raw_addr));
     while (current_value < value) {
-        const s32 decrement_value = current_value - 1;
+        const s32 decrement_value = static_cast<s32>(static_cast<u32>(current_value) - 1U);
         if (memory.WriteExclusive32(raw_addr, static_cast<u32>(decrement_value),
                                     static_cast<u32>(current_value))) {
             break;
@@ -75,11 +183,25 @@ bool DecrementIfLessThan(KernelCore& kernel, s32* out, KProcessAddress address, 
     return true;
 }
 
-bool UpdateIfEqual(KernelCore& kernel, s32* out, KProcessAddress address, s32 value,
+bool UpdateIfEqual(KProcess& process, u8* plain_ptr, s32* out, KProcessAddress address, s32 value,
                    s32 new_value) {
-    auto& memory = GetCurrentMemory(kernel);
     const u64 raw_addr = GetInteger(address);
+    u8* const ptr =
+        plain_ptr != nullptr ? plain_ptr : TryGetPlainUserPointer(process, raw_addr, sizeof(s32));
+    if (ptr != nullptr) {
+        std::atomic_ref<s32> word{*reinterpret_cast<s32*>(ptr)};
+        s32 current_value = word.load(std::memory_order_acquire);
+        while (current_value == value) {
+            if (word.compare_exchange_weak(current_value, new_value, std::memory_order_acq_rel,
+                                           std::memory_order_acquire)) {
+                break;
+            }
+        }
+        *out = current_value;
+        return true;
+    }
 
+    auto& memory = process.GetMemory();
     s32 current_value = static_cast<s32>(memory.Read32(raw_addr));
     while (current_value == value) {
         if (memory.WriteExclusive32(raw_addr, static_cast<u32>(new_value),
@@ -103,25 +225,6 @@ void ArbSpinPause() {
 #endif
 }
 
-struct ScopedStripePreparing {
-    std::atomic<u32>& stripe;
-    bool inserted = false;
-
-    explicit ScopedStripePreparing(std::atomic<u32>& s) : stripe{s} {
-        stripe.fetch_add(1, std::memory_order_seq_cst);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-    }
-
-    ~ScopedStripePreparing() {
-        if (!inserted) {
-            stripe.fetch_sub(1, std::memory_order_relaxed);
-        }
-    }
-
-    YUZU_NON_COPYABLE(ScopedStripePreparing);
-    YUZU_NON_MOVEABLE(ScopedStripePreparing);
-};
-
 /// EDEN_NX2_ARB_SPIN: microseconds a thread about to wait on an address first watches the word
 /// (default 8; 0 turns it off).
 s64 ArbSpinMicroseconds() {
@@ -142,22 +245,23 @@ s64 ArbSpinMicroseconds() {
 /// exactly what the kernel returns to a thread that entered the SVC that much later. Threads whose
 /// spins rarely pay off stop spinning (m_nx2_arb_spin_credit).
 template <typename StillWaits>
-bool SpinBeforeWait(KernelCore& kernel, KThread* cur_thread, uint64_t addr, bool is_64_bit,
-                    StillWaits&& still_waits) {
+bool SpinBeforeWait(KernelCore& kernel, KThread* cur_thread, KProcess& process, uint64_t addr,
+                    u8* plain_ptr, bool is_64_bit, StillWaits&& still_waits) {
     const s64 spin_us = ArbSpinMicroseconds();
     if (spin_us == 0 || !kernel.IsMulticore() || (addr & (is_64_bit ? 7 : 3)) != 0) {
         return false;
     }
-    // Yield the core immediately when another runnable thread is already queued on it.
-    if (const s32 core_id = GetCurrentCoreId(kernel);
-        core_id >= 0 && KScheduler::GetCoreScheduledCount(kernel, core_id) > 1) {
+    const s32 current_core = cur_thread->GetCurrentCore();
+    // Yield the core immediately when another runnable thread needs it.
+    if (current_core >= 0 && KScheduler::HasStarvedRunnableForCore(kernel, current_core)) {
         return false;
     }
     u8& credit = cur_thread->m_nx2_arb_spin_credit;
     if (credit == 0 && (++cur_thread->m_nx2_arb_spin_probe & 15) != 0) {
         return false;
     }
-    u8* const pointer = GetCurrentMemory(kernel).GetPointerSilent(addr);
+    u8* const pointer =
+        plain_ptr != nullptr ? plain_ptr : process.GetMemory().GetPointerSilent(addr);
     if (pointer == nullptr) {
         return false;
     }
@@ -169,24 +273,23 @@ bool SpinBeforeWait(KernelCore& kernel, KThread* cur_thread, uint64_t addr, bool
         return std::atomic_ref<s32>{*reinterpret_cast<s32*>(pointer)}.load(
             std::memory_order_acquire);
     };
-    if (!still_waits(load_word())) {
-        credit = static_cast<u8>((std::min)(credit + 2, 16));
+    if (plain_ptr == nullptr && !still_waits(load_word())) {
+        credit = static_cast<u8>((std::min)(static_cast<u32>(credit) + 2U, 16U));
         return !cur_thread->IsTerminationRequested();
     }
     const PhysicalCore& core = kernel.CurrentPhysicalCore();
-    const s32 current_core = GetCurrentCoreId(kernel);
     const Common::SpinDeadline::Deadline deadline{std::chrono::microseconds{spin_us}};
     for (u32 spin = 1;; ++spin) {
         ArbSpinPause();
         if (!still_waits(load_word())) {
-            credit = static_cast<u8>((std::min)(credit + 2, 16));
+            credit = static_cast<u8>((std::min)(static_cast<u32>(credit) + 2U, 16U));
             // A terminating thread takes the normal path, which reports the termination first.
             return !cur_thread->IsTerminationRequested();
         }
-        if ((spin & 31) == 0) {
+        if ((spin & 31U) == 0) {
             // Something else must run on this core: stop watching.
             if (core.IsInterrupted() ||
-                (current_core >= 0 && KScheduler::GetCoreScheduledCount(kernel, current_core) > 1)) {
+                (current_core >= 0 && KScheduler::HasStarvedRunnableForCore(kernel, current_core))) {
                 return false;
             }
             if (deadline.Expired()) {
@@ -212,7 +315,7 @@ public:
             const uint64_t key = waiting_thread->GetAddressArbiterKey();
             m_tree->erase(m_tree->iterator_to(*waiting_thread));
             waiting_thread->ClearAddressArbiter();
-            m_arbiter->NoteWaiterRemoved(key);
+            NoteArbiterWaiterRemoved(m_arbiter, key);
         }
 
         // Invoke the base cancel wait handler.
@@ -224,21 +327,141 @@ private:
     KAddressArbiter::ThreadTree* m_tree{};
 };
 
+bool TryFastWaitWithPointer(KThread* cur_thread, u8* ptr, Svc::ArbitrationType type, s64 value,
+                            s64 timeout_ns, Result* out_result) noexcept {
+    if (ptr == nullptr || cur_thread->IsTerminationRequested()) {
+        return false;
+    }
+    switch (type) {
+    case Svc::ArbitrationType::WaitIfLessThan: {
+        const s32 cur =
+            std::atomic_ref<s32>{*reinterpret_cast<s32*>(ptr)}.load(std::memory_order_acquire);
+        if (cur >= static_cast<s32>(value)) {
+            cur_thread->m_nx2_arb_spin_credit =
+                static_cast<u8>((std::min)(static_cast<u32>(cur_thread->m_nx2_arb_spin_credit) + 2U, 16U));
+            *out_result = ResultInvalidState;
+            return true;
+        }
+        if (timeout_ns == 0) {
+            *out_result = ResultTimedOut;
+            return true;
+        }
+        return false;
+    }
+    case Svc::ArbitrationType::DecrementAndWaitIfLessThan: {
+        const s32 cur =
+            std::atomic_ref<s32>{*reinterpret_cast<s32*>(ptr)}.load(std::memory_order_acquire);
+        if (cur >= static_cast<s32>(value)) {
+            cur_thread->m_nx2_arb_spin_credit =
+                static_cast<u8>((std::min)(static_cast<u32>(cur_thread->m_nx2_arb_spin_credit) + 2U, 16U));
+            *out_result = ResultInvalidState;
+            return true;
+        }
+        return false;
+    }
+    case Svc::ArbitrationType::WaitIfEqual:
+    case Svc::ArbitrationType::WaitIfEqual64: {
+        const bool is_64 = type == Svc::ArbitrationType::WaitIfEqual64;
+        const s64 target = is_64 ? value : static_cast<s64>(static_cast<s32>(value));
+        const s64 cur = is_64
+                            ? std::atomic_ref<s64>{*reinterpret_cast<s64*>(ptr)}.load(
+                                  std::memory_order_acquire)
+                            : static_cast<s64>(std::atomic_ref<s32>{*reinterpret_cast<s32*>(ptr)}
+                                                   .load(std::memory_order_acquire));
+        if (cur != target) {
+            cur_thread->m_nx2_arb_spin_credit =
+                static_cast<u8>((std::min)(static_cast<u32>(cur_thread->m_nx2_arb_spin_credit) + 2U, 16U));
+            *out_result = ResultInvalidState;
+            return true;
+        }
+        if (timeout_ns == 0) {
+            *out_result = ResultTimedOut;
+            return true;
+        }
+        return false;
+    }
+    default:
+        return false;
+    }
+}
+
+NX2_ARB_NOINLINE bool TryFastConditionalSignalMismatch(Core::System& sys, uint64_t addr, s32 value,
+                                                       Result* out_result) {
+    if (const KThread* const cur_thread = GetCurrentThreadPointer(sys.Kernel());
+        cur_thread != nullptr) {
+        if (const KProcess* const process = cur_thread->GetOwnerProcess(); process != nullptr) {
+            if (u8* const ptr = TryGetPlainUserPointer(*process, addr, sizeof(s32));
+                ptr != nullptr &&
+                std::atomic_ref<s32>{*reinterpret_cast<s32*>(ptr)}.load(
+                    std::memory_order_acquire) != value) {
+                *out_result = ResultInvalidState;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 } // namespace
 
+KAddressArbiter::KAddressArbiter(Core::System& system_)
+    : system{system_}
+{}
+
+KAddressArbiter::~KAddressArbiter() {
+    for (const auto& thread : m_tree) {
+        NoteArbiterWaiterRemoved(this, thread.GetAddressArbiterKey());
+    }
+}
+
+bool KAddressArbiter::TryFastSignalToAddress(uint64_t addr, Svc::SignalType type, s32 value,
+                                             s32 /*count*/, Result* out_result) {
+    if (type == Svc::SignalType::Signal) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (!MayHaveArbiterWaiters(this, addr)) {
+            *out_result = ResultSuccess;
+            return true;
+        }
+        return false;
+    }
+    if (type == Svc::SignalType::SignalAndIncrementIfEqual ||
+        type == Svc::SignalType::SignalAndModifyByWaitingCountIfEqual) {
+        return TryFastConditionalSignalMismatch(system, addr, value, out_result);
+    }
+    return false;
+}
+
+bool KAddressArbiter::TryFastWaitForAddress(uint64_t addr, Svc::ArbitrationType type, s64 value,
+                                            s64 timeout_ns, Result* out_result) {
+    KThread* const cur_thread = GetCurrentThreadPointer(system.Kernel());
+    if (cur_thread == nullptr) {
+        return false;
+    }
+    const KProcess* const process = cur_thread->GetOwnerProcess();
+    if (process == nullptr) {
+        return false;
+    }
+    const size_t size = type == Svc::ArbitrationType::WaitIfEqual64 ? sizeof(s64) : sizeof(s32);
+    u8* const ptr = TryGetPlainUserPointer(*process, addr, size);
+    return TryFastWaitWithPointer(cur_thread, ptr, type, value, timeout_ns, out_result);
+}
+
 Result KAddressArbiter::Signal(uint64_t addr, s32 count) {
-    // Dekker-linearizable fast path: pairs with ScopedStripePreparing's seq_cst increment+fence
+    // Dekker-linearizable fast path: pairs with ScopedStripePreparing's increment + seq_cst fence
     // before ReadFromUser in WaitIfLessThan/WaitIfEqual.
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (WaiterStripe(addr).load(std::memory_order_seq_cst) == 0) {
+    if (!MayHaveArbiterWaiters(this, addr)) {
         R_SUCCEED();
     }
+    return SignalSlow(addr, count);
+}
 
-    // Perform signaling.
+NX2_ARB_NOINLINE Result KAddressArbiter::SignalSlow(uint64_t addr, s32 count) {
+    auto& kernel = system.Kernel();
     s32 num_waiters{};
     {
-        KScopedSchedulerLock sl(system.Kernel());
-        if (m_tree.empty()) {
+        KScopedSchedulerLock sl(kernel);
+        if (m_tree.empty() || !MayHaveArbiterWaiters(this, addr)) {
             R_SUCCEED();
         }
 
@@ -247,13 +470,13 @@ Result KAddressArbiter::Signal(uint64_t addr, s32 count) {
                (it->GetAddressArbiterKey() == addr)) {
             // End the thread's wait.
             KThread* target_thread = std::addressof(*it);
-            target_thread->EndWait(system.Kernel(), ResultSuccess);
+            target_thread->EndWait(kernel, ResultSuccess);
 
             ASSERT(target_thread->IsWaitingForAddressArbiter());
             target_thread->ClearAddressArbiter();
 
             it = m_tree.erase(it);
-            NoteWaiterRemoved(addr);
+            NoteArbiterWaiterRemoved(this, addr);
             ++num_waiters;
         }
     }
@@ -261,18 +484,29 @@ Result KAddressArbiter::Signal(uint64_t addr, s32 count) {
 }
 
 Result KAddressArbiter::SignalAndIncrementIfEqual(uint64_t addr, s32 value, s32 count) {
+    auto& kernel = system.Kernel();
+    KProcess& process = *GetCurrentThreadPointer(kernel)->GetOwnerProcess();
+    u8* const plain_ptr = TryGetPlainUserPointer(process, addr, sizeof(s32));
+    if (plain_ptr != nullptr &&
+        std::atomic_ref<s32>{*reinterpret_cast<s32*>(plain_ptr)}.load(std::memory_order_acquire) !=
+            value) {
+        R_THROW(ResultInvalidState);
+    }
+
     // Perform signaling.
     s32 num_waiters{};
     {
-        KScopedSchedulerLock sl(system.Kernel());
+        KScopedSchedulerLock sl(kernel);
 
         // Check the userspace value.
         s32 user_value{};
-        R_UNLESS(UpdateIfEqual(system.Kernel(), std::addressof(user_value), addr, value, value + 1),
+        const s32 incremented = static_cast<s32>(static_cast<u32>(value) + 1U);
+        R_UNLESS(UpdateIfEqual(process, plain_ptr, std::addressof(user_value), addr, value,
+                               incremented),
                  ResultInvalidCurrentMemory);
         R_UNLESS(user_value == value, ResultInvalidState);
 
-        if (m_tree.empty()) {
+        if (m_tree.empty() || !MayHaveArbiterWaiters(this, addr)) {
             R_SUCCEED();
         }
 
@@ -281,13 +515,13 @@ Result KAddressArbiter::SignalAndIncrementIfEqual(uint64_t addr, s32 value, s32 
                (it->GetAddressArbiterKey() == addr)) {
             // End the thread's wait.
             KThread* target_thread = std::addressof(*it);
-            target_thread->EndWait(system.Kernel(), ResultSuccess);
+            target_thread->EndWait(kernel, ResultSuccess);
 
             ASSERT(target_thread->IsWaitingForAddressArbiter());
             target_thread->ClearAddressArbiter();
 
             it = m_tree.erase(it);
-            NoteWaiterRemoved(addr);
+            NoteArbiterWaiterRemoved(this, addr);
             ++num_waiters;
         }
     }
@@ -295,19 +529,30 @@ Result KAddressArbiter::SignalAndIncrementIfEqual(uint64_t addr, s32 value, s32 
 }
 
 Result KAddressArbiter::SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32 value, s32 count) {
+    auto& kernel = system.Kernel();
+    KProcess& process = *GetCurrentThreadPointer(kernel)->GetOwnerProcess();
+    u8* const plain_ptr = TryGetPlainUserPointer(process, addr, sizeof(s32));
+    if (plain_ptr != nullptr &&
+        std::atomic_ref<s32>{*reinterpret_cast<s32*>(plain_ptr)}.load(std::memory_order_acquire) !=
+            value) {
+        R_THROW(ResultInvalidState);
+    }
+
     // Perform signaling.
     s32 num_waiters{};
     {
-        KScopedSchedulerLock sl(system.Kernel());
+        KScopedSchedulerLock sl(kernel);
 
-        auto it = m_tree.empty() ? m_tree.end() : m_tree.nfind_key({addr, -1});
+        const bool may_have_waiters = !m_tree.empty() && MayHaveArbiterWaiters(this, addr);
+        auto it = may_have_waiters ? m_tree.nfind_key({addr, -1}) : m_tree.end();
         // Determine the updated value.
         s32 new_value{};
+        const u32 uval = static_cast<u32>(value);
         if (count <= 0) {
             if (it != m_tree.end() && it->GetAddressArbiterKey() == addr) {
-                new_value = value - 2;
+                new_value = static_cast<s32>(uval - 2U);
             } else {
-                new_value = value + 1;
+                new_value = static_cast<s32>(uval + 1U);
             }
         } else {
             if (it != m_tree.end() && it->GetAddressArbiterKey() == addr) {
@@ -320,12 +565,12 @@ Result KAddressArbiter::SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32 
                 }
 
                 if (tmp_num_waiters < count) {
-                    new_value = value - 1;
+                    new_value = static_cast<s32>(uval - 1U);
                 } else {
                     new_value = value;
                 }
             } else {
-                new_value = value + 1;
+                new_value = static_cast<s32>(uval + 1U);
             }
         }
 
@@ -333,9 +578,10 @@ Result KAddressArbiter::SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32 
         s32 user_value{};
         bool succeeded{};
         if (value != new_value) {
-            succeeded = UpdateIfEqual(system.Kernel(), std::addressof(user_value), addr, value, new_value);
+            succeeded = UpdateIfEqual(process, plain_ptr, std::addressof(user_value), addr, value,
+                                      new_value);
         } else {
-            succeeded = ReadFromUser(system.Kernel(), std::addressof(user_value), addr);
+            succeeded = ReadFromUser(process, plain_ptr, std::addressof(user_value), addr);
         }
 
         R_UNLESS(succeeded, ResultInvalidCurrentMemory);
@@ -345,13 +591,13 @@ Result KAddressArbiter::SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32 
                (it->GetAddressArbiterKey() == addr)) {
             // End the thread's wait.
             KThread* target_thread = std::addressof(*it);
-            target_thread->EndWait(system.Kernel(), ResultSuccess);
+            target_thread->EndWait(kernel, ResultSuccess);
 
             ASSERT(target_thread->IsWaitingForAddressArbiter());
             target_thread->ClearAddressArbiter();
 
             it = m_tree.erase(it);
-            NoteWaiterRemoved(addr);
+            NoteArbiterWaiterRemoved(this, addr);
             ++num_waiters;
         }
     }
@@ -359,18 +605,28 @@ Result KAddressArbiter::SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32 
 }
 
 Result KAddressArbiter::WaitIfLessThan(uint64_t addr, s32 value, bool decrement, s64 timeout) {
-    // Prepare to wait.
-    KThread* cur_thread = GetCurrentThreadPointer(system.Kernel());
-    if (timeout != 0 && SpinBeforeWait(system.Kernel(), cur_thread, addr, false,
+    auto& kernel = system.Kernel();
+    KThread* const cur_thread = GetCurrentThreadPointer(kernel);
+    KProcess& process = *cur_thread->GetOwnerProcess();
+    u8* const plain_ptr = TryGetPlainUserPointer(process, addr, sizeof(s32));
+    {
+        Result fast_res = ResultSuccess;
+        const auto arb_type = decrement ? Svc::ArbitrationType::DecrementAndWaitIfLessThan
+                                        : Svc::ArbitrationType::WaitIfLessThan;
+        if (TryFastWaitWithPointer(cur_thread, plain_ptr, arb_type, value, timeout, &fast_res)) {
+            return fast_res;
+        }
+    }
+    if (timeout != 0 && SpinBeforeWait(kernel, cur_thread, process, addr, plain_ptr, false,
                                        [value](s64 user_value) { return user_value < value; })) {
         R_THROW(ResultInvalidState);
     }
     KHardwareTimer* timer{};
-    ThreadQueueImplForKAddressArbiter wait_queue(system.Kernel(), this, std::addressof(m_tree));
+    ThreadQueueImplForKAddressArbiter wait_queue(kernel, this, std::addressof(m_tree));
 
     {
-        ScopedStripePreparing stripe_guard{WaiterStripe(addr)};
-        KScopedSchedulerLockAndSleep slp{system.Kernel(), std::addressof(timer), cur_thread, timeout};
+        ScopedStripePreparing stripe_guard{this, addr};
+        KScopedSchedulerLockAndSleep slp{kernel, std::addressof(timer), cur_thread, timeout};
 
         // Check that the thread isn't terminating.
         if (cur_thread->IsTerminationRequested()) {
@@ -379,12 +635,14 @@ Result KAddressArbiter::WaitIfLessThan(uint64_t addr, s32 value, bool decrement,
         }
 
         // Read the value from userspace.
+        u8* const locked_ptr = TryGetPlainUserPointer(process, addr, sizeof(s32));
         s32 user_value{};
         bool succeeded{};
         if (decrement) {
-            succeeded = DecrementIfLessThan(system.Kernel(), std::addressof(user_value), addr, value);
+            succeeded =
+                DecrementIfLessThan(process, locked_ptr, std::addressof(user_value), addr, value);
         } else {
-            succeeded = ReadFromUser(system.Kernel(), std::addressof(user_value), addr);
+            succeeded = ReadFromUser(process, locked_ptr, std::addressof(user_value), addr);
         }
 
         if (!succeeded) {
@@ -411,7 +669,7 @@ Result KAddressArbiter::WaitIfLessThan(uint64_t addr, s32 value, bool decrement,
 
         // Wait for the thread to finish.
         wait_queue.SetHardwareTimer(timer);
-        cur_thread->BeginWait(system.Kernel(), std::addressof(wait_queue));
+        cur_thread->BeginWait(kernel, std::addressof(wait_queue));
         cur_thread->SetWaitReasonForDebugging(ThreadWaitReasonForDebugging::Arbitration);
     }
 
@@ -420,18 +678,30 @@ Result KAddressArbiter::WaitIfLessThan(uint64_t addr, s32 value, bool decrement,
 }
 
 Result KAddressArbiter::WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool is_64_bit) {
-    // Prepare to wait.
-    KThread* cur_thread = GetCurrentThreadPointer(system.Kernel());
-    if (timeout != 0 && SpinBeforeWait(system.Kernel(), cur_thread, addr, is_64_bit,
+    auto& kernel = system.Kernel();
+    KThread* const cur_thread = GetCurrentThreadPointer(kernel);
+    KProcess& process = *cur_thread->GetOwnerProcess();
+    const size_t word_size = is_64_bit ? sizeof(s64) : sizeof(s32);
+    u8* const plain_ptr = TryGetPlainUserPointer(process, addr, word_size);
+    {
+        Result fast_res = ResultSuccess;
+        if (TryFastWaitWithPointer(cur_thread, plain_ptr,
+                                   is_64_bit ? Svc::ArbitrationType::WaitIfEqual64
+                                             : Svc::ArbitrationType::WaitIfEqual,
+                                   value, timeout, &fast_res)) {
+            return fast_res;
+        }
+    }
+    if (timeout != 0 && SpinBeforeWait(kernel, cur_thread, process, addr, plain_ptr, is_64_bit,
                                        [value](s64 user_value) { return user_value == value; })) {
         R_THROW(ResultInvalidState);
     }
     KHardwareTimer* timer{};
-    ThreadQueueImplForKAddressArbiter wait_queue(system.Kernel(), this, std::addressof(m_tree));
+    ThreadQueueImplForKAddressArbiter wait_queue(kernel, this, std::addressof(m_tree));
 
     {
-        ScopedStripePreparing stripe_guard{WaiterStripe(addr)};
-        KScopedSchedulerLockAndSleep slp{system.Kernel(), std::addressof(timer), cur_thread, timeout};
+        ScopedStripePreparing stripe_guard{this, addr};
+        KScopedSchedulerLockAndSleep slp{kernel, std::addressof(timer), cur_thread, timeout};
 
         // Check that the thread isn't terminating.
         if (cur_thread->IsTerminationRequested()) {
@@ -440,13 +710,14 @@ Result KAddressArbiter::WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool 
         }
 
         // Read the value from userspace.
+        u8* const locked_ptr = TryGetPlainUserPointer(process, addr, word_size);
         s64 user_value{};
         bool succeeded{};
         if (is_64_bit) {
-            succeeded = ReadFromUser(system.Kernel(), std::addressof(user_value), addr);
+            succeeded = ReadFromUser(process, locked_ptr, std::addressof(user_value), addr);
         } else {
             s32 user_value32{};
-            succeeded = ReadFromUser(system.Kernel(), std::addressof(user_value32), addr);
+            succeeded = ReadFromUser(process, locked_ptr, std::addressof(user_value32), addr);
             user_value = user_value32;
         }
         if (!succeeded) {
@@ -473,7 +744,7 @@ Result KAddressArbiter::WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool 
 
         // Wait for the thread to finish.
         wait_queue.SetHardwareTimer(timer);
-        cur_thread->BeginWait(system.Kernel(), std::addressof(wait_queue));
+        cur_thread->BeginWait(kernel, std::addressof(wait_queue));
         cur_thread->SetWaitReasonForDebugging(ThreadWaitReasonForDebugging::Arbitration);
     }
 

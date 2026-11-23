@@ -106,14 +106,24 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         // When a pending channel last moved or a command arrived (see the waits below).
         auto last_progress = std::chrono::steady_clock::now();
         constexpr std::chrono::nanoseconds PendingPoll = std::chrono::microseconds{500};
-        constexpr std::chrono::nanoseconds PendingPollPeriod = std::chrono::microseconds{20};
-        constexpr std::chrono::nanoseconds WordCheckPeriod = std::chrono::microseconds{2};
+        constexpr std::chrono::nanoseconds PendingPollPeriod = std::chrono::microseconds{100};
         auto& wake = Tegra::Nx2PendingWake::Get();
-        auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
         namespace Profile = VideoCommon::Nx2Profile;
         // Before the split's back thread starts, which reads it too.
         Profile::Initialize();
         auto& split = VideoCommon::GpuSplit::Get();
+        u64 pending_map_position{};
+        const auto wait_pending_maps = [&] {
+            if (pending_map_position == 0) {
+                return;
+            }
+            if (split.Active()) {
+                const VideoCommon::Nx2JobStats::Timer drain_timer{
+                    VideoCommon::Nx2JobStats::Kind::FrontDrain};
+                split.WaitUntil(pending_map_position, VideoCommon::DrainSite::Map);
+            }
+            pending_map_position = 0;
+        };
         while (!stop_token.stop_requested()) {
             Profile::Report();
             Common::FrameDeadline::Tick();
@@ -122,6 +132,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 // Suspended channels wait on semaphores: a new command or a GPU release wakes the
                 // wait below at once (Nx2PendingWake), so arm it before looking.
                 wake.Arm();
+                wait_pending_maps();
                 bool resumed = false;
                 {
                     Profile::Scope scope{Profile::Zone::ResumePending};
@@ -144,23 +155,21 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     const int poll = VideoCore::Nx2Debug::Experiment(6);
                     const auto now = std::chrono::steady_clock::now();
                     if (!Common::PollYield()) {
-                        wake.Sleep(std::chrono::microseconds{50});
+                        (void)wake.Sleep(std::chrono::microseconds{50});
                     } else if (now - last_progress < PendingPoll) {
                         const auto poll_end =
                             (std::min)(now + PendingPollPeriod, last_progress + PendingPoll);
-                        auto until = now;
-                        do {
-                            until = (std::min)(std::chrono::steady_clock::now() + WordCheckPeriod,
-                                               poll_end);
-                            if (wake.Poll(until) || waiters.WordStored()) {
-                                break;
-                            }
-                        } while (until < poll_end);
+                        wake.Poll(poll_end);
                     } else {
                         Profile::Add(Profile::Counter::PendingWaits, 1);
-                        const bool woken = wake.Sleep(poll == 1 ? std::chrono::microseconds{50}
+                        const u32 reason = wake.Sleep(poll == 1 ? std::chrono::microseconds{50}
                                                                 : std::chrono::microseconds{500});
-                        Profile::Add(Profile::Counter::PendingWakeTimeout, woken ? 0 : 1);
+                        const bool by_push = (reason & Tegra::Nx2PendingWake::ByPush) != 0;
+                        const bool by_latch =
+                            !by_push && (reason & Tegra::Nx2PendingWake::ByLatch) != 0;
+                        Profile::Add(Profile::Counter::PendingWakePush, by_push ? 1 : 0);
+                        Profile::Add(Profile::Counter::PendingWakeLatch, by_latch ? 1 : 0);
+                        Profile::Add(Profile::Counter::PendingWakeTimeout, reason == 0 ? 1 : 0);
                     }
                     continue;
                 }
@@ -184,6 +193,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 // in order, and so does the signal that the command ran.
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                    wait_pending_maps();
                     Profile::Scope scope{Profile::Zone::Push};
                     if (VideoCommon::Nx2Hazard::Enabled()) {
                         split.Defer([epoch = submit_list->epoch] {
@@ -200,14 +210,15 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
                     if (run->before_later_reads) {
-                        // GPU memory maps unmap caches (UnmapMemory downloads): the back's state.
-                        const VideoCommon::Nx2JobStats::Timer drain_timer{
-                            VideoCommon::Nx2JobStats::Kind::FrontDrain};
-                        split.DeferFunction(std::move(run->func));
-                        split.Drain(VideoCommon::DrainSite::Map);
+                        // Coalesce consecutive map updates on GPUBack and wait once before the
+                        // next front-side command read, without requesting the idle commit hook.
+                        split.DeferFunction(std::move(run->func), true);
+                        pending_map_position = split.WritePosition();
                     } else {
-                        split.DeferFunction(std::move(run->func));
-                        split.NoteMemoryWrite();
+                        split.DeferFunction(std::move(run->func), run->changes_mappings);
+                        if (run->changes_mappings) {
+                            split.NoteMemoryWrite();
+                        }
                     }
                 } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
                     split.Defer([rasterizer_ptr, addr = flush->addr, size = flush->size] {
@@ -235,6 +246,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 split.Publish();
                 continue;
             }
+            pending_map_position = 0;
             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
                 Profile::Scope scope{Profile::Zone::Push};
                 VideoCommon::Nx2Hazard::SetListEpoch(submit_list->epoch);
@@ -277,12 +289,14 @@ void ThreadManager::TickGPU(bool is_async) {
     PushCommand(GPUTickCommand(), false, is_async);
 }
 
-void ThreadManager::Run(std::function<void()>&& func, bool is_async, bool before_later_reads) {
-    PushCommand(RunCommand{std::move(func), before_later_reads}, false, is_async);
+void ThreadManager::Run(std::function<void()>&& func, bool is_async, bool before_later_reads,
+                        bool changes_mappings) {
+    PushCommand(RunCommand{std::move(func), before_later_reads, changes_mappings}, false, is_async);
 }
 
 void ThreadManager::InvalidateRegion(DAddr addr, u64 size) {
     rasterizer->OnCacheInvalidation(addr, size);
+    Tegra::Nx2SemaphoreWaiters::Get().NoteCpuStore(addr, size);
 }
 
 void ThreadManager::FlushAndInvalidateRegion(DAddr addr, u64 size, bool is_async) {
@@ -297,6 +311,7 @@ void ThreadManager::FlushAndInvalidateRegion(DAddr addr, u64 size, bool is_async
         }
     }
     rasterizer->OnCacheInvalidation(addr, size);
+    Tegra::Nx2SemaphoreWaiters::Get().NoteCpuStore(addr, size);
 }
 
 u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_async) {
@@ -308,7 +323,7 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
     state.queue.EmplaceWait(std::move(command_data), fence, block);
-    Tegra::Nx2PendingWake::Get().Notify();
+    Tegra::Nx2PendingWake::Get().Notify(Tegra::Nx2PendingWake::ByPush);
 
     if (block) {
         state.cv.wait(lk, thread.get_stop_token(), [this, fence] {
@@ -322,7 +337,7 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
 void ThreadManager::NotifyShutdown() {
     if (thread.joinable()) {
         thread.request_stop();
-        Tegra::Nx2PendingWake::Get().Notify();
+        Tegra::Nx2PendingWake::Get().Notify(Tegra::Nx2PendingWake::ByPush);
         thread.join();
     }
     VideoCommon::GpuSplit::Get().Stop();

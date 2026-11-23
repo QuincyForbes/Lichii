@@ -79,6 +79,7 @@ private:
     std::array<u64, Core::Hardware::NUM_CPU_CORES> m_running_thread_idle_counts{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> m_running_thread_switch_counts{};
     std::array<KThread*, Core::Hardware::NUM_CPU_CORES> m_pinned_threads{};
+    std::atomic<u32> m_pinned_core_mask{};
     std::array<DebugWatchpoint, Core::Hardware::NUM_WATCHPOINTS> m_watchpoints{};
     std::map<KProcessAddress, u64> m_debug_page_refcounts{};
 #ifdef HAS_NCE
@@ -157,6 +158,7 @@ private:
         ASSERT(thread != nullptr);
         ASSERT(m_pinned_threads[core_id] == nullptr);
         m_pinned_threads[core_id] = thread;
+        m_pinned_core_mask.fetch_or(1U << core_id, std::memory_order_release);
     }
 
     void UnpinThread(s32 core_id, KThread* thread) {
@@ -164,6 +166,7 @@ private:
         ASSERT(thread != nullptr);
         ASSERT(m_pinned_threads[core_id] == thread);
         m_pinned_threads[core_id] = nullptr;
+        m_pinned_core_mask.fetch_and(~(1U << core_id), std::memory_order_release);
     }
 
 public:
@@ -344,6 +347,10 @@ public:
         return m_pinned_threads[core_id];
     }
 
+    bool HasAnyPinnedThread() const noexcept {
+        return m_pinned_core_mask.load(std::memory_order_acquire) != 0;
+    }
+
     const Svc::SvcAccessFlagSet& GetSvcPermissions() const {
         return m_capabilities.GetSvcPermissions();
     }
@@ -522,6 +529,18 @@ public:
 
     Result WaitAddressArbiter(uintptr_t address, Svc::ArbitrationType arb_type, s64 value, s64 timeout) {
         R_RETURN(m_address_arbiter.WaitForAddress(address, arb_type, value, timeout));
+    }
+
+    bool TryFastSignalAddressArbiter(uint64_t address, Svc::SignalType signal_type, s32 value,
+                                     s32 count, Result* out_result) {
+        return m_address_arbiter.TryFastSignalToAddress(address, signal_type, value, count,
+                                                        out_result);
+    }
+
+    bool TryFastWaitAddressArbiter(uint64_t address, Svc::ArbitrationType arb_type, s64 value,
+                                   s64 timeout_ns, Result* out_result) {
+        return m_address_arbiter.TryFastWaitForAddress(address, arb_type, value, timeout_ns,
+                                                       out_result);
     }
 
     Result GetThreadList(KernelCore& kernel, s32* out_num_threads, KProcessAddress out_thread_ids, s32 max_out_count);

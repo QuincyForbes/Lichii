@@ -38,6 +38,9 @@ public:
         /// Where this frame's colour counts over the history (0..1, R16F at the render size):
         /// MetalFX's reactive mask (iOS 17.4, macOS 14.4; ignored before). Null: none.
         TextureHandle reactive{};
+        /// Optional direct output texture at `output_size` (private, single-sampled). When compatible
+        /// with MetalFX's output usage/format, avoids allocating/blitting `state.output`.
+        TextureHandle output{};
     };
 
     /// Whether MetalFX takes a reactive mask on this OS / GPU.

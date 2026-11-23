@@ -89,7 +89,7 @@ static void* EmitWrappedReadCallTrampoline(oaknut::CodeGenerator& code, T* this_
 
     oaknut::Label l_addr, l_this;
 
-    constexpr u64 save_regs = ABI_CALLER_SAVE & ~ToRegList(Xscratch0);
+    constexpr u64 save_regs = ABI_ALLOCATABLE_CALLER_SAVE & ~ToRegList(Xscratch0);
 
     void* target = code.xptr<void*>();
     ABI_PushRegisters(code, save_regs, 0);
@@ -145,7 +145,7 @@ static void* EmitWrappedWriteCallTrampoline(oaknut::CodeGenerator& code, T* this
 
     oaknut::Label l_addr, l_this;
 
-    constexpr u64 save_regs = ABI_CALLER_SAVE;
+    constexpr u64 save_regs = ABI_ALLOCATABLE_CALLER_SAVE;
 
     void* target = code.xptr<void*>();
     ABI_PushRegisters(code, save_regs, 0);

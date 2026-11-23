@@ -21,15 +21,9 @@
 #include "video_core/host_shaders/ocarina_actor_motion_frag_spv.h"
 #include "video_core/host_shaders/ocarina_actor_motion_vert_spv.h"
 #include "video_core/host_shaders/ocarina_bilinear_upscale_comp_spv.h"
-#include "video_core/host_shaders/ocarina_camera_motion_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_4k_composite_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_4k_reference_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_bias_comp_spv.h"
-#include "video_core/host_shaders/ocarina_dlss_color_comp_spv.h"
-#if __has_include("video_core/host_shaders/ocarina_dlss_effects_base_comp_spv.h")
-#include "video_core/host_shaders/ocarina_dlss_effects_base_comp_spv.h"
-#define LICHII_HAS_OOT_EFFECTS_BASE_SPV 1
-#endif
 #include "video_core/host_shaders/ocarina_dlss_effects_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_output_comp_spv.h"
 #include "video_core/renderer_metal/metal_formats.h"
@@ -94,14 +88,100 @@ bool SamplesIntoOneImage(const Shader::Info& info) {
                                 &Shader::StorageBufferDescriptor::is_written);
 }
 
-/// ocarina_camera_motion.comp's push constants: the matrix, then the jitter, padded as MSL lays
-/// the block out.
+/// Camera motion and fused input-preparation push constants: row-major reprojection matrix,
+/// subpixel jitter and logical render extent (allowing padded backing textures without cropping).
 struct MotionParameters {
     VideoCommon::OcarinaMatrix clip_to_previous_clip;
     std::array<f32, 2> jitter;
-    std::array<f32, 2> padding;
+    std::array<u32, 2> extent;
 };
 static_assert(sizeof(MotionParameters) == 80);
+
+constexpr std::string_view OcarinaMslSource = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct MotionParams {
+    float4 row0;
+    float4 row1;
+    float4 row2;
+    float4 row3;
+    float2 jitter;
+    uint2 extent;
+};
+
+static inline float2 compute_camera_motion(depth2d<float, access::sample> scene_depth,
+                                           constant MotionParams& params, uint2 gid) {
+    const float2 size = float2(params.extent);
+    const float depth = scene_depth.read(gid, 0);
+    const float2 screen = (float2(gid) + 0.5f - params.jitter) / size;
+    const float4 clip = float4(screen * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f),
+                               depth * 2.0f - 1.0f, 1.0f);
+    const float4 previous = float4(dot(params.row0, clip), dot(params.row1, clip),
+                                   dot(params.row2, clip), dot(params.row3, clip));
+    float2 pixels = float2(0.0f);
+    if (depth >= 0.0f && depth <= 1.0f && previous.w > 1e-6f) {
+        const float2 displacement =
+            (previous.xy / previous.w - clip.xy) * float2(0.5f, -0.5f) * size;
+        if (all(abs(displacement) <= float2(65504.0f))) {
+            pixels = displacement;
+        }
+    }
+    return pixels;
+}
+
+static inline float4 sanitize_ldr_color(float3 color) {
+    const uint3 exponent = as_type<uint3>(color) & uint3(0x7f800000u);
+    const float3 finite_color = select(float3(0.0f), color, exponent != uint3(0x7f800000u));
+    return float4(clamp(finite_color, float3(0.0f), float3(1.0f)), 1.0f);
+}
+
+kernel void ocarina_camera_motion(
+    depth2d<float, access::sample> scene_depth [[texture(0)]],
+    texture2d<float, access::write> motion [[texture(1)]],
+    constant MotionParams& params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= motion.get_width() || gid.y >= motion.get_height()) {
+        return;
+    }
+    if (gid.x >= params.extent.x || gid.y >= params.extent.y) {
+        motion.write(float4(0.0f), gid);
+        return;
+    }
+    motion.write(float4(compute_camera_motion(scene_depth, params, gid), 0.0f, 0.0f), gid);
+}
+
+kernel void ocarina_prepare_inputs(
+    depth2d<float, access::sample> scene_depth [[texture(0)]],
+    texture2d<float, access::sample> guest_color [[texture(1)]],
+    texture2d<float, access::write> motion [[texture(2)]],
+    texture2d<float, access::write> dlss_color [[texture(3)]],
+    constant MotionParams& params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= motion.get_width() || gid.y >= motion.get_height()) {
+        return;
+    }
+    if (gid.x >= params.extent.x || gid.y >= params.extent.y) {
+        const uint2 clamped = min(gid, max(params.extent, uint2(1u)) - 1u);
+        motion.write(float4(0.0f), gid);
+        dlss_color.write(sanitize_ldr_color(guest_color.read(clamped, 0).rgb), gid);
+        return;
+    }
+    motion.write(float4(compute_camera_motion(scene_depth, params, gid), 0.0f, 0.0f), gid);
+    dlss_color.write(sanitize_ldr_color(guest_color.read(gid, 0).rgb), gid);
+}
+
+kernel void ocarina_direct_output(
+    texture2d<float, access::sample> dlss_color [[texture(0)]],
+    texture2d<float, access::write> guest_color [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= guest_color.get_width() || gid.y >= guest_color.get_height()) {
+        return;
+    }
+    const float3 color = max(dlss_color.read(gid, 0).rgb, float3(0.0f));
+    guest_color.write(float4(color * color, 1.0f), gid);
+}
+)";
 
 bool EnvironmentOn(const char* name) {
     const char* const value = std::getenv(name);
@@ -463,11 +543,38 @@ bool OcarinaTemporal::Prepare() {
     std::string error;
     sampler = CreateLinearClampSampler(device);
     point_sampler = MakePointClampSampler(device);
-    // The scene depth (binding 0) is a depth texture.
-    ShaderTranslate::Options motion_options{};
-    motion_options.depth_images = {{0, 0}};
-    if (!BuildPass(device, motion_pass, OCARINA_CAMERA_MOTION_COMP_SPV, error, motion_options) ||
-        !BuildPass(device, color_pass, OCARINA_DLSS_COLOR_COMP_SPV, error) ||
+    msl_library = CreateLibrary(device, OcarinaMslSource, error);
+    const auto build_msl_pass = [&](Pass& pass, std::string_view entry,
+                                    std::vector<ShaderTranslate::ResourceSlot> pass_slots) {
+        pass.function = msl_library ? CreateFunction(msl_library.Get(), entry) : Object{};
+        pass.state = pass.function
+                         ? CreateComputePipelineState(device, pass.function.Get(), error, nullptr,
+                                                      GroupSize * GroupSize)
+                         : Object{};
+        pass.slots = std::move(pass_slots);
+        return static_cast<bool>(pass.state);
+    };
+    using ShaderTranslate::PushConstantSet;
+    using ShaderTranslate::ResourceKind;
+    if (!build_msl_pass(motion_pass, "ocarina_camera_motion",
+                        {
+                            {.set = PushConstantSet, .binding = 0, .kind = ResourceKind::Buffer, .index = 0},
+                            {.set = 0, .binding = 0, .kind = ResourceKind::Texture, .index = 0},
+                            {.set = 0, .binding = 1, .kind = ResourceKind::Texture, .index = 1},
+                        }) ||
+        !build_msl_pass(prepare_pass, "ocarina_prepare_inputs",
+                        {
+                            {.set = PushConstantSet, .binding = 0, .kind = ResourceKind::Buffer, .index = 0},
+                            {.set = 0, .binding = 0, .kind = ResourceKind::Texture, .index = 0},
+                            {.set = 0, .binding = 1, .kind = ResourceKind::Texture, .index = 1},
+                            {.set = 0, .binding = 2, .kind = ResourceKind::Texture, .index = 2},
+                            {.set = 0, .binding = 3, .kind = ResourceKind::Texture, .index = 3},
+                        }) ||
+        !build_msl_pass(direct_output_pass, "ocarina_direct_output",
+                        {
+                            {.set = 0, .binding = 0, .kind = ResourceKind::Texture, .index = 0},
+                            {.set = 0, .binding = 1, .kind = ResourceKind::Texture, .index = 1},
+                        }) ||
         !BuildPass(device, output_pass, OCARINA_DLSS_OUTPUT_COMP_SPV, error) || !sampler ||
         !point_sampler) {
         LOG_WARNING(Render_Metal, "Metal: Ocarina temporal upscale unavailable: {}", error);
@@ -576,13 +683,7 @@ bool OcarinaTemporal::PrepareEffects() {
     }
     effects_failed = true;
     std::string error;
-#ifdef LICHII_HAS_OOT_EFFECTS_BASE_SPV
-    const std::span<const u32> base_spv{OCARINA_DLSS_EFFECTS_BASE_COMP_SPV};
-#else
-    const std::span<const u32> base_spv{OCARINA_DLSS_COLOR_COMP_SPV};
-#endif
-    if (!BuildPass(device, effects_base_pass, base_spv, error) ||
-        !BuildPass(device, effects_mark_pass, OCARINA_DLSS_EFFECTS_COMP_SPV, error) ||
+    if (!BuildPass(device, effects_mark_pass, OCARINA_DLSS_EFFECTS_COMP_SPV, error) ||
         !BuildPass(device, effects_bias_pass, OCARINA_DLSS_BIAS_COMP_SPV, error) ||
         !Prepare()) {
         LOG_WARNING(Render_Metal, "Metal: Ocarina effects mask unavailable: {}", error);
@@ -617,11 +718,12 @@ bool OcarinaTemporal::Resize(std::array<u32, 2> extent) {
 }
 
 void OcarinaTemporal::Run(const Pass& pass, std::span<const TextureHandle> inputs,
-                          TextureHandle output, std::span<const u8> push_constants,
-                          std::array<u32, 2> extent, bool linear_filter) {
+                          std::span<const TextureHandle> outputs,
+                          std::span<const u8> push_constants, std::array<u32, 2> extent,
+                          bool linear_filter) {
     void* const bound_sampler =
         linear_filter || !point_sampler ? sampler.Get() : point_sampler.Get();
-    // The host shaders: the sampled inputs at bindings 0.., the written image after them.
+    // The host shaders: the sampled inputs at bindings 0.., the written images after them.
     scheduler.BeginCompute(pass.state.Get());
     for (const ShaderTranslate::ResourceSlot& slot : pass.slots) {
         switch (slot.kind) {
@@ -631,11 +733,15 @@ void OcarinaTemporal::Run(const Pass& pass, std::span<const TextureHandle> input
                                     static_cast<u32>(push_constants.size()));
             }
             break;
-        case ShaderTranslate::ResourceKind::Texture:
-            scheduler.BindTexture(ShaderStage::Compute, slot.index,
-                                  slot.binding < inputs.size() ? inputs[slot.binding] : output,
-                                  false, slot.binding >= inputs.size());
+        case ShaderTranslate::ResourceKind::Texture: {
+            const bool is_write = slot.binding >= inputs.size();
+            const size_t out_idx = is_write ? slot.binding - inputs.size() : 0;
+            const TextureHandle tex =
+                !is_write ? inputs[slot.binding]
+                          : (out_idx < outputs.size() ? outputs[out_idx] : nullptr);
+            scheduler.BindTexture(ShaderStage::Compute, slot.index, tex, false, is_write);
             break;
+        }
         case ShaderTranslate::ResourceKind::Sampler:
             scheduler.BindSampler(ShaderStage::Compute, slot.index, bound_sampler);
             break;
@@ -665,19 +771,20 @@ OcarinaTemporal::ActorSlot* OcarinaTemporal::AcquireActorSlot(const OcarinaActor
     ActorSlot& slot = *found;
     const size_t bone_bytes = size_t{OcarinaActorMesh::Bones} * 12 * sizeof(f32);
     if (!slot.current) {
-        slot.current = CreateBuffer(device, bone_bytes, true, &slot.current_data);
-        slot.previous = CreateBuffer(device, bone_bytes, true, &slot.previous_data);
+        slot.current = CreateBuffer(device, bone_bytes, true, &slot.current_data, true);
+        slot.previous = CreateBuffer(device, bone_bytes, true, &slot.previous_data, true);
     }
     const bool same_mesh = slot.used && slot.mesh_key == mesh.mesh_key &&
                            slot.vertex_bytes == mesh.vertices.size() &&
                            slot.index_count == mesh.indices.size();
     if (!same_mesh) {
         if (!slot.vertices || slot.vertex_bytes < mesh.vertices.size()) {
-            slot.vertices = CreateBuffer(device, mesh.vertices.size(), true, &slot.vertex_data);
+            slot.vertices =
+                CreateBuffer(device, mesh.vertices.size(), true, &slot.vertex_data, true);
         }
         if (!slot.indices || slot.index_count < mesh.indices.size()) {
-            slot.indices =
-                CreateBuffer(device, mesh.indices.size() * sizeof(u16), true, &slot.index_data);
+            slot.indices = CreateBuffer(device, mesh.indices.size() * sizeof(u16), true,
+                                        &slot.index_data, true);
         }
         if (slot.vertex_data == nullptr || slot.index_data == nullptr) {
             slot = {};
@@ -779,7 +886,6 @@ bool OcarinaTemporal::DrawActor(TextureHandle depth, std::array<u32, 2> extent,
     scheduler.DrawIndexed(*PrimitiveType(Maxwell::PrimitiveTopology::Triangles),
                           static_cast<u32>(mesh.indices.size()), 2, slot->indices.Get(), 0, 1, 0,
                           0);
-    scheduler.EndRendering();
     ++actor_frames;
     return true;
 }
@@ -794,7 +900,7 @@ bool OcarinaTemporal::EncodeMotion(TextureHandle depth, std::array<u32, 2> exten
     const MotionParameters parameters{
         .clip_to_previous_clip = clip_to_previous_clip,
         .jitter = jitter,
-        .padding = {},
+        .extent = extent,
     };
     Run(motion_pass, depth, motion.Get(),
         std::span(reinterpret_cast<const u8*>(&parameters), sizeof(parameters)), extent);
@@ -805,70 +911,106 @@ bool OcarinaTemporal::EncodeMotion(TextureHandle depth, std::array<u32, 2> exten
     return true;
 }
 
-bool OcarinaTemporal::EnsureEffectsBias(std::array<u32, 2> extent) {
-    if (extent[0] == 0 || extent[1] == 0) {
+bool OcarinaTemporal::EnsureEffectsBias(std::array<u32, 2> bias_extent) {
+    if (bias_extent[0] == 0 || bias_extent[1] == 0) {
         return false;
     }
-    if (effects.extent == extent && effects.bias) {
+    if (effects.bias_size == bias_extent && effects.bias) {
         return true;
     }
-    if (effects.base || effects.bias) {
+    if (effects.bias) {
         scheduler.Finish();
     }
-    effects = {};
-    effects.extent = extent;
     effects.bias = CreateTexture(device, {.kind = TextureKind::e2D,
                                           .format = Fmt::R16Float,
-                                          .width = extent[0],
-                                          .height = extent[1],
+                                          .width = bias_extent[0],
+                                          .height = bias_extent[1],
                                           .render_target = true,
                                           .shader_write = true,
                                           .pixel_format_view = false});
-    if (!effects.bias) {
-        effects = {};
-        return false;
-    }
-    ClearEffectsBias();
-    return true;
+    effects.bias_size = effects.bias ? bias_extent : std::array<u32, 2>{};
+    effects.bias_zeroed = false;
+    return static_cast<bool>(effects.bias);
 }
 
 void OcarinaTemporal::ClearEffectsBias() {
-    if (!effects.bias || effects.extent[0] == 0 || effects.extent[1] == 0) {
+    if (!effects.bias || effects.bias_size[0] == 0 || effects.bias_size[1] == 0) {
         return;
     }
     ClearPass clear{};
     clear.color[0] = {.texture = effects.bias.Get()};
     clear.clear_color[0] = true;
     clear.color_value[0] = {0.0, 0.0, 0.0, 0.0};
-    clear.width = effects.extent[0];
-    clear.height = effects.extent[1];
+    clear.width = effects.bias_size[0];
+    clear.height = effects.bias_size[1];
     scheduler.Clear(clear);
     effects.bias_zeroed = true;
 }
 
+TextureHandle OcarinaTemporal::EnsureUpscaled(std::array<u32, 2> output_size) {
+    if (upscaled_rejected || output_size[0] == 0 || output_size[1] == 0) {
+        return nullptr;
+    }
+    if (upscaled_size == output_size && upscaled) {
+        return upscaled.Get();
+    }
+    if (upscaled) {
+        scheduler.Finish();
+    }
+    upscaled = CreateTexture(device, {.kind = TextureKind::e2D,
+                                      .format = Fmt::RG11B10Float,
+                                      .width = output_size[0],
+                                      .height = output_size[1],
+                                      .render_target = true,
+                                      .shader_write = true,
+                                      .pixel_format_view = false});
+    upscaled_size = upscaled ? output_size : std::array<u32, 2>{};
+    if (!upscaled) {
+        upscaled_rejected = true;
+        return nullptr;
+    }
+    return upscaled.Get();
+}
+
 void OcarinaTemporal::SaveEffectsBase(TextureHandle scene, std::array<u32, 2> extent, u64 frame) {
-    if (scene == nullptr || extent[0] == 0 || extent[1] == 0 || !PrepareEffects() ||
-        !EnsureEffectsBias(extent)) {
+    if (scene == nullptr || extent[0] == 0 || extent[1] == 0 || !PrepareEffects()) {
         return;
     }
-    if (!effects.base) {
-        const auto make = [&](u32 format) {
+    const u32 scene_format = TextureFormat(scene);
+    if (scene_format == 0) {
+        return;
+    }
+    const bool extent_changed = effects.extent != extent;
+    if (!effects.base || extent_changed || effects.base_format != scene_format) {
+        if (effects.base || (extent_changed && (effects.marks[0] || effects.marks[1]))) {
+            scheduler.Finish();
+        }
+        const auto make = [&](u32 format, bool shader_write) {
             return CreateTexture(device, {.kind = TextureKind::e2D,
                                           .format = format,
                                           .width = extent[0],
                                           .height = extent[1],
-                                          .shader_write = true,
+                                          .shader_write = shader_write,
                                           .pixel_format_view = false});
         };
-        effects.base = make(Fmt::RGBA16Float);
-        effects.marks = {make(Fmt::R8Unorm), make(Fmt::R8Unorm)};
+        effects.base = make(scene_format, false);
+        if (extent_changed || !effects.marks[0] || !effects.marks[1]) {
+            effects.marks = {make(Fmt::R8Unorm, true), make(Fmt::R8Unorm, true)};
+            effects.marked_frame.reset();
+            effects.previous_marked_frame.reset();
+        }
         if (!effects.base || !effects.marks[0] || !effects.marks[1]) {
             effects.base = {};
             effects.marks = {};
+            effects.extent = {};
+            effects.base_format = 0;
+            effects.base_frame.reset();
             return;
         }
+        effects.extent = extent;
+        effects.base_format = scene_format;
     }
-    Run(effects_base_pass, scene, effects.base.Get(), {}, extent);
+    scheduler.CopyTexture(scene, 0, 0, {}, {extent[0], extent[1], 1}, effects.base.Get(), 0, 0, {});
     effects.base_frame = frame;
 }
 
@@ -883,8 +1025,8 @@ void OcarinaTemporal::MarkEffects(TextureHandle scene, u64 frame) {
 }
 
 bool OcarinaTemporal::EncodeEffectsBias(u64 frame, std::array<u32, 2> extent) {
-    if (effects.marked_frame != frame || effects.extent != extent || !effects.bias || !motion ||
-        size != extent) {
+    if (effects.marked_frame != frame || effects.extent != extent || !motion ||
+        size[0] < extent[0] || size[1] < extent[1] || !EnsureEffectsBias(size)) {
         return false;
     }
     const bool has_previous = effects.previous_marked_frame == frame - 1;
@@ -894,7 +1036,7 @@ bool OcarinaTemporal::EncodeEffectsBias(u64 frame, std::array<u32, 2> extent) {
                                               motion.Get()};
     const u32 control = has_previous ? 1U : 0U;
     Run(effects_bias_pass, inputs, effects.bias.Get(),
-        std::span(reinterpret_cast<const u8*>(&control), sizeof(control)), extent);
+        std::span(reinterpret_cast<const u8*>(&control), sizeof(control)), size);
     effects.bias_zeroed = false;
     return true;
 }
@@ -927,12 +1069,31 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
     if (frame.actor != nullptr) {
         actor.emplace(ActorMotion{*frame.actor, frame.current, frame.previous});
     }
-    if (!EncodeMotion(frame.depth, frame.extent, *transform, actor ? &*actor : nullptr,
-                      frame.jitter)) {
+    const bool force_crop = force_crop_depth && crop_extent == frame.extent &&
+                            crop_depth_size == frame.depth_size;
+    const std::array<u32, 2> backing_size =
+        !force_crop && backend == UpscaleBackend::Dlss &&
+                frame.depth_size[0] >= frame.extent[0] && frame.depth_size[1] >= frame.extent[1]
+            ? frame.depth_size
+            : frame.extent;
+    if (frame.depth == nullptr || frame.color == nullptr || frame.extent[0] == 0 ||
+        frame.extent[1] == 0 || !Prepare() || !Resize(backing_size)) {
         reason = "motion pass not made";
         return false;
     }
-    const bool bias_encoded = EffectsEnabled() && EncodeEffectsBias(frame.frame, frame.extent);
+    const MotionParameters motion_params{
+        .clip_to_previous_clip = *transform,
+        .jitter = frame.jitter,
+        .extent = frame.extent,
+    };
+    const std::array<TextureHandle, 2> prep_inputs{frame.depth, frame.color};
+    const std::array<TextureHandle, 2> prep_outputs{motion.Get(), color.Get()};
+    Run(prepare_pass, prep_inputs, prep_outputs,
+        std::span(reinterpret_cast<const u8*>(&motion_params), sizeof(motion_params)), size);
+    if (actor && ActorEnabled()) {
+        DrawActor(frame.depth, frame.extent, *actor, frame.jitter);
+    }
+    bool bias_encoded = EffectsEnabled() && EncodeEffectsBias(frame.frame, frame.extent);
     const auto now = std::chrono::steady_clock::now();
     const f32 elapsed =
         last_evaluation
@@ -950,9 +1111,7 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
 
     TextureHandle output = nullptr;
     if (backend == UpscaleBackend::Dlss) {
-        Run(color_pass, frame.color, color.Get(), {}, frame.extent);
-        TextureHandle depth_input = frame.depth;
-        if (frame.depth_size[0] != 0 && frame.depth_size != frame.extent) {
+        const auto run_crop_depth = [&]() -> TextureHandle {
             if (cropped_depth_size != frame.extent || !cropped_depth) {
                 if (cropped_depth) {
                     scheduler.Finish();
@@ -963,22 +1122,32 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
                                                        .height = frame.extent[1],
                                                        .render_target = true,
                                                        .pixel_format_view = false});
-                cropped_depth_size = frame.extent;
+                cropped_depth_size = cropped_depth ? frame.extent : std::array<u32, 2>{};
             }
-            if (cropped_depth) {
-                scheduler.CopyTexture(frame.depth, 0, 0, {}, {frame.extent[0], frame.extent[1], 1},
-                                      cropped_depth.Get(), 0, 0, {});
-                depth_input = cropped_depth.Get();
+            if (!cropped_depth) {
+                return nullptr;
             }
+            scheduler.CopyTexture(frame.depth, 0, 0, {}, {frame.extent[0], frame.extent[1], 1},
+                                  cropped_depth.Get(), 0, 0, {});
+            return cropped_depth.Get();
+        };
+        TextureHandle depth_input = force_crop ? run_crop_depth() : frame.depth;
+        if (depth_input == nullptr) {
+            depth_input = frame.depth;
         }
         TextureHandle reactive_mask = nullptr;
         if (EffectsEnabled() && TemporalUpscaler::ReactiveMaskSupported(device) &&
-            EnsureEffectsBias(frame.extent)) {
+            EnsureEffectsBias(size)) {
             if (!bias_encoded && !effects.bias_zeroed) {
                 ClearEffectsBias();
             }
             reactive_mask = effects.bias.Get();
         }
+        const TextureHandle direct_upscaled = EnsureUpscaled(output_size);
+        // EDEN_NX2_DLSS_JITTER=2: y flipped.
+        const std::array<f32, 2> dlss_jitter{
+            frame.jitter[0],
+            VideoCommon::OcarinaDlssJitterMode() == 2 ? -frame.jitter[1] : frame.jitter[1]};
         output = upscaler.Upscale(
             device, scheduler,
             {
@@ -987,17 +1156,65 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
                 .motion = motion.Get(),
                 .render_size = frame.extent,
                 .output_size = output_size,
-                // EDEN_NX2_DLSS_JITTER=2: y flipped.
-                .jitter = {frame.jitter[0], VideoCommon::OcarinaDlssJitterMode() == 2
-                                                ? -frame.jitter[1]
-                                                : frame.jitter[1]},
+                .jitter = dlss_jitter,
                 .motion_vector_scale = {1.0f, 1.0f},
                 .reset = reset,
                 .depth_reversed = false,
                 .auto_exposure = false,
                 .reactive = reactive_mask,
+                .output = direct_upscaled,
             });
+        if (output == nullptr && !upscaler.Failed() && !force_crop) {
+            if (size != frame.extent && Resize(frame.extent)) {
+                const std::array<TextureHandle, 2> fallback_outputs{motion.Get(), color.Get()};
+                Run(prepare_pass, prep_inputs, fallback_outputs,
+                    std::span(reinterpret_cast<const u8*>(&motion_params), sizeof(motion_params)),
+                    size);
+                if (actor && ActorEnabled()) {
+                    DrawActor(frame.depth, frame.extent, *actor, frame.jitter);
+                }
+                bias_encoded = EffectsEnabled() && EncodeEffectsBias(frame.frame, frame.extent);
+                reactive_mask = nullptr;
+                if (EffectsEnabled() && TemporalUpscaler::ReactiveMaskSupported(device) &&
+                    EnsureEffectsBias(size)) {
+                    if (!bias_encoded && !effects.bias_zeroed) {
+                        ClearEffectsBias();
+                    }
+                    reactive_mask = effects.bias.Get();
+                }
+            }
+            if (size == frame.extent) {
+                if (const TextureHandle cropped = run_crop_depth()) {
+                    output = upscaler.Upscale(
+                        device, scheduler,
+                        {
+                            .color = color.Get(),
+                            .depth = cropped,
+                            .motion = motion.Get(),
+                            .render_size = frame.extent,
+                            .output_size = output_size,
+                            .jitter = dlss_jitter,
+                            .motion_vector_scale = {1.0f, 1.0f},
+                            .reset = reset,
+                            .depth_reversed = false,
+                            .auto_exposure = false,
+                            .reactive = reactive_mask,
+                            .output = direct_upscaled,
+                        });
+                    if (output != nullptr) {
+                        force_crop_depth = true;
+                        crop_extent = frame.extent;
+                        crop_depth_size = frame.depth_size;
+                    }
+                }
+            }
+        }
         if (output != nullptr) {
+            if (direct_upscaled != nullptr && output != direct_upscaled) {
+                upscaled_rejected = true;
+                upscaled = {};
+                upscaled_size = {};
+            }
             if (bias_encoded && reactive_mask != nullptr) {
                 ++effects_frames;
             }
@@ -1013,7 +1230,6 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
             reason = "camera projection invalid";
             return false;
         }
-        Run(color_pass, frame.color, color.Get(), {}, frame.extent);
         if (!fsr3) {
             fsr3 = std::make_unique<Fsr3Upscaler>(device, scheduler,
                                                   Fsr3Upscaler::Profile::OcarinaLdr);
@@ -1057,7 +1273,8 @@ bool OcarinaTemporal::Record(const Frame& frame, const char*& reason) {
     last_upscaled = output;
     if (frame.target != nullptr) {
         const bool same_size = output_size == frame.target_size;
-        Run(output_pass, output, frame.target, {}, frame.target_size, !same_size);
+        Run(same_size ? direct_output_pass : output_pass, output, frame.target, {},
+            frame.target_size, !same_size);
     }
     last_evaluation = now;
     last_frame = frame.frame;

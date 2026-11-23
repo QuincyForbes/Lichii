@@ -16,6 +16,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 #include <span>
 
@@ -101,6 +102,20 @@ public:
     /// Whether p points into the emulated physical memory, the only memory with device addresses.
     bool IsPhysicalPointer(const u8* p) const {
         return (GetRawPhysicalAddr(p) >> page_bits) < compressed_device_addr.size();
+    }
+
+    /// Returns the single device page mapped to physical pointer `p`, or std::nullopt when
+    /// unmapped or multiply mapped.
+    [[nodiscard]] std::optional<u32> TryGetSingleDevicePage(const u8* p) const {
+        const size_t phys_page = GetRawPhysicalAddr(p) >> page_bits;
+        if (phys_page >= compressed_device_addr.size()) {
+            return std::nullopt;
+        }
+        const u32 base = compressed_device_addr[phys_page];
+        if (base == 0 || (base >> MULTI_FLAG_BITS) != 0) {
+            return std::nullopt;
+        }
+        return base;
     }
 
     template <typename Func>

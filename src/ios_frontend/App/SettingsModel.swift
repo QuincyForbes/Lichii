@@ -248,7 +248,7 @@ enum SettingsCatalog {
 
     static let vulkanOnlyKeys: Set<String> = [
         "moltenvk_driver", "mesh_direct_outputs", "use_vulkan_driver_pipeline_cache",
-        "async_presentation", "frame_pacing_mode",
+        "async_presentation",
     ]
 
     @MainActor

@@ -555,8 +555,14 @@ Object CreateMeshRenderPipelineState(const Device& device, const RenderPipelineD
             // Metal wants the payload in 16-byte steps.
             descriptor.payloadMemoryLength = (functions.payload_bytes + 15) & ~15U;
             descriptor.maxTotalThreadsPerObjectThreadgroup = functions.object_threads;
+            if (functions.object_threads >= 32 && (functions.object_threads % 32) == 0) {
+                descriptor.objectThreadgroupSizeIsMultipleOfThreadExecutionWidth = YES;
+            }
         }
         descriptor.maxTotalThreadsPerMeshThreadgroup = functions.mesh_threads;
+        if (functions.mesh_threads >= 32 && (functions.mesh_threads % 32) == 0) {
+            descriptor.meshThreadgroupSizeIsMultipleOfThreadExecutionWidth = YES;
+        }
         for (u32 slot = 0; slot < 31; ++slot) {
             if (((functions.object_immutable >> slot) & 1U) != 0) {
                 descriptor.objectBuffers[slot].mutability = MTLMutabilityImmutable;

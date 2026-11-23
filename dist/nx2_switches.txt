@@ -622,8 +622,8 @@ EDEN_NX2_FENCE_BATCH=1
 # Forest went from 52-53 to 66-70 fps with 03; no change with all 24 CPUs.
 #EDEN_NX2_GUEST_CORE_FIRST=03
 
-# Ocarina of Time: 0 keeps the game's own multi-core masks, 2 narrows each to the thread's ideal
-# core (default: widened to every core).
+# Ocarina of Time: 1 widens multi-core masks to every core, 2 narrows each to the thread's ideal
+# core (default: 0, the game's own Switch 2 masks).
 #EDEN_NX2_OOT_WIDE_AFFINITY=0
 
 # Yield backoff: a gap between two yields longer than this (us, default 100) starts a new run;

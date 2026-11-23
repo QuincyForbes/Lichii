@@ -75,13 +75,10 @@ public:
         delayed_destruction_ring.Tick();
     }
 
-    // Unlike other fences, this one doesn't
     void SignalOrdering() {
         if (!AsyncFences()) {
             TryReleasePendingFences<false>();
         }
-        std::scoped_lock lock{buffer_cache.mutex};
-        buffer_cache.AccumulateFlushes();
     }
 
     void SignalReference() {
@@ -101,83 +98,7 @@ public:
     }
 
     void SignalFence(std::function<void()>&& func, bool force_completion = false) {
-        Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
-        // The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
-        // at each command list end): read once, every decision of this fence uses one value.
-        const bool delay_fence = force_completion || DelayFences();
-        if (!AsyncFences()) {
-            TryReleasePendingFences<false>();
-        }
-        auto [should_flush, committed_flushes] = CommitCacheFlushes();
-        if (Nx2Profile::Enabled()) {
-            const FenceDecision decision = ClassifyFence(delay_fence, committed_flushes);
-            NoteFenceDecision(decision);
-            if (decision == FenceDecision::Skipped) {
-                ++skipped_fences;
-                Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
-                func();
-                rasterizer.InvalidateGPUCache();
-                return;
-            }
-        } else if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
-            Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
-            func();
-            rasterizer.InvalidateGPUCache();
-            return;
-        }
-        skipped_fences = 0;
-        should_flush |= force_completion || query_cache.HasUncommittedFlushes();
-        query_cache.CommitAsyncFlushes();
-        const bool stubbed = !should_flush && committed_flushes == 0;
-        if (AsyncFences() && stubbed && FenceFold() && FoldStubbedFence(delay_fence, func)) {
-            if (delay_fence) {
-                SubmitDeferredWork();
-            }
-            rasterizer.InvalidateGPUCache();
-            return;
-        }
-        TFence new_fence = CreateFence(!should_flush);
-        if (AsyncFences()) {
-            guard.lock();
-        }
-        {
-            std::scoped_lock lock{uncommitted_guard};
-            if (delay_fence) {
-                uncommitted_operations.emplace_back(std::move(func));
-            }
-            pending_operations.emplace_back(TakeUncommittedOperations());
-        }
-        pending_flushes.push_back(committed_flushes);
-        if (AsyncFences()) {
-            pending_query_pops.push_back(1);
-        }
-        QueueFence(new_fence);
-        if (!delay_fence) {
-            func();
-        }
-        fences.push(std::move(new_fence));
-        fences_in_flight.fetch_add(1, std::memory_order_relaxed);
-        work_epoch.fetch_add(1, std::memory_order_release);
-        if (should_flush) {
-            rasterizer.FlushCommands();
-        }
-        if (AsyncFences()) {
-            // The fencing thread waits for the host GPU while it has fences: it needs waking (a
-            // system call) only when it waits for fences to be made (zortos293/Lichii#1516).
-            const bool wake = !WakeOnlyWaiting() || fence_thread_waiting;
-            guard.unlock();
-            if (wake) {
-                cv.notify_all();
-            }
-        }
-        if (delay_fence) {
-            // Its callback runs on the fencing thread once the fence's work is done, and the
-            // guest or WaitPendingFences may block on that callback: a submission left for
-            // later (Scheduler::DeferFlush) would wait for the back to go idle, which it then
-            // never does (GPU accuracy switched to High while the game ran, 24 s and more).
-            SubmitDeferredWork();
-        }
-        rasterizer.InvalidateGPUCache();
+        SignalFenceImpl(std::move(func), force_completion, false, false);
     }
 
     void SignalSyncPoint(u32 value) {
@@ -188,15 +109,18 @@ public:
             LOG_ERROR(HW_GPU, "Signal of syncpoint {} past the table, ignored", value);
             return;
         }
+        const u64 render_frame_before = Tegra::g_nx2_render_frame.load(std::memory_order_relaxed);
         // The render-frame clock (video_core/nx2.h), before the increment: a flip its actions
         // wake must already see the bump.
         if (Tegra::g_nx2_render_clock_wanted.load(std::memory_order_relaxed)) {
             Tegra::Nx2NoteSyncpointSignal(
                 value, static_cast<u32>(syncpoint_manager.GetGuestSyncpointValue(value)) + 1);
         }
+        const bool frame_flip_sync =
+            Tegra::g_nx2_render_frame.load(std::memory_order_relaxed) != render_frame_before;
         syncpoint_manager.IncrementGuest(value);
         std::function<void()> func([this, value] { syncpoint_manager.IncrementHost(value); });
-        SignalFence(std::move(func));
+        SignalFenceImpl(std::move(func), false, true, frame_flip_sync);
     }
 
     void WaitPendingFences([[maybe_unused]] bool force) {
@@ -205,6 +129,33 @@ public:
         } else {
             if (!force) {
                 return;
+            }
+            if (!DelayFences()) {
+                bool need_fence = query_cache.HasUncommittedFlushes();
+                if constexpr (requires { query_cache.HasPendingFenceWork(); }) {
+                    need_fence |= query_cache.HasPendingFenceWork();
+                }
+                if (!need_fence) {
+                    std::scoped_lock lock{uncommitted_guard};
+                    need_fence = !uncommitted_operations.empty();
+                }
+                if (!need_fence) {
+                    std::scoped_lock lock{texture_cache.mutex};
+                    need_fence = texture_cache.HasAsyncFlushWork();
+                }
+                if (!need_fence) {
+                    bool check_buffer_flushes = true;
+                    if constexpr (requires { buffer_cache.CanDeferPreflushDownloads(); }) {
+                        check_buffer_flushes = !buffer_cache.CanDeferPreflushDownloads();
+                    }
+                    if (check_buffer_flushes && buffer_cache.HasUncommittedFlushes()) {
+                        need_fence = true;
+                    }
+                }
+                if (!need_fence) {
+                    rasterizer.InvalidateGPUCache();
+                    return;
+                }
             }
             std::mutex wait_mutex;
             std::condition_variable wait_cv;
@@ -254,9 +205,16 @@ public:
             }
         }
         {
-            std::unique_lock lock{buffer_cache.mutex, std::try_to_lock};
-            if (!lock || buffer_cache.HasUncommittedFlushes()) {
-                return false;
+            bool check_buffer_flushes = true;
+            if constexpr (requires { buffer_cache.CanDeferPreflushDownloads(); }) {
+                check_buffer_flushes =
+                    strict || DelayFences() || !buffer_cache.CanDeferPreflushDownloads();
+            }
+            if (check_buffer_flushes) {
+                std::unique_lock lock{buffer_cache.mutex, std::try_to_lock};
+                if (!lock || buffer_cache.HasUncommittedFlushes()) {
+                    return false;
+                }
             }
         }
         if (query_cache.HasUncommittedFlushes()) {
@@ -479,7 +437,8 @@ private:
         return enabled;
     }
 
-    bool FoldStubbedFence(bool delay_fence, std::function<void()>& func) {
+    bool FoldStubbedFence(bool delay_fence, bool has_uncommitted_ops,
+                          std::function<void()>& func) {
         std::unique_lock lock{guard};
         if (!fences.empty()) {
             {
@@ -501,7 +460,10 @@ private:
             }
             return true;
         }
-        if (!fence_thread_busy && !inline_running && GpuSplit::OnBackThread()) {
+        // Keep SyncOperation callbacks (such as Metal visibility report waits) off GPUBack so
+        // the fencing thread waits on their completion instead of stalling command encoding.
+        if (!has_uncommitted_ops && !fence_thread_busy && !inline_running &&
+            GpuSplit::OnBackThread()) {
             inline_running = true;
             fences_in_flight.fetch_add(1, std::memory_order_relaxed);
             work_epoch.fetch_add(1, std::memory_order_release);
@@ -604,13 +566,103 @@ private:
         u8 committed;       ///< TextureFlushes, BufferFlushes: the caches that committed downloads
     };
 
+    void SignalFenceImpl(std::function<void()>&& func, bool force_completion, bool is_syncpoint,
+                         bool frame_flip_sync) {
+        Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
+        // The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
+        // at each command list end): read once, every decision of this fence uses one value.
+        const bool delay_fence = force_completion || DelayFences();
+        if (!AsyncFences()) {
+            TryReleasePendingFences<false>();
+        }
+        auto [should_flush, committed_flushes] =
+            CommitCacheFlushes(delay_fence, is_syncpoint, frame_flip_sync);
+        if (Nx2Profile::Enabled()) {
+            const FenceDecision decision = ClassifyFence(delay_fence, committed_flushes);
+            NoteFenceDecision(decision);
+            if (decision == FenceDecision::Skipped) {
+                ++skipped_fences;
+                Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
+                func();
+                rasterizer.InvalidateGPUCache();
+                return;
+            }
+        } else if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
+            Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
+            func();
+            rasterizer.InvalidateGPUCache();
+            return;
+        }
+        skipped_fences = 0;
+        const bool query_flushes = query_cache.HasUncommittedFlushes();
+        bool has_uncommitted_ops = query_flushes;
+        if (!has_uncommitted_ops) {
+            std::scoped_lock lock{uncommitted_guard};
+            has_uncommitted_ops = !uncommitted_operations.empty();
+        }
+        should_flush |= force_completion || query_flushes;
+        query_cache.CommitAsyncFlushes();
+        const bool stubbed = !should_flush && committed_flushes == 0;
+        const bool submit_for_waiter =
+            delay_fence || (has_uncommitted_ops && gpu.HasSuspendedChannels());
+        if (AsyncFences() && stubbed && FenceFold() &&
+            FoldStubbedFence(delay_fence, has_uncommitted_ops, func)) {
+            if (submit_for_waiter) {
+                SubmitDeferredWork();
+            }
+            rasterizer.InvalidateGPUCache();
+            return;
+        }
+        TFence new_fence = CreateFence(!should_flush);
+        if (AsyncFences()) {
+            guard.lock();
+        }
+        {
+            std::scoped_lock lock{uncommitted_guard};
+            if (delay_fence) {
+                uncommitted_operations.emplace_back(std::move(func));
+            }
+            pending_operations.emplace_back(TakeUncommittedOperations());
+        }
+        pending_flushes.push_back(committed_flushes);
+        if (AsyncFences()) {
+            pending_query_pops.push_back(1);
+        }
+        QueueFence(new_fence);
+        if (!delay_fence) {
+            func();
+        }
+        fences.push(std::move(new_fence));
+        fences_in_flight.fetch_add(1, std::memory_order_relaxed);
+        work_epoch.fetch_add(1, std::memory_order_release);
+        if (should_flush) {
+            rasterizer.FlushCommands();
+        }
+        if (AsyncFences()) {
+            // The fencing thread waits for the host GPU while it has fences: it needs waking (a
+            // system call) only when it waits for fences to be made (zortos293/Lichii#1516).
+            const bool wake = !WakeOnlyWaiting() || fence_thread_waiting;
+            guard.unlock();
+            if (wake) {
+                cv.notify_all();
+            }
+        }
+        if (submit_for_waiter) {
+            // Its callback runs on the fencing thread once the fence's work is done, and the
+            // guest, a suspended channel, or WaitPendingFences may block on that callback: a
+            // submission left for later (Scheduler::DeferFlush) would otherwise sit uncommitted.
+            SubmitDeferredWork();
+        }
+        rasterizer.InvalidateGPUCache();
+    }
+
     /// Commits the texture and buffer caches' downloads for a new fence (the query cache's are
     /// committed once a fence is made). Switch 2 titles signal a fence per compute dispatch
     /// (thousands a second), mostly with nothing or only buffer data to download: each cache's
     /// lock is taken once, alone, and the fencing thread later takes only the lock of the cache
     /// with work, instead of holding both while it copies (the GPU thread's draws and uploads
     /// waited for it).
-    CacheFlushes CommitCacheFlushes() {
+    CacheFlushes CommitCacheFlushes(bool delay_fence, bool is_syncpoint, bool frame_flip_sync) {
         CacheFlushes flushes{};
         {
             std::scoped_lock lock{texture_cache.mutex};
@@ -620,18 +672,29 @@ private:
                 flushes.committed |= TextureFlushes;
             }
         }
-        {
-            std::scoped_lock lock{buffer_cache.mutex};
-            if (buffer_cache.HasUncommittedFlushes()) {
-                if constexpr (requires { buffer_cache.TryCommitAsyncFlushes(); }) {
-                    if (buffer_cache.TryCommitAsyncFlushes()) {
+        if (buffer_cache.HasUncommittedFlushes()) {
+            bool should_commit = true;
+            if constexpr (requires {
+                              buffer_cache.ShouldCommitPreflushNow(is_syncpoint, frame_flip_sync);
+                          }) {
+                if (!delay_fence) {
+                    should_commit =
+                        buffer_cache.ShouldCommitPreflushNow(is_syncpoint, frame_flip_sync);
+                }
+            }
+            if (should_commit) {
+                std::scoped_lock lock{buffer_cache.mutex};
+                if (buffer_cache.HasUncommittedFlushes()) {
+                    if constexpr (requires { buffer_cache.TryCommitAsyncFlushes(); }) {
+                        if (buffer_cache.TryCommitAsyncFlushes()) {
+                            flushes.should_flush = true;
+                            flushes.committed |= BufferFlushes;
+                        }
+                    } else {
+                        buffer_cache.CommitAsyncFlushes();
                         flushes.should_flush = true;
                         flushes.committed |= BufferFlushes;
                     }
-                } else {
-                    buffer_cache.CommitAsyncFlushes();
-                    flushes.should_flush = true;
-                    flushes.committed |= BufferFlushes;
                 }
             }
         }

@@ -772,6 +772,28 @@ void RegAlloc::SpillFlags() {
     active_gprs |= u64{1} << new_location_index;
 }
 
+RegisterList RegAlloc::LiveCallerSaveRegisters(RegisterList exclude) const noexcept {
+    constexpr u32 caller_gprs = static_cast<u32>(ABI_CALLER_SAVE) & ~(u32{1} << 30);
+    constexpr u32 caller_fprs = static_cast<u32>(ABI_CALLER_SAVE >> 32);
+    RegisterList live = 0;
+
+    for (u64 mask = active_gprs & caller_gprs; mask != 0; mask &= mask - 1) {
+        const int i = std::countr_zero(mask);
+        const auto& info = gprs[static_cast<std::size_t>(i)];
+        if (info.HasLiveValue() && info.accumulated_uses + info.uses_this_inst < info.expected_uses) {
+            live |= RegisterList{1} << i;
+        }
+    }
+    for (u64 mask = active_fprs & caller_fprs; mask != 0; mask &= mask - 1) {
+        const int i = std::countr_zero(mask);
+        const auto& info = fprs[static_cast<std::size_t>(i)];
+        if (info.HasLiveValue() && info.accumulated_uses + info.uses_this_inst < info.expected_uses) {
+            live |= RegisterList{1} << (i + 32);
+        }
+    }
+    return live & ~exclude;
+}
+
 int RegAlloc::FindFreeSpill() const {
     const int index = std::countr_one(active_spills);
     ASSERT(static_cast<std::size_t>(index) < SpillCount && "All spill locations are full");

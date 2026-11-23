@@ -229,9 +229,9 @@ struct NativeMesh {
 /// EDEN_NX2_METAL_MESH_NATIVE / EDEN_NX2_METAL_NATIVE_MESH (default off; 1: native Metal mesh).
 [[nodiscard]] bool NativeMeshEnabled();
 
-/// EDEN_NX2_METAL_MESH_PER_PRIMITIVE (default on; 0: mesh programs with per-primitive generics
-/// fall back to compute emulation).
-[[nodiscard]] bool NativeMeshPerPrimitive();
+/// EDEN_NX2_METAL_MESH_PER_PRIMITIVE (default on on macOS, off on iOS; 0: mesh programs with
+/// per-primitive generics fall back to compute emulation).
+[[nodiscard]] bool NativeMeshPerPrimitive(bool ios = false);
 
 /// Metal's limits for mesh pipelines on Apple GPUs, as the native path checks them.
 struct NativeMeshLimits {
@@ -423,7 +423,8 @@ public:
     [[nodiscard]] static u64 VisualWorkaroundEdits() noexcept;
 
     static void RefreshKey(GraphicsPipelineKey& key, const Tegra::Engines::Maxwell3D::Regs& regs,
-                           Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology topology);
+                           Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology topology,
+                           bool* inout_has_xfb = nullptr);
 
     /// The key's pipeline from its programs' environments (one per program of the key, in slot
     /// order); nothing when it can't be made, and Cause() says why.

@@ -8,7 +8,6 @@
 
 #include <array>
 #include <chrono>
-#include <list>
 #include <memory>
 #include <optional>
 #include <span>
@@ -43,6 +42,25 @@ using VideoCommon::ImageId;
 using VideoCommon::NUM_RT;
 using VideoCommon::Region2D;
 
+struct CachedTextureView {
+    u64 key0{};
+    u64 key1{};
+    Object view;
+    u64 gpu_resource_id{};
+
+    [[nodiscard]] static constexpr u64 PackKey0(u32 format, std::array<u8, 4> swizzle) noexcept {
+        return (u64{format} << 32) | (u64{swizzle[0]} << 24) | (u64{swizzle[1]} << 16) |
+               (u64{swizzle[2]} << 8) | u64{swizzle[3]};
+    }
+
+    [[nodiscard]] static constexpr u64 PackKey1(TextureKind kind, u32 base_level, u32 levels,
+                                                u32 base_layer, u32 layers) noexcept {
+        return (u64{static_cast<u8>(kind)} << 56) | (u64{base_level & 0xFFU} << 48) |
+               (u64{levels & 0xFFU} << 40) | (u64{base_layer & 0xFFFFFU} << 20) |
+               u64{layers & 0xFFFFFU};
+    }
+};
+
 class TextureCacheRuntime {
 public:
     explicit TextureCacheRuntime(const Device& device, Scheduler& scheduler,
@@ -65,6 +83,12 @@ public:
         return scheduler.CurrentTick();
     }
 
+    /// Last GPU command buffer tick that can reference resources retired at this point.
+    [[nodiscard]] u64 RetireTick() const noexcept {
+        const u64 cur_tick = scheduler.CurrentTick();
+        return scheduler.HasPendingWork() ? cur_tick : (cur_tick > 0 ? cur_tick - 1 : 0);
+    }
+
     [[nodiscard]] bool IsFree(u64 tick) const noexcept {
         return scheduler.IsFree(tick);
     }
@@ -77,9 +101,18 @@ public:
         return pooled_texture_bytes;
     }
 
-    [[nodiscard]] std::pair<Object, u64> AcquireTexture(const TextureDesc& tex_desc,
-                                                        bool* out_from_pool = nullptr);
-    void ReleaseTexture(const TextureDesc& tex_desc, Object&& tex, u64 tex_bytes);
+    struct AcquiredTexture {
+        Object texture;
+        u64 bytes{};
+        u64 gpu_resource_id{};
+        std::vector<CachedTextureView> views;
+        bool from_pool{};
+    };
+
+    [[nodiscard]] AcquiredTexture AcquireTexture(const TextureDesc& tex_desc);
+    void ReleaseTexture(const TextureDesc& tex_desc, Object&& tex, u64 tex_bytes,
+                        u64 gpu_resource_id, std::vector<CachedTextureView>&& views,
+                        u64 ready_tick = 0);
     void TrimTexturePool(u64 max_bytes);
 
     [[nodiscard]] u64 GetDeviceLocalMemory() const;
@@ -174,6 +207,11 @@ public:
     /// ends, storing what was drawn, so the draw's own pass reads it, as Vulkan's barrier orders
     /// it (EDEN_NX2_METAL_FRAGMENT_BARRIER).
     void BarrierFeedbackLoop();
+    void FeedbackBarrier();
+
+    void SetUpcomingRenderTargets(const RenderTargetSet* targets) noexcept {
+        upcoming_render_targets = targets;
+    }
 
     /// The LOD bias Ocarina of Time's mipmapped samplers get while a jittered temporal upscaler
     /// runs (VideoCommon::OcarinaFsrLodBias with MetalFX as Vulkan's Dlss backend), else 0.
@@ -208,6 +246,7 @@ public:
     f32 temporal_lod_bias{};
     u64 temporal_lod_frame{};
     bool ocarina_upscaler_failed{};
+    const RenderTargetSet* upcoming_render_targets{};
 
 private:
     void ZeroTexture(TextureHandle tex, const TextureDesc& tex_desc,
@@ -240,21 +279,32 @@ public:
     std::optional<f32> ocarina_lod_bias;
 
 private:
+    static constexpr u32 InvalidPoolSlot = ~0U;
+
     struct TextureDescHash {
         size_t operator()(const TextureDesc& d) const noexcept;
     };
-    struct PooledTexture {
+    struct PooledTextureSlot {
         TextureDesc desc{};
         Object texture;
+        std::vector<CachedTextureView> views;
         u64 bytes{};
+        u64 gpu_resource_id{};
         u64 frame{};
+        u64 ready_tick{};
+        u32 prev{InvalidPoolSlot};
+        u32 next{InvalidPoolSlot};
     };
+    void LinkPoolSlotTail(u32 slot_idx) noexcept;
+    void UnlinkPoolSlot(u32 slot_idx) noexcept;
     void PopOldestPooledTexture();
 
-    std::list<PooledTexture> texture_pool_lru;
-    std::unordered_map<TextureDesc, std::vector<std::list<PooledTexture>::iterator>,
-                       TextureDescHash>
-        texture_pool_index;
+    std::vector<PooledTextureSlot> texture_pool_slots;
+    std::vector<u32> texture_pool_free_slots;
+    std::unordered_map<TextureDesc, std::vector<u32>, TextureDescHash> texture_pool_index;
+    u32 pool_lru_head{InvalidPoolSlot};
+    u32 pool_lru_tail{InvalidPoolSlot};
+    u32 seen_host_pressure{};
     u64 pooled_texture_bytes{};
     u64 pool_frame{};
     u64 pool_hits{};
@@ -278,7 +328,8 @@ public:
     Image& operator=(Image&&) = default;
 
     void UploadMemory(BufferHandle buffer, size_t offset,
-                      std::span<const VideoCommon::BufferImageCopy> copies, bool ahead = false);
+                      std::span<const VideoCommon::BufferImageCopy> copies, bool ahead = false,
+                      bool buffer_range_tracked = false);
 
     void UploadMemory(const StagingBufferRef& map,
                       std::span<const VideoCommon::BufferImageCopy> copies);
@@ -386,7 +437,28 @@ public:
         return rescaled ? scaled_desc : desc;
     }
 
-    void ReleaseToPool();
+    [[nodiscard]] u64 ActiveResourceId() const noexcept {
+        return rescaled ? scaled_resource_id : base_resource_id;
+    }
+
+    struct ResolvedSubView {
+        TextureHandle handle{};
+        Object uncached_owner;
+        u64 gpu_resource_id{};
+    };
+
+    [[nodiscard]] ResolvedSubView FindOrCreateViewHandle(TextureHandle base, u32 format,
+                                                         TextureKind view_kind, u32 base_level,
+                                                         u32 levels, u32 base_layer, u32 layers,
+                                                         std::array<u8, 4> swizzle);
+
+    [[nodiscard]] Object FindOrCreateView(TextureHandle base, u32 format, TextureKind view_kind,
+                                          u32 base_level, u32 levels, u32 base_layer, u32 layers,
+                                          std::array<u8, 4> swizzle,
+                                          u64* out_gpu_resource_id = nullptr);
+
+    void OnDelete() noexcept;
+    void ReleaseToPool(u64 ready_tick = 0);
 
     u64 allocation_tick{};
 
@@ -424,6 +496,8 @@ private:
     /// The texture at the scaled size, made on the first ScaleUp.
     Object scaled_texture;
     Object sample_grid;
+    std::vector<CachedTextureView> base_views;
+    std::vector<CachedTextureView> scaled_views;
     TextureDesc desc{};
     TextureDesc scaled_desc{};
     FormatInfo host_format{};
@@ -431,13 +505,23 @@ private:
     u64 bytes{};
     u64 base_texture_bytes{};
     u64 scaled_bytes{};
+    u64 base_resource_id{};
+    u64 scaled_resource_id{};
     bool rescaled{};
     bool from_pool{};
     bool needs_pool_zero{};
+    bool delete_notified{};
 };
 
 class ImageView : public VideoCommon::ImageViewBase {
 public:
+    enum SamplerTraitBits : u8 {
+        TraitSupportsAnisotropy = 1 << 0,
+        TraitForceNearest = 1 << 1,
+        TraitIsSrgb = 1 << 2,
+        TraitRedOnlyBorder = 1 << 3,
+    };
+
     explicit ImageView(TextureCacheRuntime&, const VideoCommon::ImageViewInfo&, ImageId, Image&,
                        const SlotVector<Image>&);
     explicit ImageView(TextureCacheRuntime&, const VideoCommon::ImageInfo&,
@@ -456,7 +540,16 @@ public:
 
     /// The view shaders sample as `texture_type`, made on first use. Null for null views.
     [[nodiscard]] TextureHandle Handle(Shader::TextureType texture_type,
-                                       u64* out_gpu_resource_id = nullptr);
+                                       u64* out_gpu_resource_id = nullptr) {
+        const size_t slot = static_cast<size_t>(texture_type);
+        if (slot < Shader::NUM_TEXTURE_TYPES && (resolved_views & (1U << slot)) != 0) {
+            if (out_gpu_resource_id != nullptr) {
+                *out_gpu_resource_id = view_resource_ids[slot];
+            }
+            return view_handles[slot];
+        }
+        return HandleSlow(texture_type, out_gpu_resource_id);
+    }
 
     /// Cached MTLResourceID of `Handle(texture_type)` (0 for null views).
     [[nodiscard]] u64 GpuResourceId(Shader::TextureType texture_type) {
@@ -469,28 +562,66 @@ public:
     /// format for sRGB images and the declared `image_format` when typed, with identity swizzle.
     [[nodiscard]] TextureHandle StorageHandle(Shader::TextureType texture_type,
                                               Shader::ImageFormat image_format,
-                                              u64* out_gpu_resource_id = nullptr);
+                                              u64* out_gpu_resource_id = nullptr) {
+        const u32 key = (static_cast<u32>(texture_type) << 16) | static_cast<u32>(image_format);
+        if (key == cached_storage_key) {
+            if (out_gpu_resource_id != nullptr) {
+                *out_gpu_resource_id = cached_storage_res_id;
+            }
+            return cached_storage_handle;
+        }
+        if (image_texture == nullptr) {
+            if (out_gpu_resource_id != nullptr) {
+                *out_gpu_resource_id = 0;
+            }
+            return nullptr;
+        }
+        return StorageHandleSlow(texture_type, image_format, out_gpu_resource_id);
+    }
 
     /// What a program reads as `texture_type`: a multisampled image read as a plain texture
     /// (`multisample_read` false) reads the grid of its samples (UseSampleGrid) with
     /// EDEN_NX2_METAL_MSAA, as the guest sees it.
     [[nodiscard]] TextureHandle SampledHandle(Shader::TextureType texture_type,
                                               bool multisample_read,
-                                              u64* out_gpu_resource_id = nullptr);
+                                              u64* out_gpu_resource_id = nullptr) {
+        if (sample_grid == nullptr || multisample_read) {
+            return Handle(texture_type, out_gpu_resource_id);
+        }
+        return SampledHandleSlow(texture_type, multisample_read, out_gpu_resource_id);
+    }
 
     /// Fills the image's sample grid (Image::SampleGrid) for a draw that reads this
     /// multisampled view as a plain texture; false when it can't (the view is bound as it is).
     bool PrepareSampleGrid();
 
     /// The attachment that renders into this view's first level and layer.
-    [[nodiscard]] Attachment RenderTarget() const noexcept;
+    [[nodiscard]] Attachment RenderTarget() const noexcept {
+        if (is_3d_slice) {
+            return Attachment{
+                .texture = render_texture,
+                .level = static_cast<u32>(range.base.level),
+                .slice = 0,
+                .depth_plane = static_cast<u32>(range.base.layer),
+            };
+        }
+        return Attachment{
+            .texture = render_texture,
+            .level = static_cast<u32>(range.base.level),
+            .slice = static_cast<u32>(range.base.layer),
+        };
+    }
 
     [[nodiscard]] u32 HostFormat() const noexcept {
         return host_format;
     }
 
     [[nodiscard]] FormatClass HostClass() const noexcept {
-        return ClassOf(host_format);
+        return host_class;
+    }
+
+    [[nodiscard]] u8 SamplerTraits() const noexcept {
+        return sampler_traits;
     }
 
     [[nodiscard]] TextureHandle ImageHandle() const noexcept {
@@ -516,31 +647,53 @@ public:
 
     /// The image the view shows (null for null and buffer views).
     [[nodiscard]] const Image* BackingImage() const noexcept {
-        return slot_images != nullptr && image_id ? &(*slot_images)[image_id] : nullptr;
+        return slot_images != nullptr && image_id && image_id != VideoCommon::NULL_IMAGE_ID
+                   ? &(*slot_images)[image_id]
+                   : nullptr;
     }
 
 private:
+    void InitSamplerTraits(const Device& device) noexcept;
+    [[nodiscard]] TextureHandle HandleSlow(Shader::TextureType texture_type,
+                                           u64* out_gpu_resource_id);
+    [[nodiscard]] TextureHandle StorageHandleSlow(Shader::TextureType texture_type,
+                                                  Shader::ImageFormat image_format,
+                                                  u64* out_gpu_resource_id);
+    [[nodiscard]] TextureHandle SampledHandleSlow(Shader::TextureType texture_type,
+                                                  bool multisample_read,
+                                                  u64* out_gpu_resource_id);
+
     struct StorageVariant {
         Shader::TextureType type{};
         u32 format{};
-        Object view;
+        TextureHandle handle{};
+        Object uncached_owner;
         u64 gpu_resource_id{};
     };
 
     SlotVector<Image>* slot_images{};
     TextureHandle image_texture{};
+    TextureHandle render_texture{};
     u32 samples{1};
     u32 guest_samples{1};
     TextureKind image_kind{TextureKind::e2D};
+    FormatClass host_class{FormatClass::Float};
+    u8 sampler_traits{};
+    u16 resolved_views{};
     u32 host_format{};
+    u32 linear_format{};
+    u32 cached_storage_key{~0U};
+    TextureHandle cached_storage_handle{};
+    u64 cached_storage_res_id{};
     std::array<u8, 4> swizzle{IdentitySwizzle};
+    std::array<TextureHandle, Shader::NUM_TEXTURE_TYPES> view_handles{};
     std::array<Object, Shader::NUM_TEXTURE_TYPES> views;
     std::array<u64, Shader::NUM_TEXTURE_TYPES> view_resource_ids{};
     std::vector<StorageVariant> storage_views;
     TextureHandle sample_grid{};
     std::array<Object, 2> grid_views; ///< 2D and 2D array views of sample_grid
     std::array<u64, 2> grid_view_resource_ids{};
-    Object render_view; ///< Only when the view's format is not its image's
+    Object render_view; ///< Only when uncached on Image and the view's format is not its image's
     bool is_render_target{};
     bool is_3d_slice{};
     u32 buffer_size{};
@@ -644,6 +797,14 @@ public:
         return height;
     }
 
+    [[nodiscard]] u32 AttachmentWidth() const noexcept {
+        return attachment_width;
+    }
+
+    [[nodiscard]] u32 AttachmentHeight() const noexcept {
+        return attachment_height;
+    }
+
     /// Layers of each colour target's view, and of the depth target's, from its slice on.
     [[nodiscard]] const std::array<u32, NUM_RT>& ColorLayers() const noexcept {
         return color_layers;
@@ -670,6 +831,8 @@ private:
     bool has_stencil{};
     u32 width{};
     u32 height{};
+    u32 attachment_width{};
+    u32 attachment_height{};
     u32 layers{1};
 };
 

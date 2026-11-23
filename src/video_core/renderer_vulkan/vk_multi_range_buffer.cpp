@@ -228,6 +228,9 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
     if (it != entries.end() && it->second.geometry == geometry && it->second.size == total) {
         Entry& entry = it->second;
         entry.last_used = frame;
+        const u64 pass_serial = scheduler.BeforePassSerial();
+        const bool unused_in_pass = entry.last_pass_serial != pass_serial;
+        entry.last_pass_serial = pass_serial;
         if (entry.content != content) {
             entry.content = content;
             entry.dirty = true;
@@ -238,6 +241,7 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
             .size = entry.size,
             .sparse = true,
             .needs_gather = false,
+            .unused_in_pass = unused_in_pass,
         };
         if (!entry.sparse_handle) {
             ref.handle = *entry.gathered;
@@ -256,6 +260,7 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
     entry.content = content;
     entry.size = total;
     entry.last_used = frame;
+    entry.last_pass_serial = scheduler.BeforePassSerial();
     entry.owners.reserve(sources.size());
     for (const MultiRangeSource& source : sources) {
         entry.owners.push_back(source.handle);
@@ -298,6 +303,7 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
         .size = entry.size,
         .sparse = true,
         .needs_gather = false,
+        .unused_in_pass = true,
     };
     if (!entry.sparse_handle) {
         ref.handle = *entry.gathered;

@@ -4659,6 +4659,11 @@ int RunDeviceMsl() {
 /// records, one of them past the count, into Metal's arguments. On a GPU with mesh pipelines the
 /// functions are drawn directly (two halves through the payload) and from those arguments.
 int RunNativeMesh() {
+    if (std::getenv("EDEN_NX2_METAL_MESH_NATIVE") == nullptr &&
+        std::getenv("EDEN_NX2_METAL_NATIVE_MESH") == nullptr && Metal::NativeMeshEnabled()) {
+        std::printf("metal-smoke: FAIL native mesh: NativeMeshEnabled() defaulted on\n");
+        return 1;
+    }
     namespace Translate = Metal::ShaderTranslate;
     const std::span<const uint32_t> task_spirv{NATIVE_MESH_SMOKE_TASK_SPV};
     const std::span<const uint32_t> mesh_spirv{NATIVE_MESH_SMOKE_MESH_SPV};

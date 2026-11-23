@@ -55,6 +55,8 @@ public:
 
     [[nodiscard]] bool IsRegionUsed(u64 offset, u64 size) const noexcept;
 
+    [[nodiscard]] bool MayBeUsedInCurrentPass(u64 offset, u64 size) const noexcept;
+
     [[nodiscard]] u8* HostPtr() noexcept {
         return host_ptr;
     }
@@ -91,6 +93,9 @@ private:
     VideoCommon::UsageTracker tracker;
     /// The scheduler segment the tracker holds the uses of.
     u64 usage_serial{};
+    u64 last_pass_serial{~u64{0}};
+    u64 pass_interval_begin{};
+    u64 pass_interval_end{};
     mutable u64 last_usage_tick{};
     bool freshly_zeroed_{};
 };
@@ -181,9 +186,25 @@ public:
 
     [[nodiscard]] StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
 
+    /// Whether `buffer` is mapped unified memory not referenced by any open or in-flight GPU work.
+    [[nodiscard]] bool CanDirectUpload(const Buffer& buffer) const noexcept;
+
     /// Whether the upload may go ahead of the segment: nothing recorded in it uses the bytes.
     [[nodiscard]] bool CanReorderUpload(
         const Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies) const noexcept;
+
+    /// Whether a buffer-to-buffer copy may go ahead of the segment on AheadBuffer().
+    [[nodiscard]] bool CanReorderCopy(
+        const Buffer& dst_buffer, const Buffer& src_buffer,
+        std::span<const VideoCommon::BufferCopy> copies) const noexcept;
+
+    /// Whether a dirty >4 KiB uniform buffer should stream in-pass instead of breaking an open
+    /// Metal render pass with an in-order SynchronizeBuffer blit.
+    [[nodiscard]] bool ShouldStreamDirtyUniformInPass(const Buffer& buffer, u32 offset,
+                                                      u32 size) const noexcept;
+
+    [[nodiscard]] bool ShouldStreamDirtyComputeUniform(const Buffer& buffer, u32 offset,
+                                                       u32 size) const noexcept;
 
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
 
@@ -191,7 +212,8 @@ public:
 
     void CopyBuffer(BufferHandle dst_buffer, BufferHandle src_buffer,
                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
-                    bool can_reorder_upload = false, bool range_tracked = false);
+                    bool can_reorder_upload = false, bool range_tracked = false,
+                    bool src_range_tracked = false);
     void CopyBuffer(Buffer& dst_buffer, BufferHandle src_buffer,
                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
                     bool can_reorder_upload = false);
@@ -217,7 +239,7 @@ public:
     void PostCopyBarrier() {}
 
     void ClearBuffer(BufferHandle dest_buffer, u32 offset, size_t size, u32 value);
-    void ClearBuffer(Buffer& dest_buffer, u32 offset, size_t size, u32 value);
+    bool ClearBuffer(Buffer& dest_buffer, u32 offset, size_t size, u32 value);
 
     [[nodiscard]] BufferHandle Nx2MeshMirror();
 
@@ -248,7 +270,7 @@ public:
     }
 
     [[nodiscard]] u32 StreamUniformAllocationSize(u32 size) const noexcept {
-        return (stream_uniform_readable_bytes > size && stream_uniform_readable_bytes <= 65536U)
+        return (stream_uniform_readable_bytes > size && stream_uniform_readable_bytes < 65536U)
                    ? stream_uniform_readable_bytes
                    : size;
     }
@@ -379,12 +401,17 @@ private:
         BufferHandle buffer{};
         u32 offset{};
         u32 size{};
+        u64 ahead_serial{};
+
+        bool operator==(const MultiRangeSource&) const noexcept = default;
     };
     struct MultiRangeBuffer {
         Object buffer;
         u64 gpu_address{};
         u64 size{};
         u64 frame{};
+        u64 segment_serial{};
+        std::vector<MultiRangeSource> last_sources;
     };
     std::vector<MultiRangeSource> multi_range_sources;
     u64 multi_range_total{};
@@ -404,6 +431,7 @@ private:
     u64 upload_scratch_large_frame{};
     BufferHandle cached_stream_buffer{};
     u64 cached_stream_gpu_address{};
+    BufferHandle last_download_staging{};
     StreamUniformRef last_stream_uniform{};
     u32 stream_uniform_readable_bytes{};
     WriteHook write_hook{};

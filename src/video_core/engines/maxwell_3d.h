@@ -3277,6 +3277,7 @@ public:
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) final;
 
     void ApplyPairs(Core::System& system, const u64* pairs, u32 count) final;
+    size_t ApplyPairsRun(Core::System& system, const u64* entry, size_t max_words);
 
     /// GpuSplit's back (fast_maxwell3d): CallMethod for each of up to 64 single writes to the
     /// constant buffer data registers, uploaded in one memory write within a device page.
@@ -3288,6 +3289,13 @@ public:
     size_t CallStateMethodRun(const u64* entry, size_t max_words);
     /// A compact ring block of consecutive state registers.
     void CallStateMethodBlock(u32 method, const u32* arguments, u32 count);
+    /// Compact split-ring packet executors on the back thread.
+    void ExecuteCbBind(Core::System& system, u64 head, GPUVAddr address);
+    size_t ExecuteCbBindRun(Core::System& system, const u64* entry, size_t max_words);
+    void ExecuteCbUpload(Core::System& system, u64 head, const u32* words);
+    size_t ExecuteDrawIndexed(Core::System& system, const u64* entry);
+    void ExecuteDrawArrays(Core::System& system, u64 head, u64 counts);
+    void ExecuteRenderEnable(Core::System& system, u64 head, GPUVAddr address);
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
@@ -3380,6 +3388,8 @@ public:
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
     void ProcessCBMultiData(const u32* start_base, u32 amount);
+    void WriteCBWordsBurst(GPUVAddr buffer_address, const u32* words, u32 count,
+                           bool warn_overflow);
 
     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
 
@@ -3406,7 +3416,7 @@ private:
         if (f0 != 0) {
             dirty.flags[f0] = true;
         }
-        if (f1 != 0) {
+        if (f1 != 0 && f1 != f0) {
             dirty.flags[f1] = true;
         }
     }
@@ -3552,6 +3562,18 @@ public:
     bool FrontMacroCountsDraw(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               u32 count);
 private:
+    [[nodiscard]] bool CanDeferCbState(const FrontState& state) const noexcept;
+    [[nodiscard]] bool CanFastOotMacro(const FrontState& state) const noexcept;
+    [[nodiscard]] static bool SetsDeferredDraw(const FrontState& state, u32 method,
+                                               u32 value) noexcept;
+    void FrontSetCbSelectReg(FrontState& state, u32 slot, u32 value) noexcept;
+    void FlushCbSelect(VideoCommon::GpuSplit& split, FrontState& state, u8 mask);
+    void FlushDeferredCbState(VideoCommon::GpuSplit& split, FrontState& state);
+    void FrontBindCb(VideoCommon::GpuSplit& split, FrontState& state, u32 stage, u32 argument,
+                     u64& profile_same);
+    bool TryStageDrawStep(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                          bool is_last_call, bool from_macro);
+    void FlushStagedDraw(VideoCommon::GpuSplit& split, FrontState& state);
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
     void FrontTrackIndexDraws(FrontState& state, u32 method);
@@ -3606,6 +3628,8 @@ private:
     bool skip_same_value_writes{true};
     bool super_macro_enabled{true};
     bool perf_verify{};
+    u64 cb_bind_map_serial{};
+    std::array<u32, Regs::MaxShaderStage> cb_bind_synced{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,
     // mode before, path), printed when the sides disagree.
     struct ControlWrite {

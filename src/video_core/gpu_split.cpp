@@ -219,6 +219,8 @@ void GpuSplit::Stop() {
     last_memory_write_position = 0;
     previous_memory_write_position = 0;
     ranged_writes.clear();
+    ranged_page_max_pos.fill(0);
+    ranged_large_max_pos = 0;
     queued_releases = {};
     last_function_position = 0;
     writes.Reset();
@@ -231,6 +233,10 @@ void GpuSplit::Stop() {
     front_engine = nullptr;
     pairs_header = nullptr;
     pairs_count = 0;
+    cb_upload_header = nullptr;
+    cb_upload_flags = 0;
+    cb_upload_count = 0;
+    cb_upload_first_slot = 0;
     back_engine = nullptr;
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
@@ -279,8 +285,9 @@ void GpuSplit::WaitForSpace(size_t words) {
 }
 
 void GpuSplit::Publish() {
-    // The back may read what is published: the open Pairs block is final from here on.
+    // The back may read what is published: open Pairs and CbUpload blocks are final from here on.
     pairs_header = nullptr;
+    cb_upload_header = nullptr;
     if (published_local == write_position) {
         return;
     }
@@ -552,6 +559,7 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
             last.end = end;
             last.position = write_position;
             last.method = method;
+            NoteRangedWritePages(last.begin, last.end, write_position);
             if (data != nullptr && last.space == space && space != 0 &&
                 last.data.size() * sizeof(u32) == static_cast<size_t>(begin - last.begin)) {
                 last.data.insert(last.data.end(), data, data + words);
@@ -577,6 +585,7 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
     write.end = end;
     write.method = method;
     write.space = 0;
+    NoteRangedWritePages(begin, end, write_position);
     if (data != nullptr && space != 0 && (end - begin) % sizeof(u32) == 0) {
         write.space = space;
         write.data.assign(data, data + words);
@@ -615,6 +624,23 @@ u64 GpuSplit::MemoryWriterTarget(u64 done, GPUVAddr begin, GPUVAddr end, u32& ta
     }
     u64 target = std::max({last_writer_position, last_sync_position, last_memory_write_position});
     target_method = last_memory_write_method;
+    if (!ranged_writes.empty() && begin < end && ranged_large_max_pos <= target) {
+        const u64 first_page = begin >> 12;
+        const u64 last_page = (end - 1) >> 12;
+        if (last_page - first_page < 8) {
+            bool maybe_hit = false;
+            for (u64 page = first_page; page <= last_page; ++page) {
+                const size_t slot = static_cast<size_t>((page ^ (page >> 10)) & RangedPageMask);
+                if (ranged_page_max_pos[slot] > target) {
+                    maybe_hit = true;
+                    break;
+                }
+            }
+            if (!maybe_hit) {
+                return std::min(target, write_position);
+            }
+        }
+    }
     // Newest first (positions rise in send order): the first overlap is the target, and the
     // writes before `target` can't raise it.
     for (size_t age = 0; age < ranged_writes.size(); ++age) {
@@ -849,13 +875,15 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
     }
 }
 
-void GpuSplit::DeferFunction(std::function<void()>&& func) {
+void GpuSplit::DeferFunction(std::function<void()>&& func, bool changes_mappings) {
     auto* const heap = new std::function<void()>(std::move(func));
     Defer([heap] {
         (*heap)();
         delete heap;
-    });
-    last_function_position = write_position;
+    }, changes_mappings ? Effect::Unknown : Effect::None);
+    if (changes_mappings) {
+        last_function_position = write_position;
+    }
 }
 
 bool GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
@@ -1165,6 +1193,10 @@ void GpuSplit::ExecuteRepeated(u64 head) {
 }
 
 void GpuSplit::VerifyRepeat(u64 head) {
+    if (static_cast<Kind>(head & 0xf) != Kind::Method) {
+        verify_previous = head;
+        return;
+    }
     const u64 word = head & ~Repeatable;
     if ((head & Repeatable) != 0) {
         ++verify_mergeable;
@@ -1211,6 +1243,16 @@ void GpuSplit::StateMethodRun(Tegra::Engines::EngineInterface* engine, u32 metho
     }
     DEBUG_ASSERT(count <= 64);
     using Tegra::Engines::Maxwell3D;
+    if (ring_pairs && effect == Effect::None && WritePipeEnabled() &&
+        method < Maxwell3D::Regs::NUM_REGS && !engine->execution_mask[method] &&
+        (count < 4 || (pairs_header != nullptr && engine == front_engine && count <= 16))) {
+        std::array<u64, 16> packed;
+        for (u32 i = 0; i < count; ++i) {
+            packed[i] = u64{method + i} | (u64{arguments[i]} << 32);
+        }
+        PairWriteSpan(engine, packed.data(), count);
+        return;
+    }
     if (count < 4 || !WritePipeEnabled() || !engine->fast_maxwell3d ||
         method >= Maxwell3D::Regs::NUM_REGS || engine->execution_mask[method]) {
         for (u32 i = 0; i < count; ++i) {
@@ -1373,11 +1415,18 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
     case Kind::Pairs: {
         // EDEN_NX2_RING_PAIRS: one profiler scope and one call for the block; the sink first,
         // as for any other write, to keep the order.
-        const u32 count = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
+        if (engine->fast_maxwell3d && !verify_repeats) {
+            auto* const maxwell3d = static_cast<Tegra::Engines::Maxwell3D*>(engine);
+            if (!maxwell3d->method_sink.empty()) {
+                maxwell3d->ConsumeSink(*system);
+            }
+            return maxwell3d->ApplyPairsRun(*system, entry, words);
+        }
+        const u32 count = static_cast<u32>(head >> 32);
         if (engine->fast_maxwell3d) {
             auto* const maxwell3d = static_cast<Tegra::Engines::Maxwell3D*>(engine);
-            if (!maxwell3d->method_sink.empty()) [[unlikely]] {
+            if (!maxwell3d->method_sink.empty()) {
                 maxwell3d->ConsumeSink(*system);
             }
             maxwell3d->ApplyPairs(*system, entry + 1, count);
@@ -1387,6 +1436,34 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         engine->ConsumeSink(*system);
         engine->ApplyPairs(*system, entry + 1, count);
         return 1 + size_t{count};
+    }
+    case Kind::CbBind: {
+        auto* const maxwell3d = static_cast<Tegra::Engines::Maxwell3D*>(back_engine);
+        if (!verify_repeats) {
+            return maxwell3d->ExecuteCbBindRun(*system, entry, words);
+        }
+        maxwell3d->ExecuteCbBind(*system, head, entry[1]);
+        return 2;
+    }
+    case Kind::CbUpload: {
+        const u32 count = static_cast<u32>((head >> 16) & 0xffff);
+        auto* const maxwell3d = static_cast<Tegra::Engines::Maxwell3D*>(back_engine);
+        maxwell3d->ExecuteCbUpload(*system, head, reinterpret_cast<const u32*>(entry + 1));
+        return 1 + (size_t{count} + 1) / 2;
+    }
+    case Kind::DrawIndexed: {
+        auto* const maxwell3d = static_cast<Tegra::Engines::Maxwell3D*>(back_engine);
+        return maxwell3d->ExecuteDrawIndexed(*system, entry);
+    }
+    case Kind::DrawArrays: {
+        auto* const maxwell3d = static_cast<Tegra::Engines::Maxwell3D*>(back_engine);
+        maxwell3d->ExecuteDrawArrays(*system, head, entry[1]);
+        return 2;
+    }
+    case Kind::RenderEnable: {
+        auto* const maxwell3d = static_cast<Tegra::Engines::Maxwell3D*>(back_engine);
+        maxwell3d->ExecuteRenderEnable(*system, head, entry[1]);
+        return 2;
     }
     }
     return 1;
@@ -1612,45 +1689,54 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         // EDEN_NX2_RING_PREFETCH: the ring lines ahead of the entry, up to a line short of what
         // the front published (a line it may still be writing would only bounce between the two
         // cores). The front wrote them moments ago: they sit in its core's caches.
+        const u64 prefetch_limit = available > 8 ? available - 8 : u64{0};
         u64 prefetched = read_position;
-        while (read_position != available) {
-            const size_t index = read_position & RingMask;
-            if (g_ring_prefetch) {
-                const u64 ahead = (std::min)(read_position + RingPrefetchWords,
-                                             available > 8 ? available - 8 : u64{0});
-                prefetched = (std::max)(prefetched, read_position);
-                while (prefetched + 8 <= ahead) {
-                    prefetched += 8;
-                    PrefetchRingLine(&ring[prefetched & RingMask]);
+        u64 last_check = read_position;
+        {
+            Nx2Profile::Scope replay_scope{Nx2Profile::Zone::BackReplay};
+            while (read_position != available) {
+                const size_t index = read_position & RingMask;
+                if (g_ring_prefetch) {
+                    const u64 ahead = (std::min)(read_position + RingPrefetchWords, prefetch_limit);
+                    if (prefetched + 8 <= ahead) {
+                        prefetched = (std::max)(prefetched, read_position);
+                        while (prefetched + 8 <= ahead) {
+                            prefetched += 8;
+                            PrefetchRingLine(&ring[prefetched & RingMask]);
+                        }
+                    }
+                }
+                back_entry_position = read_position;
+                const size_t size = Execute(
+                    &ring[index], std::min<u64>(available - read_position, RingWords - index));
+                read_position += size != 0 ? size : RingWords - index;
+                // Hand ring space back now and then while working through a long batch, and
+                // promptly when the front crosses the position it waits for (WaitFor / Drain).
+                if (read_position != available && read_position - last_check >= 16) {
+                    last_check = read_position;
+                    if (hook_requested.load(std::memory_order_relaxed) && idle_hook != nullptr) {
+                        Nx2Profile::Scope hook_scope{Nx2Profile::Zone::BackIdleHook};
+                        hook_requested.store(false, std::memory_order_seq_cst);
+                        ForgetFencesQuiet();
+                        idle_hook(idle_argument, true);
+                    }
+                    const u64 target = wait_target.load(std::memory_order_relaxed);
+                    if (last_store < target && read_position >= target) {
+                        consumed.store(read_position, std::memory_order_seq_cst);
+                        last_store = read_position;
+                        NotifyFront(read_position);
+                    } else if (read_position - last_store >= 4096) {
+                        consumed.store(read_position, std::memory_order_release);
+                        last_store = read_position;
+                    }
                 }
             }
-            back_entry_position = read_position;
-            size_t size;
-            {
-                Nx2Profile::Scope replay_scope{Nx2Profile::Zone::BackReplay};
-                size = Execute(&ring[index],
-                               std::min<u64>(available - read_position, RingWords - index));
-            }
-            read_position += size != 0 ? size : RingWords - index;
-            if (hook_requested.load(std::memory_order_relaxed) &&
-                idle_hook != nullptr) [[unlikely]] {
-                hook_requested.store(false, std::memory_order_seq_cst);
-                ForgetFencesQuiet();
-                idle_hook(idle_argument, true);
-            }
-            // Hand ring space back now and then while working through a long batch, and at once
-            // when the front first crosses the position it waits for (WaitFor / Drain).
-            if (read_position != available) {
-                const u64 target = wait_target.load(std::memory_order_relaxed);
-                if (last_store < target && read_position >= target) {
-                    consumed.store(read_position, std::memory_order_seq_cst);
-                    last_store = read_position;
-                    NotifyFront(read_position);
-                } else if (read_position - last_store >= 4096) {
-                    consumed.store(read_position, std::memory_order_release);
-                    last_store = read_position;
-                }
-            }
+        }
+        if (hook_requested.load(std::memory_order_relaxed) && idle_hook != nullptr) {
+            Nx2Profile::Scope hook_scope{Nx2Profile::Zone::BackIdleHook};
+            hook_requested.store(false, std::memory_order_seq_cst);
+            ForgetFencesQuiet();
+            idle_hook(idle_argument, true);
         }
         CheckFencesQuiet(read_position);
         consumed.store(read_position, std::memory_order_seq_cst);

@@ -234,20 +234,16 @@ bool IsNceEnabled() {
 }
 
 bool IsCachedInterpreterEnabled() {
-    if (const char* env = std::getenv("EDEN_NX2_CPU_BACKEND")) {
-        if (std::string_view{env} == "cached" || std::string_view{env} == "interpreter") {
-            return true;
-        }
+    if (const char* env = std::getenv("EDEN_NX2_CPU_BACKEND"); env != nullptr && env[0] != '\0') {
+        return std::string_view{env} == "cached" || std::string_view{env} == "interpreter";
     }
     return values.cpu_backend.GetValue() == CpuBackend::CachedInterpreter;
 }
 
 bool IsHypervisorEnabled() {
 #ifdef HAS_HYPERVISOR
-    if (const char* env = std::getenv("EDEN_NX2_CPU_BACKEND")) {
-        if (std::string_view{env} == "hypervisor" || std::string_view{env} == "hv") {
-            return true;
-        }
+    if (const char* env = std::getenv("EDEN_NX2_CPU_BACKEND"); env != nullptr && env[0] != '\0') {
+        return std::string_view{env} == "hypervisor" || std::string_view{env} == "hv";
     }
     return values.cpu_backend.GetValue() == CpuBackend::Hypervisor;
 #else
@@ -533,10 +529,12 @@ OotFrameRate OcarinaRate() {
 } // namespace
 
 // The vsync rate every game starts frames on: the shared frame target (frame_pacing_mode), or the
-// frame_rate_limit setting with Auto. Ocarina of Time stays at 60 unless the target is above it
-// (OcarinaHalfRate covers 30).
+// frame_rate_limit setting with Auto. Ocarina of Time stays at 60 unless unlocked (OcarinaHalfRate
+// covers 30); when unlocked with frame_rate_limit left at or below its 60 Hz default, lift the cap.
 u16 FrameRateLimit() {
-    if (GetCurrentProgramID() == OcarinaOfTimeId && OcarinaRate() != OotFrameRate::Unlocked) {
+    constexpr u16 kUnlockedVsyncHz = 1000;
+    const bool is_ocarina = GetCurrentProgramID() == OcarinaOfTimeId;
+    if (is_ocarina && OcarinaRate() != OotFrameRate::Unlocked) {
         return 60;
     }
     switch (values.frame_pacing_mode.GetValue()) {
@@ -549,11 +547,15 @@ u16 FrameRateLimit() {
     case FramePacingMode::Target_120:
         return 120;
     case FramePacingMode::Unlocked:
-        return 1000;
+        return kUnlockedVsyncHz;
     case FramePacingMode::Target_Auto:
         break;
     }
-    return values.frame_rate_limit.GetValue();
+    const u16 limit = values.frame_rate_limit.GetValue();
+    if (is_ocarina && limit <= values.frame_rate_limit.GetDefault()) {
+        return kUnlockedVsyncHz;
+    }
+    return limit;
 }
 
 bool OcarinaHalfRate(u64 program_id) {

@@ -466,8 +466,11 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
                      matching_sdk, matching_sdk ? load_base : 0, session ? session->id : 0);
         }
     }
-    Core::OotZstd::PatchModule(process.GetProgramId(), nso_header.build_id, name, codeset.memory,
-                               load_base);
+    if (module_start < codeset.memory.size()) {
+        Core::OotZstd::PatchModule(
+            process.GetProgramId(), nso_header.build_id, name,
+            std::span<u8>{codeset.memory}.subspan(module_start), load_base + module_start);
+    }
     // Clear trailing .bss pages via ClearBackingRegion so untouched zero granules are not faulted in.
     if (codeset.memory.size() < image_size) {
         auto& page_table = process.GetPageTable();

@@ -32,6 +32,9 @@
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 #include <boost/container/static_vector.hpp>
 #include <sirit/sirit.h>
 
@@ -833,6 +836,11 @@ DeviceShaderProfiles MakeDeviceShaderProfiles(const Device& device, bool log_det
         subgroup_stage_bit(VK_SHADER_STAGE_MESH_BIT_EXT, Shader::Stage::Mesh)};
     if (driver_id == VK_DRIVER_ID_MESA_TURNIP) {
         supported_subgroup_stages &= ~(1u << static_cast<u32>(Shader::Stage::Geometry));
+    }
+    if (driver_id == VK_DRIVER_ID_MOLTENVK && device.IsExtMeshShaderSupported() &&
+        (subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT) != 0) {
+        supported_subgroup_stages |= (1u << static_cast<u32>(Shader::Stage::Task)) |
+                                     (1u << static_cast<u32>(Shader::Stage::Mesh));
     }
     out.profile = Shader::Profile{
         .supported_spirv = device.SupportedSpirvVersion(),
@@ -1673,17 +1681,21 @@ bool FlatPerPrimitiveInputs(const Device& device) {
 }
 
 /// Whether a mesh program that writes per-primitive generics is built as a native mesh pipeline:
-/// everywhere but on MoltenVK, where it takes the compute emulation. EDEN_NX2_NATIVE_PER_PRIMITIVE
-/// =1 native on every driver, =0 emulated on every driver. The iPhone refuses pipeline
-/// bbfd9d39350cdaaa at every boot ("Fragment input(s) user(locn1),user(locn3) mismatching mesh
-/// shader output type(s) or not written by mesh shader"), though the same interface builds with
-/// Apple's offline compiler for that GPU in every form tried.
+/// on macOS (libMoltenVKMesh) and desktop/Android drivers, while iOS defaults to compute emulation
+/// (matching Metal's NativeMeshPerPrimitive). EDEN_NX2_NATIVE_PER_PRIMITIVE=1 forces native on
+/// every driver, =0 forces compute emulation on every driver; any individual pipeline rejected by
+/// the driver still falls back via EmulateFailedNativeMesh.
 bool NativePerPrimitiveMesh(const Device& device) {
     static const int native = [] {
         const char* value = std::getenv("EDEN_NX2_NATIVE_PER_PRIMITIVE");
         return value == nullptr ? -1 : (value[0] != '0' ? 1 : 0);
     }();
+#if defined(__APPLE__) && TARGET_OS_IPHONE
     return native >= 0 ? native != 0 : !device.IsMoltenVK();
+#else
+    (void)device;
+    return native != 0;
+#endif
 }
 
 /// EDEN_NX2_MESH_EMULATE=all|<pipeline hash>,...: those mesh pipelines take the compute emulation
@@ -2285,14 +2297,14 @@ bool PipelineCache::IsIndirectResetShader() const {
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
-    GraphicsPipeline* const pipeline = CurrentGraphicsPipelineLookup();
-    if (pipeline != nullptr && pipeline->IsMeshPipeline() && !pipeline->IsEmulatedMesh() &&
-        pipeline->Failed()) [[unlikely]] {
-        return EmulateFailedNativeMesh(pipeline);
-    }
+    GraphicsPipeline* pipeline = CurrentGraphicsPipelineLookup();
     if (pipeline != nullptr && device.IsMoltenVK() && profile.support_descriptor_aliasing &&
-        pipeline->Failed()) [[unlikely]] {
-        return RebuildWithoutAliasing(pipeline);
+        pipeline->Failed()) {
+        pipeline = RebuildWithoutAliasing(pipeline);
+    }
+    if (pipeline != nullptr && pipeline->IsMeshPipeline() && !pipeline->IsEmulatedMesh() &&
+        pipeline->Failed()) {
+        return EmulateFailedNativeMesh(pipeline);
     }
     return pipeline;
 }
@@ -3155,6 +3167,14 @@ u64 PackDynamicFeatures(const DynamicFeatures& f) noexcept {
 
 /// The precache marker's variant: the build's SPIR-V emission stamp and the settings and device
 /// capabilities that change what the driver gets for a precache build.
+u64 WarmMeshCaps(const Device& device) {
+    if (!device.IsExtMeshShaderSupported()) {
+        return 0ULL;
+    }
+    return 1ULL | (NativePerPrimitiveMesh(device) ? 2ULL : 0ULL) |
+           (MeshDirectOutputs(device) ? 4ULL : 0ULL);
+}
+
 u64 WarmVariant(const Device& device, const DynamicFeatures& dynamic_features) {
     const auto& resolution = Settings::values.resolution_info;
     const std::array<u64, 11> inputs{
@@ -3167,7 +3187,7 @@ u64 WarmVariant(const Device& device, const DynamicFeatures& dynamic_features) {
         Settings::values.renderer_debug.GetValue() ? 1ULL : 0ULL,
         device.IsExtDescriptorBufferSupported() ? 1ULL : 0ULL,
         device.IsExtGraphicsPipelineLibrarySupported() ? 1ULL : 0ULL,
-        device.IsExtMeshShaderSupported() ? 1ULL : 0ULL,
+        WarmMeshCaps(device),
         PackDynamicFeatures(dynamic_features),
     };
     return Common::CityHash64(reinterpret_cast<const char*>(inputs.data()), sizeof(inputs));
@@ -6161,6 +6181,21 @@ std::optional<std::string> NativeMeshLimitExceeded(const Device& device,
         return fmt::format("task payload {} B, device {} B", info.payload_words * 4,
                            limits.maxTaskPayloadSize);
     }
+    if (limits.maxMeshWorkGroupInvocations != 0 &&
+        mesh->workgroup_size[0] > limits.maxMeshWorkGroupInvocations) {
+        return fmt::format("{} mesh threads, device {}", mesh->workgroup_size[0],
+                           limits.maxMeshWorkGroupInvocations);
+    }
+    if (task != nullptr && limits.maxTaskWorkGroupInvocations != 0 &&
+        task->workgroup_size[0] > limits.maxTaskWorkGroupInvocations) {
+        return fmt::format("{} task threads, device {}", task->workgroup_size[0],
+                           limits.maxTaskWorkGroupInvocations);
+    }
+    if (task != nullptr && limits.maxTaskSharedMemorySize != 0 &&
+        task->shared_memory_size > limits.maxTaskSharedMemorySize) {
+        return fmt::format("task shared memory {} B, device {} B", task->shared_memory_size,
+                           limits.maxTaskSharedMemorySize);
+    }
     if (!device.IsMoltenVK()) {
         return std::nullopt;
     }
@@ -6216,13 +6251,44 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateCachedGraphicsPipeline(
     const GraphicsPipelineCacheKey& key, std::vector<std::vector<FileEnvironment>>& records,
     PipelineStatistics* statistics) {
     ShaderPools pools;
+    const u64 hash = key.Hash();
     for (auto& envs : records) {
         pools.ReleaseContents();
         boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
         for (auto& env : envs) {
             env_ptrs.push_back(&env);
         }
-        if (auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), statistics, false)}) {
+        auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), statistics, false)};
+        if (pipeline && device.IsMoltenVK() && profile.support_descriptor_aliasing &&
+            pipeline->Failed()) {
+            bool retry_no_alias{};
+            {
+                std::scoped_lock lock{no_alias_mutex};
+                retry_no_alias = no_alias_pipelines.insert(hash).second;
+            }
+            if (retry_no_alias) {
+                pools.ReleaseContents();
+                pipeline = CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), statistics, false);
+            }
+        }
+        if (pipeline && pipeline->IsMeshPipeline() && !pipeline->IsEmulatedMesh() &&
+            pipeline->Failed()) {
+            bool retry_emulated{};
+            {
+                std::scoped_lock lock{failed_native_mesh_mutex};
+                retry_emulated = failed_native_mesh.insert(hash).second;
+            }
+            if (retry_emulated) {
+                pools.ReleaseContents();
+                pipeline = CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), statistics, false);
+                LOG_WARNING(Render_Vulkan,
+                            "Native mesh pipeline {:016x} (shaders{}) failed at boot: {}", hash,
+                            MeshPipelineShaders(key),
+                            pipeline ? "its draws take the compute emulation instead"
+                                     : "the compute emulation cannot take it either");
+            }
+        }
+        if (pipeline && !pipeline->Failed()) {
             return pipeline;
         }
     }
@@ -6230,7 +6296,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateCachedGraphicsPipeline(
     constexpr size_t MaxRecords = 3;
     if (records.size() < MaxRecords) {
         std::scoped_lock lock{failed_disk_pipelines_mutex};
-        failed_disk_pipelines.insert(key.Hash());
+        failed_disk_pipelines.insert(hash);
     }
     return nullptr;
 }
@@ -7811,7 +7877,7 @@ struct CachedVulkanWarmCaps {
     u32 device_id{};
     bool ext_descriptor_buffer{};
     bool ext_gpl{};
-    bool ext_mesh_shader{};
+    u64 mesh_caps{};
     bool driver_caches_pipelines{};
     bool mvk_mesh{};
     DynamicFeatures dynamic_features{};
@@ -7821,7 +7887,10 @@ CachedVulkanWarmCaps QueryCachedVulkanWarmCaps() {
     struct Key {
         u32 device_index{};
         u32 dyna_state{};
+        u32 moltenvk_driver{};
         bool dynamic_vi{};
+        bool use_mesh_shaders{};
+        bool mesh_direct_outputs{};
         bool want_dlss{};
         bool want_fsr4{};
         bool operator==(const Key&) const noexcept = default;
@@ -7829,7 +7898,10 @@ CachedVulkanWarmCaps QueryCachedVulkanWarmCaps() {
     const Key current_key{
         .device_index = Settings::values.vulkan_device.GetValue(),
         .dyna_state = static_cast<u32>(Settings::values.dyna_state.GetValue()),
+        .moltenvk_driver = static_cast<u32>(Settings::values.moltenvk_driver.GetValue()),
         .dynamic_vi = Settings::values.vertex_input_dynamic_state.GetValue(),
+        .use_mesh_shaders = Settings::values.use_mesh_shaders.GetValue(),
+        .mesh_direct_outputs = Settings::values.mesh_direct_outputs.GetValue(),
         .want_dlss = Settings::NvidiaDlssChosen(),
         .want_fsr4 = Settings::AmdFsr4Chosen(),
     };
@@ -7854,7 +7926,7 @@ CachedVulkanWarmCaps QueryCachedVulkanWarmCaps() {
             out.device_id = device.GetDeviceID();
             out.ext_descriptor_buffer = device.IsExtDescriptorBufferSupported();
             out.ext_gpl = device.IsExtGraphicsPipelineLibrarySupported();
-            out.ext_mesh_shader = device.IsExtMeshShaderSupported();
+            out.mesh_caps = WarmMeshCaps(device);
             out.driver_caches_pipelines = DriverCachesPipelines(device);
             out.mvk_mesh = device.IsMoltenVK() && device.IsExtMeshShaderSupported();
             out.dynamic_features = MakeDynamicFeatures(device);
@@ -7879,7 +7951,7 @@ u64 WarmVariantFromCaps(const CachedVulkanWarmCaps& caps) {
         Settings::values.renderer_debug.GetValue() ? 1ULL : 0ULL,
         caps.ext_descriptor_buffer ? 1ULL : 0ULL,
         caps.ext_gpl ? 1ULL : 0ULL,
-        caps.ext_mesh_shader ? 1ULL : 0ULL,
+        caps.mesh_caps,
         PackDynamicFeatures(caps.dynamic_features),
     };
     return Common::CityHash64(reinterpret_cast<const char*>(inputs.data()), sizeof(inputs));

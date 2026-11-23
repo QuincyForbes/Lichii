@@ -333,8 +333,18 @@ public:
 private:
     KPriorityQueueImpl m_scheduled_queue;
     KPriorityQueueImpl m_suggested_queue;
+    alignas(4) mutable u32 m_detached_count{};
 
 private:
+    constexpr void AddDetachedCount(s32 delta) {
+        if (std::is_constant_evaluated()) {
+            m_detached_count = static_cast<u32>(static_cast<s32>(m_detached_count) + delta);
+        } else {
+            std::atomic_ref<u32>{m_detached_count}.fetch_add(static_cast<u32>(delta),
+                                                             std::memory_order_relaxed);
+        }
+    }
+
     static constexpr void ClearAffinityBit(u64& affinity, s32 core) {
         affinity &= ~(UINT64_C(1) << core);
     }
@@ -353,6 +363,8 @@ private:
         if (const s32 core = member->GetActiveCore(); core >= 0) {
             m_scheduled_queue.PushBack(priority, core, member);
             ClearAffinityBit(affinity, core);
+        } else {
+            AddDetachedCount(1);
         }
 
         // And suggest the thread for all other cores.
@@ -369,6 +381,8 @@ private:
         if (const s32 core = member->GetActiveCore(); core >= 0) {
             m_scheduled_queue.PushFront(priority, core, member);
             ClearAffinityBit(affinity, core);
+        } else {
+            AddDetachedCount(1);
         }
 
         // And suggest the thread for all other cores.
@@ -386,6 +400,8 @@ private:
         if (const s32 core = member->GetActiveCore(); core >= 0) {
             m_scheduled_queue.Remove(priority, core, member);
             ClearAffinityBit(affinity, core);
+        } else {
+            AddDetachedCount(-1);
         }
 
         // Remove from the suggested queue for all other cores.
@@ -432,6 +448,17 @@ public:
 
     constexpr u32 GetScheduledCount(s32 core) const {
         return m_scheduled_queue.GetCount(core);
+    }
+
+    constexpr u32 GetSuggestedCount(s32 core) const {
+        return m_suggested_queue.GetCount(core);
+    }
+
+    constexpr u32 GetDetachedCount() const {
+        if (std::is_constant_evaluated()) {
+            return m_detached_count;
+        }
+        return std::atomic_ref<u32>{m_detached_count}.load(std::memory_order_relaxed);
     }
 
     // Mutators.
@@ -525,6 +552,11 @@ public:
                 m_suggested_queue.PushBack(priority, core, member);
             }
         }
+        if (prev_core < 0 && new_core >= 0) {
+            AddDetachedCount(-1);
+        } else if (prev_core >= 0 && new_core < 0) {
+            AddDetachedCount(1);
+        }
     }
 
     constexpr void ChangeCore(s32 prev_core, Member* member, bool to_front = false) {
@@ -557,6 +589,12 @@ public:
             // Add to the suggested queue for the previous core.
             if (prev_core >= 0) {
                 m_suggested_queue.PushBack(priority, prev_core, member);
+            }
+
+            if (prev_core < 0 && new_core >= 0) {
+                AddDetachedCount(-1);
+            } else if (prev_core >= 0 && new_core < 0) {
+                AddDetachedCount(1);
             }
         }
     }

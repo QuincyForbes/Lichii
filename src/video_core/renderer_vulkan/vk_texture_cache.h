@@ -496,13 +496,15 @@ public:
 #if defined(__APPLE__) && TARGET_OS_IPHONE
     // Dead render targets count in the process footprint jetsam watches.
     static constexpr u64 ImagePoolMaxBytes = u64{128} << 20;
+    static constexpr u64 ImagePoolMaxBytesDedicated = u64{128} << 20;
 #else
     static constexpr u64 ImagePoolMaxBytes = u64{512} << 20;
-#endif
     /// EXP42=2 pools the big dedicated render targets too (a 2560x1440 one is ~30 MiB): 512 MiB
     /// held ~17 of them and evicted 1,150-1,400 images a 600 frames in Castle Town (2026-11-10).
     static constexpr u64 ImagePoolMaxBytesDedicated = u64{1536} << 20;
-    [[nodiscard]] static u64 ImagePoolCap();
+#endif
+    static constexpr size_t ImagePoolMaxEntries = 256;
+    [[nodiscard]] u64 ImagePoolCap() const;
     static constexpr u64 ImagePoolMaxFrames = 180;
     std::deque<PooledImage> image_pool;
     u64 image_pool_bytes{};
@@ -703,6 +705,10 @@ public:
         return from_pool;
     }
 
+    [[nodiscard]] bool TakePoolZeroNeeded() noexcept {
+        return std::exchange(needs_pool_zero, false);
+    }
+
     /// EXP42: the deleted image's VkImages go to the runtime's pool instead of being destroyed,
     /// when eligible. Called once the GPU is done with them (TextureCache::TickFrame).
     void ReleaseToPool();
@@ -764,6 +770,9 @@ public:
     void NoteInitialTransition(u64 tick, u64 records) noexcept {
         initial_upload_tick = tick;
         initial_upload_records = records;
+    }
+    [[nodiscard]] bool JustTransitioned(u64 tick, u64 records) const noexcept {
+        return initial_upload_tick == tick && initial_upload_records == records;
     }
 
     u64 allocation_tick;
@@ -885,6 +894,7 @@ private:
     ImagePoolKey original_pool_key;
     ImagePoolKey scaled_pool_key;
     bool from_pool = false; ///< original_image came from the pool
+    bool needs_pool_zero = false;
 
     vk::Image original_image;
     vk::Image scaled_image;

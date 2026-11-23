@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <functional>
@@ -77,7 +78,7 @@ inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
         const u64 mask = (bits == 64 ? ~u64{0} : (u64{1} << bits) - 1) << first_bit;
         auto& word = g_nx2_gpu_written_pages[page / 64];
         if ((word.load(std::memory_order_relaxed) & mask) != mask) {
-            if ((word.fetch_or(mask, std::memory_order_relaxed) & mask) != mask) {
+            if ((word.fetch_or(mask, std::memory_order_release) & mask) != mask) {
                 g_nx2_new_written_pages.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -132,17 +133,20 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
     auto& word = g_nx2_command_list_pages[page / 64];
     const u64 bit = u64{1} << (page % 64);
     if ((word.load(std::memory_order_relaxed) & bit) == 0) {
-        word.fetch_or(bit, std::memory_order_relaxed);
-        g_nx2_has_command_list_pages.store(true, std::memory_order_relaxed);
+        word.fetch_or(bit, std::memory_order_release);
+        g_nx2_has_command_list_pages.store(true, std::memory_order_release);
     }
 }
 
 [[nodiscard]] inline bool Nx2IsCommandListPage(u64 device_address) {
+    if (!g_nx2_has_command_list_pages.load(std::memory_order_acquire)) {
+        return false;
+    }
     const u64 page = device_address >> Nx2WrittenPageBits;
     if (page >= g_nx2_command_list_pages.size() * 64) {
         return false;
     }
-    return (g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
+    return (g_nx2_command_list_pages[page / 64].load(std::memory_order_acquire) >> (page % 64)) & 1;
 }
 
 // Nx2Perf MacroReadWriterSet: graphics draws the back proved write no guest memory, so the
@@ -318,7 +322,7 @@ inline void Nx2ClearAsyncReports() {
     if (page >= g_nx2_gpu_written_pages.size() * 64) {
         return false;
     }
-    return (g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
+    return (g_nx2_gpu_written_pages[page / 64].load(std::memory_order_acquire) >> (page % 64)) & 1;
 }
 
 /// Whether any page of the range may have been written by the GPU (zortos293/Lichii#463).
@@ -601,66 +605,44 @@ inline u64 Nx2SemaphoreMirror(u64 address) {
 }
 
 /// Wakes the GPU thread while it waits for suspended channels (gpu_thread.cpp) on what lets a
-/// channel go on: a new command (ThreadManager::PushCommand) and a GPU write that latches a waiter
-/// (Nx2SemaphoreWaiters::OnWrite). Guest CPU stores to a semaphore go straight to memory through
-/// fastmem and send nothing: the waiting thread watches the words instead
-/// (Nx2SemaphoreWaiters::WordStored).
+/// channel go on: a new command (ThreadManager::PushCommand), a GPU write that latches a waiter
+/// (Nx2SemaphoreWaiters::OnWrite), or a guest CPU store to a watched semaphore word
+/// (Nx2SemaphoreWaiters::WordStored / NoteCpuStore).
 class Nx2PendingWake {
 public:
+    enum Reason : u32 {
+        None = 0,
+        ByPush = 1U << 0,
+        ByLatch = 1U << 1,
+    };
+
     static Nx2PendingWake& Get() {
         static Nx2PendingWake wake;
         return wake;
     }
 
-    void Notify() {
-        if (!woken.exchange(true, std::memory_order_seq_cst) &&
-            sleeping.load(std::memory_order_seq_cst)) {
+    void Notify(u32 reason = ByLatch) {
+        const u32 mask = reason != 0 ? reason : ByLatch;
+        const u32 prev = reasons.fetch_or(mask, std::memory_order_seq_cst);
+        if (prev == 0 && sleeping.load(std::memory_order_seq_cst)) {
             event.Set();
         }
     }
 
     /// Called before the waiter checks its channels: a Notify after it ends the next wait.
     void Arm() {
-        woken.exchange(false, std::memory_order_acq_rel);
+        reasons.exchange(0, std::memory_order_acq_rel);
     }
 
-    /// Waits until a Notify or the deadline; true if notified.
-    bool Poll(std::chrono::steady_clock::time_point deadline) {
-        if (woken.load(std::memory_order_acquire)) {
-            return true;
-        }
-        while (std::chrono::steady_clock::now() < deadline) {
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-            _mm_pause();
-#elif defined(__x86_64__) || defined(__i386__)
-            __builtin_ia32_pause();
-#elif defined(__clang__) && defined(__aarch64__)
-            __builtin_arm_yield();
-#else
-            std::this_thread::yield();
-#endif
-            if (woken.load(std::memory_order_acquire)) {
-                return true;
-            }
-        }
-        return woken.load(std::memory_order_acquire);
-    }
+    /// Waits until a Notify, a watched semaphore store, or the deadline; true if woken.
+    bool Poll(std::chrono::steady_clock::time_point deadline);
 
-    /// Blocks in the OS until a Notify, for at most `time`; true if notified.
-    bool Sleep(std::chrono::nanoseconds time) {
-        if (event.IsSet()) {
-            event.Reset();
-        }
-        sleeping.store(true, std::memory_order_seq_cst);
-        if (!woken.load(std::memory_order_seq_cst)) {
-            event.SleepFor(time);
-        }
-        sleeping.store(false, std::memory_order_relaxed);
-        return woken.load(std::memory_order_acquire);
-    }
+    /// Blocks in the OS until a Notify or watched semaphore store, for at most `time`; returns
+    /// the wake reason bitmask (0 on timeout).
+    u32 Sleep(std::chrono::nanoseconds time);
 
 private:
-    alignas(64) std::atomic<bool> woken{};
+    alignas(64) std::atomic<u32> reasons{};
     std::atomic<bool> sleeping{};
     Common::Event event;
 };
@@ -679,6 +661,7 @@ public:
     static constexpr u32 AcquireMask = 0x8;
     /// One per channel suspended at once.
     static constexpr size_t MaxWaiters = 64;
+    static_assert(MaxWaiters <= 64);
 
     static Nx2SemaphoreWaiters& Get() {
         static Nx2SemaphoreWaiters waiters;
@@ -693,28 +676,39 @@ public:
             return false;
         }
         std::scoped_lock lk{mutex};
-        Slot* free_slot = nullptr;
-        for (Slot& slot : slots) {
+        size_t chosen_index = MaxWaiters;
+        for (size_t i = 0; i < MaxWaiters; ++i) {
+            Slot& slot = slots[i];
             const void* const current = slot.owner.load(std::memory_order_relaxed);
             if (current == owner) {
+                const u64 clear_bit = ~(u64{1} << i);
+                watched_bits.fetch_and(clear_bit, std::memory_order_relaxed);
+                latched_bits.fetch_and(clear_bit, std::memory_order_relaxed);
+                slot.word = nullptr;
                 slot.owner.store(nullptr, std::memory_order_relaxed);
                 count.fetch_sub(1, std::memory_order_relaxed);
             }
-            if ((current == nullptr || current == owner) && free_slot == nullptr) {
-                free_slot = &slot;
+            if ((current == nullptr || current == owner) && chosen_index == MaxWaiters) {
+                chosen_index = i;
             }
         }
-        if (free_slot == nullptr) {
+        if (chosen_index == MaxWaiters) {
             return false;
         }
-        free_slot->address = device_address;
-        free_slot->value = value;
-        free_slot->operation = operation;
-        free_slot->word = word;
-        free_slot->seen =
-            word != nullptr ? std::atomic_ref<u32>{*word}.load(std::memory_order_relaxed) : 0;
-        free_slot->latched.store(false, std::memory_order_relaxed);
-        free_slot->owner.store(owner, std::memory_order_relaxed);
+        Slot& free_slot = slots[chosen_index];
+        const u64 bit = u64{1} << chosen_index;
+        latched_bits.fetch_and(~bit, std::memory_order_relaxed);
+        free_slot.address = device_address;
+        free_slot.value = value;
+        free_slot.operation = operation;
+        free_slot.word = word;
+        free_slot.seen =
+            word != nullptr ? std::atomic_ref<u32>{*word}.load(std::memory_order_acquire) : 0;
+        free_slot.latched.store(false, std::memory_order_relaxed);
+        free_slot.owner.store(owner, std::memory_order_release);
+        if (word != nullptr) {
+            watched_bits.fetch_or(bit, std::memory_order_release);
+        }
         count.fetch_add(1, std::memory_order_release);
         return true;
     }
@@ -726,13 +720,18 @@ public:
         std::scoped_lock lk{mutex};
         const size_t active = count.load(std::memory_order_relaxed);
         size_t seen = 0;
-        for (Slot& slot : slots) {
+        for (size_t i = 0; i < MaxWaiters; ++i) {
+            Slot& slot = slots[i];
             const void* const current = slot.owner.load(std::memory_order_relaxed);
             if (current == nullptr) {
                 continue;
             }
             if (current == owner) {
-                slot.owner.store(nullptr, std::memory_order_relaxed);
+                const u64 clear_bit = ~(u64{1} << i);
+                watched_bits.fetch_and(clear_bit, std::memory_order_release);
+                latched_bits.fetch_and(clear_bit, std::memory_order_release);
+                slot.word = nullptr;
+                slot.owner.store(nullptr, std::memory_order_release);
                 count.fetch_sub(1, std::memory_order_relaxed);
             }
             if (++seen >= active) {
@@ -742,53 +741,83 @@ public:
     }
 
     [[nodiscard]] bool Latched(const void* owner) const {
-        const size_t active = count.load(std::memory_order_acquire);
-        if (owner == nullptr || active == 0) {
+        u64 bits = latched_bits.load(std::memory_order_acquire);
+        if (owner == nullptr || bits == 0) {
             return false;
         }
-        size_t seen = 0;
-        for (const Slot& slot : slots) {
-            const void* const current = slot.owner.load(std::memory_order_relaxed);
-            if (current == nullptr) {
-                continue;
-            }
-            if (current == owner) {
+        while (bits != 0) {
+            const size_t i = static_cast<size_t>(std::countr_zero(bits));
+            bits &= bits - 1;
+            const Slot& slot = slots[i];
+            if (slot.owner.load(std::memory_order_acquire) == owner) {
                 // Acquire: what the engine wrote before the latch is visible after it.
                 return slot.latched.load(std::memory_order_acquire);
-            }
-            if (++seen >= active) {
-                break;
             }
         }
         return false;
     }
 
+    [[nodiscard]] bool HasWatchedWords() const {
+        return watched_bits.load(std::memory_order_acquire) != 0;
+    }
+
     /// GPU thread: whether a watched word changed in memory since it was added or since the last
-    /// call. Guest CPU stores to a semaphore notify nothing; the thread checks this while it waits.
+    /// call. Guest CPU stores to a semaphore notify nothing; the thread checks this while it waits
+    /// and signals Nx2PendingWake when a store is observed.
     [[nodiscard]] bool WordStored() {
-        const size_t active = count.load(std::memory_order_acquire);
-        if (active == 0) {
+        u64 bits = watched_bits.load(std::memory_order_acquire);
+        if (bits == 0) {
             return false;
         }
         bool stored = false;
-        size_t seen = 0;
-        for (Slot& slot : slots) {
-            if (slot.owner.load(std::memory_order_relaxed) == nullptr) {
+        while (bits != 0) {
+            const size_t i = static_cast<size_t>(std::countr_zero(bits));
+            bits &= bits - 1;
+            Slot& slot = slots[i];
+            if (slot.owner.load(std::memory_order_relaxed) == nullptr || slot.word == nullptr) {
                 continue;
             }
-            if (slot.word != nullptr) {
-                const u32 current =
-                    std::atomic_ref<u32>{*slot.word}.load(std::memory_order_relaxed);
-                if (current != slot.seen) {
-                    slot.seen = current;
-                    stored = true;
-                }
-            }
-            if (++seen >= active) {
-                break;
+            const u32 current =
+                std::atomic_ref<u32>{*slot.word}.load(std::memory_order_acquire);
+            if (current != slot.seen) {
+                slot.seen = current;
+                stored = true;
             }
         }
+        if (stored) {
+            Nx2PendingWake::Get().Notify(Nx2PendingWake::ByLatch);
+        }
         return stored;
+    }
+
+    /// Guest CPU write / cache invalidation over [device_address, +size): wake GPUFront at once if
+    /// a suspended channel is waiting on a semaphore in that range.
+    void NoteCpuStore(u64 device_address, u64 size) {
+        if (size == 0 || count.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        const u64 end = size > ~u64{0} - device_address ? ~u64{0} : device_address + size;
+        bool hit = false;
+        {
+            std::scoped_lock lk{mutex};
+            const size_t active = count.load(std::memory_order_relaxed);
+            size_t seen = 0;
+            for (const Slot& slot : slots) {
+                if (slot.owner.load(std::memory_order_relaxed) == nullptr) {
+                    continue;
+                }
+                if (slot.address < end && device_address < slot.address + sizeof(u32)) {
+                    hit = true;
+                    break;
+                }
+                if (++seen >= active) {
+                    break;
+                }
+            }
+        }
+        if (hit) {
+            Nx2PendingWake::Get().Notify(Nx2PendingWake::ByLatch);
+        }
     }
 
     /// A GPU write of `value` to the u32 at `device_address`.
@@ -796,26 +825,30 @@ public:
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
-        bool latched = false;
+        u64 newly_latched = 0;
         {
             std::scoped_lock lk{mutex};
             const size_t active = count.load(std::memory_order_relaxed);
             size_t seen = 0;
-            for (Slot& slot : slots) {
+            for (size_t i = 0; i < MaxWaiters; ++i) {
+                Slot& slot = slots[i];
                 if (slot.owner.load(std::memory_order_relaxed) == nullptr) {
                     continue;
                 }
                 if (slot.address == device_address && Matches(slot, value)) {
                     slot.latched.store(true, std::memory_order_release);
-                    latched = true;
+                    newly_latched |= u64{1} << i;
                 }
                 if (++seen >= active) {
                     break;
                 }
             }
+            if (newly_latched != 0) {
+                latched_bits.fetch_or(newly_latched, std::memory_order_release);
+            }
         }
-        if (latched) {
-            Nx2PendingWake::Get().Notify();
+        if (newly_latched != 0) {
+            Nx2PendingWake::Get().Notify(Nx2PendingWake::ByLatch);
         }
     }
 
@@ -846,7 +879,55 @@ private:
     std::mutex mutex; ///< Held to fill, empty and latch slots
     std::array<Slot, MaxWaiters> slots{};
     std::atomic<size_t> count{};
+    std::atomic<u64> watched_bits{};
+    std::atomic<u64> latched_bits{};
 };
+
+inline bool Nx2PendingWake::Poll(std::chrono::steady_clock::time_point deadline) {
+    auto& waiters = Nx2SemaphoreWaiters::Get();
+    if (reasons.load(std::memory_order_acquire) != 0 || waiters.WordStored()) {
+        return true;
+    }
+    while (std::chrono::steady_clock::now() < deadline) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+        _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(__clang__) && defined(__aarch64__)
+        __builtin_arm_yield();
+#else
+        std::this_thread::yield();
+#endif
+        if (reasons.load(std::memory_order_acquire) != 0 || waiters.WordStored()) {
+            return true;
+        }
+    }
+    return reasons.load(std::memory_order_acquire) != 0 || waiters.WordStored();
+}
+
+inline u32 Nx2PendingWake::Sleep(std::chrono::nanoseconds time) {
+    auto& waiters = Nx2SemaphoreWaiters::Get();
+    const auto deadline = std::chrono::steady_clock::now() + time;
+    constexpr std::chrono::nanoseconds WordPollSlice = std::chrono::microseconds{50};
+    while (reasons.load(std::memory_order_acquire) == 0 && !waiters.WordStored()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            break;
+        }
+        if (event.IsSet()) {
+            event.Reset();
+        }
+        sleeping.store(true, std::memory_order_seq_cst);
+        if (reasons.load(std::memory_order_seq_cst) == 0 && !waiters.WordStored()) {
+            const auto remaining = deadline - now;
+            const auto slice =
+                waiters.HasWatchedWords() ? (std::min)(remaining, WordPollSlice) : remaining;
+            event.SleepFor(slice);
+        }
+        sleeping.store(false, std::memory_order_seq_cst);
+    }
+    return reasons.load(std::memory_order_acquire);
+}
 
 // Render-frame clock (EDEN_NX2_RENDER_CLOCK=1, fable_answer_16 1b and 17): one count per guest
 // frame, bumped where the frame's last GPU work is, so the texture cache's relocation rules can

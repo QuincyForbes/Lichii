@@ -390,7 +390,8 @@ public:
 
     Result GetPhysicalCoreMask(KernelCore& kernel, s32* out_ideal_core, u64* out_affinity_mask);
 
-    Result SetCoreMask(KernelCore& kernel, s32 cpu_core_id, u64 v_affinity_mask);
+    Result SetCoreMask(KernelCore& kernel, s32 cpu_core_id, u64 v_affinity_mask,
+                       s32 phys_ideal_override = -3, u64 phys_affinity_override = 0);
 
     Result SetActivity(KernelCore& kernel, Svc::ThreadActivity activity);
 
@@ -1047,7 +1048,9 @@ public:
     u8 m_nx2_lock_spin_credit{8};
     u8 m_nx2_lock_spin_probe{};
     u16 m_nx2_futile_yield_streak{};
+    u16 m_nx2_yield_spin_streak{};
     bool m_nx2_last_yield_futile{};
+    u64 m_nx2_yield_handoff_until_ns{};
 
     /// EDEN_NX2_YIELD_BACKOFF (SleepThread): the current run of yields that found nothing else
     /// to run (host steady clock ns), and the callee-saved registers of the last one, whose

@@ -179,6 +179,109 @@ bool SameRanges(std::span<const VkImageSubresourceRange> a,
     });
 }
 
+// Whether a parked deferred clear on `dc_fb` can be folded directly into `target` without
+// realizing a separate 0-draw render pass (e.g. when `Clear` ran with a leftover depth attachment
+// bound and the following draws drop or swap that uncleared attachment).
+bool CanRetargetDeferredClear(const Framebuffer* dc_fb, u32 color_clear_mask, bool depth_stencil,
+                              const Framebuffer* target) {
+    if (dc_fb == nullptr || target == nullptr) {
+        return false;
+    }
+    if (dc_fb == target) {
+        return true;
+    }
+    const VkExtent2D dc_area = dc_fb->RenderArea();
+    const VkExtent2D target_area = target->RenderArea();
+    if (dc_fb->Samples() != VK_SAMPLE_COUNT_1_BIT || target->Samples() != VK_SAMPLE_COUNT_1_BIT ||
+        dc_fb->Layers() != target->Layers() || dc_area.width != target_area.width ||
+        dc_area.height != target_area.height) {
+        return false;
+    }
+    using VideoCore::Surface::PixelFormat;
+    const RenderPassKey& dc_key = dc_fb->RenderPassKeyBase();
+    const RenderPassKey& target_key = target->RenderPassKeyBase();
+    const std::span<const VkImageView> dc_views = dc_fb->AttachmentViews();
+    const std::span<const VkImageView> target_views = target->AttachmentViews();
+    const auto& dc_images = dc_fb->Images();
+    const auto& target_images = target->Images();
+    const u32 target_num_images = target->NumImages();
+    const auto unique_in_target = [&](VkImage img, u32 expected_idx) {
+        for (u32 i = 0; i < target_num_images; ++i) {
+            if (i != expected_idx && target_images[i] == img) {
+                return false;
+            }
+        }
+        return true;
+    };
+    u32 dc_idx = 0;
+    u32 target_idx = 0;
+    for (u32 slot = 0; slot < 8; ++slot) {
+        const PixelFormat dc_fmt = dc_key.color_formats[slot];
+        const PixelFormat target_fmt = target_key.color_formats[slot];
+        if ((color_clear_mask & (1U << slot)) != 0) {
+            if (dc_fmt == PixelFormat::Invalid || target_fmt != dc_fmt ||
+                dc_idx >= dc_views.size() || target_idx >= target_views.size() ||
+                dc_views[dc_idx] != target_views[target_idx] ||
+                !unique_in_target(dc_images[dc_idx], target_idx)) {
+                return false;
+            }
+        }
+        if (dc_fmt != PixelFormat::Invalid) {
+            ++dc_idx;
+        }
+        if (target_fmt != PixelFormat::Invalid) {
+            ++target_idx;
+        }
+    }
+    if (depth_stencil) {
+        if (dc_key.depth_format == PixelFormat::Invalid ||
+            target_key.depth_format != dc_key.depth_format) {
+            return false;
+        }
+        const u32 dc_depth_idx = dc_fb->NumColorBuffers();
+        const u32 target_depth_idx = target->NumColorBuffers();
+        if (dc_depth_idx >= dc_views.size() || target_depth_idx >= target_views.size() ||
+            dc_views[dc_depth_idx] != target_views[target_depth_idx] ||
+            !unique_in_target(dc_images[dc_depth_idx], target_depth_idx)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool DeferredClearTouches(const Framebuffer* dc_fb, u32 color_clear_mask, bool depth_stencil,
+                          std::span<const VkImage> touched_images) {
+    if (dc_fb == nullptr || touched_images.empty()) {
+        return false;
+    }
+    const auto& images = dc_fb->Images();
+    const u32 num_images = dc_fb->NumImages();
+    if (dc_fb->Samples() != VK_SAMPLE_COUNT_1_BIT) {
+        return std::ranges::any_of(touched_images, [&](VkImage image) {
+            return std::find(images.begin(), images.begin() + num_images, image) !=
+                   images.begin() + num_images;
+        });
+    }
+    using VideoCore::Surface::PixelFormat;
+    const RenderPassKey& dc_key = dc_fb->RenderPassKeyBase();
+    u32 img_idx = 0;
+    for (u32 slot = 0; slot < 8; ++slot) {
+        if (dc_key.color_formats[slot] == PixelFormat::Invalid) {
+            continue;
+        }
+        if ((color_clear_mask & (1U << slot)) != 0 && img_idx < num_images &&
+            std::ranges::find(touched_images, images[img_idx]) != touched_images.end()) {
+            return true;
+        }
+        ++img_idx;
+    }
+    if (depth_stencil && dc_key.depth_format != PixelFormat::Invalid && img_idx < num_images &&
+        std::ranges::find(touched_images, images[img_idx]) != touched_images.end()) {
+        return true;
+    }
+    return false;
+}
+
 // The callers of Flush and Finish: who asks for the queue submissions.
 void CountFlush(const char* file, u32 line) {
     CountSite(g_profile_flushes, file, line);
@@ -1443,23 +1546,33 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
             .pClearValues = clear_value_count != 0 ? values.data() : nullptr,
         };
         if (after_compute) {
-            // Draws read compute output as indirect arguments, vertices and resources; nothing
-            // else orders those reads after the dispatch.
+            // Draws and subsequent transfers read compute output (and byte-addressed shadow
+            // copy-backs) as indirect arguments, vertices, descriptors and images; nothing else
+            // orders those reads after the dispatch chain.
             static constexpr VkMemoryBarrier COMPUTE_TO_GRAPHICS{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                                 VK_ACCESS_MEMORY_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
             };
             // The graphics stages are also named one by one: a translation layer (MoltenVK's
             // Metal barrier stages) may map individual bits but not ALL_GRAPHICS.
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                   VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT |
-                                       VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
-                                       VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
-                                       VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                   0, COMPUTE_TO_GRAPHICS);
+            VkPipelineStageFlags dst_stages =
+                VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                VK_PIPELINE_STAGE_TRANSFER_BIT;
+            if (device.IsExtMeshShaderSupported()) {
+                dst_stages |= VK_PIPELINE_STAGE_TASK_SHADER_BIT_EXT |
+                              VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT;
+            }
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   dst_stages, 0, COMPUTE_TO_GRAPHICS);
         }
         cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
     });
@@ -1509,11 +1622,27 @@ bool Scheduler::DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot,
         return false;
     }
     if (IsRenderPassActive()) {
+        CountRenderPassEnd("vk_scheduler.cpp", __LINE__);
+        pass_end_file = "vk_scheduler.cpp";
+        pass_end_line = __LINE__;
         EndRenderPass();
     }
     if (deferred_clear.framebuffer != nullptr && deferred_clear.framebuffer != framebuffer) {
-        RealizeDeferredClear();
-        EndRenderPass();
+        if (CanRetargetDeferredClear(deferred_clear.framebuffer, deferred_clear.color_clear_mask,
+                                     deferred_clear.depth_stencil, framebuffer)) {
+            deferred_clear.framebuffer = framebuffer;
+        } else if (CanRetargetDeferredClear(framebuffer, 1u << rt_slot, false,
+                                            deferred_clear.framebuffer)) {
+            deferred_clear.color_clear_mask |= 1u << rt_slot;
+            deferred_clear.color_values[rt_slot] = value;
+            return true;
+        } else {
+            RealizeDeferredClear();
+            CountRenderPassEnd("vk_scheduler.cpp", __LINE__);
+            pass_end_file = "vk_scheduler.cpp";
+            pass_end_line = __LINE__;
+            EndRenderPass();
+        }
     }
     deferred_clear.framebuffer = framebuffer;
     deferred_clear.color_clear_mask |= 1u << rt_slot;
@@ -1528,11 +1657,26 @@ bool Scheduler::DeferDepthStencilClear(const Framebuffer* framebuffer, const VkC
         return false;
     }
     if (IsRenderPassActive()) {
+        CountRenderPassEnd("vk_scheduler.cpp", __LINE__);
+        pass_end_file = "vk_scheduler.cpp";
+        pass_end_line = __LINE__;
         EndRenderPass();
     }
     if (deferred_clear.framebuffer != nullptr && deferred_clear.framebuffer != framebuffer) {
-        RealizeDeferredClear();
-        EndRenderPass();
+        if (CanRetargetDeferredClear(deferred_clear.framebuffer, deferred_clear.color_clear_mask,
+                                     deferred_clear.depth_stencil, framebuffer)) {
+            deferred_clear.framebuffer = framebuffer;
+        } else if (CanRetargetDeferredClear(framebuffer, 0u, true, deferred_clear.framebuffer)) {
+            deferred_clear.depth_stencil = true;
+            deferred_clear.depth_stencil_value = value;
+            return true;
+        } else {
+            RealizeDeferredClear();
+            CountRenderPassEnd("vk_scheduler.cpp", __LINE__);
+            pass_end_file = "vk_scheduler.cpp";
+            pass_end_line = __LINE__;
+            EndRenderPass();
+        }
     }
     deferred_clear.framebuffer = framebuffer;
     deferred_clear.depth_stencil = true;
@@ -1551,7 +1695,10 @@ void Scheduler::FlushDeferredClear() {
 }
 
 void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_location location) {
-    if (deferred_clear.framebuffer == framebuffer) {
+    if (deferred_clear.framebuffer != nullptr &&
+        CanRetargetDeferredClear(deferred_clear.framebuffer, deferred_clear.color_clear_mask,
+                                 deferred_clear.depth_stencil, framebuffer)) {
+        deferred_clear.framebuffer = framebuffer;
         RealizeDeferredClear();
         return;
     }
@@ -1563,7 +1710,7 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     if (RenderPassMatches(framebuffer)) {
         return;
     }
-    if (state.renderpass) {
+    if (state.renderpass || deferred_clear.framebuffer != nullptr) {
         NotePassEnd(location);
     }
     // Ends any active pass and realizes a deferred clear
@@ -1572,14 +1719,48 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
 }
 
 void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {
-    if (state.renderpass) {
+    if (state.renderpass || deferred_clear.framebuffer != nullptr) {
         NotePassEnd(location);
     }
     EndRenderPass();
-    if (pass_time_host_sampling) {
+    static const int post_compute_mode = [] {
+        const char* const value = std::getenv("EDEN_NX2_MVK_POST_DISPATCH_BARRIER");
+        if (value != nullptr && value[0] == '0') {
+            return 0;
+        }
+        return value != nullptr && std::string_view{value} == "force" ? 2 : 1;
+    }();
+    const bool flush_post_compute =
+        (post_compute_mode == 2 || (post_compute_mode == 1 && device.IsMoltenVK())) &&
+        std::exchange(compute_writes_pending, false);
+    if (flush_post_compute || pass_time_host_sampling) {
         // "Perf passes:" names the GPU time up to the next timestamp after the caller.
-        Record([this, file = location.file_name(), line = location.line()](vk::CommandBuffer cmdbuf) {
-            PassTimeLabel(cmdbuf, file, line);
+        Record([this, flush_post_compute, time_label = pass_time_host_sampling,
+                file = location.file_name(), line = location.line()](vk::CommandBuffer cmdbuf) {
+            if (flush_post_compute) {
+                static constexpr VkMemoryBarrier POST_COMPUTE{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                                     VK_ACCESS_MEMORY_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                };
+                VkPipelineStageFlags dst_stages =
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                    VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                    VK_PIPELINE_STAGE_TRANSFER_BIT;
+                if (device.IsExtMeshShaderSupported()) {
+                    dst_stages |= VK_PIPELINE_STAGE_TASK_SHADER_BIT_EXT |
+                                  VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT;
+                }
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       dst_stages, 0, POST_COMPUTE);
+            }
+            if (time_label) {
+                PassTimeLabel(cmdbuf, file, line);
+            }
         });
     }
 }
@@ -1592,12 +1773,9 @@ void Scheduler::RequestOutsideRenderPassKeepClear(std::span<const VkImage> touch
                                                   std::source_location location) {
     // A parked clear means no pass is open (DeferColorClear ended it).
     if (deferred_clear.framebuffer != nullptr && KeepDeferredClear()) {
-        const auto& images = deferred_clear.framebuffer->Images();
-        const size_t num_images = deferred_clear.framebuffer->NumImages();
-        const bool touched = std::ranges::any_of(touched_images, [&](VkImage image) {
-            return std::find(images.begin(), images.begin() + num_images, image) !=
-                   images.begin() + num_images;
-        });
+        const bool touched =
+            DeferredClearTouches(deferred_clear.framebuffer, deferred_clear.color_clear_mask,
+                                 deferred_clear.depth_stencil, touched_images);
         if (!touched) {
             Common::PerfReport::Add(Common::PerfReport::DeferredClearsKept);
             if (pass_time_host_sampling) {
@@ -2168,7 +2346,9 @@ void Scheduler::EndRenderPass()
                                          | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
                                          | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
                                          | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
-                                         | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                                         | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                                         | VK_ACCESS_TRANSFER_READ_BIT
+                                         | VK_ACCESS_TRANSFER_WRITE_BIT,
                         .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
                         .newLayout = VK_IMAGE_LAYOUT_GENERAL,
                         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -2193,7 +2373,7 @@ void Scheduler::EndRenderPass()
             VkPipelineStageFlags src_stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-            VkPipelineStageFlags dst_stages = vk::PIPELINE_STAGE_GRAPHICS_COMPUTE;
+            VkPipelineStageFlags dst_stages = vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER;
             if (had_stores) {
                 src_stages |= VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
                 dst_stages |= VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
@@ -2272,11 +2452,35 @@ bool Scheduler::SplitBeforeNextPass(u64 pixels, VkFramebuffer framebuffer, u64 t
     if (min_pixels == 0 || (!wanted && (!allow_by_size || pixels < min_pixels))) {
         return false;
     }
+    const bool after_compute = std::exchange(compute_writes_pending, false);
     ++before_pass_serial;
     before_pass_split = true;
     // A new command buffer starts here: nothing bound before it is bound there.
     InvalidateState();
-    Record([this](vk::CommandBuffer) { SplitBeforePass(); });
+    Record([this, after_compute](vk::CommandBuffer cmdbuf) {
+        if (after_compute) {
+            static constexpr VkMemoryBarrier COMPUTE_BEFORE_SPLIT{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                                 VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            };
+            VkPipelineStageFlags dst_stages =
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                VK_PIPELINE_STAGE_TRANSFER_BIT;
+            if (device.IsExtMeshShaderSupported()) {
+                dst_stages |= VK_PIPELINE_STAGE_TASK_SHADER_BIT_EXT |
+                              VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT;
+            }
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   dst_stages, 0, COMPUTE_BEFORE_SPLIT);
+        }
+        SplitBeforePass();
+    });
     return true;
 }
 

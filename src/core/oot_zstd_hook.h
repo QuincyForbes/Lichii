@@ -34,4 +34,7 @@ void PatchModule(u64 program_id, std::span<const u8> build_id, std::string_view 
 /// Handles SvcNumber for the current thread.
 void Handle(Core::System& system);
 
+/// Clears cached host dictionaries and stream twins when the process shuts down.
+void Reset();
+
 } // namespace Core::OotZstd

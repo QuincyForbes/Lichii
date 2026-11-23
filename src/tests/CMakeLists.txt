@@ -44,6 +44,7 @@ add_executable(tests
     audio_core/hardware_audio_codec.cpp
     core/gpu_dirty_memory.cpp
     core/arm/cached_interpreter.cpp
+    core/arm_hypervisor_tests.cpp
     core/memory_acquire.cpp
     core/builtin_patches.cpp
     core/builtin_font_glyphs.cpp
@@ -274,6 +275,12 @@ endif()
 
 target_compile_definitions(tests PRIVATE
     LICHII_NX_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/core/nx_fixtures")
+
+if (HAS_HYPERVISOR AND NOT IOS)
+    add_custom_command(TARGET tests POST_BUILD
+        COMMAND codesign --force --sign - --entitlements
+                "${CMAKE_SOURCE_DIR}/dist/eglantine.entitlements" "$<TARGET_FILE:tests>")
+endif()
 
 add_test(NAME tests COMMAND tests)
 

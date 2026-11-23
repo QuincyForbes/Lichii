@@ -294,6 +294,8 @@ private:
 
     struct Effects {
         std::array<u32, 2> extent{};
+        std::array<u32, 2> bias_size{};
+        u32 base_format{};
         Object base;
         std::array<Object, 2> marks;
         Object bias;
@@ -306,16 +308,23 @@ private:
     bool Prepare();
     bool PrepareActor();
     bool PrepareEffects();
-    bool EnsureEffectsBias(std::array<u32, 2> extent);
+    bool EnsureEffectsBias(std::array<u32, 2> bias_extent);
     void ClearEffectsBias();
+    [[nodiscard]] TextureHandle EnsureUpscaled(std::array<u32, 2> output_size);
     bool Resize(std::array<u32, 2> extent);
+    void Run(const Pass& pass, std::span<const TextureHandle> inputs,
+             std::span<const TextureHandle> outputs, std::span<const u8> push_constants,
+             std::array<u32, 2> pass_size, bool linear_filter = false);
     void Run(const Pass& pass, std::span<const TextureHandle> inputs, TextureHandle output,
-             std::span<const u8> push_constants, std::array<u32, 2> size,
-             bool linear_filter = false);
+             std::span<const u8> push_constants, std::array<u32, 2> pass_size,
+             bool linear_filter = false) {
+        Run(pass, inputs, std::span(&output, 1), push_constants, pass_size, linear_filter);
+    }
     void Run(const Pass& pass, TextureHandle input, TextureHandle output,
              std::span<const u8> push_constants, std::array<u32, 2> pass_size,
              bool linear_filter = false) {
-        Run(pass, std::span(&input, 1), output, push_constants, pass_size, linear_filter);
+        Run(pass, std::span(&input, 1), std::span(&output, 1), push_constants, pass_size,
+            linear_filter);
     }
     bool DrawActor(TextureHandle depth, std::array<u32, 2> extent, const ActorMotion& actor,
                    std::array<f32, 2> jitter);
@@ -325,10 +334,11 @@ private:
     Scheduler& scheduler;
     TemporalUpscaler upscaler;
     std::unique_ptr<Fsr3Upscaler> fsr3;
+    Object msl_library;
     Pass motion_pass;
-    Pass color_pass;
+    Pass prepare_pass;
+    Pass direct_output_pass;
     Pass output_pass;
-    Pass effects_base_pass;
     Pass effects_mark_pass;
     Pass effects_bias_pass;
     Pass reference_pass;
@@ -337,8 +347,14 @@ private:
     Object point_sampler;
     Object motion;
     Object color;
+    Object upscaled;
+    std::array<u32, 2> upscaled_size{};
+    bool upscaled_rejected{};
     Object cropped_depth;
     std::array<u32, 2> cropped_depth_size{};
+    std::array<u32, 2> crop_extent{};
+    std::array<u32, 2> crop_depth_size{};
+    bool force_crop_depth{};
     Object native_scene;
     Object composite;
     TextureHandle last_upscaled{};

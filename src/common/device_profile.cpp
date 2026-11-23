@@ -210,9 +210,11 @@ void RecommendApple(const Device& device, Profile& p) {
             "cut GPU time 11 % and draws 20 % on the PC phone simulation (oot-presets).");
     }
     Add(p, v.oot_graphics_preset,
-        p.tier == Tier::Ultra ? OotGraphicsPreset::Console : OotGraphicsPreset::PhoneLow,
+        p.tier == Tier::Ultra ? OotGraphicsPreset::Balanced : OotGraphicsPreset::PhoneLow,
         p.tier == Tier::Ultra
-            ? "Console: no iPad run yet."
+            ? "Balanced: Console shadows, foliage and bloom with one 64x64 reflection probe and "
+              "no translucent depth prepass or field depth-of-field pass (~22 fewer render passes "
+              "and ~70 fewer draws per frame with no visible loss)."
             : "Phone Low: an iPhone18,2 spent 84-119 ms of GPU time per frame in Kokiri (builds "
               "71, 138) with 152-216 render passes. A small reflection probe, no bloom or depth "
               "of field, one small sun shadow cascade: with 50 % and Quarter, render passes 175 -> "
@@ -255,14 +257,14 @@ void RecommendApple(const Device& device, Profile& p) {
     AddApp(p, "auto_cool", true, "Steps the frame rate down while the device is hot.");
     // PC phone sim (Ocarina of Time, Kokiri, x64 code with the phone's compact JIT code): 32 MiB
     // per core flushed 13-18 times per 10 s at 5-13 fps; 48 MiB 0-2 flushes, 86 fps; 64 MiB 0-1;
-    // 96 MiB none (fullest 74 MiB). arm64 code is somewhat larger than x64's. The pool is six of
+    // 96 MiB none (fullest 74 MiB). arm64 code is somewhat larger than x64's. The pool is eight of
     // these, prepared through the debugger at app start (~0.1 s per 32 MiB) and resident.
     p.jit_cache_mib = p.tier == Tier::Ultra ? 96 : p.tier == Tier::High ? 64
                     : p.tier == Tier::Mid  ? 48 : 32;
     p.jit_cache_reason = fmt::format(
-        "{} MiB of JIT code per guest core ({} MiB for six): Ocarina of Time in Kokiri needs "
+        "{} MiB of JIT code per guest core ({} MiB for eight): Ocarina of Time in Kokiri needs "
         "40-75 MiB of code per core and recompiled everything several times a second at 32 MiB.",
-        p.jit_cache_mib, p.jit_cache_mib * 6);
+        p.jit_cache_mib, p.jit_cache_mib * 8);
     p.jit_evict_mib = p.jit_cache_mib / 8;
     p.jit_evict_reason = fmt::format(
         "A full code cache drops its oldest {} MiB and goes on: build 7707654e51 still filled 64 "
@@ -275,7 +277,7 @@ void RecommendApple(const Device& device, Profile& p) {
         "Fastmem faults: 2.7k-71k a second on the phone (16 KiB pages: one GPU-tracked or "
         "unmapped 4 KiB page takes three neighbours along) against 1-38 on a PC, and each "
         "translated its block again and left the old copy in the cache. A site found by one core "
-        "applies to all six, and a block that faulted twice translates without fastmem.";
+        "applies to all eight, and a block that faulted twice translates without fastmem.";
     p.helper_qos = true;
     p.helper_qos_reason =
         "Timing, fence and present threads at user-initiated QoS: 12 user-interactive threads "
@@ -381,6 +383,10 @@ void RecommendDesktop(const Device& device, Profile& p) {
     Add(p, v.oot_resolution, small_gpu ? OotResolution::Percent75 : OotResolution::Full,
         small_gpu ? "75 %: integrated or under 6 GB of graphics memory."
                   : "100 %: the game's full size (1440p docked).");
+    Add(p, v.oot_graphics_preset, OotGraphicsPreset::Balanced,
+        "Balanced: Console shadows, foliage, bloom, resolution and textures with one 64x64 "
+        "reflection probe and no translucent depth prepass or field depth-of-field pass (~22 "
+        "fewer render passes and ~70 fewer draws per frame with no visible loss).");
     Add(p, v.texture_quality,
         small_gpu || small_mac ? TextureQuality::Half : TextureQuality::Full,
         small_gpu || small_mac

@@ -704,8 +704,10 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
         return value && *value != '\0' && *value != '0';
     }();
-    if (DispatchDepsTrace()) {
+    if (DispatchDepsTrace() || scheduler.DeferredClearFramebufferHandle() != VK_NULL_HANDLE) {
         bound_images.assign(views.begin(), views.end());
+    } else {
+        bound_images.clear();
     }
     if (record_sampled || writer_deps || deferred_bind || CanReplaceOcarinaUpscale()) {
         sampled_images.clear();

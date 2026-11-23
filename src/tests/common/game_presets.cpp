@@ -62,7 +62,12 @@ void CheckPreset(const Settings::Values& settings, u64 program_id) {
     CHECK(settings.astc_recompression.GetValue() == Settings::AstcRecompression::Bc3);
     CHECK(settings.vram_usage_mode.GetValue() == Settings::VramUsageMode::Conservative);
     CHECK(settings.use_reactive_flushing.GetValue() ==
-          (program_id == Settings::OcarinaOfTimeProgramId));
+          (program_id == Settings::OcarinaOfTimeProgramId
+               ? Settings::DefaultOcarinaReactiveFlushing
+               : false));
+    if (program_id == Settings::OcarinaOfTimeProgramId) {
+        CHECK(settings.oot_graphics_preset.GetValue() == Settings::OotGraphicsPreset::Balanced);
+    }
     CHECK(settings.vsync_mode.GetValue() == Settings::VSyncMode::FifoRelaxed);
     CHECK(settings.use_docked_mode.GetValue() == Settings::ConsoleMode::Docked);
     CHECK(settings.scaling_filter.GetValue() == Settings::ScalingFilter::ScaleForce);

@@ -82,6 +82,15 @@ public:
     static constexpr size_t NumSets = 256;
     static constexpr size_t NumWays = 2;
     static constexpr size_t NumCopies = NumPrivate + NumSets * NumWays;
+    static constexpr size_t NumSpanCacheEntries = 32;
+
+    struct SpanCacheEntry {
+        const void* memory{};
+        u64 translation_gen{};
+        u64 base_addr{};
+        u64 end_addr{};
+        const u8* host_ptr{};
+    };
 
     /// Bytes copied to a stream allocation, and that allocation: `ref` was filled from exactly
     /// these bytes on scheduler tick `tick`. The bytes change only together with the serial.
@@ -91,11 +100,13 @@ public:
         u64 address{}; ///< the guest range copied (a lookup hint: hits compare the bytes)
         u64 verified_serial{};
         u64 page_gen{};
+        u64 cpu_epoch{};
         u32 size{};    ///< 0: nothing copied
         u32 serial{};
         /// Bytes allocated (the size padded to what the binding shader could read): a shader
         /// that may read further needs a new allocation, the padding past this is not zero.
         u32 allocated{};
+        u16 diff_offset{};
     };
 
     /// The copy a (stage, constant buffer) slot bound last.
@@ -112,21 +123,32 @@ public:
         u64 address{};
         u64 verified_serial{};
         u64 page_gen{};
+        u64 cpu_epoch{};
         u32 size{}; ///< 0: nothing copied
         u32 allocated{};
+        u16 diff_offset{};
         std::array<u8, MaxBytes> bytes{};
     };
 
-    UniformStreamReuse() : bytes{new u8[NumCopies * MaxBytes]} {}
+    constexpr UniformStreamReuse() noexcept = default;
 
-    void Reset() noexcept {
+    void EnsureAllocated() {
+        if (!bytes) {
+            bytes = std::make_unique_for_overwrite<u8[]>(NumCopies * MaxBytes);
+        }
+    }
+
+    void Reset() {
+        EnsureAllocated();
         for (Copy& copy : copies) {
             copy.size = 0;
             copy.allocated = 0;
+            copy.diff_offset = 0;
             copy.tick = 0;
             copy.address = 0;
             copy.verified_serial = 0;
             copy.page_gen = 0;
+            copy.cpu_epoch = 0;
             NextSerial(copy);
         }
         for (auto& stage : slots) {
@@ -136,15 +158,98 @@ public:
         for (ComputeSlot& slot : compute_slots) {
             slot.size = 0;
             slot.allocated = 0;
+            slot.diff_offset = 0;
             slot.tick = 0;
             slot.address = 0;
             slot.verified_serial = 0;
             slot.page_gen = 0;
+            slot.cpu_epoch = 0;
         }
+        last_span = {};
+        block_span_cache.fill({});
+        page_span_cache.fill({});
     }
 
     [[nodiscard]] u8* Bytes(size_t copy) noexcept {
         return bytes.get() + copy * MaxBytes;
+    }
+
+    template <class DeviceMemory>
+    [[nodiscard]] const u8* ResolveGuestSpan(DeviceMemory& device_memory, u64 device_addr,
+                                             u32 size) noexcept {
+        if constexpr (requires {
+                          device_memory.GetSpan(device_addr, size);
+                          device_memory.TranslationGeneration();
+                      }) {
+            const void* const mem_id = static_cast<const void*>(&device_memory);
+            const u64 gen = device_memory.TranslationGeneration();
+            const u64 end_addr = device_addr + size;
+            if (last_span.memory == mem_id && last_span.translation_gen == gen &&
+                device_addr >= last_span.base_addr && end_addr <= last_span.end_addr) {
+                return last_span.host_ptr + (device_addr - last_span.base_addr);
+            }
+            constexpr u64 BlockSize = 0x10000;
+            constexpr u64 BlockMask = BlockSize - 1;
+            const u64 block_base = device_addr & ~BlockMask;
+            const bool in_block = end_addr <= block_base + BlockSize;
+            SpanCacheEntry* block_entry = nullptr;
+            if (in_block) {
+                block_entry = &block_span_cache[static_cast<size_t>(
+                    ((device_addr >> 16) ^ (device_addr >> 21)) & (NumSpanCacheEntries - 1))];
+                if (block_entry->memory == mem_id && block_entry->translation_gen == gen &&
+                    block_entry->base_addr == block_base && end_addr <= block_entry->end_addr) {
+                    last_span = *block_entry;
+                    return block_entry->host_ptr + (device_addr - block_base);
+                }
+            }
+            constexpr u64 PageSize = 0x1000;
+            constexpr u64 PageMask = PageSize - 1;
+            const u64 page_base = device_addr & ~PageMask;
+            const bool in_page = end_addr <= page_base + PageSize;
+            SpanCacheEntry* page_entry = nullptr;
+            if (in_page) {
+                page_entry = &page_span_cache[static_cast<size_t>(
+                    ((device_addr >> 12) ^ (device_addr >> 17)) & (NumSpanCacheEntries - 1))];
+                if (page_entry->memory == mem_id && page_entry->translation_gen == gen &&
+                    page_entry->base_addr == page_base && end_addr <= page_entry->end_addr) {
+                    last_span = *page_entry;
+                    return page_entry->host_ptr + (device_addr - page_base);
+                }
+            }
+            if (in_block) {
+                if (const u8* const block_ptr = device_memory.GetSpan(block_base, BlockSize);
+                    block_ptr != nullptr) {
+                    *block_entry = SpanCacheEntry{
+                        .memory = mem_id,
+                        .translation_gen = gen,
+                        .base_addr = block_base,
+                        .end_addr = block_base + BlockSize,
+                        .host_ptr = block_ptr,
+                    };
+                    last_span = *block_entry;
+                    return block_ptr + (device_addr - block_base);
+                }
+            }
+            if (in_page) {
+                if (const u8* const page_ptr = device_memory.GetSpan(page_base, PageSize);
+                    page_ptr != nullptr) {
+                    *page_entry = SpanCacheEntry{
+                        .memory = mem_id,
+                        .translation_gen = gen,
+                        .base_addr = page_base,
+                        .end_addr = page_base + PageSize,
+                        .host_ptr = page_ptr,
+                    };
+                    last_span = *page_entry;
+                    return page_ptr + (device_addr - page_base);
+                }
+            }
+            return device_memory.GetSpan(device_addr, size);
+        } else if constexpr (requires { device_memory.GetSpan(device_addr, size); }) {
+            return device_memory.GetSpan(device_addr, size);
+        } else {
+            return nullptr;
+        }
     }
 
     static void NextSerial(Copy& copy) noexcept {
@@ -162,22 +267,101 @@ public:
     std::array<std::array<Slot, NumSlots>, NumStages> slots{};
     std::array<u8, NumSets> mru{}; ///< per set: the way used last
     std::unique_ptr<u8[]> bytes;   ///< MaxBytes per copy
+    SpanCacheEntry last_span{};
+    std::array<SpanCacheEntry, NumSpanCacheEntries> block_span_cache{};
+    std::array<SpanCacheEntry, NumSpanCacheEntries> page_span_cache{};
     std::array<ComputeSlot, NumSlots> compute_slots{};
     std::array<u8, MaxBytes> scratch{};
 };
 
 template <class Ref>
+inline UniformStreamReuse<Ref> g_uniform_stream_reuse_state{};
+
+template <class Ref>
 [[nodiscard]] inline UniformStreamReuse<Ref>& UniformStreamReuseState() noexcept {
-    static UniformStreamReuse<Ref> state;
-    return state;
+    return g_uniform_stream_reuse_state<Ref>;
 }
 
 /// Forgets every slot. Call it when a buffer cache (and so its runtime, scheduler and stream
 /// buffer) is created: ticks restart with a new scheduler and the old references are dead.
 template <class Runtime>
-inline void ResetUniformStreamReuse() noexcept {
+inline void ResetUniformStreamReuse() {
     if constexpr (StreamUniformReusable<Runtime>) {
         UniformStreamReuseState<typename Runtime::StreamUniformRef>().Reset();
+    }
+}
+
+[[nodiscard]] inline bool UniformBytes16Equal(const u8* a, const u8* b) noexcept {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const uint8x16_t d = veorq_u8(vld1q_u8(a), vld1q_u8(b));
+    return vmaxvq_u32(vreinterpretq_u32_u8(d)) == 0;
+#else
+    u64 a0, a1, b0, b1;
+    std::memcpy(&a0, a, sizeof(u64));
+    std::memcpy(&a1, a + sizeof(u64), sizeof(u64));
+    std::memcpy(&b0, b, sizeof(u64));
+    std::memcpy(&b1, b + sizeof(u64), sizeof(u64));
+    return ((a0 ^ b0) | (a1 ^ b1)) == 0;
+#endif
+}
+
+/// Copies `size` bytes from `src` to BOTH `dst_cache` and `dst_stream` reading `src` strictly
+/// once into registers, guaranteeing both outputs hold bit-identical bytes even under racing guest
+/// CPU writes while halving source cache reads compared to two sequential `std::memcpy` calls.
+inline void UniformDualCopy(u8* __restrict dst_cache, u8* __restrict dst_stream,
+                            const u8* __restrict src, u32 size) noexcept {
+    size_t off = 0;
+#ifdef __AVX2__
+    for (; off + 128 <= size; off += 128) {
+        const __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + off));
+        const __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + off + 32));
+        const __m256i v2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + off + 64));
+        const __m256i v3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + off + 96));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_cache + off), v0);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_cache + off + 32), v1);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_cache + off + 64), v2);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_cache + off + 96), v3);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_stream + off), v0);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_stream + off + 32), v1);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_stream + off + 64), v2);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_stream + off + 96), v3);
+    }
+    for (; off + 32 <= size; off += 32) {
+        const __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + off));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_cache + off), v0);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_stream + off), v0);
+    }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    for (; off + 64 <= size; off += 64) {
+        const uint8x16_t v0 = vld1q_u8(src + off);
+        const uint8x16_t v1 = vld1q_u8(src + off + 16);
+        const uint8x16_t v2 = vld1q_u8(src + off + 32);
+        const uint8x16_t v3 = vld1q_u8(src + off + 48);
+        vst1q_u8(dst_cache + off, v0);
+        vst1q_u8(dst_cache + off + 16, v1);
+        vst1q_u8(dst_cache + off + 32, v2);
+        vst1q_u8(dst_cache + off + 48, v3);
+        vst1q_u8(dst_stream + off, v0);
+        vst1q_u8(dst_stream + off + 16, v1);
+        vst1q_u8(dst_stream + off + 32, v2);
+        vst1q_u8(dst_stream + off + 48, v3);
+    }
+    for (; off + 16 <= size; off += 16) {
+        const uint8x16_t v0 = vld1q_u8(src + off);
+        vst1q_u8(dst_cache + off, v0);
+        vst1q_u8(dst_stream + off, v0);
+    }
+#endif
+    for (; off + sizeof(u64) <= size; off += sizeof(u64)) {
+        u64 word;
+        std::memcpy(&word, src + off, sizeof(u64));
+        std::memcpy(dst_cache + off, &word, sizeof(u64));
+        std::memcpy(dst_stream + off, &word, sizeof(u64));
+    }
+    for (; off < size; ++off) {
+        const u8 b = src[off];
+        dst_cache[off] = b;
+        dst_stream[off] = b;
     }
 }
 
@@ -187,23 +371,65 @@ inline void ResetUniformStreamReuse() noexcept {
 /// from zortos293/Lichii#641), a copy of the same guest range made by any stage or slot. Every
 /// reuse compares the guest bytes with the copy's. Returns false (nothing bound) when the buffer
 /// does not qualify, so the caller binds it the classic way.
-[[nodiscard]] inline bool UniformBytesEqual(const u8* copy_bytes, const u8* guest,
-                                            u32 size) noexcept {
-    if (size >= sizeof(u64)) {
-        u64 a0, b0, a1, b1;
-        std::memcpy(&a0, copy_bytes, sizeof(u64));
-        std::memcpy(&b0, guest, sizeof(u64));
-        if (a0 != b0) {
-            return false;
+[[nodiscard]] inline bool UniformBytesEqual(const u8* copy_bytes, const u8* guest, u32 size,
+                                            u16& diff_offset) noexcept {
+    if (size <= 32) {
+        if (size >= 16) {
+            return UniformBytes16Equal(copy_bytes, guest) &&
+                   (size == 16 || UniformBytes16Equal(copy_bytes + size - 16, guest + size - 16));
         }
-        std::memcpy(&a1, copy_bytes + size - sizeof(u64), sizeof(u64));
-        std::memcpy(&b1, guest + size - sizeof(u64), sizeof(u64));
-        if (a1 != b1) {
+        if (size >= sizeof(u64)) {
+            u64 a0, b0, a1, b1;
+            std::memcpy(&a0, copy_bytes, sizeof(u64));
+            std::memcpy(&b0, guest, sizeof(u64));
+            std::memcpy(&a1, copy_bytes + size - sizeof(u64), sizeof(u64));
+            std::memcpy(&b1, guest + size - sizeof(u64), sizeof(u64));
+            return ((a0 ^ b0) | (a1 ^ b1)) == 0;
+        }
+        if (size >= sizeof(u32)) {
+            u32 a0, b0, a1, b1;
+            std::memcpy(&a0, copy_bytes, sizeof(u32));
+            std::memcpy(&b0, guest, sizeof(u32));
+            std::memcpy(&a1, copy_bytes + size - sizeof(u32), sizeof(u32));
+            std::memcpy(&b1, guest + size - sizeof(u32), sizeof(u32));
+            return ((a0 ^ b0) | (a1 ^ b1)) == 0;
+        }
+        if (size == 0) {
+            return true;
+        }
+        return copy_bytes[0] == guest[0] && copy_bytes[size - 1] == guest[size - 1] &&
+               copy_bytes[size >> 1] == guest[size >> 1];
+    }
+    if (diff_offset != 0 && static_cast<u32>(diff_offset) + 16U <= size) {
+        if (!UniformBytes16Equal(copy_bytes + diff_offset, guest + diff_offset)) {
             return false;
         }
     }
+    if (!UniformBytes16Equal(copy_bytes, guest)) {
+        diff_offset = 0;
+        return false;
+    }
+    if (!UniformBytes16Equal(copy_bytes + 16, guest + 16)) {
+        diff_offset = 16;
+        return false;
+    }
+    if (size <= 64) {
+        if (size > 48 && !UniformBytes16Equal(copy_bytes + 32, guest + 32)) {
+            diff_offset = 32;
+            return false;
+        }
+        if (!UniformBytes16Equal(copy_bytes + size - 16, guest + size - 16)) {
+            diff_offset = static_cast<u16>(size - 16);
+            return false;
+        }
+        return true;
+    }
+    if (!UniformBytes16Equal(copy_bytes + size - 16, guest + size - 16)) {
+        diff_offset = static_cast<u16>(size - 16);
+        return false;
+    }
 #ifdef __AVX2__
-    size_t off = 0;
+    size_t off = 32;
     for (; off + 128 <= size; off += 128) {
         const __m256i d0 = _mm256_xor_si256(
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(copy_bytes + off)),
@@ -219,6 +445,12 @@ inline void ResetUniformStreamReuse() noexcept {
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(guest + off + 96)));
         const __m256i acc = _mm256_or_si256(_mm256_or_si256(d0, d1), _mm256_or_si256(d2, d3));
         if (!_mm256_testz_si256(acc, acc)) {
+            for (size_t k = 0; k < 128; k += 16) {
+                if (!UniformBytes16Equal(copy_bytes + off + k, guest + off + k)) {
+                    diff_offset = static_cast<u16>(off + k);
+                    break;
+                }
+            }
             return false;
         }
     }
@@ -227,12 +459,18 @@ inline void ResetUniformStreamReuse() noexcept {
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(copy_bytes + off)),
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(guest + off)));
         if (!_mm256_testz_si256(d, d)) {
+            diff_offset = static_cast<u16>(
+                UniformBytes16Equal(copy_bytes + off, guest + off) ? off + 16 : off);
             return false;
         }
     }
-    return size == off || std::memcmp(copy_bytes + off, guest + off, size - off) == 0;
+    if (off + 16 < size && !UniformBytes16Equal(copy_bytes + off, guest + off)) {
+        diff_offset = static_cast<u16>(off);
+        return false;
+    }
+    return true;
 #elif defined(__aarch64__) || defined(_M_ARM64)
-    size_t off = 0;
+    size_t off = 32;
     for (; off + 128 <= size; off += 128) {
         const uint8x16_t d0 = veorq_u8(vld1q_u8(copy_bytes + off), vld1q_u8(guest + off));
         const uint8x16_t d1 = veorq_u8(vld1q_u8(copy_bytes + off + 16), vld1q_u8(guest + off + 16));
@@ -245,6 +483,12 @@ inline void ResetUniformStreamReuse() noexcept {
         const uint8x16_t a0 = vorrq_u8(vorrq_u8(d0, d1), vorrq_u8(d2, d3));
         const uint8x16_t a1 = vorrq_u8(vorrq_u8(d4, d5), vorrq_u8(d6, d7));
         if (vmaxvq_u32(vreinterpretq_u32_u8(vorrq_u8(a0, a1))) != 0) {
+            for (size_t k = 0; k < 128; k += 16) {
+                if (!UniformBytes16Equal(copy_bytes + off + k, guest + off + k)) {
+                    diff_offset = static_cast<u16>(off + k);
+                    break;
+                }
+            }
             return false;
         }
     }
@@ -252,13 +496,34 @@ inline void ResetUniformStreamReuse() noexcept {
         const uint8x16_t d0 = veorq_u8(vld1q_u8(copy_bytes + off), vld1q_u8(guest + off));
         const uint8x16_t d1 = veorq_u8(vld1q_u8(copy_bytes + off + 16), vld1q_u8(guest + off + 16));
         if (vmaxvq_u32(vreinterpretq_u32_u8(vorrq_u8(d0, d1))) != 0) {
+            diff_offset =
+                static_cast<u16>(vmaxvq_u32(vreinterpretq_u32_u8(d0)) != 0 ? off : off + 16);
             return false;
         }
     }
-    return size == off || std::memcmp(copy_bytes + off, guest + off, size - off) == 0;
+    if (off + 16 < size && !UniformBytes16Equal(copy_bytes + off, guest + off)) {
+        diff_offset = static_cast<u16>(off);
+        return false;
+    }
+    return true;
 #else
-    return std::memcmp(copy_bytes, guest, size) == 0;
+    if (std::memcmp(copy_bytes + 32, guest + 32, size - 48) != 0) {
+        for (u32 off = 32; off + 16 <= size; off += 16) {
+            if (!UniformBytes16Equal(copy_bytes + off, guest + off)) {
+                diff_offset = static_cast<u16>(off);
+                break;
+            }
+        }
+        return false;
+    }
+    return true;
 #endif
+}
+
+[[nodiscard]] inline bool UniformBytesEqual(const u8* copy_bytes, const u8* guest,
+                                            u32 size) noexcept {
+    u16 diff_offset = 0;
+    return UniformBytesEqual(copy_bytes, guest, size, diff_offset);
 }
 
 struct NoUboRangeClean {
@@ -272,13 +537,15 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
                                            size_t stage, u32 index, u32 binding_index,
                                            u64 device_addr, u32 size, bool range_reuse = false,
                                            u64 write_serial = 0, u64 page_gen = 0,
-                                           RangeCleanPred&& range_clean = {}) {
+                                           RangeCleanPred&& range_clean = {},
+                                           u64 cpu_epoch = ~u64{0}) {
     using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
     if (size == 0 || size > Reuse::MaxBytes || stage >= Reuse::NumStages ||
         index >= Reuse::NumSlots) {
         return false;
     }
     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
+    reuse.EnsureAllocated();
     typename Reuse::Slot& slot = reuse.slots[stage][index];
     const u64 tick = runtime.CurrentTick();
     u32 needed = size;
@@ -292,13 +559,16 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
         return true;
     };
     const auto is_verified_clean = [&](typename Reuse::Copy& copy) {
-        if (write_serial == 0 || copy.verified_serial == 0) {
+        if (write_serial == 0 || copy.verified_serial == 0 || cpu_epoch == 0) {
             return false;
         }
-        if (copy.verified_serial == write_serial) [[likely]] {
+        if (copy.cpu_epoch != ~u64{0} && copy.cpu_epoch != cpu_epoch) {
+            return false;
+        }
+        if (copy.verified_serial == write_serial) {
             return true;
         }
-        if (range_clean(copy.page_gen)) [[likely]] {
+        if (range_clean(copy.page_gen)) {
             copy.verified_serial = write_serial;
             return true;
         }
@@ -343,7 +613,7 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
     const u8* guest = nullptr;
     if constexpr (requires { device_memory.GetSpan(device_addr, size); }) {
         if (UniformInPlaceCompareEnabled()) {
-            guest = device_memory.GetSpan(device_addr, size);
+            guest = reuse.ResolveGuestSpan(device_memory, device_addr, size);
         }
     }
     const bool in_place = guest != nullptr;
@@ -353,30 +623,33 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
     }
     const auto same_bytes = [&](size_t copy_index) {
         typename Reuse::Copy& copy = reuse.copies[copy_index];
-        if (copy.size != size || !UniformBytesEqual(reuse.Bytes(copy_index), guest, size)) {
+        if (copy.size != size ||
+            !UniformBytesEqual(reuse.Bytes(copy_index), guest, size, copy.diff_offset)) {
             return false;
         }
         if (copy.address == device_addr) {
             copy.verified_serial = write_serial;
             copy.page_gen = page_gen;
+            copy.cpu_epoch = cpu_epoch;
         }
         return true;
     };
     bool slot_same = false;
-    if (slot_copy != NO_COPY &&
-        (reuse.copies[slot_copy].tick == tick || range_reuse) &&
-        (write_serial == 0 || reuse.copies[slot_copy].address == device_addr)) {
+    const bool slot_current_tick = slot_copy != NO_COPY && reuse.copies[slot_copy].tick == tick;
+    const bool slot_can_check =
+        slot_copy != NO_COPY && (slot_current_tick || range_reuse) &&
+        (write_serial == 0 || reuse.copies[slot_copy].address == device_addr);
+    if (slot_can_check && slot_current_tick) {
         slot_same = same_bytes(slot_copy);
-    }
-    if (in_place) {
-        namespace Profile = Nx2Profile;
-        Profile::Add(slot_same ? Profile::Counter::UboInPlaceSame
-                               : Profile::Counter::UboInPlaceChanged,
-                     1);
-    }
-    if (slot_same && reuse.copies[slot_copy].tick == tick &&
-        reuse.copies[slot_copy].allocated >= needed) {
-        return rebind(slot_copy);
+        if (in_place) {
+            namespace Profile = Nx2Profile;
+            Profile::Add(slot_same ? Profile::Counter::UboInPlaceSame
+                                   : Profile::Counter::UboInPlaceChanged,
+                         1);
+        }
+        if (slot_same && reuse.copies[slot_copy].allocated >= needed) {
+            return rebind(slot_copy);
+        }
     }
     size_t target = stage * Reuse::NumSlots + index;
     if (range_reuse) {
@@ -388,7 +661,19 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
             if (copy_index != slot_copy && copy.address == device_addr && copy.size == size &&
                 copy.tick == tick && copy.allocated >= needed && same_bytes(copy_index)) {
                 reuse.mru[set] = static_cast<u8>(way);
+                if (in_place && !(slot_can_check && slot_current_tick)) {
+                    Nx2Profile::Add(Nx2Profile::Counter::UboInPlaceSame, 1);
+                }
                 return rebind(copy_index);
+            }
+        }
+        if (slot_can_check && !slot_current_tick) {
+            slot_same = same_bytes(slot_copy);
+            if (in_place) {
+                namespace Profile = Nx2Profile;
+                Profile::Add(slot_same ? Profile::Counter::UboInPlaceSame
+                                       : Profile::Counter::UboInPlaceChanged,
+                             1);
             }
         }
         // Replace the way holding an older copy of this range, else one from an older command
@@ -410,28 +695,43 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
         }
         reuse.mru[set] = static_cast<u8>(victim);
         target = base + victim;
+    } else if (in_place && !(slot_can_check && slot_current_tick)) {
+        Nx2Profile::Add(Nx2Profile::Counter::UboInPlaceChanged, 1);
     }
     if (slot_same) {
         // The slot's copy from an older command buffer holds these bytes: fill the new
         // allocation from it.
         target = slot_copy;
-    } else {
-        typename Reuse::Copy& fresh = reuse.copies[target];
-        std::memcpy(reuse.Bytes(target), guest, size);
-        fresh.size = size;
-        fresh.address = device_addr;
-        fresh.verified_serial = write_serial;
-        fresh.page_gen = page_gen;
-        Reuse::NextSerial(fresh);
+        typename Reuse::Copy& copy = reuse.copies[target];
+        const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+        std::memcpy(span.data(), reuse.Bytes(target), size);
+        copy.ref = runtime.LastStreamUniformRef();
+        copy.allocated = needed;
+        // After the allocation: the tick the stream region is tagged with is the one current now.
+        copy.tick = runtime.CurrentTick();
+        slot = typename Reuse::Slot{static_cast<u32>(target), copy.serial};
+        return true;
     }
-    typename Reuse::Copy& copy = reuse.copies[target];
+    typename Reuse::Copy& fresh = reuse.copies[target];
+    if (fresh.size != size) {
+        fresh.diff_offset = 0;
+    } else if (target != slot_copy && slot_copy != NO_COPY &&
+               reuse.copies[slot_copy].size == size) {
+        fresh.diff_offset = reuse.copies[slot_copy].diff_offset;
+    }
     const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
-    std::memcpy(span.data(), reuse.Bytes(target), size);
-    copy.ref = runtime.LastStreamUniformRef();
-    copy.allocated = needed;
+    UniformDualCopy(reuse.Bytes(target), span.data(), guest, size);
+    fresh.size = size;
+    fresh.address = device_addr;
+    fresh.verified_serial = write_serial;
+    fresh.page_gen = page_gen;
+    fresh.cpu_epoch = cpu_epoch;
+    Reuse::NextSerial(fresh);
+    fresh.ref = runtime.LastStreamUniformRef();
+    fresh.allocated = needed;
     // After the allocation: the tick the stream region is tagged with is the one current now.
-    copy.tick = runtime.CurrentTick();
-    slot = typename Reuse::Slot{static_cast<u32>(target), copy.serial};
+    fresh.tick = runtime.CurrentTick();
+    slot = typename Reuse::Slot{static_cast<u32>(target), fresh.serial};
     return true;
 }
 
@@ -440,7 +740,8 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
                                                   u32 index, u32 binding_index, u64 device_addr,
                                                   u32 size, u64 write_serial = 0,
                                                   u64 page_gen = 0,
-                                                  RangeCleanPred&& range_clean = {}) {
+                                                  RangeCleanPred&& range_clean = {},
+                                                  u64 cpu_epoch = ~u64{0}) {
     using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
     if (size == 0 || size > Reuse::MaxBytes || index >= Reuse::NumSlots) {
         return false;
@@ -453,8 +754,9 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
         needed = runtime.StreamUniformAllocationSize(size);
     }
     if (slot.tick == tick && slot.address == device_addr && slot.size == size &&
-        slot.allocated >= needed && write_serial != 0 && slot.verified_serial != 0) {
-        if (slot.verified_serial == write_serial || range_clean(slot.page_gen)) [[likely]] {
+        slot.allocated >= needed && write_serial != 0 && slot.verified_serial != 0 &&
+        cpu_epoch != 0 && (slot.cpu_epoch == ~u64{0} || slot.cpu_epoch == cpu_epoch)) {
+        if (slot.verified_serial == write_serial || range_clean(slot.page_gen)) {
             slot.verified_serial = write_serial;
             runtime.RebindStreamUniform(slot.ref, size);
             return true;
@@ -463,7 +765,7 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
     const u8* guest = nullptr;
     if constexpr (requires { device_memory.GetSpan(device_addr, size); }) {
         if (UniformInPlaceCompareEnabled()) {
-            guest = device_memory.GetSpan(device_addr, size);
+            guest = reuse.ResolveGuestSpan(device_memory, device_addr, size);
         }
     }
     if (guest == nullptr) {
@@ -471,25 +773,32 @@ template <class Runtime, class DeviceMemory, class RangeCleanPred = NoUboRangeCl
         guest = reuse.scratch.data();
     }
     const bool same_bytes =
-        slot.size == size && UniformBytesEqual(slot.bytes.data(), guest, size);
+        slot.size == size &&
+        UniformBytesEqual(slot.bytes.data(), guest, size, slot.diff_offset);
     if (same_bytes) {
         slot.address = device_addr;
         slot.verified_serial = write_serial;
         slot.page_gen = page_gen;
+        slot.cpu_epoch = cpu_epoch;
         if (slot.tick == tick && slot.allocated >= needed) {
             runtime.RebindStreamUniform(slot.ref, size);
             return true;
         }
     }
+    const std::span<u8> span = runtime.BindMappedUniformBuffer(0, binding_index, size);
     if (!same_bytes) {
-        std::memcpy(slot.bytes.data(), guest, size);
+        if (slot.size != size) {
+            slot.diff_offset = 0;
+        }
+        UniformDualCopy(slot.bytes.data(), span.data(), guest, size);
         slot.size = size;
         slot.address = device_addr;
         slot.verified_serial = write_serial;
         slot.page_gen = page_gen;
+        slot.cpu_epoch = cpu_epoch;
+    } else {
+        std::memcpy(span.data(), slot.bytes.data(), size);
     }
-    const std::span<u8> span = runtime.BindMappedUniformBuffer(0, binding_index, size);
-    std::memcpy(span.data(), slot.bytes.data(), size);
     slot.ref = runtime.LastStreamUniformRef();
     slot.allocated = needed;
     slot.tick = runtime.CurrentTick();

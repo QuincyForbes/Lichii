@@ -114,6 +114,7 @@ public:
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void FlushQueryResults(DAddr addr, u64 size) override;
     bool HasPendingQueries(DAddr addr, u64 size) override;
+    bool HasCachedReports(DAddr addr, u64 size) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void InvalidateRegion(DAddr addr, u64 size,
@@ -121,6 +122,9 @@ public:
     void OnCacheInvalidation(DAddr addr, u64 size) override;
     bool OnCPUWrite(DAddr addr, u64 size) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
+    bool IsCleanReadTrapPage(DAddr page_addr) override;
+    std::optional<VideoCore::RasterizerDownloadArea> TryFastCleanRead(DAddr page_begin,
+                                                                      u64 page_bytes) override;
     bool LandDownloadForCpuRead(DAddr addr, u64 size, u64 tick) override;
     void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
@@ -381,6 +385,10 @@ private:
     /// Copies written texel buffers read through aligned copies back (ends the open encoder).
     void FinishTexelWritebacks();
 
+    /// Submits completed passes at a pass boundary when the split front waits on the back or the
+    /// host GPU has caught up with all committed command buffers.
+    bool SubmitWhileWaited();
+
     /// Encodes the GPU rewrite of index_rewrite (fills its output; left empty when it can't).
     /// ahead: before the segment, leaving the open render pass as it is.
     void RewriteIndices(bool ahead);
@@ -439,7 +447,7 @@ private:
 
     /// Binds mesh_buffers to the program's slots of the emulation's bindings.
     void BindMeshBuffers(const StageProgram& program, ShaderStage metal_stage,
-                         const MeshEmulation& mesh);
+                         const MeshEmulation& mesh, bool is_task_stage = false);
 
     struct MeshArena {
         Object buffer;
@@ -447,22 +455,24 @@ private:
         u8* counter_contents{};
         u64 size{};
         u64 tick{};
+        bool ahead{};
         bool counted{}; ///< the counter of its last command buffer was read
     };
 
     /// The output arena of the command buffer being recorded (task programs' mesh output).
-    [[nodiscard]] MeshArena& AcquireMeshArena();
+    [[nodiscard]] MeshArena& AcquireMeshArena(bool ahead);
 
-    /// texture_buffer views of a stage's texel buffer bindings, in order (null where none can be
-    /// made). Ranges at offsets Metal can't view are read through an aligned copy.
-    [[nodiscard]] std::vector<TextureHandle> PrepareTexelBuffers(std::span<const Binding> bindings,
-                                                                 const Shader::Info& info);
+    /// Fills `out` with texture_buffer views of a stage's texel buffer bindings, in order (null
+    /// where none can be made). Ranges at offsets Metal can't view are read through an aligned copy.
+    void PrepareTexelBuffers(std::span<const Binding> bindings, const Shader::Info& info,
+                             std::vector<TextureHandle>& out);
 
     /// `handle`, or with the pipeline check a texture of zeros of `type` in its place when the
     /// view has none (refused by the checks, or a null descriptor); counted as a guard.
     [[nodiscard]] TextureHandle OrPlaceholder(const ImageView& view, TextureHandle handle,
                                               Shader::TextureType type, bool is_depth = false,
-                                              u64* inout_gpu_resource_id = nullptr);
+                                              u64* inout_gpu_resource_id = nullptr,
+                                              bool is_written = false);
 
     /// The zero textures OrPlaceholder binds, made once outside a render pass.
     void MakePlaceholders();
@@ -471,9 +481,26 @@ private:
     /// hold and what the device has allocated, logged once and on memory warnings.
     [[nodiscard]] std::string GraphicsMemoryReport() const;
 
+    struct StageProgramMeta {
+        u64 epoch{};
+        const StageProgram* program{};
+        u32 read_texel_buffers{};
+        u32 texel_buffers{};
+        u32 sampled_textures{};
+        u32 hp_cbuf_mask{};
+        u64 hp_ssbo_mask{};
+        u8 frag_output_mask{};
+        bool has_any_descriptors{};
+        bool has_storage_images{};
+        bool has_texel_buffers{};
+        bool has_byte_addressed_image{};
+        bool writes_any_storage{};
+    };
+    [[nodiscard]] const StageProgramMeta& GetStageMeta(const StageProgram& program) noexcept;
+
     /// Fills the sample grids of the multisampled images a stage reads as plain textures
     /// (ImageView::PrepareSampleGrid). `views` start at the stage's first.
-    void PrepareSampleGrids(const Shader::Info& info,
+    void PrepareSampleGrids(const Shader::Info& info, u32 texel_buffers,
                             std::span<const VideoCommon::ImageViewInOut> views);
 
     /// Binds a stage's buffers (the buffer cache's pending bindings for it), textures, samplers,
@@ -486,12 +513,12 @@ private:
     /// Whether the program's samplers for this draw or dispatch need its function with the
     /// sampler reduction rewrite: a min / max reduction Metal's sampler state doesn't apply
     /// (no MTLSamplerDescriptor reductionMode, or a nearest or no mip filter, or an integer view).
-    [[nodiscard]] bool NeedsReducingVariant(const StageProgram& program,
+    [[nodiscard]] bool NeedsReducingVariant(const StageProgram& program, u32 texel_buffers,
                                             std::span<const VideoCommon::ImageViewInOut> views,
                                             std::span<const VideoCommon::SamplerId> samplers);
 
-    void BindStageResources(StageProgram& program, ShaderStage metal_stage,
-                            std::span<const Binding> pending,
+    void BindStageResources(StageProgram& program, const StageProgramMeta& meta,
+                            ShaderStage metal_stage, std::span<const Binding> pending,
                             std::span<const TextureHandle> texel_buffer_views,
                             std::span<const VideoCommon::ImageViewInOut> views,
                             std::span<const VideoCommon::SamplerId> samplers, u32 render_width,
@@ -506,7 +533,8 @@ private:
     };
 
     template <typename CbufAddrFn>
-    void CollectStageDescriptors(const Shader::Info& info, bool compute, bool via_header_index,
+    void CollectStageDescriptors(const StageProgram& program, const StageProgramMeta& meta,
+                                 u32 stage_slot, bool compute, bool via_header_index,
                                  bool use_bind_memo, CbufAddrFn&& cbuf_addr_of,
                                  DescriptorPageCache& page_cache, std::vector<u32>& batch_handles,
                                  std::vector<VideoCommon::ImageViewInOut>& views,
@@ -618,7 +646,6 @@ private:
         }
     };
 
-    VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     /// Cleared every frame: views of deleted buffers must not live on.
     std::unordered_map<TexelViewKey, Object, TexelViewHash> texel_view_cache;
     u64 texel_copies{};
@@ -639,6 +666,7 @@ private:
     u32 visibility_slot{};
     bool slot_in_occlusion{};
     bool slot_in_pixels{};
+    bool visibility_active{};
     /// Pixel program invocations (PixelShaderInvocations): counted once a report asks, from the
     /// passes' visibility slots over the samples per pixel.
     bool count_pixels{};
@@ -699,9 +727,14 @@ private:
     ::Common::unordered_map<u64, Object> depth_stencil_states;
     u64 last_depth_stencil_key{~u64{0}};
     void* last_depth_stencil_state{};
+    u64 last_fast_ds_regs{~u64{0}};
+    bool last_ds_depth_written{};
     struct AttachmentFitMemo {
         bool valid{};
         u64 pass_serial{~u64{0}};
+        const Framebuffer* fb{};
+        u64 binding_clock{};
+        u8 raw_guest_color_mask{};
         RenderTargetSet raw_targets{};
         std::array<u32, Maxwell::NumRenderTargets> raw_color_formats{};
         u32 raw_depth_format{};
@@ -709,6 +742,81 @@ private:
         RenderTargetSet fitted_targets{};
         AttachmentFormatsKey formats{};
     } attachment_fit_memo;
+    struct ViewportScissorMemo {
+        bool valid{};
+        std::array<u32, 7> vp0_words{};
+        std::array<u32, 3> scissor0_words{};
+        u64 surface_clip_raw{};
+        u32 target_width{};
+        u32 target_height{};
+        u32 flags{};
+        u32 up_factor_bits{};
+        u32 up_scale{};
+        u32 down_shift{};
+        std::array<u32, 2> jitter_bits{};
+        Viewport viewport{};
+        Scissor scissor{};
+        bool scissor0_visible{};
+    } viewport_scissor_memo;
+    struct RtPreparedDrawMemo {
+        bool valid{};
+        const void* channel{};
+        u64 frame{};
+        u64 pass_serial{~u64{0}};
+        u64 segment_serial{~u64{0}};
+        u64 binding_clock{};
+        const Framebuffer* fb{};
+        u16 written_mask{};
+    } rt_draw_memo;
+    struct RenderPushConstMemo {
+        u64 pass_serial{~u64{0}};
+        u32 slot{~0U};
+        u32 byte_size{};
+        std::array<u32, 16> words{};
+    };
+    std::array<RenderPushConstMemo, 4> render_push_const_memo{};
+    static constexpr size_t RenderStageMemoIndex(ShaderStage stage) noexcept {
+        switch (stage) {
+        case ShaderStage::Vertex:
+            return 0;
+        case ShaderStage::Fragment:
+            return 1;
+        case ShaderStage::Object:
+            return 2;
+        case ShaderStage::Mesh:
+            return 3;
+        case ShaderStage::Compute:
+            return ~size_t{0};
+        }
+        return ~size_t{0};
+    }
+    void InvalidatePushConstSlot(ShaderStage stage, u32 slot) noexcept {
+        const size_t idx = RenderStageMemoIndex(stage);
+        if (idx < render_push_const_memo.size() && render_push_const_memo[idx].slot == slot) {
+            render_push_const_memo[idx].slot = ~0U;
+        }
+    }
+    void InvalidateAllPushConstMemos() noexcept {
+        for (RenderPushConstMemo& m : render_push_const_memo) {
+            m.pass_serial = ~u64{0};
+            m.slot = ~0U;
+        }
+    }
+    struct DescriptorSyncMemo {
+        const void* engine{};
+        GPUVAddr tic_addr{};
+        GPUVAddr tsc_addr{};
+        u32 tic_limit{};
+        u32 tsc_limit{};
+        bool via_header{};
+        bool valid{};
+    };
+    DescriptorSyncMemo last_gfx_desc_sync{};
+    DescriptorSyncMemo last_comp_desc_sync{};
+    RenderStateMemoKey reusable_memo_key{};
+    VertexSources reusable_vertex_sources{};
+    RenderPipelineDesc reusable_layout_desc{};
+    DrawState reusable_draw_state{};
     /// What an attribute of a vertex stream without a buffer reads, made on first use.
     Object zero_vertices;
 
@@ -739,6 +847,8 @@ private:
         std::vector<u32> binding_kinds;
         std::vector<u32> batch_handles;
         std::array<std::vector<Binding>, 5> stage_bindings;
+        std::array<std::vector<TextureHandle>, 5> texel_views;
+        bool taken{};
     } draw_scratch;
     struct ComputeScratch {
         std::vector<VideoCommon::ImageViewInOut> views;
@@ -746,15 +856,16 @@ private:
         std::vector<u32> sampler_handles;
         std::vector<u32> batch_handles;
         std::vector<Binding> bindings;
+        std::vector<TextureHandle> texel_views;
+        bool taken{};
     } compute_scratch;
     /// EDEN_NX2_METAL_BIND_SCRATCH: BindStageResources' slot lists and tables, their storage
     /// kept between calls.
     struct BindScratch {
-        std::vector<u32> texture_slots;
-        std::vector<u32> sampler_slots;
         std::vector<u64> spill_table;
         std::vector<u64> sampler_table;
         std::vector<u64> array_table;
+        bool taken{};
     } bind_scratch;
     /// Why PrepareDraw skipped the draw; empty for a draw of nothing.
     std::string_view prepare_refusal;
@@ -783,14 +894,19 @@ private:
     /// DrawMayBeSkipped's answer, while skip_valid (reset by every draw).
     bool skip_valid{};
     bool skip_decision{};
-    /// Shader::Backend::SPIRV::RescalingLayout of the draw or dispatch being bound.
-    std::array<u32, 8> rescaling_words{};
+    /// Shader::Backend::SPIRV::RescalingLayout (plus render area words 12..13) of the draw or
+    /// dispatch being bound.
+    std::array<u32, 16> rescaling_words{};
 
     static constexpr size_t MaxConvertedIndexEntries = 4096;
     static constexpr u64 MaxConvertedIndexBytes = u64{64} << 20;
     static constexpr u64 MaxSingleConvertedIndexBytes = MaxConvertedIndexBytes / 4;
-    static constexpr u64 ConvertedIndexSlabBytes = u64{1} << 20;
-    static constexpr u64 MaxSlabAllocBytes = u64{64} << 10;
+    static constexpr u64 ConvertedIndexSlabBytes = u64{2} << 20;
+    static constexpr u64 MaxSlabAllocBytes = u64{256} << 10;
+    static constexpr size_t ContentIndexSets = 256;
+    static constexpr size_t ContentIndexWays = 4;
+    static constexpr size_t MaxContentIndexSourceBytes = 65536;
+    static constexpr size_t ConvertedIndexLookupSlots = 1024;
 
     /// The GPU index rewrite of the draw being prepared.
     struct IndexRewrite {
@@ -828,6 +944,16 @@ private:
             return buffer ? buffer.Get() : slab_handle;
         }
     };
+    struct ContentIndexEntry {
+        u64 hash{};
+        u32 source_bytes{};
+        u32 count{};
+        u32 mode{};
+        u32 index_size{};
+        u32 restart{};
+        std::vector<u8> source;
+        ConvertedIndexEntry storage{};
+    };
     struct ConvertedIndexSlab {
         Object buffer;
         u8* mapped{};
@@ -840,18 +966,38 @@ private:
         u32 max_guest_count{};
     };
     static constexpr size_t ConvertedIndexPageFilterSlots = 8192;
+    struct ConvertedIndexLookupSlot {
+        u64 epoch{};
+        BufferHandle buffer{};
+        DAddr device_addr{};
+        u64 offset{};
+        u64 size{};
+        u64 packed_params{};
+        ConvertedIndexEntry* entry{};
+    };
     std::unordered_map<BufferHandle, std::vector<ConvertedIndexEntry>> converted_index_cache;
     std::unordered_map<u64, std::vector<BufferHandle>> converted_index_blocks;
     std::array<u16, ConvertedIndexPageFilterSlots> converted_index_page_counts{};
+    std::array<ConvertedIndexLookupSlot, ConvertedIndexLookupSlots> converted_index_lookup{};
+    u64 converted_index_lookup_epoch{1};
     u32 converted_index_large_entries{};
     std::vector<ConvertedIndexSlab> converted_index_slabs;
+    std::vector<ContentIndexEntry> content_index_cache;
+    u32 content_index_live_count{};
     std::array<GeneratedIndexPattern, 18> generated_index_patterns{};
     size_t converted_index_count{};
     u64 converted_index_bytes{};
     u64 converted_index_clock{};
     DAddr converted_index_min_addr{~DAddr{0}};
     DAddr converted_index_max_addr{};
+    bool suppress_ssbo_write_hook{};
+    [[nodiscard]] ConvertedIndexEntry* FindConvertedIndex(BufferHandle buffer, DAddr device_addr,
+                                                          u64 offset, u64 size, u32 mode,
+                                                          u32 index_size, u32 restart) noexcept;
+    ConvertedIndexEntry& PushConvertedIndex(BufferHandle buffer, ConvertedIndexEntry&& entry);
     void NoteConvertedIndexAdded(BufferHandle buffer, DAddr addr, u64 size);
+    [[nodiscard]] bool NoteConvertedIndexRemoved(DAddr addr, u64 size) noexcept;
+    void RemoveConvertedIndexBufFromBlocks(BufferHandle buffer, DAddr addr, u64 size);
     void ReleaseConvertedIndexStorage(ConvertedIndexEntry& entry) noexcept;
     [[nodiscard]] u8* AllocateConvertedIndexStorage(ConvertedIndexEntry& entry,
                                                     u64 needed_bytes);
@@ -995,6 +1141,7 @@ private:
     } mesh_indirect;
     /// The draw's widened 10:10:10:2 integer attributes, by vertex buffer slot.
     std::array<StagingBufferRef, Maxwell::NumVertexArrays> unpacked_vertices{};
+    u32 unpacked_vertices_mask{};
     Object vertex_unpack_library;
     Object vertex_unpack_kernel;
     bool vertex_unpack_failed{};
@@ -1010,7 +1157,7 @@ private:
     u64 native_mesh_from_gpu{};
     u64 native_mesh_indirect{};
     u64 emulated_mesh_draws{};
-    size_t mesh_arena_current{~size_t{}};
+    std::array<size_t, 2> mesh_arena_current{~size_t{}, ~size_t{}};
     u64 mesh_arena_size{u64{8} << 20};
     /// Guest index data read for draws whose indices are rewritten.
     std::vector<u8> converted_source;
@@ -1019,12 +1166,27 @@ private:
     u64 clears{};
     /// The render pass (Scheduler::RenderPassSerial) a fragment barrier waits in; 0: none.
     u64 fragment_barrier_pass{};
-    /// The last render pass with a draw that writes storage.
+    /// The last render pass with a draw that writes storage, and the ranges it wrote.
     u64 pass_stores{};
+    struct PassStoreSpan {
+        BufferHandle buffer{};
+        u64 begin{};
+        u64 end{};
+    };
+    struct PassStoreTracker {
+        u64 pass_serial{~u64{0}};
+        bool opaque{};
+        u8 span_count{};
+        u8 image_count{};
+        std::array<PassStoreSpan, 16> spans{};
+        std::array<TextureHandle, 8> images{};
+    } pass_store_tracker;
     u64 barrier_pass_ends{};
     /// One 1x1 RGBA8 / Depth32Float texture of zeros per shader texture type (OrPlaceholder).
     std::array<Object, Shader::NUM_TEXTURE_TYPES> placeholders;
     std::array<u64, Shader::NUM_TEXTURE_TYPES> placeholder_resource_ids{};
+    std::array<Object, Shader::NUM_TEXTURE_TYPES> write_placeholders;
+    std::array<u64, Shader::NUM_TEXTURE_TYPES> write_placeholder_resource_ids{};
     std::array<Object, Shader::NUM_TEXTURE_TYPES> depth_placeholders;
     std::array<u64, Shader::NUM_TEXTURE_TYPES> depth_placeholder_resource_ids{};
     Object placeholder_zeros;
@@ -1034,6 +1196,144 @@ private:
     /// EDEN_NX2_FLUSH_DRAWS: draws since the last such commit, and the commits.
     WorkPolicy::DrawFlushCounter draw_flush;
     BindMemo::Counts bind_memo_counts;
+    BindMemo::OverflowState<TextureCache> bind_memo_overflow;
+    static constexpr size_t ResolvedSampledMemoSize = 4096;
+    struct ResolvedSampledEntry {
+        u64 epoch{};
+        u64 key{~u64{0}};
+        TextureHandle tex_handle{};
+        u64 tex_res_id{};
+        void* samp_handle{};
+        u64 samp_res_id{};
+        u8 placeholder_guard{};
+    };
+    std::vector<ResolvedSampledEntry> resolved_sampled_memo;
+    u64 resolved_sampled_epoch{1};
+    u64 resolved_sampled_clock{};
+    u32 resolved_sampled_bias_state{~0U};
+    struct ResolvedSampledBiasMemo {
+        bool valid{};
+        bool has_oot_opt{};
+        u32 oot_bias_bits{};
+        u32 temporal_bias_bits{};
+        u64 temporal_frame{};
+        u64 pool_frame{};
+        bool upscaler_failed{};
+        bool has_oot_bias{};
+        bool temporal_bias_on{};
+        u32 bias_state{};
+    } resolved_sampled_bias_memo;
+    static constexpr size_t ProvenNonWriterSlots = 1024;
+    struct ProvenNonWriterEntry {
+        u64 epoch{};
+        u64 memory_id{};
+        u64 map_serial{};
+        std::array<u64, 6> addresses{};
+        bool native{};
+    };
+    std::vector<ProvenNonWriterEntry> proven_non_writers;
+    ProvenNonWriterEntry last_proven_non_writer{};
+    static constexpr size_t StageProgramMetaSlots = 4096;
+    std::vector<StageProgramMeta> stage_program_meta;
+    std::atomic<u64> stage_meta_epoch{1};
+    static constexpr size_t StageCollectMemoSets = 256;
+    static constexpr size_t StageCollectMemoWays = 2;
+    static constexpr size_t MaxCollectCbufChecks = 8;
+    static constexpr size_t MaxCollectReadSpans = 16;
+    static constexpr size_t MaxCollectSnapshotBytes = 512;
+    struct StageCollectMemo {
+        struct CbufCheck {
+            u8 index{};
+            bool check_enabled{};
+            GPUVAddr addr{};
+        };
+        struct ReadSpan {
+            const u8* host{};
+            u16 snap_offset{};
+            u16 size{};
+        };
+        u64 epoch{};
+        const StageProgram* program{};
+        size_t as_id{};
+        u64 map_serial{};
+        u64 translation_gen{};
+        bool via_header{};
+        bool compute{};
+        int exp21{};
+        u8 num_cbuf_checks{};
+        u8 num_spans{};
+        u16 snap_bytes{};
+        std::array<CbufCheck, MaxCollectCbufChecks> cbuf_checks{};
+        std::array<ReadSpan, MaxCollectReadSpans> spans{};
+        std::array<u8, MaxCollectSnapshotBytes> snapshot{};
+        std::vector<VideoCommon::ImageViewInOut> views;
+        std::vector<u32> sampler_handles;
+    };
+    std::vector<StageCollectMemo> stage_collect_memos;
+    std::array<u8, StageCollectMemoSets> stage_collect_victim{};
+    void BumpStageMemoEpoch() noexcept {
+        stage_meta_epoch.fetch_add(1, std::memory_order_release);
+    }
+    struct LastPipelineSetupMemo {
+        u64 epoch{};
+        const GraphicsPipeline* pipeline{};
+        const NativeMesh* native{};
+        std::array<size_t, 5> stages{};
+        std::array<StageProgram*, 5> programs{};
+        std::array<const StageProgramMeta*, 5> stage_metas{};
+        u8 active_mask{};
+        u8 ssbo_mask{};
+        u8 desc_mask{};
+        u8 tex_mask{};
+        u8 bind_buf_mask{};
+        bool has_storage_images{};
+        bool has_texel_buffers{};
+        bool any_uses_rescaling_uniform{};
+        bool writes_storage{};
+        bool kernel_writes_storage{};
+        bool uses_viewport_index{};
+    } last_pipe_setup;
+    u32 last_memo_pressure_gen{};
+    bool macro_read_writer_set_enabled{};
+    bool cache_paths_enabled{};
+    bool invalidate_before_use{};
+    bool list_copies_enabled{};
+    bool draw_scratch_enabled{};
+    bool bind_scratch_enabled{};
+    bool pipeline_check_enabled{};
+    bool targetless_reach_enabled{};
+    bool bind_memo_enabled{};
+    bool draw_encode_enabled{};
+    bool dispatch_encode_enabled{};
+    bool draw_trace_enabled{};
+    bool indirect_reset_enabled{};
+    char gpu_indices_mode{'a'};
+    bool cache_converted_indices_enabled{};
+    bool indirect_ssbos_enabled{};
+    bool state_memo_enabled{};
+    bool all_viewports_enabled{};
+    bool mesh_flip_y_enabled{};
+    bool fill_lines_enabled{};
+    bool provoking_last_enabled{};
+    bool flat_invariance_enabled{};
+    bool clear_draws_enabled{};
+    bool clear_layers_enabled{};
+    bool gpu_indirect_enabled{};
+    bool gpu_condition_enabled{};
+    bool tess_base_vertex_enabled{};
+    bool mesh_first_enabled{};
+    bool native_reduction_enabled{};
+    bool reduction_variants_enabled{};
+    bool viewport_swizzle_enabled{};
+    std::vector<u64> sample_grid_checked_views;
+    std::vector<u64> sample_grid_msaa_views;
+    std::vector<u32> sample_grid_active_words;
+    u64 sample_grid_clock{};
+    bool sample_grid_any_msaa{};
+    std::vector<u64> non_reducing_sampler_bits;
+    const GraphicsPipeline* last_non_tonemap_pipeline{};
+    u64 oot_camera_checked_frame{};
+    VideoCommon::ImageViewId oot_camera_checked_color_id{};
     u64 draw_flushes{};
     /// EDEN_NX2_NO_MESH and its file.
     std::optional<WorkPolicy::MeshSkip> mesh_skip;

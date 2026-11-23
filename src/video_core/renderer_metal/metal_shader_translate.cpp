@@ -253,6 +253,7 @@ struct Declared {
     u32 binding;
     bool combined; ///< Takes a texture and a sampler
     bool spillable_single; ///< Read-only sampled/separate texture (not storage or buffer)
+    bool uniform_only; ///< Uniform buffer (`constant`), not aliased with a storage buffer
     ResourceKind kind;
     u32 count; ///< Array elements, each a slot
 };
@@ -1324,7 +1325,8 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
         const spv::ExecutionModel model = Model(stage);
         const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
         std::vector<Declared> declared;
-        const auto add = [&](const auto& list, bool combined, bool sampled, ResourceKind kind) {
+        const auto add = [&](const auto& list, bool combined, bool sampled, bool uniform_only,
+                             ResourceKind kind) {
             for (const spirv_cross::Resource& resource : list) {
                 const spirv_cross::SPIRType& type = compiler.get_type(resource.base_type_id);
                 declared.push_back(Declared{
@@ -1332,20 +1334,42 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                     .binding = compiler.get_decoration(resource.id, spv::DecorationBinding),
                     .combined = combined,
                     .spillable_single = sampled && type.image.dim != spv::DimBuffer,
+                    .uniform_only = uniform_only,
                     .kind = kind,
                     .count = ArrayCount(compiler, resource),
                 });
             }
         };
-        add(resources.uniform_buffers, false, false, ResourceKind::Buffer);
-        add(resources.storage_buffers, false, false, ResourceKind::Buffer);
-        add(resources.sampled_images, true, true, ResourceKind::Texture);
-        add(resources.separate_images, false, true, ResourceKind::Texture);
-        add(resources.storage_images, false, false, ResourceKind::Texture);
-        add(resources.separate_samplers, false, false, ResourceKind::Sampler);
+        add(resources.uniform_buffers, false, false, true, ResourceKind::Buffer);
+        add(resources.storage_buffers, false, false, false, ResourceKind::Buffer);
+        add(resources.sampled_images, true, true, false, ResourceKind::Texture);
+        add(resources.separate_images, false, true, false, ResourceKind::Texture);
+        add(resources.storage_images, false, false, false, ResourceKind::Texture);
+        add(resources.separate_samplers, false, false, false, ResourceKind::Sampler);
         std::ranges::sort(declared, [](const Declared& lhs, const Declared& rhs) {
-            return lhs.set != rhs.set ? lhs.set < rhs.set : lhs.binding < rhs.binding;
+            if (lhs.set != rhs.set) {
+                return lhs.set < rhs.set;
+            }
+            if (lhs.binding != rhs.binding) {
+                return lhs.binding < rhs.binding;
+            }
+            return static_cast<u8>(lhs.kind) < static_cast<u8>(rhs.kind);
         });
+        size_t unique_declared = 0;
+        for (const Declared& item : declared) {
+            if (unique_declared > 0 && declared[unique_declared - 1].set == item.set &&
+                declared[unique_declared - 1].binding == item.binding &&
+                declared[unique_declared - 1].kind == item.kind) {
+                Declared& prev = declared[unique_declared - 1];
+                prev.combined = prev.combined || item.combined;
+                prev.spillable_single = prev.spillable_single && item.spillable_single;
+                prev.uniform_only = prev.uniform_only && item.uniform_only;
+                prev.count = (std::max)(prev.count, item.count);
+            } else {
+                declared[unique_declared++] = item;
+            }
+        }
+        declared.resize(unique_declared);
 
         u32 buffers = 0;
         u32 spilled = 0;
@@ -1450,6 +1474,9 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                 }
             }
         };
+        const bool render_stage_immutable_cbufs =
+            stage == Stage::Vertex || stage == Stage::Fragment || stage == Stage::Object ||
+            stage == Stage::Mesh || tess_evaluation;
         for (const Declared& resource : declared) {
             spirv_cross::MSLResourceBinding binding{};
             binding.stage = model;
@@ -1467,6 +1494,9 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                     break;
                 }
                 binding.msl_buffer = buffers;
+                if (render_stage_immutable_cbufs && resource.uniform_only) {
+                    mark_immutable(buffers, resource.count);
+                }
                 result.slots.push_back(
                     {resource.set, resource.binding, resource.kind, buffers, resource.count});
                 buffers += resource.count;
@@ -1521,6 +1551,7 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
             result.sampler_spill_slot = buffers++;
         }
         if (array_entries != 0) {
+            mark_immutable(buffers, 1);
             result.array_spill_slot = buffers++;
             result.array_spill_entries = array_entries;
         }
@@ -1631,6 +1662,9 @@ Result SpirvToMslOnThisStack(std::span<const u32> spirv, Stage stage, const Opti
                 return result;
             }
             if (status == SpillStatus::Unused) {
+                if (result.array_spill_slot < 31) {
+                    result.immutable_buffer_mask &= ~(1U << result.array_spill_slot);
+                }
                 result.array_spill_slot = ~0U;
                 result.array_spill_entries = 0;
             }

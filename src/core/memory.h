@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -29,6 +31,8 @@ struct PageTable;
 namespace Core {
 class System;
 class GPUDirtyMemoryManager;
+template <typename Traits>
+class DeviceMemoryManager;
 } // namespace Core
 
 namespace Kernel {
@@ -37,6 +41,8 @@ class KProcess;
 
 namespace Tegra {
 class MemoryManager;
+struct MaxwellDeviceTraits;
+using MaxwellDeviceMemoryManager = Core::DeviceMemoryManager<MaxwellDeviceTraits>;
 }
 
 namespace Core::Memory {
@@ -523,24 +529,102 @@ public:
 
     bool InvalidateSeparateHeap(void* fault_address);
 
-    struct HotWritePage {
+    struct alignas(128) HotWritePage {
         u64 vaddr_page{~u64{0}};
         u8* host_page{};
         u64 daddr_page{};
+        u64 collected_granules{};
+        u64 gather_epoch{};
         u64 mem_gen{};
         u64 map_gen{};
         u64 answer_epoch{};
         bool rasterizer_cached{};
     };
 
+    struct HotReadPage {
+        u64 vaddr_page{~u64{0}};
+        const u8* host_page{};
+        u64 mem_gen{};
+        u64 map_gen{};
+        bool rasterizer_cached{};
+        bool uses_map_gen{};
+    };
+
+    static constexpr std::size_t MaxHotCores = 8;
+
+    struct alignas(128) HotCoreState {
+        static constexpr std::size_t WriteSlots = 64;
+        static constexpr std::size_t ReadSlots = 16;
+
+        std::array<HotWritePage, WriteSlots> writes{};
+        std::array<HotReadPage, ReadSlots> reads{};
+        const std::atomic<u64>* gather_epoch_ptr{};
+        const Tegra::MaxwellDeviceMemoryManager* dev_mem{};
+
+        [[nodiscard]] HotWritePage& WriteSlot(u64 page_vaddr) noexcept {
+            const u64 idx = page_vaddr >> YUZU_PAGEBITS;
+            return writes[(idx ^ (idx >> 6)) & (WriteSlots - 1)];
+        }
+
+        [[nodiscard]] const HotWritePage& WriteSlot(u64 page_vaddr) const noexcept {
+            const u64 idx = page_vaddr >> YUZU_PAGEBITS;
+            return writes[(idx ^ (idx >> 6)) & (WriteSlots - 1)];
+        }
+
+        [[nodiscard]] HotReadPage& ReadSlot(u64 page_vaddr) noexcept {
+            const u64 idx = page_vaddr >> YUZU_PAGEBITS;
+            return reads[(idx ^ (idx >> 4)) & (ReadSlots - 1)];
+        }
+
+        [[nodiscard]] const HotReadPage& ReadSlot(u64 page_vaddr) const noexcept {
+            const u64 idx = page_vaddr >> YUZU_PAGEBITS;
+            return reads[(idx ^ (idx >> 4)) & (ReadSlots - 1)];
+        }
+
+        [[nodiscard]] u64 GatherEpoch() const noexcept {
+            return gather_epoch_ptr != nullptr ? gather_epoch_ptr->load(std::memory_order_acquire)
+                                               : 0;
+        }
+    };
+
+    void PrepareHotCores();
+
+    [[nodiscard]] HotCoreState* HotCore(std::size_t core_index) noexcept {
+        return hot_cores_ptr != nullptr && core_index < MaxHotCores
+                   ? &hot_cores_ptr[core_index]
+                   : nullptr;
+    }
+
+    [[nodiscard]] const HotCoreState* HotCore(std::size_t core_index) const noexcept {
+        return hot_cores_ptr != nullptr && core_index < MaxHotCores
+                   ? &hot_cores_ptr[core_index]
+                   : nullptr;
+    }
+
     [[nodiscard]] u64 FastReadGeneration() const noexcept {
         return fast_read_gen_ptr != nullptr ? fast_read_gen_ptr->load(std::memory_order_acquire)
+                                            : 0;
+    }
+
+    [[nodiscard]] u64 FastReadGenerationRelaxed() const noexcept {
+        return fast_read_gen_ptr != nullptr ? fast_read_gen_ptr->load(std::memory_order_relaxed)
                                             : 0;
     }
 
     [[nodiscard]] u64 FastWriteGeneration() const noexcept {
         return fast_write_gen_ptr != nullptr ? fast_write_gen_ptr->load(std::memory_order_acquire)
                                              : 0;
+    }
+
+    [[nodiscard]] u64 FastWriteGenerationRelaxed() const noexcept {
+        return fast_write_gen_ptr != nullptr ? fast_write_gen_ptr->load(std::memory_order_relaxed)
+                                             : 0;
+    }
+
+    [[nodiscard]] u64 RasterizerWriteGenerationRelaxed() const noexcept {
+        return rasterizer_write_gen_ptr != nullptr
+                   ? rasterizer_write_gen_ptr->load(std::memory_order_relaxed)
+                   : 0;
     }
 
     [[nodiscard]] const std::atomic<std::uintptr_t>* JitReadTrapStatePtr() const noexcept {
@@ -553,11 +637,29 @@ public:
     [[nodiscard]] bool TryCacheCleanReadPage(u64 vaddr, const u8*& out_host_page,
                                              u64& out_generation) const noexcept;
 
-    [[nodiscard]] bool TryCollectHotWrite(std::size_t core_index, u64 offset, std::size_t size,
-                                          const HotWritePage& hot) noexcept;
+    struct JitHotWriteContext {
+        Memory* memory{};
+        std::size_t core_index{};
+        HotCoreState* hot_core{};
+        const std::atomic<u64>* rast_gen_ptr{};
+    };
 
-    [[nodiscard]] bool TryCacheHotWritePage(std::size_t core_index, u64 vaddr,
-                                            HotWritePage& out_hot) const noexcept;
+    [[nodiscard]] bool TryCacheHotReadPage(std::size_t core_index, u64 vaddr,
+                                           HotReadPage& out_hot) noexcept;
+
+    [[nodiscard]] bool TryCollectHotWrite(std::size_t core_index, u64 offset, std::size_t size,
+                                          u64 granule_mask, HotWritePage& hot) noexcept;
+
+    [[nodiscard]] bool TryCacheHotWritePage(std::size_t core_index, u64 vaddr, u64 granule_mask,
+                                            HotWritePage& out_hot) noexcept;
+
+    [[nodiscard]] bool WriteCoreInPage(std::size_t core_index, u64 vaddr, const u8* src,
+                                       std::size_t size, u64 granule_mask,
+                                       HotWritePage& out_hot) noexcept;
+
+    [[nodiscard]] bool PopulateJitHotWrite(std::size_t core_index, JitHotWriteContext& out_ctx,
+                                           std::array<std::uintptr_t, 5>& out_write_fns,
+                                           bool& out_preserve_all_abi) noexcept;
 
 private:
     Core::System& system;
@@ -566,7 +668,9 @@ private:
     std::unique_ptr<Impl> impl;
     const std::atomic<u64>* fast_read_gen_ptr{};
     const std::atomic<u64>* fast_write_gen_ptr{};
+    const std::atomic<u64>* rasterizer_write_gen_ptr{};
     const std::atomic<std::uintptr_t>* jit_read_trap_state_ptr{};
+    HotCoreState* hot_cores_ptr{};
 };
 
 template <typename T, GuestMemoryFlags FLAGS>

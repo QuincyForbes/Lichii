@@ -274,6 +274,10 @@ public:
                hook_requested.load(std::memory_order_relaxed) ||
                front_waiting.load(std::memory_order_relaxed);
     }
+    /// Any thread: whether the back has already run its idle hook since its last entry.
+    [[nodiscard]] bool IsBackQuiet() const {
+        return BackQuiet();
+    }
 
     /// Starts the back thread once the split is wanted (EDEN_NX2_SPLIT=1, a Switch 2 title,
     /// commands read without cache flushes). Called by the front between commands.
@@ -339,7 +343,7 @@ public:
         const u64 pair = u64{method & 0xffff} | (u64{argument} << 32);
         const size_t index = write_position & RingMask;
         if (pairs_header != nullptr && index != 0 && pairs_count < MaxPairs &&
-            write_position + 1 - consumed_cache <= RingWords) [[likely]] {
+            write_position + 1 - consumed_cache <= RingWords) {
             ring[index] = pair;
             ++pairs_count;
             *pairs_header = static_cast<u64>(Kind::Pairs) | (u64{pairs_count} << 32);
@@ -354,6 +358,158 @@ public:
         pairs_count = 1;
         CountBatched(Batched::Pairs);
         CountBatched(Batched::PairBlocks);
+        Commit(2, Effect::None);
+    }
+    /// Appends a pre-packed span of (method | (u64{value} << 32)) pairs in one ring commit.
+    void PairWriteSpan(Tegra::Engines::EngineInterface* engine, const u64* pairs, u32 count) {
+        if (count == 0) {
+            return;
+        }
+        SelectEngine(engine);
+        const size_t index = write_position & RingMask;
+        if (pairs_header != nullptr && index != 0 && index + count <= RingWords &&
+            pairs_count + count <= MaxPairs &&
+            write_position + count - consumed_cache <= RingWords) {
+            std::memcpy(&ring[index], pairs, size_t{count} * sizeof(u64));
+            pairs_count += count;
+            *pairs_header = static_cast<u64>(Kind::Pairs) | (u64{pairs_count} << 32);
+            CountBatched(Batched::Pairs, count);
+            Commit(count, Effect::None);
+            return;
+        }
+        u64* const entry = Reserve(1 + size_t{count});
+        entry[0] = static_cast<u64>(Kind::Pairs) | (u64{count} << 32);
+        std::memcpy(entry + 1, pairs, size_t{count} * sizeof(u64));
+        pairs_header = entry;
+        pairs_count = count;
+        CountBatched(Batched::Pairs, count);
+        CountBatched(Batched::PairBlocks);
+        Commit(1 + size_t{count}, Effect::None);
+    }
+    /// Compact Maxwell3D constant-buffer bind: sets const_buffer.{size,address} and binds to stage.
+    void CbBind(Tegra::Engines::EngineInterface* engine, u32 stage, u32 raw_config, u32 size,
+                GPUVAddr address, bool track_shadow) {
+        SelectEngine(engine);
+        u64* const entry = Reserve(2);
+        entry[0] = static_cast<u64>(Kind::CbBind) | (u64{stage & 0x7} << 4) |
+                   (track_shadow ? PacketTrackShadow : 0) | (u64{size & 0xfffff} << 12) |
+                   (u64{raw_config} << 32);
+        entry[1] = address;
+        Commit(2, Effect::None);
+    }
+    /// Compact Maxwell3D constant-buffer data upload (optionally setting const_buffer.offset first).
+    void CbUpload(Tegra::Engines::EngineInterface* engine, u32 first_slot, bool incrementing,
+                  bool has_offset, bool track_shadow, u32 offset, const u32* words, u32 count) {
+        SelectEngine(engine);
+        const size_t entry_words = 1 + (size_t{count} + 1) / 2;
+        u64* const entry = Reserve(entry_words);
+        const u64 flags = (u64{first_slot & 0xf} << 4) | (incrementing ? CbUploadInc : 0) |
+                          (has_offset ? CbUploadHasOffset : 0) |
+                          (track_shadow ? CbUploadTrack : 0) | (u64{offset} << 32);
+        entry[0] = static_cast<u64>(Kind::CbUpload) | flags | (u64{count} << 16);
+        entry[entry_words - 1] = 0;
+        std::memcpy(entry + 1, words, size_t{count} * sizeof(u32));
+        if (count != 0 && (incrementing ? ((first_slot & 0xf) + count < 16)
+                                        : (count < MaxCbUploadWords))) {
+            cb_upload_header = entry;
+            cb_upload_flags = flags;
+            cb_upload_first_slot = static_cast<u8>(first_slot & 0xf);
+            cb_upload_count = count;
+        }
+        Commit(entry_words, Effect::None);
+        NoteMethodWrite(engine, CbDataBaseMethod + (first_slot & 0xf));
+    }
+    /// Single-word CBData write that coalesces consecutive 0x8e4+i words into an open CbUpload.
+    void CbUploadWord(Tegra::Engines::EngineInterface* engine, u32 slot, bool has_offset,
+                      bool track_shadow, u32 offset, u32 word) {
+        const u64 track_flag = track_shadow ? CbUploadTrack : 0;
+        if (cb_upload_header != nullptr && engine == front_engine && !has_offset &&
+            (cb_upload_flags & CbUploadTrack) == track_flag) {
+            const bool can_inc = (cb_upload_flags & CbUploadInc) != 0 && cb_upload_count < 16 &&
+                                 cb_upload_first_slot + cb_upload_count == slot;
+            const bool can_same_slot =
+                slot == cb_upload_first_slot && cb_upload_count < MaxCbUploadWords &&
+                (cb_upload_count == 1 || (cb_upload_flags & CbUploadInc) == 0);
+            if (can_inc || can_same_slot) {
+                if ((cb_upload_count & 1) == 1) {
+                    if (!can_inc) {
+                        cb_upload_flags &= ~CbUploadInc;
+                    }
+                    ring[(write_position - 1) & RingMask] |= u64{word} << 32;
+                    ++cb_upload_count;
+                    *cb_upload_header = static_cast<u64>(Kind::CbUpload) | cb_upload_flags |
+                                        (u64{cb_upload_count} << 16);
+                    NoteMethodWrite(engine, CbDataBaseMethod + (slot & 0xf));
+                    return;
+                }
+                const size_t index = write_position & RingMask;
+                if (index != 0 && write_position + 1 - consumed_cache <= RingWords) {
+                    if (!can_inc) {
+                        cb_upload_flags &= ~CbUploadInc;
+                    }
+                    ring[index] = u64{word};
+                    ++cb_upload_count;
+                    *cb_upload_header = static_cast<u64>(Kind::CbUpload) | cb_upload_flags |
+                                        (u64{cb_upload_count} << 16);
+                    Commit(1, Effect::None);
+                    NoteMethodWrite(engine, CbDataBaseMethod + (slot & 0xf));
+                    return;
+                }
+            }
+        }
+        SelectEngine(engine);
+        u64* const entry = Reserve(2);
+        const u64 flags = (u64{slot & 0xf} << 4) | CbUploadInc |
+                          (has_offset ? CbUploadHasOffset : 0) | track_flag | (u64{offset} << 32);
+        entry[0] = static_cast<u64>(Kind::CbUpload) | flags | (u64{1} << 16);
+        entry[1] = u64{word};
+        cb_upload_header = entry;
+        cb_upload_flags = flags;
+        cb_upload_first_slot = static_cast<u8>(slot);
+        cb_upload_count = 1;
+        Commit(2, Effect::None);
+        NoteMethodWrite(engine, CbDataBaseMethod + (slot & 0xf));
+    }
+    /// Compact Maxwell3D indexed draw packet (covers E04, E52, EA0, and staged 0x586..0x585 draws).
+    void DrawIndexed(Tegra::Engines::EngineInterface* engine, u32 begin, u32 first, u32 count,
+                     bool has_bases, bool has_driver_cb, bool track_shadow, u32 base_vertex,
+                     u32 base_instance, u32 instances, Effect effect) {
+        const bool with_instances = instances != 1;
+        const size_t entry_words = 2 + (has_bases ? 1 : 0) + (with_instances ? 1 : 0);
+        SelectEngine(engine);
+        u64* const entry = Reserve(entry_words);
+        entry[0] = static_cast<u64>(Kind::DrawIndexed) | (has_bases ? DrawHasBases : 0) |
+                   (has_driver_cb ? DrawHasDriverCb : 0) |
+                   (track_shadow ? PacketTrackShadow : 0) |
+                   (with_instances ? DrawHasInstances : 0) | (u64{begin} << 32);
+        entry[1] = u64{first} | (u64{count} << 32);
+        size_t pos = 2;
+        if (has_bases) {
+            entry[pos++] = u64{base_vertex} | (u64{base_instance} << 32);
+        }
+        if (with_instances) {
+            entry[pos++] = u64{instances};
+        }
+        Commit(entry_words, effect);
+    }
+    /// Compact Maxwell3D array / mesh draw packet (0x586, 0x35d, 0x35e, 0x585).
+    void DrawArrays(Tegra::Engines::EngineInterface* engine, u32 begin, u32 first, u32 count,
+                    bool track_shadow, Effect effect) {
+        SelectEngine(engine);
+        u64* const entry = Reserve(2);
+        entry[0] = static_cast<u64>(Kind::DrawArrays) | (track_shadow ? PacketTrackShadow : 0) |
+                   (u64{begin} << 32);
+        entry[1] = u64{first} | (u64{count} << 32);
+        Commit(2, effect);
+    }
+    /// Compact Maxwell3D conditional-render evaluation at `address` (OoT 0xe2c OcclusionHle).
+    void RenderEnable(Tegra::Engines::EngineInterface* engine, u32 mode, GPUVAddr address,
+                      bool track_shadow) {
+        SelectEngine(engine);
+        u64* const entry = Reserve(2);
+        entry[0] = static_cast<u64>(Kind::RenderEnable) | (track_shadow ? PacketTrackShadow : 0) |
+                   (u64{mode} << 32);
+        entry[1] = address;
         Commit(2, Effect::None);
     }
 
@@ -403,7 +559,7 @@ public:
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload, effect);
     }
-    void DeferFunction(std::function<void()>&& func);
+    void DeferFunction(std::function<void()>&& func, bool changes_mappings = true);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
     /// cache download that records into the Vulkan scheduler. A drained back still submits from
     /// its idle hook, so the front never touches that state itself.
@@ -669,6 +825,15 @@ public:
     }
     [[nodiscard]] u64 LastFunctionPosition() const {
         return last_function_position;
+    }
+    /// Front: whether every queued mapping-changing function has executed, using consumed_cache
+    /// first to avoid an atomic load on every macro call and constant-buffer bind.
+    [[nodiscard]] bool FunctionsSettled() {
+        if (last_function_position <= consumed_cache) {
+            return true;
+        }
+        consumed_cache = consumed.load(std::memory_order_acquire);
+        return last_function_position <= consumed_cache;
     }
     /// whether work sent after position `since` may write device bytes
     /// [begin, begin + size): compute or copies (any range), unranged writers, or a noted write
@@ -1026,22 +1191,40 @@ public:
         return WaitFor((std::min)(position, write_position), site);
     }
 
+    static constexpr u64 PairsTag = 5;
+    static constexpr u64 CbBindTag = 7;
+
 private:
     friend struct GpuSplitTestAccess;
 
     enum class Kind : u64 {
-        Wrap,       ///< The rest of the ring is unused: continue at its start
-        Engine,     ///< The engine the next methods go to: word 1
-        Method,     ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
-        Multi,      ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
-        Call,       ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
-        Pairs,      ///< Bits 32-63 count; then one word per write: bits 0-15 method, 32-63 value
-        StateBlock, ///< Bits 8-23 first method, 32-63 count; then packed u32 arguments
+        Wrap,         ///< The rest of the ring is unused: continue at its start
+        Engine,       ///< The engine the next methods go to: word 1
+        Method,       ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
+        Multi,        ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
+        Call,         ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+        Pairs,        ///< Bits 32-63 count; then one word per write: bits 0-15 method, 32-63 value
+        StateBlock,   ///< Bits 8-23 first method, 32-63 count; then packed u32 arguments
+        CbBind,       ///< Bits 4-6 stage, 7 track, 12-31 size, 32-63 config; word 1 address
+        CbUpload,     ///< Bits 4-7 slot, 8 inc, 9 off, 10 track, 16-31 count, 32-63 offset; words
+        DrawIndexed,  ///< Bits 4 bases, 5 cb, 6 inst, 7 track, 32-63 begin; first|count; [bases]; [inst]
+        DrawArrays,   ///< Bit 7 track, 32-63 begin; word 1 first|count
+        RenderEnable, ///< Bit 7 track, 32-63 mode; word 1 address
     };
+    static_assert(PairsTag == static_cast<u64>(Kind::Pairs) &&
+                  CbBindTag == static_cast<u64>(Kind::CbBind));
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
     static constexpr u64 Sink = 1 << 7;   ///< Method: into the method sink, tagged (SinkMethod)
+    static constexpr u64 DrawHasBases = u64{1} << 4;
+    static constexpr u64 DrawHasDriverCb = u64{1} << 5;
+    static constexpr u64 DrawHasInstances = u64{1} << 6;
+    static constexpr u64 PacketTrackShadow = u64{1} << 7;
+    static constexpr u64 CbUploadInc = u64{1} << 8;
+    static constexpr u64 CbUploadHasOffset = u64{1} << 9;
+    static constexpr u64 CbUploadTrack = u64{1} << 10;
+    static constexpr u32 CbDataBaseMethod = 0x8e4;
 
     // Read when the split first starts (MaybeStart), after main() applied nx2_switches.txt: a
     // static initialiser would run before it.
@@ -1049,6 +1232,7 @@ private:
     static inline bool compute_sink{};
     static inline bool ring_pairs{};
     static constexpr u32 MaxPairs = 4096;
+    static constexpr u32 MaxCbUploadWords = 4096;
 
     /// Method, EDEN_NX2_PERF_VERIFY with draw_begin_coalesce: the front would have counted this
     /// entry into the one before it (RepeatableMethod). Bit 31: bit 7 is Sink's.
@@ -1073,10 +1257,10 @@ private:
 
     /// Room for an entry of `words` at the write position (never across the ring's end).
     u64* Reserve(size_t words) {
-        pairs_header = nullptr; // What follows ends the open Pairs block
+        pairs_header = nullptr;     // What follows ends the open Pairs block
+        cb_upload_header = nullptr; // and any open CbUpload block
         const size_t index = write_position & RingMask;
-        if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
-            [[likely]] {
+        if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords) {
             return &ring[index];
         }
         return ReserveSlow(words);
@@ -1302,6 +1486,29 @@ private:
         size_t count{};
     };
     RangedWriteRing ranged_writes;
+    static constexpr size_t RangedPageTableSize = 1024;
+    static constexpr u64 RangedPageMask = RangedPageTableSize - 1;
+    std::array<u64, RangedPageTableSize> ranged_page_max_pos{};
+    u64 ranged_large_max_pos{};
+    void NoteRangedWritePages(GPUVAddr begin, GPUVAddr end, u64 position) noexcept {
+        if (begin >= end) {
+            return;
+        }
+        const u64 first_page = begin >> 12;
+        const u64 last_page = (end - 1) >> 12;
+        if (last_page - first_page >= 8) {
+            if (position > ranged_large_max_pos) {
+                ranged_large_max_pos = position;
+            }
+            return;
+        }
+        for (u64 page = first_page; page <= last_page; ++page) {
+            const size_t slot = static_cast<size_t>((page ^ (page >> 10)) & RangedPageMask);
+            if (position > ranged_page_max_pos[slot]) {
+                ranged_page_max_pos[slot] = position;
+            }
+        }
+    }
     struct QueuedRelease {
         u64 position;
         u64 device;
@@ -1339,6 +1546,11 @@ private:
     /// The open Pairs block's head (PairWrite), and its count.
     u64* pairs_header{};
     u32 pairs_count{};
+    /// The open CbUpload block's head (CbUploadWord), flags, starting slot, and word count.
+    u64* cb_upload_header{};
+    u64 cb_upload_flags{};
+    u32 cb_upload_count{};
+    u8 cb_upload_first_slot{};
     std::array<u64, static_cast<size_t>(Batched::Count)> batched{};
     std::chrono::steady_clock::time_point batched_since{};
     u32 publishes{};

@@ -61,6 +61,7 @@ private:
     friend class KScopedSchedulerLockAndSleep;
 
     std::atomic_bool m_scheduler_update_needed{};
+    std::atomic<u32> m_active_handoff_mask{};
     KSchedulerPriorityQueue m_priority_queue;
     LockType m_scheduler_lock;
     std::mutex m_global_list_guard;

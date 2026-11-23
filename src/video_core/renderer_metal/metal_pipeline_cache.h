@@ -10,6 +10,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
@@ -26,6 +28,7 @@
 #include "common/container/unordered_map.h"
 #include "common/polyfill_thread.h"
 #include "common/thread_worker.h"
+#include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/shader_environment.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
@@ -187,7 +190,23 @@ public:
 
     /// Whether any stage of the pipeline may write guest memory (SSBOs, storage images, XFB,
     /// global stores/atomics, or task/mesh shaders).
-    [[nodiscard]] bool Nx2MayWriteMemory() const noexcept;
+    [[nodiscard]] bool Nx2MayWriteMemory() const noexcept {
+        return nx2_may_write_memory;
+    }
+
+    [[nodiscard]] bool HasXfbKey() const noexcept {
+        return has_xfb_key;
+    }
+
+    [[nodiscard]] const std::array<u32, VideoCommon::NUM_STAGES>& UniformMasks(
+        bool use_native) const noexcept {
+        return use_native ? native_uniform_masks : default_uniform_masks;
+    }
+
+    [[nodiscard]] const VideoCommon::UniformBufferSizes& UniformSizes(
+        bool use_native) const noexcept {
+        return use_native ? native_uniform_sizes : default_uniform_sizes;
+    }
 
     /// Whether any render vertex or fragment stage has a separate sampler-reduction variant.
     [[nodiscard]] bool HasReductionVariants() const noexcept {
@@ -207,19 +226,42 @@ public:
 
     [[nodiscard]] const CachedRenderState* FindCachedRenderState(
         const RenderStateMemoKey& memo_key) const noexcept {
-        if (cached_render_state.state != nullptr &&
-            cached_render_state.key.Matches(memo_key, IsMeshPipeline())) {
-            return &cached_render_state;
+        const bool mesh_pipe = IsMeshPipeline();
+        for (const CachedRenderState& entry : cached_render_states) {
+            if (entry.state != nullptr && entry.key.Matches(memo_key, mesh_pipe)) {
+                return &entry;
+            }
         }
         return nullptr;
     }
 
     void StoreCachedRenderState(const RenderStateMemoKey& memo_key, void* state, u8 color_written,
                                 const VertexSources& vertex_sources) noexcept {
-        cached_render_state.state = state;
-        cached_render_state.color_written = color_written;
-        cached_render_state.vertex_sources = vertex_sources;
-        cached_render_state.key = memo_key;
+        const bool mesh_pipe = IsMeshPipeline();
+        for (size_t i = 0; i < cached_render_states.size(); ++i) {
+            if (cached_render_states[i].state == nullptr ||
+                cached_render_states[i].key.Matches(memo_key, mesh_pipe)) {
+                for (size_t j = i; j > 0; --j) {
+                    cached_render_states[j] = cached_render_states[j - 1];
+                }
+                cached_render_states[0] = CachedRenderState{
+                    .state = state,
+                    .color_written = color_written,
+                    .vertex_sources = vertex_sources,
+                    .key = memo_key,
+                };
+                return;
+            }
+        }
+        for (size_t j = cached_render_states.size() - 1; j > 0; --j) {
+            cached_render_states[j] = cached_render_states[j - 1];
+        }
+        cached_render_states[0] = CachedRenderState{
+            .state = state,
+            .color_written = color_written,
+            .vertex_sources = vertex_sources,
+            .key = memo_key,
+        };
     }
 
     /// Builds the stages' functions (Native()'s while it has them); false (logged once) when Metal
@@ -308,13 +350,20 @@ private:
     PipelineArchive* archive{};
     PipelineFiles* recorder{};
     bool used{};
+    bool functions_built{};
+    bool nx2_may_write_memory{};
+    bool has_xfb_key{};
     bool flat_inputs{};
     bool flat_always_varies{true};
     u32 flat_generic_mask{};
     u32 flat_attr_deps_mask{};
     u64 last_use{};
+    std::array<u32, VideoCommon::NUM_STAGES> default_uniform_masks{};
+    std::array<u32, VideoCommon::NUM_STAGES> native_uniform_masks{};
+    VideoCommon::UniformBufferSizes default_uniform_sizes{};
+    VideoCommon::UniformBufferSizes native_uniform_sizes{};
     std::optional<VertexProgramUse> cached_vertex_use;
-    CachedRenderState cached_render_state;
+    std::array<CachedRenderState, 4> cached_render_states{};
     ::Common::unordered_map<u64, Object> render_states;
     /// Vertex kernel states by kind, variant and vertex layout.
     ::Common::unordered_map<u64, Object> vertex_kernel_states;
@@ -330,6 +379,10 @@ public:
 
     [[nodiscard]] const ComputePipelineKey& Key() const noexcept {
         return key;
+    }
+
+    [[nodiscard]] const VideoCommon::ComputeUniformBufferSizes& UniformSizes() const noexcept {
+        return uniform_sizes;
     }
 
     void SetArchive(PipelineArchive* archive_) noexcept {
@@ -351,6 +404,7 @@ public:
 private:
     ComputePipelineKey key;
     StageProgram program;
+    VideoCommon::ComputeUniformBufferSizes uniform_sizes{};
     Object state;
     Object reducing_state;
     PipelineArchive* archive{};
@@ -548,14 +602,29 @@ private:
 
     const Device& device;
 
+    struct FastGraphicsKey {
+        std::array<u64, offsetof(GraphicsPipelineKey, xfb) / sizeof(u64)> words{};
+
+        bool operator==(const FastGraphicsKey&) const noexcept = default;
+    };
+    static_assert(sizeof(FastGraphicsKey) == offsetof(GraphicsPipelineKey, xfb));
+
+    struct FastGraphicsKeyHash {
+        size_t operator()(const FastGraphicsKey& k) const noexcept;
+    };
+
     VideoCommon::StageCache stage_cache;
     StageMslCache msl_cache;
     PipelineTranslator translator;
     GraphicsPipelineKey graphics_key{};
+    bool graphics_key_has_xfb{};
     GraphicsPipeline* current_pipeline{};
+    ComputePipeline* current_compute_pipeline{};
     const Tegra::Engines::Maxwell3D* last_rasterize_channel{};
     u32 last_rasterize_enable{~0U};
     ::Common::unordered_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
+    ::Common::unordered_map<FastGraphicsKey, GraphicsPipeline*, FastGraphicsKeyHash>
+        fast_graphics_cache;
     ::Common::unordered_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_cache;
 
     PipelineArchive archive;

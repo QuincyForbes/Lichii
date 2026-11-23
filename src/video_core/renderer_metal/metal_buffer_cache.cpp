@@ -46,6 +46,9 @@ Buffer::Buffer(Buffer&& other) noexcept
       bytes{std::exchange(other.bytes, 0)},
       tracker{std::move(other.tracker)},
       usage_serial{std::exchange(other.usage_serial, 0)},
+      last_pass_serial{std::exchange(other.last_pass_serial, ~u64{0})},
+      pass_interval_begin{std::exchange(other.pass_interval_begin, 0)},
+      pass_interval_end{std::exchange(other.pass_interval_end, 0)},
       last_usage_tick{std::exchange(other.last_usage_tick, 0)},
       freshly_zeroed_{std::exchange(other.freshly_zeroed_, false)} {
     if (runtime != nullptr && buffer) {
@@ -72,6 +75,9 @@ Buffer& Buffer::operator=(Buffer&& other) noexcept {
     bytes = std::exchange(other.bytes, 0);
     tracker = std::move(other.tracker);
     usage_serial = std::exchange(other.usage_serial, 0);
+    last_pass_serial = std::exchange(other.last_pass_serial, ~u64{0});
+    pass_interval_begin = std::exchange(other.pass_interval_begin, 0);
+    pass_interval_end = std::exchange(other.pass_interval_end, 0);
     last_usage_tick = std::exchange(other.last_usage_tick, 0);
     freshly_zeroed_ = std::exchange(other.freshly_zeroed_, false);
     if (runtime != nullptr && buffer) {
@@ -99,12 +105,31 @@ void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
         usage_serial = serial;
         tracker.Reset();
     }
+    if (size != 0 && runtime->scheduler.IsRendering()) {
+        const u64 pserial = runtime->scheduler.RenderPassSerial();
+        const u64 end = size > ~u64{0} - offset ? ~u64{0} : offset + size;
+        if (last_pass_serial != pserial) {
+            last_pass_serial = pserial;
+            pass_interval_begin = offset;
+            pass_interval_end = end;
+        } else {
+            pass_interval_begin = (std::min)(pass_interval_begin, offset);
+            pass_interval_end = (std::max)(pass_interval_end, end);
+        }
+    }
     tracker.Track(offset, size);
 }
 
 bool Buffer::IsRegionUsed(u64 offset, u64 size) const noexcept {
     return runtime != nullptr && usage_serial == runtime->scheduler.SegmentSerial() &&
            tracker.IsUsed(offset, size);
+}
+
+bool Buffer::MayBeUsedInCurrentPass(u64 offset, u64 size) const noexcept {
+    return size != 0 && runtime != nullptr && runtime->scheduler.IsRendering() &&
+           last_pass_serial == runtime->scheduler.RenderPassSerial() &&
+           offset < pass_interval_end &&
+           pass_interval_begin < (size > ~u64{0} - offset ? ~u64{0} : offset + size);
 }
 
 bool Buffer::IsInFlight() const noexcept {
@@ -165,20 +190,88 @@ bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {
         return false;
     }
     MultiRangeBuffer& entry = multi_range_buffers[key];
+    entry.frame = frame;
+    const u64 cur_serial = scheduler.SegmentSerial();
+    for (MultiRangeSource& source : multi_range_sources) {
+        source.ahead_serial = scheduler.BufferAheadWriteSerial(source.buffer);
+    }
+    const bool any_written_in_order =
+        std::ranges::any_of(multi_range_sources, [&](const MultiRangeSource& source) {
+            return scheduler.WrittenInOrder(source.buffer, source.offset, source.size) ||
+                   scheduler.UsedUntrackedInOrder(source.buffer);
+        });
+    const auto can_read_sources_ahead = [&]() noexcept {
+        return std::ranges::all_of(multi_range_sources, [&](const MultiRangeSource& source) {
+            return scheduler.CanReadBufferAhead(source.buffer, source.offset, source.size);
+        });
+    };
+    const auto matches_cached_prefix = [&]() noexcept {
+        if (!entry.buffer || entry.size < multi_range_total ||
+            multi_range_sources.size() > entry.last_sources.size()) {
+            return false;
+        }
+        const size_t last_idx = multi_range_sources.size() - 1;
+        for (size_t i = 0; i < last_idx; ++i) {
+            if (!(multi_range_sources[i] == entry.last_sources[i])) {
+                return false;
+            }
+        }
+        const MultiRangeSource& want_tail = multi_range_sources[last_idx];
+        const MultiRangeSource& have_tail = entry.last_sources[last_idx];
+        return want_tail.buffer == have_tail.buffer && want_tail.offset == have_tail.offset &&
+               want_tail.ahead_serial == have_tail.ahead_serial && want_tail.size <= have_tail.size;
+    };
+    const u32 gathered_size = static_cast<u32>(multi_range_total);
+    if (entry.segment_serial == cur_serial && !any_written_in_order && matches_cached_prefix()) {
+        bindings.push_back({Binding::Kind::Buffer, is_written, entry.buffer.Get(), 0, gathered_size,
+                            {}, nullptr, entry.gpu_address, gathered_size,
+                            is_written ? gathered_size : 0U});
+        Coverage::NoteGuard("storage buffer gathered from several mappings");
+        return true;
+    }
+    if (entry.buffer && entry.segment_serial == cur_serial &&
+        multi_range_total <= (u64{16} << 20)) {
+        const StagingBufferRef scratch =
+            staging_pool.Stream(static_cast<size_t>(multi_range_total), 256);
+        if (scratch.buffer != nullptr && scratch.offset <= UINT32_MAX) {
+            const bool gather_ahead =
+                !any_written_in_order && scheduler.CanOrderAheadCopies() &&
+                can_read_sources_ahead() &&
+                scheduler.CanWriteBufferAhead(scratch.buffer, scratch.offset, multi_range_total);
+            u64 dst_offset = scratch.offset;
+            for (const MultiRangeSource& source : multi_range_sources) {
+                const std::array copy{VideoCommon::BufferCopy{
+                    .src_offset = source.offset,
+                    .dst_offset = dst_offset,
+                    .size = source.size,
+                }};
+                CopyBuffer(scratch.buffer, source.buffer, copy, false, gather_ahead, true, true);
+                dst_offset += source.size;
+            }
+            bindings.push_back({Binding::Kind::Buffer, is_written, scratch.buffer,
+                                static_cast<u32>(scratch.offset), gathered_size, {}, nullptr,
+                                Scheduler::BufferGpuAddress(scratch.buffer), gathered_size,
+                                is_written ? gathered_size : 0U});
+            Coverage::NoteGuard("storage buffer gathered from several mappings");
+            return true;
+        }
+    }
     if (!entry.buffer || entry.size < multi_range_total) {
         allocated_bytes -= entry.size;
         entry.size = Common::AlignUp(multi_range_total, u64{256});
         entry.buffer = CreateBuffer(device, entry.size, false, nullptr);
         entry.gpu_address = Scheduler::BufferGpuAddress(entry.buffer.Get());
+        entry.segment_serial = 0;
         if (!entry.buffer) {
             entry.size = 0;
             return false;
         }
         allocated_bytes += entry.size;
     }
-    entry.frame = frame;
-    // In order in the segment: the copies land before this draw reads them and after the draws
-    // before it read the last gather (Metal tracks the buffer's hazards).
+    const bool gather_ahead =
+        entry.segment_serial != cur_serial && !any_written_in_order &&
+        scheduler.CanOrderAheadCopies() && can_read_sources_ahead() &&
+        scheduler.CanWriteBufferAhead(entry.buffer.Get(), 0, multi_range_total);
     u64 dst_offset = 0;
     for (const MultiRangeSource& source : multi_range_sources) {
         const std::array copy{VideoCommon::BufferCopy{
@@ -186,10 +279,14 @@ bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {
             .dst_offset = dst_offset,
             .size = source.size,
         }};
-        CopyBuffer(entry.buffer.Get(), source.buffer, copy, false);
+        CopyBuffer(entry.buffer.Get(), source.buffer, copy, false, gather_ahead, true, true);
         dst_offset += source.size;
     }
-    const u32 gathered_size = static_cast<u32>(multi_range_total);
+    for (MultiRangeSource& source : multi_range_sources) {
+        source.ahead_serial = scheduler.BufferAheadWriteSerial(source.buffer);
+    }
+    entry.segment_serial = cur_serial;
+    entry.last_sources = multi_range_sources;
     bindings.push_back({Binding::Kind::Buffer, is_written, entry.buffer.Get(), 0, gathered_size, {},
                         nullptr, entry.gpu_address, gathered_size, is_written ? gathered_size : 0U});
     Coverage::NoteGuard("storage buffer gathered from several mappings");
@@ -224,7 +321,9 @@ StagingBufferRef BufferCacheRuntime::UploadStagingBuffer(size_t size) {
 }
 
 StagingBufferRef BufferCacheRuntime::DownloadStagingBuffer(size_t size, bool deferred) {
-    return staging_pool.Request(size, deferred);
+    const StagingBufferRef ref = staging_pool.Request(size, deferred);
+    last_download_staging = ref.buffer;
+    return ref;
 }
 
 void BufferCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
@@ -248,18 +347,91 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick, u64) {
     }
 }
 
+bool BufferCacheRuntime::CanDirectUpload(const Buffer& buffer) const noexcept {
+    return VideoCommon::GpuSplit::OwnsScheduler() && buffer.HostPtr() != nullptr &&
+           !buffer.IsInFlight();
+}
+
 bool BufferCacheRuntime::CanReorderUpload(
     const Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies) const noexcept {
-    return scheduler.CanCopyBufferAhead() &&
-           !scheduler.UsedUntrackedInOrder(buffer.Handle()) &&
-           std::ranges::none_of(copies, [&](const VideoCommon::BufferCopy& copy) {
-               return buffer.IsRegionUsed(copy.dst_offset, copy.size);
-           });
+    const BufferHandle handle = buffer.Handle();
+    if (handle == nullptr || !scheduler.CanCopyBufferAhead() ||
+        scheduler.UsedUntrackedInOrder(handle)) {
+        return false;
+    }
+    return std::ranges::none_of(copies, [&](const VideoCommon::BufferCopy& copy) {
+        return buffer.IsRegionUsed(copy.dst_offset, copy.size) ||
+               !scheduler.CanWriteBufferAhead(handle, copy.dst_offset, copy.size);
+    });
+}
+
+bool BufferCacheRuntime::CanReorderCopy(
+    const Buffer& dst_buffer, const Buffer& src_buffer,
+    std::span<const VideoCommon::BufferCopy> copies) const noexcept {
+    const BufferHandle src_handle = src_buffer.Handle();
+    if (src_handle == nullptr || !scheduler.CanOrderAheadCopies() ||
+        !CanReorderUpload(dst_buffer, copies) || scheduler.UsedUntrackedInOrder(src_handle)) {
+        return false;
+    }
+    if (&dst_buffer == &src_buffer) {
+        for (size_t i = 0; i < copies.size(); ++i) {
+            const u64 s0 = copies[i].src_offset;
+            const u64 s1 = s0 + copies[i].size;
+            for (size_t j = 0; j < copies.size(); ++j) {
+                const u64 d0 = copies[j].dst_offset;
+                const u64 d1 = d0 + copies[j].size;
+                if (s0 < d1 && d0 < s1) {
+                    return false;
+                }
+            }
+        }
+    }
+    return std::ranges::all_of(copies, [&](const VideoCommon::BufferCopy& copy) {
+        return scheduler.CanReadBufferAhead(src_handle, copy.src_offset, copy.size);
+    });
+}
+
+bool BufferCacheRuntime::ShouldStreamDirtyUniformInPass(const Buffer& buffer, u32 offset,
+                                                        u32 size) const noexcept {
+    if (!scheduler.IsRendering() || size == 0 || CanDirectUpload(buffer)) {
+        return false;
+    }
+    // SynchronizeBuffer uploads dirty memory at 4 KiB device-page granularity.
+    const u64 page_begin = Common::AlignDown(u64{offset}, u64{4096});
+    const u64 page_end = (std::min)(Common::AlignUp(u64{offset} + size, u64{4096}),
+                                    static_cast<u64>(buffer.SizeBytes()));
+    const u64 check_offset = page_end > page_begin ? page_begin : u64{offset};
+    const u64 check_size = page_end > page_begin ? (page_end - page_begin) : u64{size};
+    const std::array copy{VideoCommon::BufferCopy{
+        .src_offset = 0,
+        .dst_offset = check_offset,
+        .size = check_size,
+    }};
+    return !CanReorderUpload(buffer, copy);
+}
+
+bool BufferCacheRuntime::ShouldStreamDirtyComputeUniform(const Buffer& buffer, u32 offset,
+                                                         u32 size) const noexcept {
+    if (!scheduler.HasOpenInOrderCompute() || size == 0 || CanDirectUpload(buffer)) {
+        return false;
+    }
+    const u64 page_begin = Common::AlignDown(u64{offset}, u64{4096});
+    const u64 page_end = (std::min)(Common::AlignUp(u64{offset} + size, u64{4096}),
+                                    static_cast<u64>(buffer.SizeBytes()));
+    const u64 check_offset = page_end > page_begin ? page_begin : u64{offset};
+    const u64 check_size = page_end > page_begin ? (page_end - page_begin) : u64{size};
+    const std::array copy{VideoCommon::BufferCopy{
+        .src_offset = 0,
+        .dst_offset = check_offset,
+        .size = check_size,
+    }};
+    return !CanReorderUpload(buffer, copy);
 }
 
 void BufferCacheRuntime::CopyBuffer(BufferHandle dst_buffer, BufferHandle src_buffer,
                                     std::span<const VideoCommon::BufferCopy> copies, bool,
-                                    bool can_reorder_upload, bool range_tracked) {
+                                    bool can_reorder_upload, bool range_tracked,
+                                    bool src_range_tracked) {
     if (src_buffer == &upload_scratch_tag) {
         if (upload_scratch_size == 0 || copies.empty()) {
             return;
@@ -271,7 +443,8 @@ void BufferCacheRuntime::CopyBuffer(BufferHandle dst_buffer, BufferHandle src_bu
                 write_hook(write_hook_user, dst_buffer, copy.dst_offset, copy.size);
             }
             scheduler.CopyBuffer(staged.buffer, staged.offset + copy.src_offset, dst_buffer,
-                                 copy.dst_offset, copy.size, can_reorder_upload, range_tracked);
+                                 copy.dst_offset, copy.size, can_reorder_upload, range_tracked,
+                                 src_range_tracked);
         }
         return;
     }
@@ -282,25 +455,28 @@ void BufferCacheRuntime::CopyBuffer(BufferHandle dst_buffer, BufferHandle src_bu
             write_hook(write_hook_user, dst_buffer, copy.dst_offset, copy.size);
         }
         scheduler.CopyBuffer(src_buffer, copy.src_offset, dst_buffer, copy.dst_offset, copy.size,
-                             can_reorder_upload, range_tracked);
+                             can_reorder_upload, range_tracked, src_range_tracked);
     }
 }
 
 void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, BufferHandle src_buffer,
                                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
                                     bool can_reorder_upload) {
+    const BufferHandle dst_handle = dst_buffer.Handle();
+    const bool can_ahead =
+        scheduler.CanCopyBufferAhead() && !scheduler.UsedUntrackedInOrder(dst_handle);
     if (src_buffer == &upload_scratch_tag) {
         if (upload_scratch_size == 0 || copies.empty()) {
             return;
         }
-        if (dst_buffer.HostPtr() != nullptr && !dst_buffer.IsInFlight()) {
+        if (CanDirectUpload(dst_buffer)) {
             u8* const dst_ptr = dst_buffer.HostPtr();
             for (const VideoCommon::BufferCopy& copy : copies) {
                 if (copy.size == 0) {
                     continue;
                 }
                 if (write_hook != nullptr) {
-                    write_hook(write_hook_user, dst_buffer.Handle(), copy.dst_offset, copy.size);
+                    write_hook(write_hook_user, dst_handle, copy.dst_offset, copy.size);
                 }
                 std::memcpy(dst_ptr + copy.dst_offset, upload_scratch.data() + copy.src_offset,
                             copy.size);
@@ -309,35 +485,66 @@ void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, BufferHandle src_buffer,
         }
         const StagingBufferRef staged = staging_pool.RequestUpload(upload_scratch_size, 16);
         std::memcpy(staged.mapped_span.data(), upload_scratch.data(), upload_scratch_size);
-        const bool ahead = can_reorder_upload && scheduler.CanCopyBufferAhead();
         dst_buffer.NoteUsed();
-        if (!ahead) {
-            for (const VideoCommon::BufferCopy& copy : copies) {
+        for (const VideoCommon::BufferCopy& copy : copies) {
+            const bool ahead =
+                can_ahead && !dst_buffer.IsRegionUsed(copy.dst_offset, copy.size) &&
+                scheduler.CanWriteBufferAhead(dst_handle, copy.dst_offset, copy.size);
+            if (!ahead) {
+                if (can_ahead && scheduler.IsRendering() &&
+                    !dst_buffer.MayBeUsedInCurrentPass(copy.dst_offset, copy.size)) {
+                    scheduler.WantSplitBeforeCurrentPass();
+                }
                 dst_buffer.MarkUsage(copy.dst_offset, copy.size);
             }
-        }
-        for (const VideoCommon::BufferCopy& copy : copies) {
             if (write_hook != nullptr) {
-                write_hook(write_hook_user, dst_buffer.Handle(), copy.dst_offset, copy.size);
+                write_hook(write_hook_user, dst_handle, copy.dst_offset, copy.size);
             }
-            scheduler.CopyBuffer(staged.buffer, staged.offset + copy.src_offset,
-                                 dst_buffer.Handle(), copy.dst_offset, copy.size, ahead, true);
+            scheduler.CopyBuffer(staged.buffer, staged.offset + copy.src_offset, dst_handle,
+                                 copy.dst_offset, copy.size, ahead, true);
         }
         return;
     }
-    const bool ahead = can_reorder_upload && scheduler.CanCopyBufferAhead();
     dst_buffer.NoteUsed();
-    if (!ahead) {
-        for (const VideoCommon::BufferCopy& copy : copies) {
+    if (can_reorder_upload && can_ahead) {
+        CopyBuffer(dst_handle, src_buffer, copies, barrier, true, true);
+        return;
+    }
+    for (const VideoCommon::BufferCopy& copy : copies) {
+        const bool ahead =
+            can_ahead && !dst_buffer.IsRegionUsed(copy.dst_offset, copy.size) &&
+            scheduler.CanWriteBufferAhead(dst_handle, copy.dst_offset, copy.size);
+        if (!ahead) {
+            if (can_ahead && scheduler.IsRendering() &&
+                !dst_buffer.MayBeUsedInCurrentPass(copy.dst_offset, copy.size)) {
+                scheduler.WantSplitBeforeCurrentPass();
+            }
             dst_buffer.MarkUsage(copy.dst_offset, copy.size);
         }
+        if (write_hook != nullptr) {
+            write_hook(write_hook_user, dst_handle, copy.dst_offset, copy.size);
+        }
+        scheduler.CopyBuffer(src_buffer, copy.src_offset, dst_handle, copy.dst_offset, copy.size,
+                             ahead, true);
     }
-    CopyBuffer(dst_buffer.Handle(), src_buffer, copies, barrier, ahead, true);
 }
 
 void BufferCacheRuntime::CopyBuffer(BufferHandle dst_buffer, Buffer& src_buffer,
                                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
                                     bool can_reorder_upload) {
+    if (!can_reorder_upload && dst_buffer != nullptr && dst_buffer == last_download_staging &&
+        dst_buffer != nx2_mesh_mirror.Get()) {
+        src_buffer.NoteUsed();
+        for (const VideoCommon::BufferCopy& copy : copies) {
+            src_buffer.MarkUsage(copy.src_offset, copy.size);
+            if (write_hook != nullptr && copy.size != 0) {
+                write_hook(write_hook_user, dst_buffer, copy.dst_offset, copy.size);
+            }
+            scheduler.DownloadBuffer(src_buffer.Handle(), copy.src_offset, dst_buffer,
+                                     copy.dst_offset, copy.size);
+        }
+        return;
+    }
     const bool ahead = can_reorder_upload && scheduler.CanCopyBufferAhead();
     src_buffer.NoteUsed();
     if (!ahead) {
@@ -345,32 +552,51 @@ void BufferCacheRuntime::CopyBuffer(BufferHandle dst_buffer, Buffer& src_buffer,
             src_buffer.MarkUsage(copy.src_offset, copy.size);
         }
     }
-    CopyBuffer(dst_buffer, src_buffer.Handle(), copies, barrier, ahead, false);
+    CopyBuffer(dst_buffer, src_buffer.Handle(), copies, barrier, ahead, false, true);
 }
 
 void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, Buffer& src_buffer,
                                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
                                     bool can_reorder_upload) {
+    if (can_reorder_upload && CanDirectUpload(dst_buffer) && CanDirectUpload(src_buffer)) {
+        u8* const dst_ptr = dst_buffer.HostPtr();
+        const u8* const src_ptr = src_buffer.HostPtr();
+        for (const VideoCommon::BufferCopy& copy : copies) {
+            if (copy.size == 0) {
+                continue;
+            }
+            if (write_hook != nullptr) {
+                write_hook(write_hook_user, dst_buffer.Handle(), copy.dst_offset, copy.size);
+            }
+            std::memcpy(dst_ptr + copy.dst_offset, src_ptr + copy.src_offset, copy.size);
+        }
+        return;
+    }
     const bool ahead = can_reorder_upload && scheduler.CanCopyBufferAhead();
     src_buffer.NoteUsed();
     dst_buffer.NoteUsed();
     if (!ahead) {
+        const bool check_split = scheduler.CanCopyBufferAhead() && scheduler.IsRendering();
         for (const VideoCommon::BufferCopy& copy : copies) {
+            if (check_split && !src_buffer.MayBeUsedInCurrentPass(copy.src_offset, copy.size) &&
+                !dst_buffer.MayBeUsedInCurrentPass(copy.dst_offset, copy.size)) {
+                scheduler.WantSplitBeforeCurrentPass();
+            }
             src_buffer.MarkUsage(copy.src_offset, copy.size);
             dst_buffer.MarkUsage(copy.dst_offset, copy.size);
         }
     }
-    CopyBuffer(dst_buffer.Handle(), src_buffer.Handle(), copies, barrier, ahead, true);
+    CopyBuffer(dst_buffer.Handle(), src_buffer.Handle(), copies, barrier, ahead, true, true);
 }
 
-void BufferCacheRuntime::ClearBuffer(Buffer& dest_buffer, u32 offset, size_t size, u32 value) {
+bool BufferCacheRuntime::ClearBuffer(Buffer& dest_buffer, u32 offset, size_t size, u32 value) {
     if (dest_buffer.ConsumeFreshlyZeroed(offset) && value == 0) {
         if (write_hook != nullptr && size != 0) {
             write_hook(write_hook_user, dest_buffer.Handle(), offset, size);
         }
-        return;
+        return false;
     }
-    if (dest_buffer.HostPtr() != nullptr && !dest_buffer.IsInFlight()) {
+    if (CanDirectUpload(dest_buffer)) {
         if (write_hook != nullptr && size != 0) {
             write_hook(write_hook_user, dest_buffer.Handle(), offset, size);
         }
@@ -387,19 +613,24 @@ void BufferCacheRuntime::ClearBuffer(Buffer& dest_buffer, u32 offset, size_t siz
                 std::memcpy(dst + at, &value, size - at);
             }
         }
-        return;
+        return false;
     }
-    const bool ahead = scheduler.CanCopyBufferAhead() &&
-                       !scheduler.UsedUntrackedInOrder(dest_buffer.Handle()) &&
-                       !dest_buffer.IsRegionUsed(offset, size);
+    const BufferHandle dest_handle = dest_buffer.Handle();
+    const bool ahead = !dest_buffer.IsRegionUsed(offset, size) &&
+                       scheduler.CanWriteBufferAhead(dest_handle, offset, size);
     dest_buffer.NoteUsed();
     if (!ahead) {
+        if (scheduler.CanCopyBufferAhead() && scheduler.IsRendering() &&
+            !dest_buffer.MayBeUsedInCurrentPass(offset, size)) {
+            scheduler.WantSplitBeforeCurrentPass();
+        }
         dest_buffer.MarkUsage(offset, size);
     }
     if (write_hook != nullptr && size != 0) {
-        write_hook(write_hook_user, dest_buffer.Handle(), offset, size);
+        write_hook(write_hook_user, dest_handle, offset, size);
     }
-    scheduler.FillBufferPattern(dest_buffer.Handle(), offset, size, value, ahead, true);
+    scheduler.FillBufferPattern(dest_handle, offset, size, value, ahead, true);
+    return !ahead;
 }
 
 void BufferCacheRuntime::ClearBuffer(BufferHandle dest_buffer, u32 offset, size_t size,

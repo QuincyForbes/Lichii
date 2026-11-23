@@ -116,6 +116,7 @@ enum class FormatFallback : u8 {
 [[nodiscard]] bool IsConverted(const Device& device, VideoCore::Surface::PixelFormat format);
 
 [[nodiscard]] FormatClass ClassOf(u32 mtl_format);
+[[nodiscard]] u32 TextureFormat(TextureHandle texture);
 
 /// The format CAMetalLayer presents (BGRA8Unorm).
 [[nodiscard]] u32 DrawableFormat();

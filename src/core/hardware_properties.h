@@ -18,14 +18,14 @@ namespace Hardware {
 
 constexpr u64 BASE_CLOCK_RATE = 1'020'000'000; // Default CPU Frequency = 1020 MHz
 constexpr u64 CNTFREQ = 19'200'000;            // CNTPCT_EL0 Frequency = 19.2 MHz
-// Switch 1 applications get cores 0..3. Switch 2 applications ask for 0..5 (title 4's npdm), and
-// its job system starts a worker per core, so emulate six: with four, cores 0 and 1 each ran two
-// of its workers. Switch 1 titles leave cores 4 and 5 idle.
-constexpr u32 NUM_CPU_CORES = 6;               // Number of CPU Cores - sync with dynarmic exclusive_monitor.h
+// Switch 1 applications get cores 0..3; Switch 2 hardware (T239) has eight cores 0..7 (e.g.
+// Ocarina of Time pins six job workers to 0..5 and its main/render threads to 6..7). Switch 1
+// titles leave cores 4..7 idle.
+constexpr u32 NUM_CPU_CORES = 8;               // Number of CPU Cores - sync with dynarmic exclusive_monitor.h
 
 // Virtual to Physical core map.
 constexpr std::array<s32, Common::BitSize<u64>()> VirtualToPhysicalCoreMap{
-    0, 1, 2, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
 };
 

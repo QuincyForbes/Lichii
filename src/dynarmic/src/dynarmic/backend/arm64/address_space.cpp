@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -40,7 +41,26 @@
 
 namespace Dynarmic::Backend::Arm64 {
 
+struct JitHotWriteCallbacks {
+    std::uintptr_t ctx_ptr = 0;
+    std::uintptr_t writes_base = 0;
+    std::array<std::uintptr_t, 5> write_fns{};
+    bool preserve_all_abi = false;
+};
+
 namespace {
+
+struct SharedJitHotWrites {
+    std::shared_mutex mutex;
+    std::atomic<std::size_t> count{0};
+    boost::container::small_vector<std::pair<const u64*, JitHotWriteCallbacks>, 8> entries;
+};
+
+SharedJitHotWrites& HotWriteRegistry() {
+    static SharedJitHotWrites registry;
+    return registry;
+}
+
 // Blocks are assumed to be smaller than this (as the full-flush check always did).
 constexpr std::size_t kBlockHeadroom = 1024 * 1024;
 // Architectural AArch64 unconditional B / BL range is +/- 128 MiB.
@@ -49,17 +69,31 @@ constexpr std::size_t kMaxArm64CodeCacheSize = 128 * 1024 * 1024;
 // Fastmem markers every guest core sees (FastmemManager::Configure).
 struct SharedFastmemMarkers {
     std::shared_mutex mutex;
+    std::size_t live_spaces = 0;
     ::Common::unordered_set<DoNotFastmemMarker, DoNotFastmemMarkerHash> markers;
     ::Common::unordered_set<IR::LocationDescriptor> blocks;
     ::Common::unordered_set<IR::LocationDescriptor> load_blocks;
     ::Common::unordered_map<IR::LocationDescriptor, unsigned> faults_per_block;
     ::Common::unordered_map<IR::LocationDescriptor, unsigned> load_faults_per_block;
     ::Common::unordered_map<DoNotFastmemMarker, unsigned, DoNotFastmemMarkerHash> load_faults;
+    ::Common::unordered_map<DoNotFastmemMarker, u64, DoNotFastmemMarkerHash> store_faults;
 };
+
+std::atomic<unsigned> g_default_store_fault_limit{0};
 
 SharedFastmemMarkers& SharedMarkers() {
     static SharedFastmemMarkers shared;
     return shared;
+}
+
+// 4-second buckets (non-zero) so HotPages warm-up / 512-frame cooldown traps (~2 traps every
+// ~10 s) stay in fastmem while persistently non-contiguous or GPU-tracked stores hit
+// store_faults_limit immediately and recompile permanently.
+u32 CurrentStoreFaultWindow() noexcept {
+    const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+    return static_cast<u32>((static_cast<u64>(secs) >> 2) + 1U);
 }
 
 bool EnvIs(const char* name, char wanted) {
@@ -94,6 +128,68 @@ bool LocalFaultMarkersOn() {
 }
 }  // namespace
 
+void RegisterJitHotWrite(const u64* tpidrro_el0, const JitHotWriteCallbacks& cb) {
+    if (tpidrro_el0 == nullptr || cb.ctx_ptr == 0 || cb.writes_base == 0) {
+        return;
+    }
+    SharedJitHotWrites& reg = HotWriteRegistry();
+    std::unique_lock lock{reg.mutex};
+    for (auto& [key, val] : reg.entries) {
+        if (key == tpidrro_el0) {
+            val = cb;
+            return;
+        }
+    }
+    reg.entries.emplace_back(tpidrro_el0, cb);
+    reg.count.store(reg.entries.size(), std::memory_order_release);
+}
+
+void UnregisterJitHotWrite(const u64* tpidrro_el0) noexcept {
+    if (tpidrro_el0 == nullptr) {
+        return;
+    }
+    SharedJitHotWrites& reg = HotWriteRegistry();
+    if (reg.count.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    std::unique_lock lock{reg.mutex};
+    for (auto it = reg.entries.begin(); it != reg.entries.end(); ++it) {
+        if (it->first == tpidrro_el0) {
+            reg.entries.erase(it);
+            reg.count.store(reg.entries.size(), std::memory_order_release);
+            return;
+        }
+    }
+}
+
+std::optional<JitHotWriteCallbacks> FindJitHotWrite(const u64* tpidrro_el0) noexcept {
+    if (tpidrro_el0 == nullptr) {
+        return std::nullopt;
+    }
+    SharedJitHotWrites& reg = HotWriteRegistry();
+    if (reg.count.load(std::memory_order_acquire) == 0) {
+        return std::nullopt;
+    }
+    std::shared_lock lock{reg.mutex};
+    for (const auto& [key, val] : reg.entries) {
+        if (key == tpidrro_el0) {
+            return val;
+        }
+    }
+    return std::nullopt;
+}
+
+void FastmemManager::SetDefaultStoreFaultLimit(unsigned limit) noexcept {
+    g_default_store_fault_limit.store(limit, std::memory_order_relaxed);
+}
+
+void FastmemManager::Configure(bool shared, unsigned block_after_faults, unsigned load_fault_limit) {
+    shared_markers = shared;
+    faults_per_block_limit = block_after_faults;
+    load_faults_limit = load_fault_limit;
+    store_faults_limit = g_default_store_fault_limit.load(std::memory_order_relaxed);
+}
+
 bool FastmemManager::ShouldFastmem(DoNotFastmemMarker marker, bool is_load) const {
     const IR::LocationDescriptor block = std::get<0>(marker);
     const auto& local_blocks = is_load ? do_not_fastmem_load_blocks : do_not_fastmem_blocks;
@@ -112,6 +208,7 @@ bool FastmemManager::ShouldFastmem(DoNotFastmemMarker marker, bool is_load) cons
 void FastmemManager::MarkDoNotFastmem(DoNotFastmemMarker marker, bool is_load) {
     const IR::LocationDescriptor block = std::get<0>(marker);
     if (shared_markers && !LocalFaultMarkersOn()) {
+        do_not_fastmem.insert(marker);
         SharedFastmemMarkers& shared = SharedMarkers();
         std::unique_lock lock{shared.mutex};
         auto& counts = is_load ? shared.load_faults_per_block : shared.faults_per_block;
@@ -148,9 +245,16 @@ bool FastmemManager::LoadFaultRecompiles(DoNotFastmemMarker marker) {
     if (load_faults_limit <= 1) {
         return true;
     }
+    const IR::LocationDescriptor block = std::get<0>(marker);
+    if (do_not_fastmem.count(marker) != 0 || do_not_fastmem_load_blocks.count(block) != 0) {
+        return true;
+    }
     if (shared_markers && !LocalFaultMarkersOn()) {
         SharedFastmemMarkers& shared = SharedMarkers();
         std::unique_lock lock{shared.mutex};
+        if (shared.markers.count(marker) != 0 || shared.load_blocks.count(block) != 0) {
+            return true;
+        }
         if (++shared.load_faults[marker] < load_faults_limit) {
             return false;
         }
@@ -162,6 +266,37 @@ bool FastmemManager::LoadFaultRecompiles(DoNotFastmemMarker marker) {
     }
     load_faults.erase(marker);
     return true;
+}
+
+bool FastmemManager::StoreFaultRecompiles(DoNotFastmemMarker marker) {
+    if (store_faults_limit <= 1) {
+        return true;
+    }
+    const IR::LocationDescriptor block = std::get<0>(marker);
+    if (do_not_fastmem.count(marker) != 0 || do_not_fastmem_blocks.count(block) != 0) {
+        return true;
+    }
+    const u32 window = CurrentStoreFaultWindow();
+    const auto bump = [window, limit = store_faults_limit](auto& map, const DoNotFastmemMarker& key) {
+        u64& state = map[key];
+        const u32 prev_window = static_cast<u32>(state >> 32);
+        const u32 count = (state != 0 && prev_window == window) ? static_cast<u32>(state) + 1U : 1U;
+        if (count < limit) {
+            state = (static_cast<u64>(window) << 32) | count;
+            return false;
+        }
+        map.erase(key);
+        return true;
+    };
+    if (shared_markers && !LocalFaultMarkersOn()) {
+        SharedFastmemMarkers& shared = SharedMarkers();
+        std::unique_lock lock{shared.mutex};
+        if (shared.markers.count(marker) != 0 || shared.blocks.count(block) != 0) {
+            return true;
+        }
+        return bump(shared.store_faults, marker);
+    }
+    return bump(store_faults, marker);
 }
 
 AddressSpace::AddressSpace(std::size_t requested_code_cache_size, std::size_t requested_evict_slice, std::size_t processor_id)
@@ -183,13 +318,35 @@ AddressSpace::AddressSpace(std::size_t requested_code_cache_size, std::size_t re
 {
     ASSERT(code_cache_size <= kMaxArm64CodeCacheSize && "code_cache_size > 128 MiB not currently supported");
 
+    {
+        SharedFastmemMarkers& shared = SharedMarkers();
+        std::unique_lock lock{shared.mutex};
+        ++shared.live_spaces;
+    }
+
     exception_handler.Register(mem, code_cache_size);
     exception_handler.SetFastmemCallback([this](u64 host_pc) {
         return FastmemCallback(host_pc);
     });
 }
 
-AddressSpace::~AddressSpace() = default;
+AddressSpace::~AddressSpace() {
+    SharedFastmemMarkers& shared = SharedMarkers();
+    std::unique_lock lock{shared.mutex};
+    if (shared.live_spaces != 0 && --shared.live_spaces == 0) {
+        shared.markers.clear();
+        shared.blocks.clear();
+        shared.load_blocks.clear();
+        shared.faults_per_block.clear();
+        shared.load_faults_per_block.clear();
+        shared.load_faults.clear();
+        shared.store_faults.clear();
+        SharedJitHotWrites& reg = HotWriteRegistry();
+        std::unique_lock hw_lock{reg.mutex};
+        reg.entries.clear();
+        reg.count.store(0, std::memory_order_release);
+    }
+}
 
 void AddressSpace::BlockReferences::Add(CodePtr ptr) {
     for (CodePtr& slot : first) {
@@ -938,7 +1095,11 @@ FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
             goto fail;
         }
 
-        if (patch->recompile && (!patch->load || fastmem_manager.LoadFaultRecompiles(patch->marker))) {
+        const bool should_recompile =
+            patch->recompile &&
+            (patch->load ? fastmem_manager.LoadFaultRecompiles(patch->marker)
+                         : fastmem_manager.StoreFaultRecompiles(patch->marker));
+        if (should_recompile) {
             fastmem_manager.MarkDoNotFastmem(patch->marker, patch->load);
             InvalidateBasicBlocks({std::get<0>(patch->marker)});
         }

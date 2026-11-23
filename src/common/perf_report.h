@@ -278,7 +278,7 @@ struct ProcessCpu {
 };
 std::optional<ProcessCpu> ReadProcessCpu();
 
-constexpr std::size_t PlacementCores = 6;
+constexpr std::size_t PlacementCores = 8;
 /// Guest core threads, sampled now and then: the host CPU each ran on (Apple).
 struct Placement {
     std::array<u64, PlacementCores> samples;

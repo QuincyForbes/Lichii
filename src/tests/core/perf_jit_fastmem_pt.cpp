@@ -214,13 +214,31 @@ TEST_CASE("Short fastmem arena routes out-of-arena accesses through inline page 
     REQUIRE(env.read_callbacks == 0);
     REQUIRE(env.write_callbacks == 0);
 
-    // 3. Cross-page boundary access at HighBase + 0xFFD falls back cleanly to callbacks
+    // 3a. Contiguous unmarked cross-page access at HighBase + 0xFFD runs inline on arm64
+    // (EmitCrossPageContiguousLookup) and falls back cleanly elsewhere.
     jit.SetPC(CodeBase);
     jit.SetRegister(0, 0x1020);
     jit.SetRegister(1, HighBase + 0xFFD);
     jit.SetRegister(2, 0xAABBCCDD'EEFF0011ULL);
     jit.Run();
     REQUIRE(jit.GetRegister(3) == 0xAABBCCDD'EEFF0011ULL);
+#ifdef ARCHITECTURE_arm64
+    REQUIRE(env.read_callbacks == 0);
+    REQUIRE(env.write_callbacks == 0);
+#else
+    REQUIRE(env.read_callbacks == 1);
+    REQUIRE(env.write_callbacks == 1);
+#endif
+
+    // 3b. Cross-page access straddling into marked page (HighBase + 0x1FFD -> +0x2000) falls back to callbacks
+    env.read_callbacks = 0;
+    env.write_callbacks = 0;
+    jit.SetPC(CodeBase);
+    jit.SetRegister(0, 0x1028);
+    jit.SetRegister(1, HighBase + 0x1FFD);
+    jit.SetRegister(2, 0x22334455'66778899ULL);
+    jit.Run();
+    REQUIRE(jit.GetRegister(3) == 0x22334455'66778899ULL);
     REQUIRE(env.read_callbacks == 1);
     REQUIRE(env.write_callbacks == 1);
 

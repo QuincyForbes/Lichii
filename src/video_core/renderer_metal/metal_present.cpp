@@ -384,7 +384,6 @@ bool PresentPasses::Draw(const Pass& pass) {
                                                     ? Maxwell::PrimitiveTopology::TriangleStrip
                                                     : Maxwell::PrimitiveTopology::Triangles;
     scheduler.Draw(*PrimitiveType(topology), 0, pass.vertices, 1, 0);
-    scheduler.EndRendering();
     ++passes;
     return true;
 }
@@ -731,6 +730,7 @@ bool PresentPasses::TemporalFilter(const TemporalInputs& inputs) {
     if (!sharpen) {
         return true;
     }
+    scheduler.EndRendering();
     struct SharpenConstants {
         std::array<f32, 2> tex_scale;
         std::array<f32, 2> tex_offset;

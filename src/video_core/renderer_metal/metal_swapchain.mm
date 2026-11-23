@@ -107,6 +107,7 @@ void Swapchain::Present(id<MTLCommandBuffer> command_buffer, id<CAMetalDrawable>
     f64 minimum_ns = 0.0;
     // Not in the Turbo speed mode, as Vulkan's present thread.
     if (guest_frame && vsync && HostPaceEnabled() &&
+        Settings::values.use_speed_limit.GetValue() &&
         Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo) {
         if (pacer.refresh_ns == 0.0) {
             pacer.refresh_ns = ScreenRefreshNs();

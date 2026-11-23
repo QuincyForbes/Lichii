@@ -18,6 +18,7 @@
 #include "core/core.h"
 #include "core/debugger/trace_hooks.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc/svc_nx2_oot_poll.h"
 #include "core/hle/kernel/svc/svc_nx2_zstd.h"
@@ -2657,6 +2658,10 @@ void Call(Core::System& system, u32 imm) {
     //kernel.ExitSVCProfile();
     if (imm != static_cast<u32>(SvcId::SleepThread)) {
         kernel.CurrentPhysicalCore().LoadSvcArguments(process, args);
+    }
+    if (auto* const sched = kernel.CurrentScheduler();
+        sched != nullptr && sched->GetHandoffExpiryNs() != 0) {
+        KScheduler::RefreshExpiredHandoff(kernel);
     }
 }
 

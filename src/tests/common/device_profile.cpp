@@ -100,6 +100,7 @@ TEST_CASE("Apple tiers follow memory and GPU family", "[device_profile]") {
     CHECK(Value(profile, "backend") == "Metal");
     CHECK(Value(profile, "frame_gen") == "On");
     CHECK(Value(profile, "oot_frame_rate") == "Fps60");
+    CHECK(Value(profile, "oot_graphics_preset") == "Balanced");
     CHECK(Value(profile, "texture_quality") == "Full");
 
     device.model = "iPad13,16"; // M1 iPad Air: Apple GPU family 7, 8 GB
@@ -121,6 +122,7 @@ TEST_CASE("Desktop profile follows the GPU when it is known", "[device_profile]"
     CHECK(Value(profile, "backend") == "Vulkan");
     CHECK(Value(profile, "upscaler") == "Auto");
     CHECK(Value(profile, "oot_resolution") == "Full");
+    CHECK(Value(profile, "oot_graphics_preset") == "Balanced");
     CHECK(Value(profile, "texture_quality") == "Full");
     CHECK(Value(profile, "scaling_filter") == "Fsr3");
     CHECK(Value(profile, "moltenvk_driver") == "<none>");
@@ -168,6 +170,7 @@ TEST_CASE("macOS Apple Silicon recommends Direct Metal while Windows and Linux r
     CHECK(Value(mac_profile, "backend") == "Metal");
     CHECK(Value(mac_profile, "moltenvk_driver") == "Legacy");
     CHECK(Value(mac_profile, "use_reactive_flushing") == "Off");
+    CHECK(Value(mac_profile, "oot_graphics_preset") == "Balanced");
     CHECK(Value(mac_profile, "texture_quality") == "Full");
     for (const auto& value : mac_profile.settings) {
         CHECK_FALSE(value.reason.empty());

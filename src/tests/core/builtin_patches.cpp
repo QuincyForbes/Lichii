@@ -130,6 +130,7 @@ public:
             WriteIps(exefs / fmt::format("{}.ips", OcarinaBuildIdHex), *user_mod_word,
                      user_mod_offset);
         }
+        Settings::values.oot_graphics_preset.SetValue(Settings::OotGraphicsPreset::Console);
         system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
         system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
         system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
@@ -141,6 +142,7 @@ public:
         }
         Settings::values.disabled_addons.erase(OcarinaTitleId);
         Settings::values.oot_resolution.SetValue(resolution);
+        Settings::values.oot_graphics_preset.SetValue(oot_preset);
         Settings::values.upscaler.SetValue(upscaler);
         Settings::values.patch_performance.SetValue(Settings::GamePatchMode::Auto);
         SetFrameTiming(nullptr);
@@ -158,6 +160,8 @@ public:
 
 private:
     const Settings::OotResolution resolution = Settings::values.oot_resolution.GetValue();
+    const Settings::OotGraphicsPreset oot_preset =
+        Settings::values.oot_graphics_preset.GetValue();
     const Settings::Upscaler upscaler = Settings::values.upscaler.GetValue();
     std::array<std::filesystem::path, TestDirectories.size()> previous;
     const std::filesystem::path root =

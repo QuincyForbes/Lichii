@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <limits>
+
 #include "core/core.h"
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_memory_layout.h"
@@ -24,26 +27,22 @@ Result WaitProcessWideKeyAtomic(Core::System& system, u64 address, u64 cv_key, u
     R_UNLESS(!IsKernelAddress(address), ResultInvalidCurrentMemory);
     R_UNLESS(Common::IsAligned(address, sizeof(s32)), ResultInvalidAddress);
 
-    // Convert timeout from nanoseconds to ticks.
+    auto& kernel = system.Kernel();
+
+    // Convert timeout from nanoseconds to ticks without signed overflow.
     s64 timeout{};
     if (timeout_ns > 0) {
-        const s64 offset_tick(timeout_ns);
-        if (offset_tick > 0) {
-            timeout = system.Kernel().HardwareTimer().GetTick() + offset_tick + 2;
-            if (timeout <= 0) {
-                timeout = (std::numeric_limits<s64>::max)();
-            }
-        } else {
-            timeout = (std::numeric_limits<s64>::max)();
-        }
+        const u64 tick = static_cast<u64>(kernel.HardwareTimer().GetTick());
+        const u64 deadline = tick + static_cast<u64>(timeout_ns) + u64{2};
+        constexpr u64 max_s64 = static_cast<u64>((std::numeric_limits<s64>::max)());
+        timeout = static_cast<s64>((std::min)(deadline, max_s64));
     } else {
         timeout = timeout_ns;
     }
 
     // Wait on the condition variable.
-    R_RETURN(
-        GetCurrentProcess(system.Kernel())
-            .WaitConditionVariable(address, Common::AlignDown(cv_key, sizeof(u32)), tag, timeout));
+    R_RETURN(GetCurrentProcess(kernel).WaitConditionVariable(
+        address, Common::AlignDown(cv_key, sizeof(u32)), tag, timeout));
 }
 
 /// Signal process wide key

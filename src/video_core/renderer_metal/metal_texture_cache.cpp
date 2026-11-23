@@ -16,6 +16,7 @@
 #include "common/assert.h"
 #include "common/div_ceil.h"
 #include "common/logging.h"
+#include "common/platform_events.h"
 #include "common/settings.h"
 #include "video_core/dlss_contract.h"
 #include "video_core/host_budget.h"
@@ -189,7 +190,10 @@ namespace {
     case ImageType::e2D:
     case ImageType::Linear:
     default:
-        return info.num_samples > 1 ? TextureKind::e2DMultisampleArray : TextureKind::e2DArray;
+        if (info.num_samples > 1) {
+            return TextureKind::e2DMultisampleArray;
+        }
+        return info.resources.layers > 1 ? TextureKind::e2DArray : TextureKind::e2D;
     }
 }
 
@@ -380,9 +384,10 @@ namespace {
 }
 
 [[nodiscard]] bool IsPoolableDesc(const TextureDesc& d) noexcept {
-    return (d.kind == TextureKind::e2D || d.kind == TextureKind::e2DArray) && d.samples == 1 &&
-           d.depth == 1 && d.width > 0 && d.height > 0 && d.levels > 0 && d.layers > 0 &&
-           d.format != 0;
+    return (d.kind == TextureKind::e2D || d.kind == TextureKind::e2DArray ||
+            d.kind == TextureKind::Cube || d.kind == TextureKind::CubeArray) &&
+           d.samples == 1 && d.depth == 1 && d.width > 0 && d.height > 0 && d.levels > 0 &&
+           d.layers > 0 && d.format != 0;
 }
 
 /// Normalizes usage flags to match the exact MTLTextureUsage MakeTextureDescriptor applies, so
@@ -416,8 +421,48 @@ namespace {
     return extent && VideoCommon::DlssContract::FitsExtent(requested, *extent);
 }
 
-constexpr u64 MaxTexturePoolBytes = u64{256} << 20;
+std::array<std::atomic<u64>, 2> rejected_direct_metalfx_formats{};
+
+[[nodiscard]] bool IsDirectMetalFxFormatRejected(u32 host_format) noexcept {
+    if (host_format == 0 || host_format >= 128) {
+        return true;
+    }
+    const u64 mask = u64{1} << (host_format & 63U);
+    return (rejected_direct_metalfx_formats[host_format >> 6].load(std::memory_order_relaxed) &
+            mask) != 0;
+}
+
+void NoteDirectMetalFxFormatRejected(u32 host_format) noexcept {
+    if (host_format > 0 && host_format < 128 && host_format != Fmt::RGBA16Float) {
+        const u64 mask = u64{1} << (host_format & 63U);
+        rejected_direct_metalfx_formats[host_format >> 6].fetch_or(mask, std::memory_order_relaxed);
+    }
+}
+
+[[nodiscard]] u64 TexturePoolCapBytes(u64 device_budget) noexcept {
+    static const u64 forced_mib = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_TEXTURE_POOL_MIB");
+        return value != nullptr ? u64{std::strtoull(value, nullptr, 10)} : u64{0};
+    }();
+    if (forced_mib != 0) {
+        return forced_mib << 20;
+    }
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    (void)device_budget;
+    return u64{64} << 20;
+#else
+    if (VideoCommon::HostBudget::Active()) {
+        return u64{64} << 20;
+    }
+    if (device_budget == 0) {
+        return u64{256} << 20;
+    }
+    return std::clamp<u64>(device_budget / 16, u64{256} << 20, u64{1024} << 20);
+#endif
+}
+
 constexpr u64 MaxTexturePoolIdleFrames = 120;
+constexpr size_t MaxCachedViewsPerTexture = 16;
 
 } // Anonymous namespace
 
@@ -439,7 +484,8 @@ size_t TextureCacheRuntime::TextureDescHash::operator()(const TextureDesc& d) co
 TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
                                          StagingBufferPool& staging_buffer_pool_)
     : device{device_}, scheduler{scheduler_}, staging_buffer_pool{staging_buffer_pool_},
-      sample_limits{DevicePipelineLimits(device_)} {}
+      sample_limits{DevicePipelineLimits(device_)},
+      seen_host_pressure{Common::PlatformEvents::MemoryPressureGeneration()} {}
 
 TextureCacheRuntime::~TextureCacheRuntime() = default;
 
@@ -447,16 +493,51 @@ void TextureCacheRuntime::Finish() {
     scheduler.Finish();
 }
 
-void TextureCacheRuntime::PopOldestPooledTexture() {
-    const auto it = texture_pool_lru.begin();
-    if (const auto idx = texture_pool_index.find(it->desc); idx != texture_pool_index.end()) {
-        std::erase(idx->second, it);
-        if (idx->second.empty()) {
-            texture_pool_index.erase(idx);
-        }
+void TextureCacheRuntime::LinkPoolSlotTail(u32 slot_idx) noexcept {
+    PooledTextureSlot& slot = texture_pool_slots[slot_idx];
+    slot.prev = pool_lru_tail;
+    slot.next = InvalidPoolSlot;
+    if (pool_lru_tail != InvalidPoolSlot) {
+        texture_pool_slots[pool_lru_tail].next = slot_idx;
+    } else {
+        pool_lru_head = slot_idx;
     }
-    pooled_texture_bytes -= (std::min)(pooled_texture_bytes, it->bytes);
-    texture_pool_lru.pop_front();
+    pool_lru_tail = slot_idx;
+}
+
+void TextureCacheRuntime::UnlinkPoolSlot(u32 slot_idx) noexcept {
+    PooledTextureSlot& slot = texture_pool_slots[slot_idx];
+    if (slot.prev != InvalidPoolSlot) {
+        texture_pool_slots[slot.prev].next = slot.next;
+    } else {
+        pool_lru_head = slot.next;
+    }
+    if (slot.next != InvalidPoolSlot) {
+        texture_pool_slots[slot.next].prev = slot.prev;
+    } else {
+        pool_lru_tail = slot.prev;
+    }
+    slot.prev = InvalidPoolSlot;
+    slot.next = InvalidPoolSlot;
+}
+
+void TextureCacheRuntime::PopOldestPooledTexture() {
+    if (pool_lru_head == InvalidPoolSlot) {
+        return;
+    }
+    const u32 slot_idx = pool_lru_head;
+    UnlinkPoolSlot(slot_idx);
+    PooledTextureSlot& slot = texture_pool_slots[slot_idx];
+    if (const auto idx = texture_pool_index.find(slot.desc); idx != texture_pool_index.end()) {
+        std::erase(idx->second, slot_idx);
+    }
+    pooled_texture_bytes -= (std::min)(pooled_texture_bytes, slot.bytes);
+    slot.views.clear();
+    slot.texture.Reset();
+    slot.bytes = 0;
+    slot.gpu_resource_id = 0;
+    slot.ready_tick = 0;
+    texture_pool_free_slots.push_back(slot_idx);
     ++pool_evicted;
 }
 
@@ -466,72 +547,152 @@ void TextureCacheRuntime::TickFrame() {
         TrimTexturePool(0);
         return;
     }
+    const u32 pressure = Common::PlatformEvents::MemoryPressureGeneration();
+    const bool host_pressure = pressure != seen_host_pressure;
+    seen_host_pressure = pressure;
+    if (host_pressure) {
+        TrimTexturePool(0);
+        return;
+    }
     const u64 budget = GetDeviceLocalMemory();
     const u64 used = DeviceAllocatedSize(device);
+    if (VideoCommon::HostBudget::Active()) {
+        const u64 available = VideoCommon::HostBudget::Available(used);
+        if (available != 0 &&
+            available <= VideoCommon::HostBudget::Reserve + (u64{128} << 20)) {
+            TrimTexturePool(0);
+            return;
+        }
+    }
     if (budget != 0 && (used >= budget || budget - used < (u64{256} << 20))) {
         TrimTexturePool(0);
         return;
     }
-    while (!texture_pool_lru.empty() &&
-           pool_frame - texture_pool_lru.front().frame > MaxTexturePoolIdleFrames) {
+    if (budget != 0 && budget - used < (u64{512} << 20)) {
+        TrimTexturePool(u64{64} << 20);
+    }
+    while (pool_lru_head != InvalidPoolSlot) {
+        PooledTextureSlot& oldest = texture_pool_slots[pool_lru_head];
+        if (oldest.ready_tick != 0) {
+            if (!scheduler.IsFree(oldest.ready_tick)) {
+                break;
+            }
+            oldest.ready_tick = 0;
+        }
+        if (pool_frame - oldest.frame <= MaxTexturePoolIdleFrames) {
+            break;
+        }
         PopOldestPooledTexture();
     }
 }
 
-std::pair<Object, u64> TextureCacheRuntime::AcquireTexture(const TextureDesc& tex_desc,
-                                                           bool* out_from_pool) {
-    if (out_from_pool != nullptr) {
-        *out_from_pool = false;
-    }
+TextureCacheRuntime::AcquiredTexture TextureCacheRuntime::AcquireTexture(
+    const TextureDesc& tex_desc) {
     const TextureDesc canonical = CanonicalPoolDesc(tex_desc);
     if (TexturePoolEnabled() && IsPoolableDesc(canonical)) {
         if (const auto idx = texture_pool_index.find(canonical);
             idx != texture_pool_index.end() && !idx->second.empty()) {
-            const auto lru_it = idx->second.back();
-            idx->second.pop_back();
-            if (idx->second.empty()) {
-                texture_pool_index.erase(idx);
+            auto& bucket = idx->second;
+            for (size_t i = bucket.size(); i-- > 0;) {
+                const u32 slot_idx = bucket[i];
+                PooledTextureSlot& slot = texture_pool_slots[slot_idx];
+                if (slot.ready_tick != 0 && !scheduler.IsFree(slot.ready_tick)) {
+                    continue;
+                }
+                bucket.erase(bucket.begin() + static_cast<ptrdiff_t>(i));
+                UnlinkPoolSlot(slot_idx);
+                AcquiredTexture result{
+                    .texture = std::move(slot.texture),
+                    .bytes = slot.bytes,
+                    .gpu_resource_id = slot.gpu_resource_id,
+                    .views = std::move(slot.views),
+                    .from_pool = true,
+                };
+                pooled_texture_bytes -= (std::min)(pooled_texture_bytes, slot.bytes);
+                slot.views.clear();
+                slot.bytes = 0;
+                slot.gpu_resource_id = 0;
+                slot.ready_tick = 0;
+                texture_pool_free_slots.push_back(slot_idx);
+                ++pool_hits;
+                return result;
             }
-            Object tex = std::move(lru_it->texture);
-            const u64 tex_bytes = lru_it->bytes;
-            pooled_texture_bytes -= (std::min)(pooled_texture_bytes, tex_bytes);
-            texture_pool_lru.erase(lru_it);
-            ++pool_hits;
-            if (out_from_pool != nullptr) {
-                *out_from_pool = true;
-            }
-            return {std::move(tex), tex_bytes};
         }
         ++pool_misses;
     }
     Object tex = CreateTexture(device, canonical);
     const u64 tex_bytes = tex ? AllocatedSize(tex.Get()) : 0;
-    return {std::move(tex), tex_bytes};
-}
-
-void TextureCacheRuntime::ReleaseTexture(const TextureDesc& tex_desc, Object&& tex,
-                                         u64 tex_bytes) {
-    const TextureDesc canonical = CanonicalPoolDesc(tex_desc);
-    if (!TexturePoolEnabled() || !tex || !IsPoolableDesc(canonical) || tex_bytes == 0 ||
-        tex_bytes > MaxTexturePoolBytes) {
-        return;
-    }
-    TrimTexturePool(MaxTexturePoolBytes - tex_bytes);
-    texture_pool_lru.push_back(PooledTexture{
-        .desc = canonical,
+    const u64 res_id = tex ? Scheduler::TextureResourceId(tex.Get()) : 0;
+    return AcquiredTexture{
         .texture = std::move(tex),
         .bytes = tex_bytes,
-        .frame = pool_frame,
-    });
-    const auto lru_it = std::prev(texture_pool_lru.end());
-    texture_pool_index[canonical].push_back(lru_it);
+        .gpu_resource_id = res_id,
+        .views = {},
+        .from_pool = false,
+    };
+}
+
+void TextureCacheRuntime::ReleaseTexture(const TextureDesc& tex_desc, Object&& tex, u64 tex_bytes,
+                                         u64 gpu_resource_id,
+                                         std::vector<CachedTextureView>&& views, u64 ready_tick) {
+    const TextureDesc canonical = CanonicalPoolDesc(tex_desc);
+    const u64 max_pool_bytes = TexturePoolCapBytes(GetDeviceLocalMemory());
+    const u64 max_single_bytes =
+        VideoCommon::HostBudget::Active()
+            ? max_pool_bytes
+            : (std::min)(max_pool_bytes, (std::max)(max_pool_bytes / 2, u64{128} << 20));
+    if (!TexturePoolEnabled() || !tex || !IsPoolableDesc(canonical) || tex_bytes == 0 ||
+        tex_bytes > max_single_bytes) {
+        views.clear();
+        return;
+    }
+    TrimTexturePool(max_pool_bytes - tex_bytes);
+    u32 slot_idx = InvalidPoolSlot;
+    if (!texture_pool_free_slots.empty()) {
+        slot_idx = texture_pool_free_slots.back();
+        texture_pool_free_slots.pop_back();
+        texture_pool_slots[slot_idx] = PooledTextureSlot{
+            .desc = canonical,
+            .texture = std::move(tex),
+            .views = std::move(views),
+            .bytes = tex_bytes,
+            .gpu_resource_id = gpu_resource_id,
+            .frame = pool_frame,
+            .ready_tick = ready_tick,
+        };
+    } else {
+        slot_idx = static_cast<u32>(texture_pool_slots.size());
+        texture_pool_slots.push_back(PooledTextureSlot{
+            .desc = canonical,
+            .texture = std::move(tex),
+            .views = std::move(views),
+            .bytes = tex_bytes,
+            .gpu_resource_id = gpu_resource_id,
+            .frame = pool_frame,
+            .ready_tick = ready_tick,
+        });
+    }
+    LinkPoolSlotTail(slot_idx);
+    texture_pool_index[canonical].push_back(slot_idx);
     pooled_texture_bytes += tex_bytes;
     ++pool_recycled;
 }
 
 void TextureCacheRuntime::TrimTexturePool(u64 max_bytes) {
-    while (!texture_pool_lru.empty() && pooled_texture_bytes > max_bytes) {
+    while (pool_lru_head != InvalidPoolSlot && pooled_texture_bytes > max_bytes) {
+        PooledTextureSlot& oldest = texture_pool_slots[pool_lru_head];
+        if (oldest.ready_tick != 0) {
+            if (!scheduler.IsFree(oldest.ready_tick)) {
+                break;
+            }
+            oldest.ready_tick = 0;
+        }
         PopOldestPooledTexture();
+    }
+    if (max_bytes == 0 && pool_lru_head == InvalidPoolSlot) {
+        texture_pool_index.clear();
+        texture_pool_slots.clear();
+        texture_pool_free_slots.clear();
     }
 }
 
@@ -595,7 +756,7 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
                 ToOffset(copy.src_offset), extent, dst.Handle(),
                 static_cast<u32>(copy.dst_subresource.base_level),
                 dst_3d ? 0U : static_cast<u32>(copy.dst_subresource.base_layer + layer),
-                ToOffset(copy.dst_offset));
+                ToOffset(copy.dst_offset), true);
         }
     }
 }
@@ -613,13 +774,40 @@ void TextureCacheRuntime::BarrierFeedbackLoop() {
         const char* const value = std::getenv("EDEN_NX2_METAL_DEPTH_READ_KEEP_PASS");
         return value == nullptr || value[0] != '0';
     }();
-    if (enabled && scheduler.IsRendering()) {
+    if (!enabled) {
+        return;
+    }
+    if (upcoming_render_targets != nullptr &&
+        !scheduler.IsRenderingTo(*upcoming_render_targets)) {
+        scheduler.FlushPendingClearsForTargets(*upcoming_render_targets);
+        return;
+    }
+    if (scheduler.IsRendering()) {
         if (keep_pass && !scheduler.RenderPassWroteDepthStencil()) {
             Coverage::NoteGuard("depth feedback loop pass kept");
             return;
         }
         scheduler.EndRendering();
         Coverage::NoteGuard("depth feedback loop pass ends");
+    }
+}
+
+void TextureCacheRuntime::FeedbackBarrier() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_FRAGMENT_BARRIER");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled) {
+        return;
+    }
+    if (upcoming_render_targets != nullptr &&
+        !scheduler.IsRenderingTo(*upcoming_render_targets)) {
+        scheduler.FlushPendingClearsForTargets(*upcoming_render_targets);
+        return;
+    }
+    if (scheduler.IsRendering() &&
+        (scheduler.RenderPassWroteColorMask() != 0 || scheduler.RenderPassWroteDepthStencil())) {
+        scheduler.EndRendering();
     }
 }
 
@@ -1242,6 +1430,13 @@ bool TextureCacheRuntime::MetalFxTemporalUpscale(Framebuffer* dst_framebuffer, I
                        now - *temporal_last_evaluation > std::chrono::milliseconds{250} ||
                        !temporal_last_frame || pool_frame > *temporal_last_frame + 1 ||
                        temporal_last_render != *color_dims || temporal_last_output != output_size;
+    const Attachment dst_target = dst.RenderTarget();
+    const u32 dst_format = dst.HostFormat();
+    const TextureHandle direct_dst =
+        dst_target.level == 0 && dst_target.slice == 0 && dst_target.depth_plane == 0 &&
+                dst.range.extent.levels == 1 && !IsDirectMetalFxFormatRejected(dst_format)
+            ? dst.StorageHandle(Shader::TextureType::Color2D, Shader::ImageFormat::Typeless)
+            : nullptr;
     const TextureHandle output = temporal->Upscale(
         device, scheduler,
         {
@@ -1256,6 +1451,7 @@ bool TextureCacheRuntime::MetalFxTemporalUpscale(Framebuffer* dst_framebuffer, I
             .reset = reset,
             .depth_reversed = true,
             .auto_exposure = IsPixelFormatFloatingPoint(input_color.format),
+            .output = direct_dst,
         });
     if (output == nullptr) {
         if (temporal->Failed()) {
@@ -1263,13 +1459,17 @@ bool TextureCacheRuntime::MetalFxTemporalUpscale(Framebuffer* dst_framebuffer, I
         }
         return false;
     }
+    if (direct_dst != nullptr && output != direct_dst) {
+        NoteDirectMetalFxFormatRejected(dst_format);
+    }
     const s32 width = static_cast<s32>(output_size[0]);
     const s32 height = static_cast<s32>(output_size[1]);
-    if (!scheduler.Blit(BlitPass{
+    if (output != direct_dst &&
+        !scheduler.Blit(BlitPass{
             .src = output,
             .src_rect = {0, 0, width, height},
-            .dst = dst.RenderTarget(),
-            .dst_format = dst.HostFormat(),
+            .dst = dst_target,
+            .dst_format = dst_format,
             .dst_rect = {0, 0, width, height},
             .dst_width = output_size[0],
             .dst_height = output_size[1],
@@ -1330,6 +1530,9 @@ bool TextureCacheRuntime::UpscaleWithCameraMotion(Framebuffer* dst_framebuffer,
                                     reprojection)) {
         return false;
     }
+    const TextureHandle direct_target =
+        target.level == 0 && target.slice == 0 && target.depth_plane == 0 ? target.texture
+                                                                          : nullptr;
     const TextureHandle output = temporal->Upscale(
         device, scheduler,
         {
@@ -1345,6 +1548,7 @@ bool TextureCacheRuntime::UpscaleWithCameraMotion(Framebuffer* dst_framebuffer,
             // Ocarina's scene has its depth at 0 at the camera and linear B10G11R11_FLOAT colour.
             .depth_reversed = false,
             .auto_exposure = true,
+            .output = direct_target,
         });
     if (output == nullptr) {
         if (temporal->Failed()) {
@@ -1354,7 +1558,8 @@ bool TextureCacheRuntime::UpscaleWithCameraMotion(Framebuffer* dst_framebuffer,
     }
     const s32 width = static_cast<s32>(output_size[0]);
     const s32 height = static_cast<s32>(output_size[1]);
-    if (!scheduler.Blit(BlitPass{
+    if (output != target.texture &&
+        !scheduler.Blit(BlitPass{
             .src = output,
             .src_rect = {0, 0, width, height},
             .dst = target,
@@ -1384,7 +1589,8 @@ void TextureCacheRuntime::ZeroTexture(TextureHandle tex, const TextureDesc& tex_
         return;
     }
     const FormatClass fmt_class = ClassOf(tex_desc.format);
-    if (tex_desc.render_target) {
+    if (tex_desc.render_target &&
+        (!IsColor(fmt_class) || (tex_desc.levels == 1 && tex_desc.layers == 1))) {
         const bool clear_color = IsColor(fmt_class);
         const bool clear_depth =
             fmt_class == FormatClass::Depth || fmt_class == FormatClass::DepthStencil;
@@ -1529,7 +1735,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         }
     }
     if (samples == 1 && kind == TextureKind::e2DMultisampleArray) {
-        kind = TextureKind::e2DArray;
+        kind = info.resources.layers > 1 ? TextureKind::e2DArray : TextureKind::e2D;
     }
     desc = TextureDesc{
         .kind = kind,
@@ -1552,6 +1758,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         if (std::optional<SparseTexture> made = CreateSparseTexture(
                 runtime->device, desc, SparseHeapBytes(VideoCommon::CalculateGuestSizeInBytes(info)))) {
             texture = std::move(made->texture);
+            base_resource_id = Scheduler::TextureResourceId(texture.Get());
             sparse = SparseTiles{
                 .heap = std::move(made->heap),
                 .tile_width = made->tile_width,
@@ -1579,7 +1786,12 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
             return;
         }
     }
-    std::tie(texture, base_texture_bytes) = runtime->AcquireTexture(desc, &from_pool);
+    TextureCacheRuntime::AcquiredTexture acquired = runtime->AcquireTexture(desc);
+    texture = std::move(acquired.texture);
+    base_texture_bytes = acquired.bytes;
+    base_resource_id = acquired.gpu_resource_id;
+    base_views = std::move(acquired.views);
+    from_pool = acquired.from_pool;
     needs_pool_zero = from_pool;
     if (!texture) {
         LOG_ERROR(Render_Metal, "Metal: texture {}x{}x{} format {} levels {} layers {} failed",
@@ -1613,7 +1825,105 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
 
 Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBase{params} {}
 
-void Image::ReleaseToPool() {
+Image::ResolvedSubView Image::FindOrCreateViewHandle(TextureHandle base, u32 format,
+                                                     TextureKind view_kind, u32 base_level,
+                                                     u32 levels, u32 base_layer, u32 layers,
+                                                     std::array<u8, 4> swizzle) {
+    if (base == nullptr) {
+        return {};
+    }
+    std::vector<CachedTextureView>* cache = nullptr;
+    const TextureDesc* tex_desc = nullptr;
+    u64 tex_res_id = 0;
+    if (base == texture.Get()) {
+        cache = &base_views;
+        tex_desc = &desc;
+        tex_res_id = base_resource_id;
+    } else if (base == scaled_texture.Get()) {
+        cache = &scaled_views;
+        tex_desc = &scaled_desc;
+        tex_res_id = scaled_resource_id;
+    }
+    if (tex_desc != nullptr && format == tex_desc->format && view_kind == tex_desc->kind &&
+        base_level == 0 && levels == tex_desc->levels && base_layer == 0 &&
+        layers == tex_desc->layers && swizzle == IdentitySwizzle) {
+        return ResolvedSubView{
+            .handle = base,
+            .uncached_owner = {},
+            .gpu_resource_id = tex_res_id,
+        };
+    }
+    const u64 key0 = CachedTextureView::PackKey0(format, swizzle);
+    const u64 key1 = CachedTextureView::PackKey1(view_kind, base_level, levels, base_layer, layers);
+    if (cache != nullptr) {
+        for (const CachedTextureView& entry : *cache) {
+            if (entry.key0 == key0 && entry.key1 == key1) {
+                return ResolvedSubView{
+                    .handle = entry.view.Get(),
+                    .uncached_owner = {},
+                    .gpu_resource_id = entry.gpu_resource_id,
+                };
+            }
+        }
+    }
+    Object made =
+        CreateTextureView(base, format, view_kind, base_level, levels, base_layer, layers, swizzle);
+    const TextureHandle handle = made.Get();
+    const u64 res_id = Scheduler::TextureResourceId(handle);
+    if (cache != nullptr && cache->size() < MaxCachedViewsPerTexture) {
+        cache->push_back(CachedTextureView{
+            .key0 = key0,
+            .key1 = key1,
+            .view = std::move(made),
+            .gpu_resource_id = res_id,
+        });
+        return ResolvedSubView{
+            .handle = handle,
+            .uncached_owner = {},
+            .gpu_resource_id = res_id,
+        };
+    }
+    return ResolvedSubView{
+        .handle = handle,
+        .uncached_owner = std::move(made),
+        .gpu_resource_id = res_id,
+    };
+}
+
+Object Image::FindOrCreateView(TextureHandle base, u32 format, TextureKind view_kind,
+                               u32 base_level, u32 levels, u32 base_layer, u32 layers,
+                               std::array<u8, 4> swizzle, u64* out_gpu_resource_id) {
+    ResolvedSubView resolved = FindOrCreateViewHandle(base, format, view_kind, base_level, levels,
+                                                      base_layer, layers, swizzle);
+    if (out_gpu_resource_id != nullptr) {
+        *out_gpu_resource_id = resolved.gpu_resource_id;
+    }
+    if (resolved.uncached_owner) {
+        return std::move(resolved.uncached_owner);
+    }
+    return resolved.handle != nullptr ? Object{RetainObject(resolved.handle)} : Object{};
+}
+
+void Image::OnDelete() noexcept {
+    if (delete_notified) {
+        return;
+    }
+    delete_notified = true;
+    if (runtime == nullptr) {
+        return;
+    }
+    if (texture) {
+        runtime->scheduler.DropPendingClears(texture.Get());
+    }
+    if (scaled_texture) {
+        runtime->scheduler.DropPendingClears(scaled_texture.Get());
+    }
+    if (resolve_shadow && texture) {
+        runtime->scheduler.SetResolveShadow(texture.Get(), nullptr);
+    }
+}
+
+void Image::ReleaseToPool(u64 ready_tick) {
     if (runtime == nullptr || !texture || sparse.tile_width != 0 ||
         True(flags & (ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked))) {
         return;
@@ -1621,34 +1931,61 @@ void Image::ReleaseToPool() {
     if (!IsPoolableDesc(desc) && (!scaled_texture || !IsPoolableDesc(scaled_desc))) {
         return;
     }
+    u64 effective_tick = ready_tick;
+    if (!delete_notified) {
+        OnDelete();
+        if (effective_tick == 0) {
+            effective_tick = runtime->RetireTick();
+        }
+    }
+    if (effective_tick != 0 && runtime->IsFree(effective_tick)) {
+        effective_tick = 0;
+    }
     if (resolve_shadow) {
-        runtime->scheduler.SetResolveShadow(texture.Get(), nullptr);
         resolve_shadow.Reset();
     }
     runtime->allocated_bytes -= bytes + scaled_bytes;
     const u64 orig_base_bytes = base_texture_bytes;
     const u64 orig_scaled_bytes = scaled_bytes;
+    const u64 orig_base_res_id = base_resource_id;
+    const u64 orig_scaled_res_id = scaled_resource_id;
     bytes = 0;
     base_texture_bytes = 0;
     scaled_bytes = 0;
+    base_resource_id = 0;
+    scaled_resource_id = 0;
     sample_grid.Reset();
     if (IsPoolableDesc(desc)) {
-        runtime->ReleaseTexture(desc, std::move(texture), orig_base_bytes);
+        runtime->ReleaseTexture(desc, std::move(texture), orig_base_bytes, orig_base_res_id,
+                                std::move(base_views), effective_tick);
     } else {
+        base_views.clear();
         texture.Reset();
     }
     if (scaled_texture) {
         if (IsPoolableDesc(scaled_desc)) {
-            runtime->ReleaseTexture(scaled_desc, std::move(scaled_texture), orig_scaled_bytes);
+            runtime->ReleaseTexture(scaled_desc, std::move(scaled_texture), orig_scaled_bytes,
+                                    orig_scaled_res_id, std::move(scaled_views), effective_tick);
         } else {
+            scaled_views.clear();
             scaled_texture.Reset();
         }
     }
 }
 
 Image::~Image() {
-    if (resolve_shadow && runtime != nullptr) {
-        runtime->scheduler.SetResolveShadow(texture.Get(), nullptr);
+    base_views.clear();
+    scaled_views.clear();
+    if (!delete_notified && runtime != nullptr) {
+        if (texture) {
+            runtime->scheduler.DropPendingClears(texture.Get());
+        }
+        if (scaled_texture) {
+            runtime->scheduler.DropPendingClears(scaled_texture.Get());
+        }
+        if (resolve_shadow && texture) {
+            runtime->scheduler.SetResolveShadow(texture.Get(), nullptr);
+        }
     }
     if (texture && runtime != nullptr) {
         runtime->allocated_bytes -= bytes + scaled_bytes;
@@ -1684,7 +2021,11 @@ bool Image::ScaleUp(bool ignore) {
         if (info.type == ImageType::e2D) {
             scaled_desc.height = resolution.ScaleUp(desc.height);
         }
-        std::tie(scaled_texture, scaled_bytes) = runtime->AcquireTexture(scaled_desc);
+        TextureCacheRuntime::AcquiredTexture acquired = runtime->AcquireTexture(scaled_desc);
+        scaled_texture = std::move(acquired.texture);
+        scaled_bytes = acquired.bytes;
+        scaled_resource_id = acquired.gpu_resource_id;
+        scaled_views = std::move(acquired.views);
         if (!scaled_texture) {
             LOG_ONCE(warned_scaled, "Metal: a scaled {}x{} texture failed; images stay native",
                      scaled_desc.width, scaled_desc.height);
@@ -1987,7 +2328,8 @@ bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
 }
 
 void Image::UploadMemory(BufferHandle buffer, size_t offset,
-                         std::span<const VideoCommon::BufferImageCopy> copies, bool ahead) {
+                         std::span<const VideoCommon::BufferImageCopy> copies, bool ahead,
+                         bool buffer_range_tracked) {
     needs_pool_zero = false;
     if (!CanCopyWithBuffers()) {
         return;
@@ -2038,7 +2380,8 @@ void Image::UploadMemory(BufferHandle buffer, size_t offset,
                 is_3d ? bytes_per_image : 0U, target,
                 static_cast<u32>(copy.image_subresource.base_level),
                 is_3d ? 0U : static_cast<u32>(copy.image_subresource.base_layer + layer),
-                ToOffset(copy.image_offset), extent, ahead && !multisampled && !rescaled);
+                ToOffset(copy.image_offset), extent, ahead && !multisampled && !rescaled,
+                buffer_range_tracked && !multisampled);
         }
     }
     if (multisampled) {
@@ -2117,6 +2460,7 @@ void Image::DownloadMemory(std::span<BufferHandle> buffers, std::span<size_t> of
     const std::optional<DepthLayout> depth_layout = DepthBytesLayout();
     const bool is_3d = info.type == ImageType::e3D;
     for (size_t index = 0; index < buffers.size(); ++index) {
+        const bool dst_tracked = buffers.size() == 2 && index == 0;
         for (const VideoCommon::BufferImageCopy& copy : copies) {
             if (copy.image_subresource.base_level >= info.resources.levels) {
                 continue;
@@ -2157,7 +2501,8 @@ void Image::DownloadMemory(std::span<BufferHandle> buffers, std::span<size_t> of
                     is_3d ? 0U : static_cast<u32>(copy.image_subresource.base_layer + layer),
                     ToOffset(copy.image_offset), extent, buffers[index],
                     offsets[index] + copy.buffer_offset + u64{bytes_per_image} * layer,
-                    bytes_per_row, is_3d ? bytes_per_image : 0U);
+                    bytes_per_row, is_3d ? bytes_per_image : 0U,
+                    dst_tracked && packed_shift == 0);
             }
         }
         if (packed_shift != 0) {
@@ -2180,15 +2525,37 @@ void Image::DownloadMemory(const StagingBufferRef& map,
     DownloadMemory(map.buffer, map.offset, copies);
 }
 
+void ImageView::InitSamplerTraits(const Device& device) noexcept {
+    u8 traits = 0;
+    if (SupportsAnisotropy()) {
+        traits |= TraitSupportsAnisotropy;
+    }
+    if (VideoCore::Surface::IsPixelFormatInteger(format) || host_class == FormatClass::Stencil ||
+        (Is32BitFloatFormat(format) && !DeviceSupports32BitFloatFiltering(device))) {
+        traits |= TraitForceNearest;
+    }
+    if (VideoCore::Surface::IsPixelFormatSRGB(format)) {
+        traits |= TraitIsSrgb;
+    }
+    if (IsDepth(host_class) || RedOnlyFormat(format)) {
+        traits |= TraitRedOnlyBorder;
+    }
+    sampler_traits = traits;
+}
+
 ImageView::ImageView(TextureCacheRuntime& runtime, const ImageViewInfo& info, ImageId image_id_,
                      Image& image, const SlotVector<Image>& slot_images_)
     : VideoCommon::ImageViewBase{info, image.info, image_id_, image.gpu_addr},
       // The texture cache owns the images; views reach theirs for the sample grid.
-      slot_images{const_cast<SlotVector<Image>*>(&slot_images_)}, image_texture{image.Handle()}, samples{image.HostSamples()},
+      slot_images{const_cast<SlotVector<Image>*>(&slot_images_)}, image_texture{image.Handle()},
+      render_texture{image_texture}, samples{image.HostSamples()},
       guest_samples{image.info.num_samples}, image_kind{image.Kind()} {
     const bool converted = True(image.flags & ImageFlagBits::Converted);
-    const FormatInfo host = SurfaceFormat(runtime.device, format, converted);
+    const FormatInfo host = format == image.info.format
+                                ? image.HostFormat()
+                                : SurfaceFormat(runtime.device, format, converted);
     host_format = host.format;
+    host_class = host.format_class;
     is_render_target = info.IsRenderTarget();
     is_3d_slice = True(flags & ImageViewFlagBits::Slice);
     if (!is_render_target) {
@@ -2211,6 +2578,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const ImageViewInfo& info, Im
         if (stencil_aspect && image.HostFormat().format == Fmt::Depth32Float_Stencil8 &&
             samples == 1) {
             host_format = Fmt::X32_Stencil8;
+            host_class = FormatClass::Stencil;
         }
         if (surface_type == SurfaceType::Depth || surface_type == SurfaceType::Stencil ||
             surface_type == SurfaceType::DepthStencil) {
@@ -2227,28 +2595,88 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const ImageViewInfo& info, Im
                    HostSwizzle(view_swizzle[2], host.swizzle),
                    HostSwizzle(view_swizzle[3], host.swizzle)};
     }
+    if (FormatsExpanded()) {
+        const u32 twin = LinearTwin(host_format);
+        linear_format = twin != 0 ? twin : host_format;
+    } else {
+        linear_format = host_format;
+    }
+    InitSamplerTraits(runtime.device);
+    if (image_texture == nullptr) {
+        resolved_views = 0xFFFFU;
+    } else {
+        resolved_views = static_cast<u16>(1U << static_cast<size_t>(Shader::TextureType::Buffer));
+        const TextureDesc& active_desc = image.ActiveDesc();
+        const u64 active_res_id = image.ActiveResourceId();
+        if (host_format == active_desc.format && swizzle == IdentitySwizzle &&
+            range.base.level == 0 && static_cast<u32>(range.extent.levels) == active_desc.levels &&
+            range.base.layer == 0 && static_cast<u32>(range.extent.layers) == active_desc.layers) {
+            const auto seed = [&](Shader::TextureType tex_type) {
+                const size_t s = static_cast<size_t>(tex_type);
+                view_handles[s] = image_texture;
+                view_resource_ids[s] = active_res_id;
+                resolved_views |= static_cast<u16>(1U << s);
+            };
+            Shader::TextureType default_storage_type = Shader::TextureType::Buffer;
+            switch (active_desc.kind) {
+            case TextureKind::e2D:
+                seed(Shader::TextureType::Color2D);
+                seed(Shader::TextureType::Color2DRect);
+                default_storage_type = Shader::TextureType::Color2D;
+                break;
+            case TextureKind::e2DArray:
+            case TextureKind::e2DMultisampleArray:
+                seed(Shader::TextureType::ColorArray2D);
+                default_storage_type = Shader::TextureType::ColorArray2D;
+                break;
+            case TextureKind::e3D:
+                seed(Shader::TextureType::Color3D);
+                default_storage_type = Shader::TextureType::Color3D;
+                break;
+            default:
+                break;
+            }
+            if (default_storage_type != Shader::TextureType::Buffer &&
+                linear_format == host_format) {
+                cached_storage_key = (static_cast<u32>(default_storage_type) << 16) |
+                                     static_cast<u32>(Shader::ImageFormat::Typeless);
+                cached_storage_handle = image_texture;
+                cached_storage_res_id = active_res_id;
+            }
+        }
+    }
     // A render target in another format than its image draws through a view of that format.
     if (is_render_target && image_texture != nullptr && host_format != image.HostFormat().format &&
         host_format != Fmt::X32_Stencil8) {
         const u32 view_layers =
             image_kind == TextureKind::e3D ? 1U : static_cast<u32>(image.info.resources.layers);
-        render_view =
-            CreateTextureView(image_texture, host_format, image_kind, 0,
-                              static_cast<u32>(image.info.resources.levels), 0, view_layers,
-                              IdentitySwizzle);
+        Image::ResolvedSubView rv = image.FindOrCreateViewHandle(
+            image_texture, host_format, image_kind, 0,
+            static_cast<u32>(image.info.resources.levels), 0, view_layers, IdentitySwizzle);
+        if (rv.handle != nullptr) {
+            render_texture = rv.handle;
+            render_view = std::move(rv.uncached_owner);
+        }
     }
 }
 
-ImageView::ImageView(TextureCacheRuntime&, const ImageInfo& info, const ImageViewInfo& view_info,
-                     GPUVAddr gpu_addr_)
-    : VideoCommon::ImageViewBase{info, view_info, gpu_addr_},
-      buffer_size{static_cast<u32>(VideoCommon::CalculateGuestSizeInBytes(info))} {}
+ImageView::ImageView(TextureCacheRuntime& runtime, const ImageInfo& info,
+                     const ImageViewInfo& view_info, GPUVAddr gpu_addr_)
+    : VideoCommon::ImageViewBase{info, view_info, gpu_addr_}, resolved_views{0xFFFFU},
+      buffer_size{static_cast<u32>(VideoCommon::CalculateGuestSizeInBytes(info))} {
+    InitSamplerTraits(runtime.device);
+}
 
-ImageView::ImageView(TextureCacheRuntime&, const ImageInfo& info, const ImageViewInfo& view_info)
-    : VideoCommon::ImageViewBase{info, view_info, 0} {}
+ImageView::ImageView(TextureCacheRuntime& runtime, const ImageInfo& info,
+                     const ImageViewInfo& view_info)
+    : VideoCommon::ImageViewBase{info, view_info, 0}, resolved_views{0xFFFFU} {
+    InitSamplerTraits(runtime.device);
+}
 
-ImageView::ImageView(TextureCacheRuntime&, const VideoCommon::NullImageViewParams& params)
-    : VideoCommon::ImageViewBase{params} {}
+ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::NullImageViewParams& params)
+    : VideoCommon::ImageViewBase{params}, resolved_views{0xFFFFU} {
+    InitSamplerTraits(runtime.device);
+}
 
 ImageView::~ImageView() = default;
 
@@ -2263,7 +2691,8 @@ struct ResolvedViewShape {
 [[nodiscard]] std::optional<ResolvedViewShape> ResolveViewShape(
     Shader::TextureType texture_type, TextureKind image_kind,
     const VideoCommon::SubresourceRange& range) {
-    const bool multisample = image_kind == TextureKind::e2DMultisampleArray;
+    const bool multisample =
+        image_kind == TextureKind::e2DMultisample || image_kind == TextureKind::e2DMultisampleArray;
     ResolvedViewShape shape{
         .kind = TextureKind::e2D,
         .base_layer = static_cast<u32>(range.base.layer),
@@ -2318,97 +2747,130 @@ struct ResolvedViewShape {
 
 } // Anonymous namespace
 
-TextureHandle ImageView::Handle(Shader::TextureType texture_type, u64* out_gpu_resource_id) {
+TextureHandle ImageView::HandleSlow(Shader::TextureType texture_type, u64* out_gpu_resource_id) {
+    static_assert(Shader::NUM_TEXTURE_TYPES <= 16);
     if (out_gpu_resource_id != nullptr) {
         *out_gpu_resource_id = 0;
     }
-    if (image_texture == nullptr || texture_type == Shader::TextureType::Buffer) {
+    const size_t slot = static_cast<size_t>(texture_type);
+    if (image_texture == nullptr || slot >= Shader::NUM_TEXTURE_TYPES ||
+        texture_type == Shader::TextureType::Buffer) {
         return nullptr;
     }
-    const size_t slot = static_cast<size_t>(texture_type);
-    Object& view = views[slot];
-    if (view) {
+    const u16 bit = static_cast<u16>(1U << slot);
+    if ((resolved_views & bit) != 0) {
         if (out_gpu_resource_id != nullptr) {
             *out_gpu_resource_id = view_resource_ids[slot];
         }
-        return view.Get();
+        return view_handles[slot];
     }
+    resolved_views |= bit;
     const auto shape = ResolveViewShape(texture_type, image_kind, range);
     if (!shape) {
         return nullptr;
     }
-    view = CreateTextureView(image_texture, host_format, shape->kind,
-                             static_cast<u32>(range.base.level),
-                             static_cast<u32>(range.extent.levels), shape->base_layer,
-                             shape->layers, swizzle);
-    view_resource_ids[slot] = Scheduler::TextureResourceId(view.Get());
+    if (slot_images != nullptr && image_id && image_id != VideoCommon::NULL_IMAGE_ID &&
+        slot_images->contains(image_id)) {
+        Image::ResolvedSubView rv = (*slot_images)[image_id].FindOrCreateViewHandle(
+            image_texture, host_format, shape->kind, static_cast<u32>(range.base.level),
+            static_cast<u32>(range.extent.levels), shape->base_layer, shape->layers, swizzle);
+        view_handles[slot] = rv.handle;
+        views[slot] = std::move(rv.uncached_owner);
+        view_resource_ids[slot] = rv.gpu_resource_id;
+    } else {
+        views[slot] = CreateTextureView(
+            image_texture, host_format, shape->kind, static_cast<u32>(range.base.level),
+            static_cast<u32>(range.extent.levels), shape->base_layer, shape->layers, swizzle);
+        view_handles[slot] = views[slot].Get();
+        view_resource_ids[slot] = Scheduler::TextureResourceId(view_handles[slot]);
+    }
     if (out_gpu_resource_id != nullptr) {
         *out_gpu_resource_id = view_resource_ids[slot];
     }
-    return view.Get();
+    return view_handles[slot];
 }
 
-TextureHandle ImageView::StorageHandle(Shader::TextureType texture_type,
-                                       Shader::ImageFormat image_format,
-                                       u64* out_gpu_resource_id) {
-    if (!FormatsExpanded()) {
-        return Handle(texture_type, out_gpu_resource_id);
-    }
-    if (image_texture == nullptr || texture_type == Shader::TextureType::Buffer) {
+TextureHandle ImageView::StorageHandleSlow(Shader::TextureType texture_type,
+                                           Shader::ImageFormat image_format,
+                                           u64* out_gpu_resource_id) {
+    const u32 key = (static_cast<u32>(texture_type) << 16) | static_cast<u32>(image_format);
+    const auto finish = [&](TextureHandle h, u64 res_id) noexcept {
+        cached_storage_key = key;
+        cached_storage_handle = h;
+        cached_storage_res_id = res_id;
         if (out_gpu_resource_id != nullptr) {
-            *out_gpu_resource_id = 0;
+            *out_gpu_resource_id = res_id;
         }
-        return nullptr;
+        return h;
+    };
+    if (image_texture == nullptr || texture_type == Shader::TextureType::Buffer) {
+        return finish(nullptr, 0);
+    }
+    if (!FormatsExpanded()) {
+        u64 res_id = 0;
+        const TextureHandle h = Handle(texture_type, &res_id);
+        return finish(h, res_id);
     }
     u32 view_format = StorageFormat(image_format);
     if (view_format == 0) {
-        const u32 linear = LinearTwin(host_format);
-        view_format = linear != 0 ? linear : host_format;
+        view_format = linear_format;
     }
     if (view_format == host_format && swizzle == IdentitySwizzle) {
-        return Handle(texture_type, out_gpu_resource_id);
+        u64 res_id = 0;
+        const TextureHandle h = Handle(texture_type, &res_id);
+        return finish(h, res_id);
     }
     for (const StorageVariant& existing : storage_views) {
         if (existing.type == texture_type && existing.format == view_format) {
-            if (!existing.view) {
-                return Handle(texture_type, out_gpu_resource_id);
+            if (existing.handle == nullptr) {
+                u64 res_id = 0;
+                const TextureHandle h = Handle(texture_type, &res_id);
+                return finish(h, res_id);
             }
-            if (out_gpu_resource_id != nullptr) {
-                *out_gpu_resource_id = existing.gpu_resource_id;
-            }
-            return existing.view.Get();
+            return finish(existing.handle, existing.gpu_resource_id);
         }
     }
     const auto shape = ResolveViewShape(texture_type, image_kind, range);
     if (!shape) {
-        if (out_gpu_resource_id != nullptr) {
-            *out_gpu_resource_id = 0;
-        }
-        return nullptr;
+        return finish(nullptr, 0);
     }
-    Object storage = CreateTextureView(image_texture, view_format, shape->kind,
-                                       static_cast<u32>(range.base.level),
-                                       static_cast<u32>(range.extent.levels), shape->base_layer,
-                                       shape->layers, IdentitySwizzle);
-    const u64 storage_res_id = Scheduler::TextureResourceId(storage.Get());
+    TextureHandle storage_handle = nullptr;
+    Object storage_owner;
+    u64 storage_res_id = 0;
+    if (slot_images != nullptr && image_id && image_id != VideoCommon::NULL_IMAGE_ID &&
+        slot_images->contains(image_id)) {
+        Image::ResolvedSubView rv = (*slot_images)[image_id].FindOrCreateViewHandle(
+            image_texture, view_format, shape->kind, static_cast<u32>(range.base.level),
+            static_cast<u32>(range.extent.levels), shape->base_layer, shape->layers,
+            IdentitySwizzle);
+        storage_handle = rv.handle;
+        storage_owner = std::move(rv.uncached_owner);
+        storage_res_id = rv.gpu_resource_id;
+    } else {
+        storage_owner = CreateTextureView(image_texture, view_format, shape->kind,
+                                          static_cast<u32>(range.base.level),
+                                          static_cast<u32>(range.extent.levels), shape->base_layer,
+                                          shape->layers, IdentitySwizzle);
+        storage_handle = storage_owner.Get();
+        storage_res_id = Scheduler::TextureResourceId(storage_handle);
+    }
     u64 fallback_res_id = 0;
     const TextureHandle result =
-        storage ? storage.Get() : Handle(texture_type, &fallback_res_id);
-    const u64 final_res_id = storage ? storage_res_id : fallback_res_id;
+        storage_handle != nullptr ? storage_handle : Handle(texture_type, &fallback_res_id);
+    const u64 final_res_id = storage_handle != nullptr ? storage_res_id : fallback_res_id;
     storage_views.push_back(StorageVariant{
         .type = texture_type,
         .format = view_format,
-        .view = std::move(storage),
+        .handle = storage_handle,
+        .uncached_owner = std::move(storage_owner),
         .gpu_resource_id = storage_res_id,
     });
-    if (out_gpu_resource_id != nullptr) {
-        *out_gpu_resource_id = final_res_id;
-    }
-    return result;
+    return finish(result, final_res_id);
 }
 
 bool ImageView::PrepareSampleGrid() {
-    if (samples == 1 || !MsaaEnabled() || slot_images == nullptr || !image_id) {
+    if (samples == 1 || !MsaaEnabled() || slot_images == nullptr || !image_id ||
+        image_id == VideoCommon::NULL_IMAGE_ID) {
         return false;
     }
     Image& image = (*slot_images)[image_id];
@@ -2423,8 +2885,8 @@ bool ImageView::PrepareSampleGrid() {
     return true;
 }
 
-TextureHandle ImageView::SampledHandle(Shader::TextureType texture_type, bool multisample_read,
-                                       u64* out_gpu_resource_id) {
+TextureHandle ImageView::SampledHandleSlow(Shader::TextureType texture_type, bool multisample_read,
+                                           u64* out_gpu_resource_id) {
     if (samples == 1 || multisample_read || sample_grid == nullptr || !MsaaEnabled()) {
         return Handle(texture_type, out_gpu_resource_id);
     }
@@ -2446,23 +2908,6 @@ TextureHandle ImageView::SampledHandle(Shader::TextureType texture_type, bool mu
         *out_gpu_resource_id = grid_view_resource_ids[slot];
     }
     return view.Get();
-}
-
-Attachment ImageView::RenderTarget() const noexcept {
-    const TextureHandle target_texture = render_view ? render_view.Get() : image_texture;
-    if (is_3d_slice) {
-        return Attachment{
-            .texture = target_texture,
-            .level = static_cast<u32>(range.base.level),
-            .slice = 0,
-            .depth_plane = static_cast<u32>(range.base.layer),
-        };
-    }
-    return Attachment{
-        .texture = target_texture,
-        .level = static_cast<u32>(range.base.level),
-        .slice = static_cast<u32>(range.base.layer),
-    };
 }
 
 f32 TextureCacheRuntime::OcarinaLodBias() {
@@ -2536,39 +2981,44 @@ void* Sampler::HandleFor(const ImageView& view, bool is_depth, u64* out_gpu_reso
         RedOnlyBorder = 32,
         TemporalBiasShift = 8,
     };
+    const u8 traits = view.SamplerTraits();
     u16 key = 0;
-    if (has_added_anisotropy && !view.SupportsAnisotropy()) {
+    if (has_added_anisotropy && (traits & ImageView::TraitSupportsAnisotropy) == 0) {
         key |= ReduceAnisotropy;
     }
-    if (has_linear_filtering &&
-        (VideoCore::Surface::IsPixelFormatInteger(view.format) ||
-         view.HostClass() == FormatClass::Stencil ||
-         (Is32BitFloatFormat(view.format) && !DeviceSupports32BitFloatFiltering(*device)))) {
+    if (has_linear_filtering && (traits & ImageView::TraitForceNearest) != 0) {
         key |= ForceNearest;
     }
     // A compare sampler read by a plain sample: Maxwell ignores the comparison.
     if (has_depth_comparison && !is_depth) {
         key |= DropCompare;
     }
-    const Image* const image = view.BackingImage();
-    const bool gpu_written = image != nullptr && True(image->flags & ImageFlagBits::GpuModified);
     if (added_lod_bias != 0.0f) {
+        const Image* const image = view.BackingImage();
+        const bool gpu_written =
+            image != nullptr && True(image->flags & ImageFlagBits::GpuModified);
         if (!VideoCommon::KeepOcarinaFsrLodBias(Settings::IsDockedMode(),
                                                 runtime->ocarina_upscaler_failed, gpu_written)) {
             key |= DropBias;
         }
-    } else if (!gpu_written && runtime->temporal_lod_bias < -0.125f &&
+    } else if (runtime->temporal_lod_bias < -0.125f &&
                runtime->temporal_lod_frame + 2 >= runtime->PoolFrame() &&
                tsc.mipmap_filter.Value() != TextureMipmapFilter::None &&
                tsc.LodBias() == 0.0f && SamplerBiasSupported(*device)) {
-        const u16 steps = static_cast<u16>(
-            std::clamp(static_cast<int>(std::lround(-runtime->temporal_lod_bias * 4.0f)), 0, 15));
-        key |= static_cast<u16>(steps << TemporalBiasShift);
+        const Image* const image = view.BackingImage();
+        const bool gpu_written =
+            image != nullptr && True(image->flags & ImageFlagBits::GpuModified);
+        if (!gpu_written) {
+            const u16 steps = static_cast<u16>(
+                std::clamp(static_cast<int>(std::lround(-runtime->temporal_lod_bias * 4.0f)), 0,
+                           15));
+            key |= static_cast<u16>(steps << TemporalBiasShift);
+        }
     }
-    if (has_srgb_border && VideoCore::Surface::IsPixelFormatSRGB(view.format)) {
+    if (has_srgb_border && (traits & ImageView::TraitIsSrgb) != 0) {
         key |= Srgb;
     }
-    if (is_depth || IsDepth(view.HostClass()) || RedOnlyFormat(view.format)) {
+    if (is_depth || (traits & ImageView::TraitRedOnlyBorder) != 0) {
         key |= RedOnlyBorder;
     }
     if (key == 0) {
@@ -2609,21 +3059,26 @@ void* Sampler::HandleFor(const ImageView& view, bool is_depth, u64* out_gpu_reso
 Framebuffer::Framebuffer(TextureCacheRuntime&, std::span<ImageView*, NUM_RT> color_buffers,
                          ImageView* depth_buffer, const VideoCommon::RenderTargets& key)
     : width{key.size.width}, height{key.size.height} {
-    // The fewest layers among the attachments' views; a 3D slice takes none beyond its own.
     std::optional<u32> view_layers;
-    const auto note_layers = [&view_layers](const ImageView& view) {
+    u32 att_w = ~0U;
+    u32 att_h = ~0U;
+    const auto note_view = [&](const ImageView& view) {
         const u32 count = True(view.flags & ImageViewFlagBits::Slice)
                               ? 1U
                               : static_cast<u32>((std::max)(view.range.extent.layers, 1));
         view_layers = (std::min)(view_layers.value_or(count), count);
+        if (const auto ext = HostExtent(view)) {
+            att_w = (std::min)(att_w, (*ext)[0]);
+            att_h = (std::min)(att_h, (*ext)[1]);
+        }
     };
     for (size_t index = 0; index < NUM_RT; ++index) {
         if (color_buffers[index] != nullptr) {
-            note_layers(*color_buffers[index]);
+            note_view(*color_buffers[index]);
         }
     }
     if (depth_buffer != nullptr) {
-        note_layers(*depth_buffer);
+        note_view(*depth_buffer);
     }
     if (LayersEnabled()) {
         layers = view_layers.value_or(1);
@@ -2646,6 +3101,15 @@ Framebuffer::Framebuffer(TextureCacheRuntime&, std::span<ImageView*, NUM_RT> col
         has_depth = format_class == FormatClass::Depth || format_class == FormatClass::DepthStencil;
         has_stencil =
             format_class == FormatClass::Stencil || format_class == FormatClass::DepthStencil;
+    }
+    if (att_w != ~0U && att_h != ~0U) {
+        attachment_width = att_w;
+        attachment_height = att_h;
+        width = width != 0 ? (std::min)(width, att_w) : att_w;
+        height = height != 0 ? (std::min)(height, att_h) : att_h;
+    } else {
+        attachment_width = width;
+        attachment_height = height;
     }
 }
 

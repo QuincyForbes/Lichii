@@ -16,7 +16,7 @@ Log line: `Ocarina graphics preset <name>: N values in the game's parameter file
 | Console | none (the game as shipped) | unchanged |
 | High | `DepthShadowTexWidth/Height=2048` | unchanged |
 
-Default: Phone Low on iPhones (device profile), Console elsewhere.
+Default: Phone Low on iPhones and non-Ultra iPads (device profile), Balanced elsewhere.
 
 ## Testing switches
 

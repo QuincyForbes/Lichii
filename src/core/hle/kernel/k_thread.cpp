@@ -210,6 +210,9 @@ namespace Kernel {
         m_schedule_count = -1;
         m_yield_core_id = -1;
         m_yield_core_seq = 0;
+        m_nx2_futile_yield_streak = 0;
+        m_nx2_yield_spin_streak = 0;
+        m_nx2_yield_handoff_until_ns = 0;
         m_last_scheduled_tick = 0;
         m_light_ipc_data = nullptr;
 
@@ -649,7 +652,8 @@ namespace Kernel {
         R_SUCCEED();
     }
 
-    Result KThread::SetCoreMask(KernelCore& kernel, s32 core_id, u64 v_affinity_mask) {
+    Result KThread::SetCoreMask(KernelCore& kernel, s32 core_id, u64 v_affinity_mask,
+                                s32 phys_ideal_override, u64 phys_affinity_override) {
         ASSERT(m_parent != nullptr);
         ASSERT(v_affinity_mask != 0);
         KScopedLightLock lk(m_activity_pause_lock);
@@ -666,7 +670,9 @@ namespace Kernel {
             } else {
                 // Preserve our ideal core id.
                 core_id = m_virtual_ideal_core_id;
-                R_UNLESS(((1ULL << core_id) & v_affinity_mask) != 0, ResultInvalidCombination);
+                if (core_id >= 0) {
+                    R_UNLESS(((1ULL << core_id) & v_affinity_mask) != 0, ResultInvalidCombination);
+                }
             }
 
             // Set our affinity mask.
@@ -682,6 +688,13 @@ namespace Kernel {
                 const u64 next = std::countr_zero(v_affinity_mask);
                 v_affinity_mask &= ~(1ULL << next);
                 p_affinity_mask |= (1ULL << Core::Hardware::VirtualToPhysicalCoreMap[next]);
+            }
+
+            if (phys_affinity_override != 0) {
+                p_affinity_mask = phys_affinity_override;
+                if (phys_ideal_override >= -2) {
+                    core_id = phys_ideal_override;
+                }
             }
 
             // If we haven't disabled migration, perform an affinity change.

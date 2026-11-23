@@ -26,27 +26,33 @@ namespace Core {
 
 class GPUDirtyMemoryManager {
 public:
-    GPUDirtyMemoryManager() : current{default_transform} {
+    GPUDirtyMemoryManager() {
+        for (auto& slot : current) {
+            slot.store(default_transform, std::memory_order_relaxed);
+        }
         back_buffer.reserve(256);
         front_buffer.reserve(256);
     }
 
     ~GPUDirtyMemoryManager() = default;
 
-    void Collect(PAddr address, size_t size) {
+    /// Collects [address, address + size) and returns true when at least one 64-byte granule bit
+    /// was newly set since the last Gather.
+    bool Collect(PAddr address, size_t size) {
         // A transform covers one 2 KiB page: a write past its page goes in a page at a time. Its
         // mask was otherwise built with shifts of 32 or more, which could leave it wrong or empty
         // and lose the write (zortos293/Lichii#1586, #1591).
-        if ((address & page_mask) + size <= page_size || !SplitAcrossPages()) [[likely]] {
-            CollectInPage(address, size);
-            return;
+        if ((address & page_mask) + size <= page_size || !SplitAcrossPages()) {
+            return CollectInPage(address, size);
         }
+        bool any_new = false;
         while (size != 0) {
             const size_t in_page = (std::min<size_t>)(size, page_size - (address & page_mask));
-            CollectInPage(address, in_page);
+            any_new |= CollectInPage(address, in_page);
             address += in_page;
             size -= in_page;
         }
+        return any_new;
     }
 
     /// EDEN_NX2_COLLECT_SPLIT=0: a write crossing a 2 KiB page is collected as one transform, as
@@ -60,33 +66,51 @@ public:
     }
 
 private:
-    void CollectInPage(PAddr address, size_t size) {
-        TransformAddress t = BuildTransform(address, size);
-        TransformAddress tmp, original;
+    bool CollectInPage(PAddr address, size_t size) {
+        const TransformAddress t = BuildTransform(address, size);
+        auto& slot = current[t.address & (num_current_slots - 1)];
+        TransformAddress tmp = slot.load(std::memory_order_acquire);
+        if (tmp.address == t.address && (tmp.mask | t.mask) == tmp.mask) {
+            return false;
+        }
+        TransformAddress original;
         do {
-            tmp = current.load(std::memory_order_acquire);
             original = tmp;
             if (tmp.address != t.address) {
                 if (IsValid(tmp.address)) {
                     std::scoped_lock lk(guard);
-                    back_buffer.emplace_back(tmp);
-                    has_back.store(true, std::memory_order_release);
-                    current.exchange(t, std::memory_order_seq_cst);
+                    const TransformAddress prev = slot.exchange(t, std::memory_order_seq_cst);
+                    if (prev.address == t.address) {
+                        if ((prev.mask | t.mask) == prev.mask) {
+                            return false;
+                        }
+                        TransformAddress merged = t;
+                        merged.mask |= prev.mask;
+                        slot.store(merged, std::memory_order_seq_cst);
+                    } else if (IsValid(prev.address)) {
+                        back_buffer.emplace_back(prev);
+                        has_back.store(true, std::memory_order_release);
+                    }
                     NoteAnyWrites();
-                    return;
+                    return true;
                 }
                 tmp.address = t.address;
                 tmp.mask = 0;
             }
             if ((tmp.mask | t.mask) == tmp.mask) {
-                return;
+                return false;
             }
             tmp.mask |= t.mask;
-        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_seq_cst,
-                                                std::memory_order_relaxed));
+            if (slot.compare_exchange_weak(original, tmp, std::memory_order_seq_cst,
+                                           std::memory_order_acquire)) {
+                break;
+            }
+            tmp = original;
+        } while (true);
         if (!IsValid(original.address)) {
             NoteAnyWrites();
         }
+        return true;
     }
 
 public:
@@ -104,8 +128,16 @@ public:
         any_gatherers.fetch_sub(1, std::memory_order_seq_cst);
     }
 
+    [[nodiscard]] u64 GatherEpoch() const noexcept {
+        return gather_epoch.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] const std::atomic<u64>* GatherEpochPtr() const noexcept {
+        return &gather_epoch;
+    }
+
     bool MayHaveWrites() const {
-        return IsValid(current.load(std::memory_order_acquire).address) ||
+        return AnyCurrentValid() ||
                has_back.load(std::memory_order_acquire) ||
                has_front.load(std::memory_order_acquire);
     }
@@ -122,9 +154,11 @@ public:
             std::scoped_lock lk(guard);
             pending = back_buffer;
             pending.insert(pending.end(), front_buffer.begin(), front_buffer.end());
-            const TransformAddress t = current.load(std::memory_order_acquire);
-            if (IsValid(t.address)) {
-                pending.push_back(t);
+            for (const auto& slot : current) {
+                const TransformAddress t = slot.load(std::memory_order_acquire);
+                if (IsValid(t.address)) {
+                    pending.push_back(t);
+                }
             }
         }
         for (const auto& transform : pending) {
@@ -133,11 +167,11 @@ public:
     }
 
     void Gather(std::function<void(PAddr, size_t)>& callback) {
-        // Nothing collected: back_buffer only grows (under guard) while current holds a valid
-        // address, and only Gather resets current, so an invalid current means both are empty.
+        // Nothing collected: back_buffer only grows (under guard) while a current slot holds a
+        // valid address, and only Gather resets current.
         // Every fence gathers each core's manager; most find nothing.
         if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::DirtyGatherFast) &&
-            !IsValid(current.load(std::memory_order_acquire).address)) {
+            !AnyCurrentValid() && !has_back.load(std::memory_order_acquire)) {
             return;
         }
         // FlushRegion also gathers off the GPU thread (host1x video decode reads); serialize
@@ -145,12 +179,17 @@ public:
         std::scoped_lock gather_lk(gather_guard);
         {
             std::scoped_lock lk(guard);
-            TransformAddress t = current.exchange(default_transform, std::memory_order_seq_cst);
+            gather_epoch.fetch_add(1, std::memory_order_seq_cst);
             front_buffer.swap(back_buffer);
             has_back.store(false, std::memory_order_relaxed);
-            if (IsValid(t.address)) {
-                front_buffer.emplace_back(t);
+            for (auto& slot : current) {
+                const TransformAddress t =
+                    slot.exchange(default_transform, std::memory_order_seq_cst);
+                if (IsValid(t.address)) {
+                    front_buffer.emplace_back(t);
+                }
             }
+            gather_epoch.fetch_add(1, std::memory_order_seq_cst);
             has_front.store(!front_buffer.empty(), std::memory_order_release);
         }
         for (auto& transform : front_buffer) {
@@ -179,8 +218,10 @@ public:
             return (t.mask & CreateMask<u32>(top_bit, minor_bit)) != 0;
         };
         std::scoped_lock lk(guard);
-        if (overlaps(current.load(std::memory_order_acquire))) {
-            return true;
+        for (const auto& slot : current) {
+            if (overlaps(slot.load(std::memory_order_acquire))) {
+                return true;
+            }
         }
         for (const TransformAddress& t : back_buffer) {
             if (overlaps(t)) {
@@ -224,10 +265,20 @@ private:
     constexpr static size_t align_bits = 6U;
     constexpr static size_t align_size = 1U << align_bits;
     constexpr static size_t align_mask = align_size - 1;
+    constexpr static size_t num_current_slots = 4U;
     constexpr static TransformAddress default_transform = {.address = ~0U, .mask = 0U};
 
     static constexpr bool IsValid(PAddr address) {
         return address < (1ULL << 39);
+    }
+
+    bool AnyCurrentValid() const noexcept {
+        for (const auto& slot : current) {
+            if (IsValid(slot.load(std::memory_order_acquire).address)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static void NoteAnyWrites() {
@@ -259,7 +310,8 @@ private:
         return result;
     }
 
-    std::atomic<TransformAddress> current{};
+    std::array<std::atomic<TransformAddress>, num_current_slots> current{};
+    std::atomic<u64> gather_epoch{2};
     std::atomic<bool> has_back{};
     std::atomic<bool> has_front{};
     std::mutex guard;

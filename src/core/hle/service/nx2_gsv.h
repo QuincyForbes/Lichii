@@ -350,6 +350,10 @@ private:
                                            Common::PerfReport::NowNs() - armed_ns);
                 }
             });
+        if (request.handle != 0) {
+            VideoCommon::Nx2GpuLatency::NoteGuestWait();
+            system.GPU().NotifySyncpointWait();
+        }
         TipcReplyWords(ctx, {});
     }
 
@@ -657,21 +661,25 @@ private:
     // console's graphics server completes unmap jobs behind the submitted work.
     void SignalAfterGpu(u32 slot, bool release_memory = false) {
         auto* const event = EventFor(slot);
-        system.GPU().RunInOrder([this, event, release_memory] {
-            if (release_memory) {
-                system.GPU().Renderer().ReadRasterizer()->SignalFence(
-                    [this, event] { event->Signal(system.Kernel()); }, true);
-            } else {
-                event->Signal(system.Kernel());
-            }
-        });
+        system.GPU().RunInOrder(
+            [this, event, release_memory] {
+                if (release_memory) {
+                    system.GPU().Renderer().ReadRasterizer()->SignalFence(
+                        [this, event] { event->Signal(system.Kernel()); }, true);
+                } else {
+                    event->Signal(system.Kernel());
+                }
+            },
+            false);
     }
 
     void QueueBackingRelease(std::shared_ptr<std::atomic<bool>> done) {
-        system.GPU().RunInOrder([this, done] {
-            system.GPU().Renderer().ReadRasterizer()->SignalFence(
-                [done] { done->store(true, std::memory_order_release); }, true);
-        });
+        system.GPU().RunInOrder(
+            [this, done] {
+                system.GPU().Renderer().ReadRasterizer()->SignalFence(
+                    [done] { done->store(true, std::memory_order_release); }, true);
+            },
+            false);
     }
 
     // Sub 102: word 2 is the memory handle 101 returned, word 3 the job slot. The game frees the
@@ -1806,8 +1814,18 @@ inline u32 Nx2VsyncRateHz() {
         const char* text = std::getenv("EDEN_NX2_VSYNC_HZ");
         return text ? (std::max)(std::strtoll(text, nullptr, 10), 1LL) : 0LL;
     }();
-    u32 hz = forced != 0 ? static_cast<u32>(forced)
-                         : (std::max<u32>)(Settings::FrameRateLimit(), 1);
+    constexpr u32 kUnlockedVsyncHz = 1000;
+    u32 hz = 0;
+    if (forced != 0) {
+        hz = static_cast<u32>(forced);
+    } else if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
+        hz = kUnlockedVsyncHz;
+    } else {
+        hz = (std::max<u32>)(Settings::FrameRateLimit(), 1);
+        if (const u32 speed = Settings::SpeedLimit(); speed > 100) {
+            hz = (std::min<u32>)(hz * speed / 100, kUnlockedVsyncHz);
+        }
+    }
     if (const u32 thermal_cap = Common::PlatformEvents::ThermalMaxFps();
         thermal_cap != 0 && thermal_cap < hz) {
         hz = thermal_cap;
@@ -1971,7 +1989,9 @@ private:
             frames_ahead = (video_playing || light_ui_frame) ? 0 : 1;
         }
         const auto entered = std::chrono::steady_clock::now();
-        m_host_while_suspended = frames_ahead != 0;
+        // Ocarina suspends GPU channels routinely during 3D rendering; keeping m_host_while_suspended
+        // true when frames_ahead == 1 forced WaitForFrame onto a host wait that froze guest Core 3.
+        m_host_while_suspended = frames_ahead != 0 && app_program_id != OcarinaOfTimeProgramId;
         if (frames_ahead == 1 && m_ahead_cooldown != 0) {
             --m_ahead_cooldown;
             WaitForFrame(~w[22], w[24]);
@@ -1979,20 +1999,21 @@ private:
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
                       m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,
                       ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
-            // With EDEN_NX2_FRAMES_AHEAD=1, only run a frame ahead while the GPU keeps up. With
-            // the previous frame still on the GPU here, the GPU is the limit and running ahead
-            // gains nothing; and Splatoon Raiders, which reuses its command memory as if the GPU
-            // were at most a frame behind, rewrote command lists Eden had not read yet (misread
-            // commands, then crashes, with a slow GPU). Wait for this frame too then. Not when a
-            // suspended channel brought us here: this frame can't finish before the present
-            // returns.
-            const bool gpu_behind = frames_ahead == 1 && m_previous_fence_id < 192 &&
-                                    !system.Host1x().GetSyncpointManager().IsReadyGuest(
-                                        m_previous_fence_id, m_previous_fence_value);
-            WaitForFrame(m_previous_fence_id, m_previous_fence_value);
-            if (gpu_behind) {
+            // Waiting for m_previous_fence already bounds Ocarina of Time to at most one frame in
+            // flight on the GPU thread (preserving CPU/GPU overlap when GPU > CPU). Only drain the
+            // current frame (~w[22]) if m_previous_fence timed out, or for non-Ocarina titles under
+            // EDEN_NX2_FRAMES_AHEAD=1 (Splatoon Raiders command-list reuse on slow GPUs).
+            const bool drain_behind = frames_ahead == 1 &&
+                                      app_program_id != OcarinaOfTimeProgramId &&
+                                      m_previous_fence_id < 192 &&
+                                      !system.Host1x().GetSyncpointManager().IsReadyGuest(
+                                          m_previous_fence_id, m_previous_fence_value);
+            const bool prev_ready = WaitForFrame(m_previous_fence_id, m_previous_fence_value);
+            if (drain_behind || !prev_ready) {
                 WaitForFrame(~w[22], w[24]);
-                m_ahead_cooldown = 2;
+                if (drain_behind) {
+                    m_ahead_cooldown = 2;
+                }
             }
         } else if (frames_ahead == 0) {
             static const bool back_wait_start = [] {
@@ -2675,13 +2696,15 @@ private:
         };
         auto wake = std::make_shared<Wake>();
         VideoCommon::Nx2GpuLatency::NoteGuestWait();
-        system.GPU().RunInOrder([wake] {
-            {
-                std::scoped_lock lk{wake->mutex};
-                wake->done = true;
-            }
-            wake->cv.notify_all();
-        });
+        system.GPU().RunInOrder(
+            [wake] {
+                {
+                    std::scoped_lock lk{wake->mutex};
+                    wake->done = true;
+                }
+                wake->cv.notify_all();
+            },
+            false);
         std::unique_lock lk{wake->mutex};
         wake->cv.wait_for(lk, std::chrono::milliseconds{4000},
                           [&] { return wake->done || !system.IsPoweredOn(); });
@@ -2715,6 +2738,7 @@ private:
         if (!syncpoints.IsReadyGuest(fence_id, fence_value)) {
             // The game is blocked on the GPU, so it isn't writing what queued lists read.
             VideoCommon::Nx2GpuLatency::NoteGuestWait();
+            system.GPU().NotifySyncpointWait();
             // Title 1's channels resume and suspend again while they wait on this thread, so any
             // suspension counts, not only an unbroken one.
             bool gpu_waited = false;
@@ -5240,6 +5264,7 @@ private:
         std::array<u64, 0x40> changed_ids{};
         UpdateSyncptValues(&changed_ids);
         bool acked = false;
+        bool any_new_wait = false;
         for (u32 w = 0; w < words; ++w) {
             const u64 diff = armed[w] ^ m_last_ro_bits[w];
             for (u64 bits = diff; bits != 0; bits &= bits - 1) {
@@ -5252,6 +5277,7 @@ private:
                 m_last_ro_bits[w] = armed[w];
                 m_syncpt_memory->Write64(m_syncpt_ro + SyncptRoBitsOffset + w * 8, armed[w]);
                 acked = true;
+                any_new_wait = true;
             }
             if (w < changed_ids.size() && (armed[w] & changed_ids[w]) != 0) {
                 acked = true;
@@ -5263,6 +5289,10 @@ private:
             m_syncpt_memory->Write64(m_syncpt_ro + SyncptRoSummaryOffset, rw_summary);
         }
         ArmSyncptWatches();
+        if (any_new_wait) {
+            VideoCommon::Nx2GpuLatency::NoteGuestWait();
+            system.GPU().NotifySyncpointWait();
+        }
         if (acked) {
             m_syncpt_events[1]->Signal(system.Kernel());
         }

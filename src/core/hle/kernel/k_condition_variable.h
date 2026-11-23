@@ -37,6 +37,7 @@ public:
 
 private:
     void SignalImpl(KernelCore& kernel, KThread* thread);
+    void SignalSlow(u64 cv_key, s32 count);
 
 private:
     Core::System& m_system;

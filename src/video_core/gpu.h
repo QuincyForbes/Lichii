@@ -262,11 +262,20 @@ public:
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
     [[nodiscard]] VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size);
 
+    [[nodiscard]] bool IsCleanReadTrapPage(DAddr page_addr) const;
+
+    [[nodiscard]] std::optional<VideoCore::RasterizerDownloadArea> TryFastCleanRead(
+        DAddr page_begin, u64 page_bytes);
+
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
     void FlushRegion(DAddr addr, u64 size);
 
     /// Runs func on the GPU thread after the command lists submitted so far.
-    void RunInOrder(std::function<void()>&& func);
+    void RunInOrder(std::function<void()>&& func, bool changes_mappings = true);
+
+    /// Wakes the GPU back thread to commit any deferred fence submission when a guest thread
+    /// blocks waiting on an unreached syncpoint.
+    void NotifySyncpointWait();
 
     /// RunInOrder for GPU memory maps: also done before the GPU thread reads the command lists
     /// submitted later (with the GPU split, on its front rather than its back).

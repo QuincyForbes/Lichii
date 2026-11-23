@@ -109,6 +109,27 @@ constexpr u32 StateColorTypesShift = 8;
     return enabled;
 }
 
+/// EDEN_NX2_METAL_DESCRIPTOR_ALIASING=0: back to one SPIR-V type per SSBO (scalarized 64/128-bit
+/// loads/stores and software 8/16-bit & f32 atomics).
+[[nodiscard]] bool DescriptorAliasingEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_DESCRIPTOR_ALIASING");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// EDEN_NX2_METAL_SPIRV_NAN_PRESERVE=1: emits SPIR-V SignedZeroInfNanPreserve (forces software
+/// `precise::*` transcendentals in MSL; off by default because MTLMathModeRelaxed already
+/// preserves NaN and Inf at hardware SFU speed).
+[[nodiscard]] bool SpirvNanPreserveEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_SPIRV_NAN_PRESERVE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
 /// Two bits per generic attribute: 0 disabled (or constant), 1 float, 2 signed, 3 unsigned
 /// integer, by Maxwell's VertexAttribute::Type. Normalized and scaled types read as floats. This
 /// is the table FixedPipelineState::DynamicAttributeTypes had before b8d5405b1a packed it into the
@@ -318,7 +339,7 @@ static_assert(std::is_trivially_copyable_v<ShaderTranslate::ResourceSlot>);
 static_assert(std::is_trivially_copyable_v<ShaderTranslate::TessellationSlots>);
 
 constexpr std::array<char, 8> StageMslMagic{'M', 'T', 'L', 'S', 'T', 'G', '0', '2'};
-constexpr u32 StageMslVersion = 4;
+constexpr u32 StageMslVersion = 6;
 constexpr u32 MaxMslSourceBytes = 16U << 20;
 constexpr u32 MaxStageRecordBytes = 40U << 20;
 
@@ -843,7 +864,7 @@ void PipelineTranslator::Refuse(std::atomic<u32>& count, u64 hash, std::string_v
 }
 
 void PipelineTranslator::RefreshKey(GraphicsPipelineKey& key, const Maxwell& regs,
-                                    Maxwell::PrimitiveTopology topology) {
+                                    Maxwell::PrimitiveTopology topology, bool* inout_has_xfb) {
     key.topology = static_cast<u32>(topology);
     key.early_z = regs.mandated_early_z != 0 ? 1 : 0;
     key.attribute_types = AttributeTypes(regs);
@@ -859,7 +880,24 @@ void PipelineTranslator::RefreshKey(GraphicsPipelineKey& key, const Maxwell& reg
         key.tessellation |= (std::clamp(regs.patch_vertices, 1U, 32U) - 1) << TessPatchShift;
     }
     RefreshFixedState(key, regs);
-    key.xfb = Xfb::MakeLayout(regs, topology, key.unique_hashes[4] != 0);
+    const bool xfb_possible =
+        regs.transform_feedback_enabled != 0 &&
+        (key.unique_hashes[4] != 0 || topology == Maxwell::PrimitiveTopology::Points ||
+         topology == Maxwell::PrimitiveTopology::Lines ||
+         topology == Maxwell::PrimitiveTopology::Triangles);
+    if (!xfb_possible) {
+        if (inout_has_xfb == nullptr || *inout_has_xfb) {
+            key.xfb = {};
+            if (inout_has_xfb != nullptr) {
+                *inout_has_xfb = false;
+            }
+        }
+    } else {
+        key.xfb = Xfb::MakeLayout(regs, topology, key.unique_hashes[4] != 0);
+        if (inout_has_xfb != nullptr) {
+            *inout_has_xfb = key.xfb.Active();
+        }
+    }
 }
 
 size_t GraphicsPipelineKey::Hash() const noexcept {
@@ -872,11 +910,27 @@ size_t ComputePipelineKey::Hash() const noexcept {
         Common::CityHash64(reinterpret_cast<const char*>(this), sizeof *this));
 }
 
+namespace {
+
+[[nodiscard]] bool NativeMeshExplicitlyDisabled() {
+    static const bool disabled = [] {
+        const char* value = std::getenv("EDEN_NX2_METAL_MESH_NATIVE");
+        if (value == nullptr) {
+            value = std::getenv("EDEN_NX2_METAL_NATIVE_MESH");
+        }
+        return value != nullptr && value[0] == '0';
+    }();
+    return disabled;
+}
+
+} // Anonymous namespace
+
 PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_mesh_,
                                        VideoCommon::StageCache* stage_cache_,
                                        StageMslCache* msl_cache_)
     : stage_cache{stage_cache_}, msl_cache{msl_cache_},
-      native_mesh{native_mesh_ && NativeMeshEnabled()}, native_mesh_capable{native_mesh_} {
+      native_mesh{native_mesh_ && NativeMeshEnabled()},
+      native_mesh_capable{native_mesh_ && !NativeMeshExplicitlyDisabled()} {
     enum class PreciseMode : u8 { All, Mixed, Fma, Strip };
     static const PreciseMode precise_mode = [] {
         const char* const value = std::getenv("EDEN_NX2_METAL_PRECISE");
@@ -896,7 +950,7 @@ PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_m
     profile = Shader::Profile{
         .supported_spirv = 0x00010300,
         .unified_descriptor_binding = true,
-        .support_descriptor_aliasing = false,
+        .support_descriptor_aliasing = DescriptorAliasingEnabled(),
         .support_int8 = true,
         .support_uniform_and_storage_buffer_8bit = true,
         .support_storage_buffer_8bit = true,
@@ -905,9 +959,10 @@ PipelineTranslator::PipelineTranslator(bool ios, u32 apple_family, bool native_m
         .support_storage_buffer_16bit = true,
         .support_int64 = true,
         .support_vertex_instance_id = false,
-        .support_float_controls = true,
-        .support_fp16_signed_zero_nan_preserve = true,
-        .support_fp32_signed_zero_nan_preserve = true,
+        .support_float_controls = SpirvNanPreserveEnabled(),
+        .support_fp16_signed_zero_nan_preserve = SpirvNanPreserveEnabled(),
+        .support_fp32_signed_zero_nan_preserve = SpirvNanPreserveEnabled(),
+        .support_quad_shuffles = true,
         .support_vote = true,
         // Metal has simd_shuffle_up/down/xor (SPIRV-Cross's ShuffleUp/Down/Xor), as MoltenVK
         // reports VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT: without, every relative shuffle
@@ -1052,7 +1107,8 @@ std::optional<StageProgram> PipelineTranslator::TranslateCached(
     if (translation == nullptr) {
         return Translate(program, stage, bindings, runtime_info, &eff_options);
     }
-    std::vector<u8> runtime_key = Cache::RuntimeKey(runtime_info, bindings);
+    std::vector<u8> runtime_key =
+        Cache::RuntimeKey(runtime_info, bindings, profile.support_descriptor_aliasing);
     std::shared_ptr<const Cache::Emitted> emitted;
     if (stage_reuse.reused[slot]) {
         emitted = stage_cache->FindEmitted(*stage_reuse.reused[slot], runtime_key);
@@ -1280,7 +1336,11 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
         std::optional<NativeMesh> native;
         if (native_mesh) {
             native = NativeMeshPipeline(key, programs, mesh_index);
-            if (native && !eager_fallback) {
+            const bool writes_per_primitive =
+                std::ranges::any_of(programs[mesh_index].mesh.primitive_lines, [](u32 line) {
+                    return Shader::IR::IsGeneric(static_cast<Shader::IR::Attribute>(line));
+                });
+            if (native && !eager_fallback && !writes_per_primitive) {
                 cause.clear();
                 detail.clear();
                 return TranslatedPipeline{.native_mesh = std::move(native)};
@@ -1297,12 +1357,16 @@ std::optional<TranslatedPipeline> PipelineTranslator::Graphics(
                 return std::nullopt;
             }
         } else {
-            native_cause = "the device has no Metal 3 mesh pipelines (or EDEN_NX2_METAL_MESH_NATIVE=0)";
+            native_cause =
+                native_mesh_capable
+                    ? "compute mesh emulation is default (EDEN_NX2_METAL_MESH_NATIVE=1 for native)"
+                    : "the device has no Metal 3 mesh pipelines (or EDEN_NX2_METAL_MESH_NATIVE=0)";
         }
         std::optional<TranslatedPipeline> emulated = Mesh(key, programs, mesh_index);
         if (!native && !emulated && !native_mesh && native_mesh_capable) {
             // The emulation is the default path; what it can't take still gets Metal's mesh
             // stage when the device has one (else the pipeline's draws were all refused).
+            native_cause.clear();
             std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> native_programs;
             size_t native_index = 0;
             if (TranslatePrograms(key, envs, native_programs, native_index)) {
@@ -1866,9 +1930,11 @@ std::optional<TranslatedPipeline> PipelineTranslator::Mesh(
         target.workgroup_size = programs[index].workgroup_size;
     }
     if (has_task) {
+        ShaderTranslate::Options dist_options = translate_options;
+        dist_options.sampler_reduction = false;
         ShaderTranslate::Result distribution = ShaderTranslate::SpirvToMsl(
             Shader::Backend::SPIRV::EmitMeshEmulationDistribution(profile),
-            ShaderTranslate::Stage::Compute, translate_options);
+            ShaderTranslate::Stage::Compute, dist_options);
         if (distribution.source.empty()) {
             Refuse(refused_logged, hash, "SPIR-V to MSL failed", distribution.error);
             return std::nullopt;
@@ -1887,6 +1953,7 @@ std::optional<TranslatedPipeline> PipelineTranslator::Mesh(
         (key.state & StateDepthMinusOneToOne) != 0,
         FixedStateEnabled() && topology == 0 ? std::bit_cast<float>(key.point_size) : 1.0f);
     ShaderTranslate::Options vertex_options = translate_options;
+    vertex_options.sampler_reduction = false;
     vertex_options.point_size_builtin = topology == 0;
     ShaderTranslate::Result vertex =
         ShaderTranslate::SpirvToMsl(vertex_spirv, ShaderTranslate::Stage::Vertex, vertex_options);
@@ -1942,17 +2009,17 @@ bool NativeMeshEnabled() {
         if (value == nullptr) {
             value = std::getenv("EDEN_NX2_METAL_NATIVE_MESH");
         }
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] != '0';
     }();
     return enabled;
 }
 
-bool NativeMeshPerPrimitive() {
-    static const bool enabled = [] {
+bool NativeMeshPerPrimitive(bool ios) {
+    static const int override_mode = [] {
         const char* const value = std::getenv("EDEN_NX2_METAL_MESH_PER_PRIMITIVE");
-        return value == nullptr || value[0] != '0';
+        return value == nullptr ? -1 : (value[0] != '0' ? 1 : 0);
     }();
-    return enabled;
+    return override_mode >= 0 ? override_mode != 0 : !ios;
 }
 
 namespace {
@@ -2051,7 +2118,7 @@ std::optional<NativeMesh> PipelineTranslator::NativeMeshPipeline(
         native_cause = std::move(*limit);
         return std::nullopt;
     }
-    if (WritesPerPrimitiveGenerics(mesh) && !NativeMeshPerPrimitive()) {
+    if (WritesPerPrimitiveGenerics(mesh) && !NativeMeshPerPrimitive(translate_options.ios)) {
         native_cause = "writes per-primitive attributes (emulated, as Vulkan on MoltenVK; "
                        "EDEN_NX2_METAL_MESH_PER_PRIMITIVE=1 builds it natively)";
         return std::nullopt;
@@ -2399,7 +2466,8 @@ std::optional<StageProgram> PipelineTranslator::Compute(u64 unique_hash,
         std::shared_ptr<const Cache::Translation> reused = stage_cache->Find(signature, env);
         const Shader::RuntimeInfo runtime_info{};
         Shader::Backend::Bindings bindings{};
-        std::vector<u8> runtime_key = Cache::RuntimeKey(runtime_info, bindings);
+        std::vector<u8> runtime_key =
+        Cache::RuntimeKey(runtime_info, bindings, profile.support_descriptor_aliasing);
         if (reused && !stage_cache->Verify()) {
             if (const auto emitted = stage_cache->FindEmitted(*reused, runtime_key)) {
                 stage_cache->CountReuse(true);

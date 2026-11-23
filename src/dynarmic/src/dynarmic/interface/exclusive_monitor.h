@@ -94,9 +94,9 @@ private:
 
     static constexpr VAddr RESERVATION_GRANULE_MASK = 0xFFFF'FFFF'FFFF'FFFFull;
     static constexpr VAddr INVALID_EXCLUSIVE_ADDRESS = 0xDEAD'DEAD'DEAD'DEADull;
-    static constexpr size_t MAX_NUM_CPU_CORES = 6; // Sync with src/core/hardware_properties
+    static constexpr size_t MAX_NUM_CPU_CORES = 8; // Sync with src/core/hardware_properties
     /// A processor's reservation. Every exclusive load and store on that processor writes it, so
-    /// each has its own cache line: packed together, all six shared one or two lines, which
+    /// each has its own cache line: packed together, all eight shared one or two lines, which
     /// guest atomics on any two cores bounced between them. Apple silicon's lines are 128 bytes.
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
     static constexpr std::size_t RESERVATION_ALIGNMENT = 128;

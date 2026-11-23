@@ -62,23 +62,14 @@ public:
         }
     }
 
-public:
-    static constexpr size_t NumWaiterStripes = 64;
-
-    static constexpr size_t WaiterStripeIndex(uint64_t addr) {
-        return static_cast<size_t>(((addr >> 2) ^ (addr >> 10)) & (NumWaiterStripes - 1));
-    }
-
-    void NoteWaiterRemoved(uint64_t addr) {
-        m_waiter_stripes[WaiterStripeIndex(addr)].fetch_sub(1, std::memory_order_relaxed);
-    }
+    bool TryFastSignalToAddress(uint64_t addr, Svc::SignalType type, s32 value, s32 count,
+                                Result* out_result);
+    bool TryFastWaitForAddress(uint64_t addr, Svc::ArbitrationType type, s64 value, s64 timeout_ns,
+                               Result* out_result);
 
 private:
-    std::atomic<u32>& WaiterStripe(uint64_t addr) {
-        return m_waiter_stripes[WaiterStripeIndex(addr)];
-    }
-
     Result Signal(uint64_t addr, s32 count);
+    Result SignalSlow(uint64_t addr, s32 count);
     Result SignalAndIncrementIfEqual(uint64_t addr, s32 value, s32 count);
     Result SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32 value, s32 count);
     Result WaitIfLessThan(uint64_t addr, s32 value, bool decrement, s64 timeout);
@@ -86,7 +77,6 @@ private:
 
 private:
     ThreadTree m_tree;
-    std::array<std::atomic<u32>, NumWaiterStripes> m_waiter_stripes{};
     Core::System& system;
 };
 

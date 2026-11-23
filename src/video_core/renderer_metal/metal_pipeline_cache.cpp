@@ -332,6 +332,35 @@ std::string_view PipelineCache::NoteRefusal(u64 key_hash) {
     return it->second;
 }
 
+namespace {
+bool StageInfoMayWriteMemory(const Shader::Info& info) noexcept {
+    if (info.stores_global_memory || info.uses_global_increment || info.uses_global_decrement ||
+        info.uses_int64_bit_atomics || info.uses_atomic_f32_add || info.uses_atomic_f16x2_add ||
+        info.uses_atomic_f16x2_min || info.uses_atomic_f16x2_max || info.uses_atomic_f32x2_add ||
+        info.uses_atomic_f32x2_min || info.uses_atomic_f32x2_max || info.uses_atomic_s32_min ||
+        info.uses_atomic_s32_max || info.uses_atomic_image_u32 || info.uses_typeless_image_writes ||
+        info.is_task || info.is_mesh) {
+        return true;
+    }
+    for (const auto& desc : info.storage_buffers_descriptors) {
+        if (desc.is_written) {
+            return true;
+        }
+    }
+    for (const auto& desc : info.image_buffer_descriptors) {
+        if (desc.is_written) {
+            return true;
+        }
+    }
+    for (const auto& desc : info.image_descriptors) {
+        if (desc.is_written) {
+            return true;
+        }
+    }
+    return false;
+}
+} // Anonymous namespace
+
 GraphicsPipeline::GraphicsPipeline(const GraphicsPipelineKey& key_, StageProgram vertex_,
                                    StageProgram fragment_, std::optional<MeshEmulation> mesh_,
                                    std::optional<Tessellation> tessellation_,
@@ -340,7 +369,8 @@ GraphicsPipeline::GraphicsPipeline(const GraphicsPipelineKey& key_, StageProgram
                                    std::optional<GeometryCompute> geometry_)
     : key{key_}, vertex{std::move(vertex_)}, fragment{std::move(fragment_)},
       mesh{std::move(mesh_)}, tessellation{std::move(tessellation_)},
-      native_mesh{std::move(native_mesh_)}, xfb{std::move(xfb_)}, geometry{std::move(geometry_)} {
+      native_mesh{std::move(native_mesh_)}, xfb{std::move(xfb_)}, geometry{std::move(geometry_)},
+      has_xfb_key{key_.xfb.Active()} {
     const StageProgram& frag =
         !fragment.entry_point.empty()
             ? fragment
@@ -427,6 +457,96 @@ GraphicsPipeline::GraphicsPipeline(const GraphicsPipelineKey& key_, StageProgram
         }
         build_stage_kinds(geometry->kernel.program);
     }
+
+    const auto fill_uniforms = [&](bool use_native,
+                                   std::array<u32, VideoCommon::NUM_STAGES>& out_masks,
+                                   VideoCommon::UniformBufferSizes& out_sizes) {
+        const NativeMesh* const nat = use_native && native_mesh ? &*native_mesh : nullptr;
+        const MeshEmulation* const emu = nat != nullptr ? nullptr : (mesh ? &*mesh : nullptr);
+        const Tessellation* const tess = tessellation ? &*tessellation : nullptr;
+        const GeometryCompute* const geo = geometry ? &*geometry : nullptr;
+        const bool nat_task = nat != nullptr && !nat->object.entry_point.empty();
+        const bool has_task = (emu != nullptr && emu->has_task) || nat_task;
+        const u32 mstage = nat != nullptr ? nat->mesh_stage : emu != nullptr ? emu->mesh_stage : 0U;
+        const bool tess_geo = tess != nullptr && geo != nullptr;
+        const std::array<size_t, 5> stages{
+            0,
+            has_task          ? size_t{mstage}
+            : tess != nullptr ? size_t{1}
+            : geo != nullptr  ? size_t{3}
+                              : 0,
+            tess != nullptr ? size_t{2} : 0, 3, 4};
+        const std::array<const StageProgram*, 5> progs{
+            nat != nullptr   ? (nat_task ? &nat->object : &nat->mesh)
+            : emu != nullptr ? &emu->first.program
+            : tess != nullptr ? &tess->vertex[0]
+            : geo != nullptr  ? &geo->capture[0]
+                              : &vertex,
+            nat_task          ? &nat->mesh
+            : has_task        ? &emu->mesh.program
+            : tess != nullptr ? &tess->control.program
+            : geo != nullptr  ? &geo->kernel.program
+                              : nullptr,
+            tess != nullptr ? (tess->domain ? &tess->domain->evaluate.program : &vertex) : nullptr,
+            tess_geo ? &geo->kernel.program : nullptr,
+            nat != nullptr ? &nat->fragment : &fragment};
+        for (size_t i = 0; i < stages.size(); ++i) {
+            if (progs[i] == nullptr || progs[i]->entry_point.empty()) {
+                continue;
+            }
+            const Shader::Info& sinfo = progs[i]->info;
+            out_masks[stages[i]] = sinfo.constant_buffer_mask;
+            std::ranges::copy_n(sinfo.constant_buffer_used_sizes.begin(),
+                                out_sizes[stages[i]].size(), out_sizes[stages[i]].begin());
+        }
+    };
+    fill_uniforms(false, default_uniform_masks, default_uniform_sizes);
+    if (native_mesh) {
+        fill_uniforms(true, native_uniform_masks, native_uniform_sizes);
+    } else {
+        native_uniform_masks = default_uniform_masks;
+        native_uniform_sizes = default_uniform_sizes;
+    }
+
+    nx2_may_write_memory = [&]() noexcept {
+        if (IsMeshPipeline() || xfb.has_value()) {
+            return true;
+        }
+        if (!vertex.entry_point.empty() && StageInfoMayWriteMemory(vertex.info)) {
+            return true;
+        }
+        if (!fragment.entry_point.empty() && StageInfoMayWriteMemory(fragment.info)) {
+            return true;
+        }
+        if (tessellation) {
+            for (const StageProgram& v : tessellation->vertex) {
+                if (!v.entry_point.empty() && StageInfoMayWriteMemory(v.info)) {
+                    return true;
+                }
+            }
+            if (!tessellation->control.program.entry_point.empty() &&
+                StageInfoMayWriteMemory(tessellation->control.program.info)) {
+                return true;
+            }
+            if (tessellation->domain &&
+                !tessellation->domain->evaluate.program.entry_point.empty() &&
+                StageInfoMayWriteMemory(tessellation->domain->evaluate.program.info)) {
+                return true;
+            }
+        }
+        if (geometry) {
+            for (const StageProgram& c : geometry->capture) {
+                if (!c.entry_point.empty() && StageInfoMayWriteMemory(c.info)) {
+                    return true;
+                }
+            }
+            if (!geometry->kernel.program.entry_point.empty() &&
+                StageInfoMayWriteMemory(geometry->kernel.program.info)) {
+                return true;
+            }
+        }
+        return false;
+    }();
 }
 
 VertexProgramUse GraphicsPipeline::GetVertexUse() noexcept {
@@ -518,7 +638,8 @@ std::pair<void*, void*> GraphicsPipeline::XfbKernelStates(const Device& device, 
                                ? CreateFunction(program.library.Get(), program.entry_point)
                                : Object{};
         if (program.function && gather) {
-            xfb->gather[variant] = CreateComputePipelineState(device, gather.Get(), error, archive);
+            xfb->gather[variant] = CreateComputePipelineState(device, gather.Get(), error, archive,
+                                                              Xfb::GatherGroupSize);
         }
         if (!program.function || !xfb->gather[variant]) {
             program.build_failed = true;
@@ -558,7 +679,8 @@ std::pair<void*, void*> GraphicsPipeline::GeometryKernelStates(const Device& dev
                                : Object{};
         if (program.function && records) {
             geometry->records[variant] =
-                CreateComputePipelineState(device, records.Get(), error, archive);
+                CreateComputePipelineState(device, records.Get(), error, archive,
+                                           Geometry::GroupSize);
         }
         if (!program.function || !geometry->records[variant]) {
             program.build_failed = true;
@@ -586,7 +708,8 @@ void* GraphicsPipeline::GeometryXfbState(const Device& device, u32 stream) {
         const Object function = CreateFunction(geometry->kernel.program.library.Get(),
                                                Geometry::XfbEntryOf(stream));
         if (function) {
-            state = CreateComputePipelineState(device, function.Get(), error, archive);
+            state = CreateComputePipelineState(device, function.Get(), error, archive,
+                                               Geometry::GroupSize);
         }
         if (!state) {
             LOG_ERROR(Render_Metal,
@@ -636,7 +759,8 @@ void GraphicsPipeline::FailNative(std::string_view reason) {
         return;
     }
     native_mesh->failed = true;
-    cached_render_state.state = nullptr;
+    functions_built = false;
+    cached_render_states = {};
     static std::atomic<u32> logged{};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
         // Warning: the iOS log shows Render.Metal from there.
@@ -683,7 +807,11 @@ bool GraphicsPipeline::BuildNativeFunctions(const Device& device) {
 }
 
 bool GraphicsPipeline::BuildFunctions(const Device& device) {
+    if (functions_built) {
+        return true;
+    }
     if (Native() != nullptr && BuildNativeFunctions(device)) {
+        functions_built = true;
         return true;
     }
     if (native_mesh && !mesh) {
@@ -734,6 +862,7 @@ bool GraphicsPipeline::BuildFunctions(const Device& device) {
         }
         ReleaseSource(*stage);
     }
+    functions_built = true;
     return true;
 }
 
@@ -839,6 +968,8 @@ void* GraphicsPipeline::AdoptState(u64 hash, const RenderPipelineDesc& desc, Obj
 
 ComputePipeline::ComputePipeline(const ComputePipelineKey& key_, StageProgram program_)
     : key{key_}, program{std::move(program_)} {
+    std::ranges::copy_n(program.info.constant_buffer_used_sizes.begin(), uniform_sizes.size(),
+                        uniform_sizes.begin());
     BindMemo::AppendKinds(program.info, BindMemo::Kind::ComputeBit, program.binding_kinds);
 }
 
@@ -1082,6 +1213,11 @@ void PipelineCache::EvictUnusedPipelines() {
         return;
     }
     for (const size_t index : evicted) {
+        if (!keys[index].xfb.Active()) {
+            FastGraphicsKey fk;
+            std::memcpy(&fk, &keys[index], sizeof(fk));
+            fast_graphics_cache.erase(fk);
+        }
         graphics_cache.erase(keys[index]);
     }
     LOG_INFO(Render_Metal,
@@ -1095,7 +1231,7 @@ void PipelineCache::EvictUnusedPipelines() {
 }
 
 namespace {
-constexpr u64 MetalStageCanonicalVersion = 4ULL;
+constexpr u64 MetalStageCanonicalVersion = 6ULL;
 
 [[nodiscard]] u64 MetalWarmVariant(u32 apple_family, bool mesh_shaders) {
     const auto& resolution = Settings::values.resolution_info;
@@ -2310,7 +2446,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 if (pipeline) {
                     // The states made from here on are new ones: they go to the states file.
                     pipeline->SetRecorder(&files);
+                    GraphicsPipeline* const raw_pipe = pipeline.get();
                     graphics_cache.insert_or_assign(key, std::move(pipeline));
+                    if (!key.xfb.Active()) {
+                        FastGraphicsKey fk;
+                        std::memcpy(&fk, &key, sizeof(fk));
+                        fast_graphics_cache.insert_or_assign(fk, raw_pipe);
+                    }
                     ++state.graphics;
                     state.render_states += made;
                 } else {
@@ -2352,73 +2494,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
              num_workers, unlisted, counts.hits, counts.misses);
 }
 
-namespace {
-bool StageInfoMayWriteMemory(const Shader::Info& info) noexcept {
-    if (info.stores_global_memory || info.uses_global_increment || info.uses_global_decrement ||
-        info.uses_int64_bit_atomics || info.uses_atomic_f32_add || info.uses_atomic_f16x2_add ||
-        info.uses_atomic_f16x2_min || info.uses_atomic_f16x2_max || info.uses_atomic_f32x2_add ||
-        info.uses_atomic_f32x2_min || info.uses_atomic_f32x2_max || info.uses_atomic_s32_min ||
-        info.uses_atomic_s32_max || info.uses_atomic_image_u32 || info.uses_typeless_image_writes ||
-        info.is_task || info.is_mesh) {
-        return true;
-    }
-    for (const auto& desc : info.storage_buffers_descriptors) {
-        if (desc.is_written) {
-            return true;
-        }
-    }
-    for (const auto& desc : info.image_buffer_descriptors) {
-        if (desc.is_written) {
-            return true;
-        }
-    }
-    for (const auto& desc : info.image_descriptors) {
-        if (desc.is_written) {
-            return true;
-        }
-    }
-    return false;
-}
-} // Anonymous namespace
-
-bool GraphicsPipeline::Nx2MayWriteMemory() const noexcept {
-    if (IsMeshPipeline() || xfb.has_value()) {
-        return true;
-    }
-    if (!vertex.entry_point.empty() && StageInfoMayWriteMemory(vertex.info)) {
-        return true;
-    }
-    if (!fragment.entry_point.empty() && StageInfoMayWriteMemory(fragment.info)) {
-        return true;
-    }
-    if (tessellation) {
-        for (const StageProgram& v : tessellation->vertex) {
-            if (!v.entry_point.empty() && StageInfoMayWriteMemory(v.info)) {
-                return true;
-            }
-        }
-        if (!tessellation->control.program.entry_point.empty() &&
-            StageInfoMayWriteMemory(tessellation->control.program.info)) {
-            return true;
-        }
-        if (tessellation->domain &&
-            !tessellation->domain->evaluate.program.entry_point.empty() &&
-            StageInfoMayWriteMemory(tessellation->domain->evaluate.program.info)) {
-            return true;
-        }
-    }
-    if (geometry) {
-        for (const StageProgram& c : geometry->capture) {
-            if (!c.entry_point.empty() && StageInfoMayWriteMemory(c.info)) {
-                return true;
-            }
-        }
-        if (!geometry->kernel.program.entry_point.empty() &&
-            StageInfoMayWriteMemory(geometry->kernel.program.info)) {
-            return true;
-        }
-    }
-    return false;
+size_t PipelineCache::FastGraphicsKeyHash::operator()(const FastGraphicsKey& k) const noexcept {
+    return static_cast<size_t>(
+        Common::CityHash64(reinterpret_cast<const char*>(k.words.data()), sizeof(k.words)));
 }
 
 bool PipelineCache::IsIndirectResetShader() const {
@@ -2449,11 +2527,33 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         refusal = "shader programs not in guest memory";
         return nullptr;
     }
-    PipelineTranslator::RefreshKey(graphics_key, maxwell3d->regs, DrawTopology(*maxwell3d));
+    PipelineTranslator::RefreshKey(graphics_key, maxwell3d->regs, DrawTopology(*maxwell3d),
+                                   &graphics_key_has_xfb);
     graphics_key.attribute_types = VideoCommon::KeyedAttributeTypes(
         graphics_key.attribute_types, graphics_key.unique_hashes, vertex_attribute_masks);
     const u64 current_frame = frame_count.load(std::memory_order_relaxed);
-    if (current_pipeline != nullptr && current_pipeline->Key() == graphics_key) {
+    if (!graphics_key_has_xfb) {
+        if (current_pipeline != nullptr && !current_pipeline->HasXfbKey() &&
+            std::memcmp(&current_pipeline->Key(), &graphics_key, sizeof(FastGraphicsKey)) == 0) {
+            current_pipeline->SetLastUse(current_frame);
+            return current_pipeline;
+        }
+        FastGraphicsKey fast_key;
+        std::memcpy(&fast_key, &graphics_key, sizeof(fast_key));
+        if (const auto fast_it = fast_graphics_cache.find(fast_key);
+            fast_it != fast_graphics_cache.end()) {
+            current_pipeline = fast_it->second;
+            if (current_pipeline == nullptr) {
+                refusal = NoteRefusal(graphics_key.Hash());
+            } else {
+                current_pipeline->SetLastUse(current_frame);
+                if (!current_pipeline->MarkUsed()) {
+                    files.NoteUsed(graphics_key.Hash());
+                }
+            }
+            return current_pipeline;
+        }
+    } else if (current_pipeline != nullptr && current_pipeline->Key() == graphics_key) {
         current_pipeline->SetLastUse(current_frame);
         return current_pipeline;
     }
@@ -2480,6 +2580,11 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         it = graphics_cache.emplace(graphics_key, std::move(made)).first;
     }
     current_pipeline = it->second.get();
+    if (!graphics_key_has_xfb) {
+        FastGraphicsKey fast_key;
+        std::memcpy(&fast_key, &graphics_key, sizeof(fast_key));
+        fast_graphics_cache.insert_or_assign(fast_key, current_pipeline);
+    }
     if (current_pipeline == nullptr) {
         refusal = NoteRefusal(graphics_key.Hash());
     } else {
@@ -2497,6 +2602,7 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64* out_native_key) {
     }
     const VideoCommon::ShaderInfo* const shader = ComputeShader();
     if (shader == nullptr) {
+        current_compute_pipeline = nullptr;
         refusal = "shader programs not in guest memory";
         return nullptr;
     }
@@ -2509,6 +2615,9 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64* out_native_key) {
         .shared_memory_size = qmd.shared_alloc,
         .workgroup_size{qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z},
     };
+    if (current_compute_pipeline != nullptr && current_compute_pipeline->Key() == key) {
+        return current_compute_pipeline;
+    }
     const auto [it, is_new] = compute_cache.try_emplace(key);
     if (is_new) {
         it->second = CreateComputePipeline(key, shader);
@@ -2517,12 +2626,13 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64* out_native_key) {
             it->second->SetArchive(&archive);
         }
     }
-    if (!it->second) {
+    current_compute_pipeline = it->second.get();
+    if (current_compute_pipeline == nullptr) {
         refusal = NoteRefusal(key.Hash());
-    } else if (!it->second->MarkUsed()) {
+    } else if (!current_compute_pipeline->MarkUsed()) {
         files.NoteUsed(key.Hash());
     }
-    return it->second.get();
+    return current_compute_pipeline;
 }
 
 void PipelineCache::StoreRecord(const GraphicsPipelineKey& key,

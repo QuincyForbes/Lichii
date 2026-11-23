@@ -20,6 +20,7 @@
 #include "dynarmic/mcl/is_instance_of_template.hpp"
 #include <oaknut/oaknut.hpp>
 
+#include "dynarmic/backend/arm64/abi.h"
 #include "dynarmic/backend/arm64/stack_layout.h"
 #include "dynarmic/ir/cond.h"
 #include "dynarmic/ir/microinstruction.h"
@@ -318,6 +319,7 @@ public:
     void ReadWriteFlags(Argument& read, IR::Inst* write);
     void SpillFlags();
     void SpillAll();
+    RegisterList LiveCallerSaveRegisters(RegisterList exclude = 0) const noexcept;
 
     bool HasFastmemBase(const IR::Inst* base_inst) const;
     RAFastmemBase AcquireExistingFastmemBase(const IR::Inst* base_inst);

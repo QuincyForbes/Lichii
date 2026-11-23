@@ -133,6 +133,9 @@ public:
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
+    bool IsCleanReadTrapPage(DAddr page_addr) override;
+    std::optional<VideoCore::RasterizerDownloadArea> TryFastCleanRead(DAddr page_begin,
+                                                                      u64 page_bytes) override;
     bool LandDownloadForCpuRead(DAddr addr, u64 size, u64 tick) override;
     bool HasPendingQueries(DAddr addr, u64 size) override;
     bool HasCachedReports(DAddr addr, u64 size) override;

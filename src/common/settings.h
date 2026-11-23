@@ -513,10 +513,11 @@ struct Values {
 #endif
                                                     "oot_resolution", Category::Renderer};
     // Ocarina of Time's shadows, ambient occlusion, effects and foliage, set in the game's own
-    // parameter files as it reads them (core/file_sys/oot_game_params.cpp): Console is the game
-    // as shipped. Phones get a lighter one from the device profile. Read when the game starts.
+    // parameter files as it reads them (core/file_sys/oot_game_params.cpp): Balanced trims
+    // duplicate reflection probes, XluZPrePass and field DoF (~22 fewer passes/frame, no visual
+    // loss); Console is the game as shipped.
     SwitchableSetting<OotGraphicsPreset> oot_graphics_preset{
-        linkage, OotGraphicsPreset::Console, "oot_graphics_preset", Category::Renderer};
+        linkage, OotGraphicsPreset::Balanced, "oot_graphics_preset", Category::Renderer};
     // Ocarina of Time: 30 FPS (two vblanks a frame, nx2_gsv.h PaceToVblank), 60 FPS, or the
     // frame rate limit. The game's step follows real time (built-in FPS Unlock), so it keeps full
     // speed at each. The first desktop launch asks (oot_fps_asked). Takes effect at once.

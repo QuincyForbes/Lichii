@@ -46,6 +46,13 @@ inline constexpr RendererBackend DefaultPresetBackend =
     RendererBackend::Vulkan;
 #endif
 
+inline constexpr bool DefaultOcarinaReactiveFlushing =
+#if defined(__ANDROID__) || defined(__APPLE__)
+    false;
+#else
+    true;
+#endif
+
 // Keys are registered setting labels; values use the same encoding as configuration files.
 inline const std::map<u64, GamePreset> game_presets{
     {MarioKartWorldProgramId,
@@ -65,11 +72,12 @@ inline const std::map<u64, GamePreset> game_presets{
      {"Ocarina of Time",
       {{"backend", DefaultPresetBackend},
        {"resolution_setup", ResolutionSetup::Res1X},
+       {"oot_graphics_preset", OotGraphicsPreset::Balanced},
        {"gpu_accuracy", GpuAccuracy::Low},
        {"use_asynchronous_shaders", true},
        {"astc_recompression", AstcRecompression::Bc3},
        {"vram_usage_mode", VramUsageMode::Conservative},
-       {"use_reactive_flushing", true},
+       {"use_reactive_flushing", DefaultOcarinaReactiveFlushing},
        {"use_vsync", VSyncMode::FifoRelaxed},
        {"use_docked_mode", ConsoleMode::Docked},
        {"scaling_filter", ScalingFilter::ScaleForce},

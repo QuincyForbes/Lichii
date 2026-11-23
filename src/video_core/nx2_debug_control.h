@@ -173,9 +173,10 @@ inline void LoadExperiments() {
         g_experiments[18].store(7, std::memory_order_relaxed);
         // EXP19 = 2: live pipeline lookup without Refresh, with #641 patches for blend/vertex input.
         g_experiments[19].store(2, std::memory_order_relaxed);
-        // EXP42 = 1 and EXP43 = 3: pooled VkImages for deleted render targets, and drifted
+        // EXP42 = 2 and EXP43 = 3: pooled VkImages for deleted render targets (dedicated
+        // allocations included, required on MoltenVK and >8 MiB / DCC targets), and drifted
         // per-frame render targets relocated in place.
-        g_experiments[42].store(1, std::memory_order_relaxed);
+        g_experiments[42].store(2, std::memory_order_relaxed);
         g_experiments[43].store(3, std::memory_order_relaxed);
         // EXP34 = 1: ACQUIRE_PRECHECK=2 answers no GEQUAL acquire met over a write to its word
         // queued for the back (a reset there let a channel run before its producer). A strict

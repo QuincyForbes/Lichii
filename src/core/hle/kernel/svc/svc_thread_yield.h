@@ -15,10 +15,18 @@ constexpr u64 HashYieldSpinWord(u64 hash, u64 word) noexcept {
     return (hash ^ word) * 0x100000001B3ULL;
 }
 
-/// Lock-free in-JIT fast path for `svcSleepThread` yield calls (`ns` in `{-2, -1, 0}`) on 64-bit
-/// multicore guest threads when the yield is provably futile and neither backoff nor runnable
-/// handoff needs to sleep the calling thread. Returns true when handled in place without halting
-/// the JIT, or false when the caller must perform a normal SupervisorCall halt.
+bool YieldBackoffEnabled();
+
+/// Lock-free in-JIT fast paths for hot non-blocking 64-bit multicore SVCs.
+/// Every fast path is strictly side-effect-free when returning false so the caller can fall back
+/// to a standard SupervisorCall halt.
 bool TryFastFutileYield64(Core::System& system, s64 ns, u64 spin_state_hash);
+bool TryFastGetCurrentProcessorNumber64(Core::System& system, u64* out_core);
+bool TryFastSignalToAddress64(Core::System& system, u64 address, u32 signal_type, s32 value,
+                              s32 count, u64* out_result);
+bool TryFastWaitForAddress64(Core::System& system, u64 address, u32 arb_type, s64 value,
+                             s64 timeout_ns, u64* out_result);
+bool TryFastArbitrateLock64(Core::System& system, u32 thread_handle, u64 address, u32 tag,
+                            u64* out_result);
 
 } // namespace Kernel::Svc

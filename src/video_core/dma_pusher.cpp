@@ -180,6 +180,18 @@ bool ListValidateEnabled() {
     return enabled;
 }
 
+// Only Fast Fusion (040041E0212AE000) writes command lists from GPU work without a host sync
+// between the writer and the GPFIFO entry that fetches them. EDEN_NX2_ENTRY_WRITER_WAIT=1 forces
+// unsynced writer waits on for diagnostics.
+bool NeedsUnsyncedListWriters(u64 program_id) {
+    static const bool force_entry_writer_wait = [] {
+        const char* value = std::getenv("EDEN_NX2_ENTRY_WRITER_WAIT");
+        return value != nullptr && value[0] == '1';
+    }();
+    constexpr u64 EntryWriterWaitProgramId = u64{0x040041E0212AE000};
+    return force_entry_writer_wait || program_id == EntryWriterWaitProgramId;
+}
+
 // Whether an entry's words (the first `carry` the data of a method an earlier entry opened) parse
 // as commands a driver writes: no old-style or undefined header modes, and no host method (below
 // 0x40) written with more words than the host methods have (non-incrementing NOPs excepted).
@@ -521,16 +533,8 @@ bool DmaPusher::Step() {
         // Waiting for every earlier writer before each entry stalled the front on nearly every
         // entry (OoT Hyrule Market ~7,400/frame, Kokiri ~3 ms/frame) without finding newly
         // GPU-written words; only Fast Fusion (040041E0212AE000) needs per-entry waits.
-        // EDEN_NX2_ENTRY_WRITER_WAIT=1 forces the wait back on for diagnostics.
-        static const bool force_entry_writer_wait = [] {
-            const char* value = std::getenv("EDEN_NX2_ENTRY_WRITER_WAIT");
-            return value != nullptr && value[0] == '1';
-        }();
-        constexpr u64 EntryWriterWaitProgramId = u64{0x040041E0212AE000};
-        const bool wait_entry_writers =
-            force_entry_writer_wait ||
-            (front_lean ? dispatch_program_id : system.GetApplicationProcessProgramID()) ==
-                EntryWriterWaitProgramId;
+        const bool wait_entry_writers = NeedsUnsyncedListWriters(
+            front_lean ? dispatch_program_id : system.GetApplicationProcessProgramID());
         if (!gpu_written && VideoCommon::GpuSplit::Get().Active() && wait_entry_writers &&
             !SkipWriterWait(u64{header.size} * sizeof(u32))) {
             gpu_written = WaitForListWriters(dma_state.dma_get, size_t{header.size} * sizeof(u32));
@@ -1793,24 +1797,90 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* any_co
         rasterizer == nullptr) {
         return false;
     }
+    auto& split = VideoCommon::GpuSplit::Get();
+    const u64 consumed = split.Active()
+                             ? (split.FunctionsSettled() ? split.RetireWrites()
+                                                         : split.SettleWrites())
+                             : 0;
     const GPUVAddr end = address + u64{count} * sizeof(u32);
-    bool written = false;
+    boost::container::small_vector<u64, 4> written_pages;
+    bool all_known_list_pages = true;
     for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < end; page += 0x1000) {
         if (const auto device = memory_manager.GpuToCpuAddress(page);
             device && Tegra::Nx2IsGpuWritten(*device)) {
-            Tegra::Nx2MarkCommandListPage(*device);
-            written = true;
+            if (!Tegra::Nx2IsCommandListPage(*device)) {
+                Tegra::Nx2MarkCommandListPage(*device);
+                all_known_list_pages = false;
+            }
+            written_pages.push_back(*device & ~u64{0xfff});
         }
     }
-    if (!written) {
+    if (written_pages.empty() || !all_known_list_pages) {
         return false;
     }
-    auto& split = VideoCommon::GpuSplit::Get();
     if (split.Active()) {
-        if ((VideoCore::Nx2Debug::Experiment(40) & 2) != 0) {
-            split.WaitForSyncedWriters(VideoCommon::DrainSite::ListCopies);
-        } else {
-            split.WaitForWriters();
+        const auto site = (VideoCore::Nx2Debug::Experiment(40) & 2) != 0
+                              ? VideoCommon::DrainSite::ListCopies
+                              : VideoCommon::DrainSite::ListWriters;
+        u64 target = split.LastUnrangedPosition();
+        bool has_queued_host_write = false;
+        for (const u64 dev_page : written_pages) {
+            target = (std::max)(target, split.Writes().LastWriteTo(dev_page, dev_page + 0x1000));
+            if (!has_queued_host_write && split.HasQueuedWritesTo(dev_page, 0x1000)) {
+                has_queued_host_write = true;
+            }
+        }
+        if (target > consumed) {
+            split.WaitUntil(target, site);
+        }
+        if (has_queued_host_write) {
+            for (const u64 dev_page : written_pages) {
+                if (!split.WaitForWritesTo(dev_page, 0x1000)) {
+                    split.Drain(site);
+                    break;
+                }
+            }
+        }
+        const u64 settled_now = split.ConsumedNow();
+        const bool writer_set =
+            VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::MacroReadWriterSet);
+        bool may_have_gpu_writer = !writer_set;
+        if (!may_have_gpu_writer && split.Writes().LastGpu() > settled_now) {
+            const u64 epoch = Tegra::g_nx2_code_epoch.load(std::memory_order_acquire);
+            if (!split.Writes().DrawsValid(settled_now, epoch) ||
+                split.Writes().AnyPendingWrite(settled_now, split.Writes().LastGpu(),
+                                               [](u64 begin, u64 end) {
+                                                   return Tegra::Nx2IsProvenCode(begin,
+                                                                                 end - begin);
+                                               })) {
+                may_have_gpu_writer = true;
+            }
+        }
+        if (!may_have_gpu_writer && split.LastWriterPosition() > settled_now) {
+            for (const u64 dev_page : written_pages) {
+                if (split.WritersMayWriteSince(settled_now, dev_page, 0x1000)) {
+                    may_have_gpu_writer = true;
+                    break;
+                }
+                u64 checked_dispatches = 0;
+                bool dispatch_waited = false;
+                if (split.DispatchesMayWriteSince(settled_now, dev_page, 0x1000, false,
+                                                  checked_dispatches, dispatch_waited) !=
+                    VideoCommon::GpuSplit::DispatchCheck::Miss) {
+                    may_have_gpu_writer = true;
+                    break;
+                }
+            }
+        }
+        if (may_have_gpu_writer) {
+            const u64 program_id =
+                front_lean ? dispatch_program_id : system.GetApplicationProcessProgramID();
+            if (NeedsUnsyncedListWriters(program_id) &&
+                (VideoCore::Nx2Debug::Experiment(40) & 2) == 0) {
+                split.WaitForWriters();
+            } else {
+                split.WaitForSyncedWriters(site);
+            }
         }
     }
     bool past_sync = !split.Active();

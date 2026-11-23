@@ -7,6 +7,9 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
@@ -19,11 +22,75 @@
 #include "core/arm/dynarmic/dynarmic_cp15.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "core/core_timing.h"
+#include "core/gpu_dirty_memory_manager.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/memory.h"
+#include "video_core/host1x/gpu_device_memory_manager.h"
 
 namespace Core {
 
 using namespace Common::Literals;
+
+namespace {
+
+bool Nx2EnvOn32(const char* name) {
+    const char* value = std::getenv(name);
+    return value == nullptr || value[0] != '0';
+}
+
+inline u64 LoadLeValue32(const u8* src, std::size_t size) noexcept {
+    switch (size) {
+    case sizeof(u64): {
+        u64 v64{};
+        std::memcpy(&v64, src, sizeof(u64));
+        return v64;
+    }
+    case sizeof(u32): {
+        u32 v32{};
+        std::memcpy(&v32, src, sizeof(u32));
+        return v32;
+    }
+    case sizeof(u16): {
+        u16 v16{};
+        std::memcpy(&v16, src, sizeof(u16));
+        return v16;
+    }
+    case sizeof(u8): {
+        u8 v8{};
+        std::memcpy(&v8, src, sizeof(u8));
+        return v8;
+    }
+    default:
+        UNREACHABLE();
+    }
+}
+
+inline void StoreLeValue32(u8* dst, u64 value, std::size_t size) noexcept {
+    switch (size) {
+    case sizeof(u64):
+        std::memcpy(dst, &value, sizeof(u64));
+        break;
+    case sizeof(u32): {
+        const u32 v32 = static_cast<u32>(value);
+        std::memcpy(dst, &v32, sizeof(u32));
+        break;
+    }
+    case sizeof(u16): {
+        const u16 v16 = static_cast<u16>(value);
+        std::memcpy(dst, &v16, sizeof(u16));
+        break;
+    }
+    case sizeof(u8): {
+        const u8 v8 = static_cast<u8>(value);
+        std::memcpy(dst, &v8, sizeof(u8));
+        break;
+    }
+    default:
+        UNREACHABLE();
+    }
+}
+
+} // Anonymous namespace
 
 DynarmicCallbacks32::DynarmicCallbacks32(ArmDynarmic32& parent, Kernel::KProcess* process)
     : m_parent{parent}, m_memory(process->GetMemory())
@@ -32,14 +99,45 @@ DynarmicCallbacks32::DynarmicCallbacks32(ArmDynarmic32& parent, Kernel::KProcess
 {}
 
 u64 DynarmicCallbacks32::MemoryRead(u32 vaddr, size_t size) {
-    CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Read);
+    const u64 page = u64{vaddr} & ~u64{Core::Memory::YUZU_PAGEMASK};
+    const u64 offset = u64{vaddr} & u64{Core::Memory::YUZU_PAGEMASK};
+    const bool in_page = offset + size <= Core::Memory::YUZU_PAGESIZE;
+    if (!m_check_memory_access) {
+        if (in_page) {
+            if (auto* const hot_core = m_memory.HotCore(m_parent.m_core_index)) {
+                const auto& hot = hot_core->ReadSlot(page);
+                if (page == hot.vaddr_page &&
+                    m_memory.FastReadGenerationRelaxed() == hot.mem_gen &&
+                    (!hot.uses_map_gen || hot_core->dev_mem->MappingGeneration() == hot.map_gen)) {
+                    return LoadLeValue32(hot.host_page + offset, size);
+                }
+            }
+        }
+    } else if (!CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Read)) {
+        return 0;
+    }
+    u64 value{};
     switch (size) {
-    case sizeof(u64): return m_memory.Read64(vaddr);
-    case sizeof(u32): return m_memory.Read32(vaddr);
-    case sizeof(u16): return m_memory.Read16(vaddr);
-    case sizeof(u8): return m_memory.Read8(vaddr);
+    case sizeof(u64): value = m_memory.Read64(vaddr); break;
+    case sizeof(u32): value = m_memory.Read32(vaddr); break;
+    case sizeof(u16): value = m_memory.Read16(vaddr); break;
+    case sizeof(u8): value = m_memory.Read8(vaddr); break;
     default: UNREACHABLE();
     }
+    if (value == 0) {
+        if (auto& unmapped = Core::Memory::UnmappedReadFlag(); unmapped != 0) {
+            unmapped = 0;
+            return value;
+        }
+    }
+    if (!m_check_memory_access && in_page) {
+        const std::size_t core_index = m_parent.m_core_index;
+        if (auto* const hot_core = m_memory.HotCore(core_index)) {
+            static_cast<void>(
+                m_memory.TryCacheHotReadPage(core_index, vaddr, hot_core->ReadSlot(page)));
+        }
+    }
+    return value;
 }
 
 std::optional<u32> DynarmicCallbacks32::MemoryReadCode(u32 vaddr) {
@@ -54,31 +152,82 @@ std::optional<u32> DynarmicCallbacks32::MemoryReadCode(u32 vaddr) {
 }
 
 void DynarmicCallbacks32::MemoryWrite(Dynarmic::A32::VAddr vaddr, u64 value, size_t size) {
-    if (CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Write)) {
-        switch (size) {
-        case sizeof(u64): return m_memory.Write64(vaddr, value);
-        case sizeof(u32): return m_memory.Write32(vaddr, u32(value));
-        case sizeof(u16): return m_memory.Write16(vaddr, u16(value));
-        case sizeof(u8): return m_memory.Write8(vaddr, u8(value));
-        default: UNREACHABLE();
+    const u64 page = u64{vaddr} & ~u64{Core::Memory::YUZU_PAGEMASK};
+    const u64 offset = u64{vaddr} & u64{Core::Memory::YUZU_PAGEMASK};
+    const bool in_page = offset + size <= Core::Memory::YUZU_PAGESIZE;
+    if (!m_check_memory_access) {
+        if (in_page) {
+            const std::size_t core_index = m_parent.m_core_index;
+            if (auto* const hot_core = m_memory.HotCore(core_index)) {
+                auto& hot = hot_core->WriteSlot(page);
+                if (page == hot.vaddr_page) {
+                    if (!hot.rasterizer_cached) {
+                        if (m_memory.FastWriteGenerationRelaxed() == hot.mem_gen) {
+                            StoreLeValue32(hot.host_page + offset, value, size);
+                            return;
+                        }
+                    } else {
+                        const u64 granule_mask =
+                            (u64{1} << (offset >> 6)) | (u64{1} << ((offset + size - 1) >> 6));
+                        if ((hot.collected_granules & granule_mask) == granule_mask &&
+                            m_memory.RasterizerWriteGenerationRelaxed() == hot.mem_gen &&
+                            Core::g_write_answer_epoch.load(std::memory_order_relaxed) ==
+                                hot.answer_epoch &&
+                            hot_core->dev_mem->MappingGeneration() == hot.map_gen) {
+                            const u64 gather_ep = hot_core->GatherEpoch();
+                            if (gather_ep == hot.gather_epoch) {
+                                Core::g_collected_write_pages.Mark(hot.daddr_page, 1);
+                                StoreLeValue32(hot.host_page + offset, value, size);
+                                std::atomic_signal_fence(std::memory_order_seq_cst);
+                                if (hot_core->GatherEpoch() == gather_ep) {
+                                    return;
+                                }
+                            }
+                        }
+                        if (m_memory.TryCollectHotWrite(core_index, offset, size, granule_mask,
+                                                        hot)) {
+                            StoreLeValue32(hot.host_page + offset, value, size);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    } else if (!CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Write)) {
+        return;
+    }
+    switch (size) {
+    case sizeof(u64): m_memory.Write64(vaddr, value); break;
+    case sizeof(u32): m_memory.Write32(vaddr, u32(value)); break;
+    case sizeof(u16): m_memory.Write16(vaddr, u16(value)); break;
+    case sizeof(u8): m_memory.Write8(vaddr, u8(value)); break;
+    default: UNREACHABLE();
+    }
+    if (!m_check_memory_access && in_page) {
+        const std::size_t core_index = m_parent.m_core_index;
+        if (auto* const hot_core = m_memory.HotCore(core_index)) {
+            const u64 granule_mask =
+                (u64{1} << (offset >> 6)) | (u64{1} << ((offset + size - 1) >> 6));
+            static_cast<void>(m_memory.TryCacheHotWritePage(
+                core_index, vaddr, granule_mask, hot_core->WriteSlot(page)));
         }
     }
 }
 bool DynarmicCallbacks32::MemoryWriteExclusive8(u32 vaddr, u8 value, u8 expected) {
-    return CheckMemoryAccess(vaddr, 1, Kernel::DebugWatchpointType::Write) &&
-            m_memory.WriteExclusive8(vaddr, value, expected);
+    return !CheckMemoryAccess(vaddr, 1, Kernel::DebugWatchpointType::Write) ||
+           m_memory.WriteExclusive8(vaddr, value, expected);
 }
 bool DynarmicCallbacks32::MemoryWriteExclusive16(u32 vaddr, u16 value, u16 expected) {
-    return CheckMemoryAccess(vaddr, 2, Kernel::DebugWatchpointType::Write) &&
-            m_memory.WriteExclusive16(vaddr, value, expected);
+    return !CheckMemoryAccess(vaddr, 2, Kernel::DebugWatchpointType::Write) ||
+           m_memory.WriteExclusive16(vaddr, value, expected);
 }
 bool DynarmicCallbacks32::MemoryWriteExclusive32(u32 vaddr, u32 value, u32 expected) {
-    return CheckMemoryAccess(vaddr, 4, Kernel::DebugWatchpointType::Write) &&
-            m_memory.WriteExclusive32(vaddr, value, expected);
+    return !CheckMemoryAccess(vaddr, 4, Kernel::DebugWatchpointType::Write) ||
+           m_memory.WriteExclusive32(vaddr, value, expected);
 }
 bool DynarmicCallbacks32::MemoryWriteExclusive64(u32 vaddr, u64 value, u64 expected) {
-    return CheckMemoryAccess(vaddr, 8, Kernel::DebugWatchpointType::Write) &&
-            m_memory.WriteExclusive64(vaddr, value, expected);
+    return !CheckMemoryAccess(vaddr, 8, Kernel::DebugWatchpointType::Write) ||
+           m_memory.WriteExclusive64(vaddr, value, expected);
 }
 
 void DynarmicCallbacks32::ExceptionRaised(u32 pc, Dynarmic::A32::Exception exception) {
@@ -313,6 +462,21 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
     if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Debugging &&
         Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
         config.optimizations |= Dynarmic::OptimizationFlag::DisableVerification;
+    }
+#if defined(ARCHITECTURE_x86_64)
+    static const bool tso_loads = Nx2EnvOn32("EDEN_NX2_TSO_LOADS");
+    if (tso_loads && Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
+        config.tso_ordered_loads = true;
+    }
+#endif
+    if (!m_cb->m_check_memory_access && config.page_table != nullptr &&
+        Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid &&
+        Nx2EnvOn32("EDEN_NX2_JIT_PT_CACHED_READ")) {
+        config.untrapped_read_bitmap_ptr =
+            reinterpret_cast<std::uintptr_t>(m_cb->m_memory.JitReadTrapStatePtr());
+    }
+    if (page_table != nullptr) {
+        m_cb->m_memory.PrepareHotCores();
     }
     m_jit.emplace(config);
 }

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 
 #include <Hypervisor/Hypervisor.h>
@@ -11,6 +12,10 @@
 
 #include "core/arm/arm_interface.h"
 #include "core/hle/kernel/svc_types.h"
+
+namespace Core::Memory {
+class Memory;
+}
 
 namespace Core {
 
@@ -44,6 +49,8 @@ public:
     void ClearInstructionCache() override;
     void InvalidateCacheRange(u64 addr, std::size_t size) override;
 
+    bool EmulateLoadStore(Memory::Memory& memory, u64 pc);
+
 protected:
     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override {
         return nullptr;
@@ -55,15 +62,19 @@ private:
     void LoadVcpuContext();
     void ReadVcpuContext(Kernel::Svc::ThreadContext& ctx) const;
     bool VcpuHoldsContext() const;
-    bool RunFlushStub();
+    bool RunFlushStub(u64 stub_va, u64 arg_x0 = 0);
     void ArmHeartbeat();
     bool EmulateSystemRegister(u64 esr);
     HaltReason HandleGuestException(Kernel::KThread* thread);
+    bool BeginTrackedStep(u64 pc, u64 page, bool write);
     void FinishTrackedAccess();
+    void ClearExclusiveMonitor(Kernel::KProcess* process = nullptr);
     bool EmulateTrackedAccess(Kernel::KProcess* process, u64 pc);
     bool EmulateMemoryTagging(Kernel::KProcess* process, u64 pc);
     u64 GetBaseRegister(u32 index);
     void SetBaseRegister(u32 index, u64 value);
+    void GetVectorRegister(u32 index, u8* out);
+    void SetVectorRegister(u32 index, const u8* in);
 
     System& m_system;
     HvVm& m_vm;
@@ -74,6 +85,7 @@ private:
     bool m_vcpu_created{};
     pthread_t m_owner_thread{};
     u64 m_flushed_generation{};
+    u64 m_flushed_icache_generation{};
     u64 m_heartbeat_ticks{};
 
     Kernel::Svc::ThreadContext m_ctx{};
@@ -89,9 +101,17 @@ private:
     u64 m_last_fault_address{};
     u32 m_fault_repeat{};
 
-    Kernel::KProcess* m_step_process{};
-    u64 m_step_page{};
+    u64 m_step_pc{};
+    std::array<u64, 4> m_step_pages{};
+    std::array<bool, 4> m_step_writes{};
+    u32 m_step_count{};
     bool m_stepping{};
+
+    u64 m_excl_addr{};
+    u128 m_excl_val{};
+    u64 m_excl_rearm_page{};
+    u32 m_excl_size{};
+    bool m_excl_valid{};
 };
 
 } // namespace Core

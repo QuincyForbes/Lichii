@@ -365,14 +365,16 @@ OotGameParamEdits EditFoliagePack(std::span<u8> sarc, u32 level) {
         for (const std::string_view lod : {"LodSetting", "LodSetting_hh"}) {
             for (const std::string_view key :
                  {"Dist_LowTree", "Dist_LowTreeShadow", "Dist_LowTreeShootLeaf", "Dist_Ornament",
-                  "Dist_Undergrowth0", "Dist_Undergrowth1"}) {
+                  "Dist_Undergrowth0", "Dist_Undergrowth1", "Range_LowTree01",
+                  "Range_LowTree12"}) {
                 if (const auto distance = byml.GetFloat({lod, key})) {
                     count(byml.SetFloat({lod, key}, *distance * distance_scale));
                 }
             }
         }
         if (level >= 2) {
-            for (const std::string_view key : {"IsEnableUndergrowth8", "IsEnableMoss"}) {
+            for (const std::string_view key :
+                 {"IsEnableUndergrowth4", "IsEnableUndergrowth8", "IsEnableMoss"}) {
                 if (byml.GetBool({key}).value_or(false)) {
                     count(byml.SetBool({key}, false));
                 }
@@ -485,37 +487,79 @@ struct Preset {
 // instead of three of 1024, a 1024 static shadow map instead of 4096, thinner grass. Depth of
 // field is turned off in its agl parameters: without the object (CreateDof=false) the game reads
 // and writes through a null pointer every frame.
-// Phone Medium: one 64x64 probe, bloom kept, two 512x512 cascades, a 2048 static shadow map.
-// Balanced: Console shadows, foliage, bloom, resolution and textures kept, with one 64x64
-// reflection probe, no translucent depth prepass and no field depth-of-field pass (~22 fewer
-// render passes and ~70 fewer draws per frame with no visible loss).
+// Phone Medium: one 64x64 sky-clipped probe, bloom kept, two 512x512 cascades, a 2048 static
+// shadow map.
+// Balanced: Console 1024x1024 shadow resolution (two cascades + 2048 static shadow map), foliage,
+// bloom, resolution and textures kept, with one 64x64 sky-clipped reflection probe, no translucent
+// depth prepass and no field depth-of-field pass.
 // High: sun shadow cascades of 2048x2048.
+// Exact 16-pixel-aligned 16:9 dynamic resolution steps for 2560x1440 (#2ebeca77) and 1920x1080
+// (#90e0a495) in Pack/Bootup!System/GameGraphics/ModelSceneExtensionParam/Default, avoiding
+// non-whole GOB-padded sizes where the game draws its meshes twice and temporal upscalers copy
+// or decline the frame.
+#define OOT_WHOLE_DR_SCALES                                                                        \
+    ";Pack/Bootup!System/GameGraphics/ModelSceneExtensionParam/Default:"                           \
+    "DynamicResolutionParam.LevelPaletteDict.#2ebeca77.DynamicResolutionLevelParamList.1."         \
+    "ResolutionReduceScale=0.7,"                                                                   \
+    "DynamicResolutionParam.LevelPaletteDict.#2ebeca77.DynamicResolutionLevelParamList.2."         \
+    "ResolutionReduceScale=0.65,"                                                                  \
+    "DynamicResolutionParam.LevelPaletteDict.#2ebeca77.DynamicResolutionLevelParamList.3."         \
+    "ResolutionReduceScale=0.6,"                                                                   \
+    "DynamicResolutionParam.LevelPaletteDict.#2ebeca77.DynamicResolutionLevelParamList.4."         \
+    "ResolutionReduceScale=0.5625,"                                                                \
+    "DynamicResolutionParam.LevelPaletteDict.#2ebeca77.DynamicResolutionLevelParamList.5."         \
+    "ResolutionReduceScale=0.55,"                                                                  \
+    "DynamicResolutionParam.LevelPaletteDict.#2ebeca77.DynamicResolutionLevelParamList.7."         \
+    "ResolutionReduceScale=0.45,"                                                                  \
+    "DynamicResolutionParam.LevelPaletteDict.#2ebeca77.DynamicResolutionLevelParamList.8."         \
+    "ResolutionReduceScale=0.4,"                                                                   \
+    "DynamicResolutionParam.LevelPaletteDict.#2ebeca77.DynamicResolutionLevelParamList.9."         \
+    "ResolutionReduceScale=0.4,"                                                                   \
+    "DynamicResolutionParam.LevelPaletteDict.#90e0a495.DynamicResolutionLevelParamList.6."         \
+    "ResolutionReduceScale=0.46666667"
+
 constexpr std::array<Preset, 6> Presets{{
     {"Phone Low",
      "gsys/ModelSceneConfigParam/Main:CubeMapMaxTexNum=1,CubeMapMaxTexWidth=64,"
      "CreateXluZPrePass=false,DepthShadowCascadeNum0=1,DepthShadowTexWidth=512,"
-     "DepthShadowTexHeight=512,StaticSdwWidth=1024;agl/BloomParam/MainField:Enable=false;"
-     "agl/DepthOfFieldParam/MainField:Enable=false",
+     "DepthShadowTexHeight=512,StaticSdwWidth=1024;"
+     "agl/CubeMapMgrParam/Common:SamplePoints.0.Far=1.0,SamplePoints.1.Enable=false,"
+     "SamplePoints.2.Enable=false;"
+     "agl/BloomParam/MainField:Enable=false;"
+     "agl/DepthOfFieldParam/MainField:Enable=false" OOT_WHOLE_DR_SCALES,
      1},
     {"Phone Medium",
      "gsys/ModelSceneConfigParam/Main:CubeMapMaxTexNum=1,CubeMapMaxTexWidth=64,"
      "CreateXluZPrePass=false,DepthShadowCascadeNum0=2,DepthShadowTexWidth=512,"
-     "DepthShadowTexHeight=512,StaticSdwWidth=2048;agl/DepthOfFieldParam/MainField:Enable=false",
+     "DepthShadowTexHeight=512,StaticSdwWidth=2048;"
+     "agl/CubeMapMgrParam/Common:SamplePoints.0.Far=1.0,SamplePoints.1.Enable=false,"
+     "SamplePoints.2.Enable=false;"
+     "agl/DepthOfFieldParam/MainField:Enable=false" OOT_WHOLE_DR_SCALES,
      0},
     {"Console", "", 0},
-    {"High", "gsys/ModelSceneConfigParam/Main:DepthShadowTexWidth=2048,DepthShadowTexHeight=2048",
+    {"High",
+     "gsys/ModelSceneConfigParam/Main:DepthShadowTexWidth=2048,DepthShadowTexHeight=2048"
+     OOT_WHOLE_DR_SCALES,
      0},
     {"Ultra Low",
      "gsys/ModelSceneConfigParam/Main:CubeMapMaxTexNum=1,CubeMapMaxTexWidth=64,"
      "CreateXluZPrePass=false,DepthShadowCascadeNum0=1,DepthShadowTexWidth=512,"
-     "DepthShadowTexHeight=512,StaticSdwWidth=1024;agl/BloomParam/MainField:Enable=false;"
-     "agl/DepthOfFieldParam/MainField:Enable=false",
+     "DepthShadowTexHeight=512,StaticSdwWidth=1024;"
+     "agl/CubeMapMgrParam/Common:SamplePoints.0.Far=1.0,SamplePoints.1.Enable=false,"
+     "SamplePoints.2.Enable=false;"
+     "agl/BloomParam/MainField:Enable=false;"
+     "agl/DepthOfFieldParam/MainField:Enable=false" OOT_WHOLE_DR_SCALES,
      2},
     {"Balanced",
      "gsys/ModelSceneConfigParam/Main:CubeMapMaxTexNum=1,CubeMapMaxTexWidth=64,"
-     "CreateXluZPrePass=false;agl/DepthOfFieldParam/MainField:Enable=false",
+     "CreateXluZPrePass=false,DepthShadowCascadeNum0=2,StaticSdwWidth=2048;"
+     "agl/CubeMapMgrParam/Common:SamplePoints.0.Far=1.0,SamplePoints.1.Enable=false,"
+     "SamplePoints.2.Enable=false;"
+     "agl/DepthOfFieldParam/MainField:Enable=false" OOT_WHOLE_DR_SCALES,
      0},
 }};
+
+#undef OOT_WHOLE_DR_SCALES
 
 } // namespace
 

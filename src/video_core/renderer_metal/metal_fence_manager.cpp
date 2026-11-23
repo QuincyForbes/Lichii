@@ -41,12 +41,12 @@ void InnerFence::Wait() {
     }
     if (FenceManagerParams::AsyncCheck()) {
         // The fencing thread: waits for GPU completion, never commits (Scheduler::Wait walks and
-        // commits the GPU thread's command buffers). Match Vulkan's FencePatience default (0 us:
-        // ask GPUBack to commit any deferred fence immediately unless EDEN_NX2_FENCE_PATIENCE_US
-        // is set).
+        // commits the GPU thread's command buffers). Allow WaitCompleted to hold off waking
+        // GPUBack mid-batch while earlier GPU ticks are still in flight or a render pass is open
+        // (matching Vulkan's WaitFenceSubmitted), unless EDEN_NX2_FENCE_PATIENCE_US=0 disables it.
         static const bool allow_grace = [] {
             const char* const value = std::getenv("EDEN_NX2_FENCE_PATIENCE_US");
-            return value != nullptr && std::atoll(value) > 0;
+            return value == nullptr || std::atoll(value) > 0;
         }();
         scheduler.WaitAnyThread(tick, CommitReason::Fence, allow_grace);
     } else {

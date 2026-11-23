@@ -318,11 +318,17 @@ public:
 
     bool OnCPUWrite(DAddr device_addr, u64 size);
 
+    /// Lock-free check for active per-frame GPU-written pages whose CPU writes stay collected.
+    [[nodiscard]] bool TryFastOnCpuWrite(DAddr device_addr, u64 size);
+
     /// EDEN_NX2_CPU_WRITE_STATS (CpuWriteStats): the GPU mark behind a trapped CPU write.
     void NoteCpuWriteOfGpuPage(DAddr device_addr, u64 size);
     /// True when the write's pages may be written as CPU pages now (EDEN_NX2_CPU_WRITE_RECLAIM).
     bool ReclaimGpuPagesForCpu(DAddr device_addr, u64 size);
     void NoteGpuMark(DAddr device_addr, u64 size, u32 source);
+    void NoteGpuWriteStamp(DAddr device_addr, u64 size) noexcept;
+    [[nodiscard]] bool IsRecentlyGpuWrittenPage(DAddr page_addr) const noexcept;
+    [[nodiscard]] bool IsRecentlyGpuWrittenRange(DAddr page_begin, u64 pages_size) const noexcept;
 
     void DownloadMemory(DAddr device_addr, u64 size);
 
@@ -335,6 +341,9 @@ public:
     /// 4 KiB pages (their fence download already landed in guest memory).
     [[nodiscard]] std::optional<VideoCore::RasterizerDownloadArea> TryFastGetFlushArea(
         DAddr device_addr, u64 size);
+    [[nodiscard]] bool IsPageCleanForFastRead(DAddr page_addr) const noexcept;
+    [[nodiscard]] std::optional<VideoCore::RasterizerDownloadArea>
+    TryFastGetFlushAreaForDisarmed(DAddr page_begin, u64 page_bytes);
 
     /// EDEN_NX2_GPU_READ_LAND: a guest read of [device_addr, device_addr + size) lands the fence
     /// downloads in flight over it, up to the newest one that holds bytes of the read, and the
@@ -368,22 +377,38 @@ public:
             [[likely]] {
             return;
         }
-        const std::optional<DAddr> device_addr =
-            (current.gpu_addr == gpu_addr && current.map_serial == map_serial &&
-             current.device_addr != 0)
-                ? std::optional<DAddr>{current.device_addr}
-                : gpu_memory->GpuToCpuAddress(gpu_addr);
+        std::optional<DAddr> device_addr;
+        if (gpu_addr != 0 && current.device_addr != 0 && current.map_serial == map_serial &&
+            (current.gpu_addr >> Core::DEVICE_PAGEBITS) == (gpu_addr >> Core::DEVICE_PAGEBITS)) {
+            device_addr = (current.device_addr & ~DAddr{Core::DEVICE_PAGEMASK}) |
+                          (gpu_addr & Core::DEVICE_PAGEMASK);
+        } else {
+            device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+        }
         if (!device_addr) {
             current = NULL_BINDING;
             channel_state->unresolved_uniform_buffers[stage] |= 1U << index;
             return;
         }
         if (!channel_state->has_deleted_buffers && current.buffer_id &&
-            current.buffer_id != NULL_BUFFER_ID && current.device_addr == *device_addr &&
-            current.size == size) {
-            current.gpu_addr = gpu_addr;
-            current.map_serial = map_serial;
-            return;
+            current.buffer_id != NULL_BUFFER_ID) {
+            if (current.device_addr == *device_addr && current.size == size) {
+                current.gpu_addr = gpu_addr;
+                current.map_serial = map_serial;
+                return;
+            }
+            if (!fence_behavior_accurate &&
+                slot_buffers[current.buffer_id].IsInBounds(*device_addr, size)) {
+                if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
+                    channel_state->dirty_uniform_buffers[stage] |= 1U << index;
+                }
+                current.device_addr = *device_addr;
+                current.gpu_addr = gpu_addr;
+                current.map_serial = map_serial;
+                current.size = size;
+                channel_state->unresolved_uniform_buffers[stage] &= ~(1U << index);
+                return;
+            }
         }
         current = Binding{
             .device_addr = *device_addr,
@@ -526,6 +551,11 @@ public:
 
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
+
+    [[nodiscard]] bool CanDeferPreflushDownloads() const noexcept;
+
+    [[nodiscard]] bool ShouldCommitPreflushNow(bool is_syncpoint,
+                                               bool frame_flip_sync) const noexcept;
 
     void AccumulateFlushes();
 
@@ -698,6 +728,12 @@ public:
 
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectBuffer();
 
+    void NoteUniformCpuSync() noexcept {
+        if (++ubo_cpu_epoch == 0 || ubo_cpu_epoch == ~u64{0}) {
+            ubo_cpu_epoch = 1;
+        }
+    }
+
     template <typename Func>
     void BufferOperations(Func&& func) {
         do {
@@ -779,17 +815,26 @@ public:
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
     struct NativeUniformBankShadow {
+        DAddr device_addr{~DAddr{0}};
         u64 last_draw_ticket{};
         u64 last_frame_tick{~u64{0}};
         u64 last_skipped_draw_ticket{~u64{0}}; ///< Profiler only: bank_once_per_frame skips
         u32 initialized_mask{};
         u32 unchanged_streak{};
-        std::array<u8, 0x10000> bytes{};
+        std::unique_ptr<std::array<u8, 0x10000>> bytes;
     };
-    std::unordered_map<DAddr, NativeUniformBankShadow> native_indirect_uniform_shadow;
-    std::array<std::pair<DAddr, NativeUniformBankShadow*>, 8> native_indirect_uniform_cache{};
-    DAddr native_indirect_uniform_last_bank = ~DAddr{0};
-    NativeUniformBankShadow* native_indirect_uniform_last_ptr = nullptr;
+    struct NativeUniformBankCacheEntry {
+        DAddr device_addr{~DAddr{0}};
+        u64 seen_frame_tick{~u64{0}};
+        u32 pool_index{};
+    };
+    static constexpr size_t NativeUniformBankCacheSize = 512;
+    static constexpr size_t MaxNativeUniformBankShadows = 2048;
+    Common::unordered_map<DAddr, u32> native_indirect_uniform_index;
+    std::vector<NativeUniformBankShadow> native_indirect_uniform_pool;
+    std::vector<u32> native_indirect_uniform_free;
+    std::array<NativeUniformBankCacheEntry, NativeUniformBankCacheSize>
+        native_indirect_uniform_cache{};
     u64 native_indirect_uniform_draw_ticket = 0;
 
     struct LastSyncedRange {
@@ -811,8 +856,11 @@ public:
         u32 size{};
         bool valid{};
         bool usage_marked{};
+        u64 binding_epoch{};
         u64 cpu_epoch{};
         u64 gpu_epoch{};
+        u64 global_cpu_epoch{};
+        u64 global_gpu_epoch{};
         u64 tick{};
         u64 usage_serial{};
         u64 frame{};
@@ -841,10 +889,11 @@ public:
 private:
     template <typename Mask, typename Func>
     static void ForEachEnabledBit(Mask enabled_mask, Func&& func) {
-        for (u32 index = 0; enabled_mask != 0; ++index, enabled_mask >>= 1) {
-            const int disabled_bits = std::countr_zero(enabled_mask);
-            index += disabled_bits;
-            enabled_mask >>= disabled_bits;
+        using UnsignedMask = std::make_unsigned_t<Mask>;
+        UnsignedMask bits = static_cast<UnsignedMask>(enabled_mask);
+        while (bits != 0) {
+            const u32 index = static_cast<u32>(std::countr_zero(bits));
+            bits &= bits - 1;
             func(index);
         }
     }
@@ -972,7 +1021,7 @@ private:
 
     [[nodiscard]] static bool BindMemoEnabled();
     [[nodiscard]] u64 CurrentUsageSerial() const noexcept;
-    [[nodiscard]] bool BindMemoHit(const BindMemo& memo, Buffer& buffer, BufferId buffer_id,
+    [[nodiscard]] bool BindMemoHit(BindMemo& memo, Buffer& buffer, BufferId buffer_id,
                                    DAddr device_addr, u32 size, u32 offset, const char* kind,
                                    size_t stage, u32 index);
     void BindMemoNote(BindMemo& memo, BufferId buffer_id, DAddr device_addr, u32 size,
@@ -1002,9 +1051,10 @@ private:
 
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
-    [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
-                                               bool native_pointer = false,
-                                               bool table_pointer = false) const;
+    [[nodiscard]] Binding StorageBufferBinding(
+        GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written, bool native_pointer = false,
+        bool table_pointer = false,
+        std::optional<std::pair<u64, u64>> pre_read_words = std::nullopt) const;
 
     void TraceTablePointer(bool compute, size_t stage, size_t ssbo_index, u32 cbuf_index,
                            u32 cbuf_offset, u32 indirect_offset, GPUVAddr holder,
@@ -1130,6 +1180,93 @@ private:
     static constexpr size_t UBO_PAGE_SLOTS = 4096;
     std::array<UboPageWrite, UBO_PAGE_SLOTS> ubo_page_writes{};
     u64 cb_write_serial = 1;
+    u64 ubo_cpu_epoch = 0;
+
+    struct UboPageStateEntry {
+        u64 page{~u64{0}};
+        u64 epoch{};
+        bool gpu_modified{};
+        bool unprotected{};
+    };
+    struct UboPageState {
+        bool gpu_modified{};
+        bool unprotected{};
+    };
+    static constexpr size_t UBO_PAGE_STATE_SLOTS = 64;
+    std::array<UboPageStateEntry, UBO_PAGE_STATE_SLOTS> ubo_page_state_cache{};
+    u64 ubo_page_state_epoch = 1;
+
+    [[nodiscard]] UboPageState QueryUboPageState(DAddr device_addr, u32 size) noexcept {
+        if (size != 0 && (device_addr & Core::DEVICE_PAGEMASK) + size <= Core::DEVICE_PAGESIZE) {
+            const u64 page = device_addr >> Core::DEVICE_PAGEBITS;
+            const u64 cur_epoch =
+                ubo_page_state_epoch + memory_tracker.CpuEpoch() + memory_tracker.GpuEpoch();
+            UboPageStateEntry& entry = ubo_page_state_cache[static_cast<size_t>(
+                (page ^ (page >> 6)) & (UBO_PAGE_STATE_SLOTS - 1))];
+            if (entry.page == page && entry.epoch == cur_epoch) {
+                return UboPageState{entry.gpu_modified, entry.unprotected};
+            }
+            const DAddr page_addr = page << Core::DEVICE_PAGEBITS;
+            const bool gpu_mod =
+                memory_tracker.IsRegionGpuModified(page_addr, Core::DEVICE_PAGESIZE);
+            const bool unprot =
+                memory_tracker.IsRegionHot(page_addr, Core::DEVICE_PAGESIZE) ||
+                memory_tracker.IsRegionCpuModified(page_addr, Core::DEVICE_PAGESIZE);
+            entry = UboPageStateEntry{
+                .page = page,
+                .epoch = cur_epoch,
+                .gpu_modified = gpu_mod,
+                .unprotected = unprot,
+            };
+            return UboPageState{gpu_mod, unprot};
+        }
+        const bool gpu_mod = memory_tracker.IsRegionGpuModified(device_addr, size);
+        const bool unprot = memory_tracker.IsRegionHot(device_addr, size) ||
+                            memory_tracker.IsRegionCpuModified(device_addr, size);
+        return UboPageState{gpu_mod, unprot};
+    }
+
+    [[nodiscard]] u64 RangeCpuEpoch(DAddr addr, u64 size) const noexcept {
+        constexpr u64 ChunkBits = 22;
+        constexpr u64 GroupChunks = 8;
+        constexpr u64 MaxChunks = 68;
+        const u64 eff_size = size != 0 ? size : u64{1};
+        const u64 first = addr >> ChunkBits;
+        const u64 last = (addr + eff_size - 1) >> ChunkBits;
+        if (last < first || last - first < GroupChunks) {
+            return memory_tracker.CpuRangeEpoch(addr, eff_size);
+        }
+        if (last - first >= MaxChunks) {
+            return (u64{1} << 63) | memory_tracker.CpuEpoch();
+        }
+        u64 sum = 0;
+        for (u64 chunk = first; chunk <= last; chunk += GroupChunks) {
+            const u64 count = (std::min<u64>)(GroupChunks, last - chunk + 1);
+            sum += memory_tracker.CpuRangeEpoch(chunk << ChunkBits, count << ChunkBits);
+        }
+        return sum & ~(u64{1} << 63);
+    }
+
+    [[nodiscard]] u64 RangeGpuEpoch(DAddr addr, u64 size) const noexcept {
+        constexpr u64 ChunkBits = 22;
+        constexpr u64 GroupChunks = 8;
+        constexpr u64 MaxChunks = 68;
+        const u64 eff_size = size != 0 ? size : u64{1};
+        const u64 first = addr >> ChunkBits;
+        const u64 last = (addr + eff_size - 1) >> ChunkBits;
+        if (last < first || last - first < GroupChunks) {
+            return memory_tracker.GpuRangeEpoch(addr, eff_size);
+        }
+        if (last - first >= MaxChunks) {
+            return (u64{1} << 63) | memory_tracker.GpuEpoch();
+        }
+        u64 sum = 0;
+        for (u64 chunk = first; chunk <= last; chunk += GroupChunks) {
+            const u64 count = (std::min<u64>)(GroupChunks, last - chunk + 1);
+            sum += memory_tracker.GpuRangeEpoch(chunk << ChunkBits, count << ChunkBits);
+        }
+        return sum & ~(u64{1} << 63);
+    }
 
     void NoteUniformWrite(DAddr device_addr, u64 size) noexcept {
         if (size == 0) {
@@ -1279,21 +1416,17 @@ private:
     /// Preflushable marks, just the marked pages are queued: a write that covers one marked page
     /// of a large buffer would otherwise copy the whole buffer back at every fence.
     void QueueFenceDownload(DAddr device_addr, u64 size) {
-        static const bool exact = [] {
-            const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
-            return value == nullptr || value[0] != '0';
-        }();
         if (AsyncBufferDownloads() || size <= SmallDownloadLimit()) {
-            uncommitted_gpu_modified_ranges.Add(device_addr, size);
+            AddUncommittedRange(device_addr, size);
             return;
         }
         // Preflushed writes arm the read traps too: their data reaches guest memory only when
         // the fence's download lands, and a read before that saw stale words (Ocarina of Time's
         // whole screen flashed white at the sword boulder, ~180 times in 30 s). The trapped read
         // flushes on demand only while the data is still in flight (GetFlushArea).
-        if (!exact) {
+        if (!exact_preflush) {
             if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
-                uncommitted_gpu_modified_ranges.Add(device_addr, size);
+                AddUncommittedRange(device_addr, size);
                 if (Nx2Perf::On(Nx2Perf::Opt::PreflushAging)) {
                     Nx2NotePreflushWrite(device_addr, device_addr + size);
                 }
@@ -1304,18 +1437,14 @@ private:
         const DAddr end = device_addr + size;
         u64 queued = 0;
         memory_tracker.ForEachPreflushableRange(device_addr, size, [&](DAddr begin, u64 length) {
-            const DAddr lower = (std::max)(begin, device_addr);
-            const DAddr upper = (std::min)(begin + length, end);
+            const DAddr lower = (std::max<DAddr>)(begin, device_addr);
+            const DAddr upper = (std::min<DAddr>)(begin + length, end);
             if (lower < upper) {
-                uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
-                queued += upper - lower;
-                if (Nx2Perf::On(Nx2Perf::Opt::PreflushAging)) {
-                    Nx2NotePreflushWrite(lower, upper);
-                }
+                queued += Nx2QueuePreflushRange(lower, upper);
             }
         });
         ArmReadTraps(device_addr, size);
-        if (Nx2DownloadTrace::g_enabled && queued != 0) [[unlikely]] {
+        if (Nx2DownloadTrace::g_enabled && queued != 0) {
             Nx2DownloadTrace::Queued(device_addr, size, queued);
         }
     }
@@ -1341,19 +1470,33 @@ private:
     bool Nx2VerifyDownloadBatch(const Nx2Downloads& downloads, const Nx2Downloads& batched);
     /// Profiling: counts a download's bytes by the age of their blocks' preflush stamps.
     void Nx2CountDownloadAges(DAddr device_addr, u64 size);
+    /// Queues the 64-byte cachelines of [lower, upper) that the guest CPU has read on marked
+    /// 4 KiB preflush blocks; returns the number of bytes queued.
+    u64 Nx2QueuePreflushRange(DAddr lower, DAddr upper);
     /// The guest CPU read [begin, end): `marked` when GetFlushArea marked it Preflushable after a
-    /// flush, else (PreflushAging) a trapped read of a marked range.
+    /// flush, else a trapped read of an already-marked range.
     void Nx2StampPreflushBlocks(DAddr begin, DAddr end, bool marked);
     /// PreflushAging, every 60 frames: drops the marks of blocks the CPU stopped reading.
     void Nx2AgePreflushBlocks();
 
-    static constexpr u64 NX2_PREFLUSH_BLOCK_BITS = 16; ///< 64 KiB blocks
+    static constexpr u64 NX2_PREFLUSH_BLOCK_BITS = 12; ///< 4 KiB blocks (device pages)
+    static constexpr u64 NX2_PREFLUSH_LINE_BITS = 6;   ///< 64-byte cachelines (64 per 4 KiB block)
+    static_assert((u64{1} << NX2_PREFLUSH_BLOCK_BITS) == Core::DEVICE_PAGESIZE);
+    static_assert((u64{64} << NX2_PREFLUSH_LINE_BITS) == (u64{1} << NX2_PREFLUSH_BLOCK_BITS));
     static constexpr u32 NX2_PREFLUSH_MIN_LIMIT = 256; ///< Unread GPU-write frames before a drop
     static constexpr u32 NX2_PREFLUSH_MAX_LIMIT = 3600;
-    /// A 64 KiB block with Preflushable marks. Aged by frames in which QueueFenceDownload queued
-    /// downloads from the block without a CPU read, so quiet blocks keep their marks at zero cost.
+    [[nodiscard]] static u64 Nx2PreflushLineMask(DAddr page_base, DAddr begin,
+                                                 DAddr end) noexcept {
+        const u64 first_line = (begin - page_base) >> NX2_PREFLUSH_LINE_BITS;
+        const u64 last_line = (end - 1 - page_base) >> NX2_PREFLUSH_LINE_BITS;
+        return (~u64{0} << first_line) & (~u64{0} >> (63 - last_line));
+    }
+    /// A 4 KiB page with Preflushable marks. Aged by frames in which QueueFenceDownload queued
+    /// downloads from the page without a CPU read, so quiet pages keep their marks at zero cost.
+    /// `read_mask` tracks which 64-byte cachelines inside the 4 KiB page the guest CPU has read.
     /// Guarded by `mutex`.
     struct Nx2PreflushBlock {
+        u64 read_mask{};
         u64 last_read_frame{};
         u64 last_write_frame{~u64{0}}; ///< Last frame_tick QueueFenceDownload counted for this block
         u64 limit_frame{};  ///< Dropped: start of the decay period (the drop or the last halving)
@@ -1375,10 +1518,11 @@ private:
             }
         }
     }
-    std::unordered_map<u64, Nx2PreflushBlock> nx2_preflush_blocks;
+    Common::unordered_map<u64, Nx2PreflushBlock> nx2_preflush_blocks;
     u64 nx2_preflush_drops{};   ///< Blocks dropped since start
     u64 nx2_preflush_remarks{}; ///< Reads of dropped blocks that flushed (stalled) and marked them
 
+    void AddUncommittedRange(DAddr addr, u64 size);
     void AddGpuModifiedRange(DAddr addr, u64 size);
     void SubtractGpuModifiedRange(DAddr addr, u64 size);
     void NoteFastPreflushRead(DAddr begin, DAddr end) noexcept;
@@ -1386,13 +1530,19 @@ private:
 
     ReadTrapTracker read_trapped_ranges;
     DevicePageBitmap live_gpu_modified_pages;
-    std::array<std::atomic<u64>, 256> fast_preflush_reads{};
+    std::array<std::atomic<u64>, 1024> fast_preflush_reads{};
+    static constexpr size_t GPU_WRITE_STAMP_SLOTS = 4096;
+    std::atomic<u64> atomic_frame_tick{0};
+    std::atomic<bool> has_uncommitted_flushes{false};
+    std::atomic<u64> preflush_queued_frame{0};
+    std::atomic<u64> preflush_last_commit_ns{0};
+    std::array<std::atomic<u64>, GPU_WRITE_STAMP_SLOTS> recent_gpu_page_stamps{};
+    std::array<std::atomic<u64>, GPU_WRITE_STAMP_SLOTS> recent_gpu_block_stamps{};
     /// Ranges the guest CPU read after GPU writes. A read that must flush downloads the GPU
     /// writes in all of them, so the reads that usually follow it find nothing left to flush.
     Common::RangeSet<DAddr> cpu_read_ranges;
     bool download_cpu_read_ranges{};
     Common::RangeSet<DAddr> gpu_modified_ranges;
-    std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 
     // Async Buffers
     std::deque<std::optional<Async_Buffer>> async_buffers;
@@ -1673,6 +1823,70 @@ private:
     /// Copies replaced while the GPU may still write them: freed once it is past their tick.
     std::vector<std::pair<u64, Nx2Staging>> nx2_retired_list_copies;
     boost::container::small_vector<std::pair<BufferId, DAddr>, 8> nx2_list_copy_requests;
+    struct SsboCbufPageCache {
+        size_t as_id{};
+        u64 map_serial{~u64{0}};
+        u64 translation_gen{};
+        GPUVAddr page_addr{~GPUVAddr{0}};
+        const u8* page_host{};
+    };
+    SsboCbufPageCache last_ssbo_cbuf_page{};
+
+    const bool exact_preflush = [] {
+        const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool defer_preflush_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_DEFER_PREFLUSH");
+        return value == nullptr || value[0] != '0';
+    }();
+    const s64 preflush_interval_ns = [] {
+        const char* value = std::getenv("EDEN_NX2_PREFLUSH_INTERVAL_US");
+        const s64 us = value != nullptr ? std::strtoll(value, nullptr, 10) : s64{2000};
+        return us > 0 ? us * 1000 : s64{0};
+    }();
+    const char bank_reupload_mode = [] {
+        const char* v = std::getenv("EDEN_NX2_BANK_REUPLOAD");
+        return v != nullptr ? v[0] : '1';
+    }();
+    const bool host_import_start = [&] {
+        const char* const value = std::getenv("EDEN_NX2_HOST_IMPORT");
+        if (value != nullptr) {
+            return value[0] == '1';
+        }
+        if constexpr (requires { runtime.HostImportByDefault(); }) {
+            return runtime.HostImportByDefault();
+        }
+        return false;
+    }();
+    const bool bind_memo_enabled = !IS_OPENGL && Nx2Perf::On(Nx2Perf::Opt::BindMemo);
+    const bool sync_skip_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_SYNC_SKIP");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool skip_regions_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_REGIONS");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool sync_precheck_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_SYNC_PRECHECK");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool ssbo_memo_enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_SSBO_MEMO");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool bare_graphics_ssbo_pointers = [] {
+        const char* const value = std::getenv("EDEN_NX2_GRAPHICS_SSBO_BARE");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool mark_guards_enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_BUFCACHE_MARK");
+        return value == nullptr || value[0] != '0';
+    }();
+    bool bind_stats_enabled = false;
+    bool hazard_trace_enabled = false;
+
     bool nx2_collect_list_copies{};
     int nx2_graphics_stage{-1};
 };

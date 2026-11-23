@@ -40,6 +40,7 @@ struct MultiRangeRef {
     VkDeviceSize size{};
     bool sparse{};
     bool needs_gather{};
+    bool unused_in_pass{};
 };
 
 class MultiRangeBufferCache final {
@@ -84,6 +85,7 @@ private:
         u64 geometry{};
         u64 content{};
         u64 last_used{};
+        u64 last_pass_serial{~u64{0}};
         bool dirty{true};
     };
 

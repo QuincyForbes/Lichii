@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -13,7 +14,9 @@
 #include "common/swap.h"
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/svc.h"
@@ -71,11 +74,17 @@ constexpr u64 kStackSpan = kWalkCountOffset - kIssuedOffset + sizeof(u32);
 constexpr u64 kPageSize = 0x1000;
 
 constexpr s64 kMinSleepNs = 500'000;
+constexpr s64 kHeavyWalkThresholdNs = 500'000;
+constexpr s64 kHeavyWalkMinSleepNs = 1'500'000;
+constexpr s64 kHeavySteadyMinSleepNs = 8'000'000;
 constexpr s64 kLimitMaxSleepNs = 16'000'000; // the game's own idle sleep in this loop
 constexpr s64 kDefaultMaxSleepNs = kLimitMaxSleepNs;
-constexpr s64 kDefaultSliceNs = 4'000'000;
+constexpr s64 kFirstIdleMaxSleepNs = 3'000'000;
+constexpr s64 kSecondIdleMaxSleepNs = 6'000'000;
+constexpr s64 kDefaultSliceNs = 1'500'000;
 constexpr long long kMinSliceUs = 100;
 constexpr s64 kWalkFactor = 4;
+constexpr u32 kMaxUnchangedProgressResets = 3;
 // A gap longer than this since the last return from the SVC is not one walk (the thread idled in
 // the 16 ms sleep or was preempted for long); such a walk gets the minimum sleep.
 constexpr s64 kStaleWalkNs = 20'000'000;
@@ -100,7 +109,7 @@ s64 MaxSleepNs() {
 }
 
 // EDEN_NX2_OOT_POLL_SLICE=0: one sleep of the whole length (as before). Otherwise the sleep is
-// cut into slices of this many us (default 4000, at least 100) and ends early once the request
+// cut into slices of this many us (default 1500, at least 100) and ends early once the request
 // ring moves (head or count) or the manager leaves state 3: what would have made the walk return
 // at once had it happened during the walk.
 s64 SliceNs() {
@@ -122,6 +131,21 @@ s64 NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+// Scheduled guest-core CPU time of the calling thread in ns (excludes preemptions and game sleeps).
+s64 ThreadCpuNs(Core::System& system) {
+    auto& kernel = system.Kernel();
+    const auto* const scheduler = kernel.CurrentScheduler();
+    const auto* const thread = GetCurrentThreadPointer(kernel);
+    if (scheduler == nullptr || thread == nullptr) {
+        return 0;
+    }
+    const u64 prev_ctx_ticks = static_cast<u64>(scheduler->GetLastContextSwitchTime());
+    const u64 cur_ticks = system.CoreTiming().GetClockTicks();
+    const u64 delta = cur_ticks >= prev_ctx_ticks ? cur_ticks - prev_ctx_ticks : 0;
+    const u64 total_ticks = static_cast<u64>(thread->GetCpuTime()) + delta;
+    return static_cast<s64>((total_ticks / 12) * 625 + ((total_ticks % 12) * 625) / 12);
 }
 
 enum class Outcome : u8 {
@@ -277,8 +301,11 @@ WalkView ReadWalk(Core::Memory::Memory& memory, const ThreadContext& ctx) {
 struct Slot {
     u64 manager{};
     s64 resume_ns{}; // when the thread last returned from this SVC (start of the next walk)
+    s64 resume_cpu_ns{};
     u32 head{};
     u32 count{};
+    u32 idle_walks{};
+    u32 unchanged_progress{};
 };
 
 struct Stats {
@@ -349,8 +376,9 @@ bool CallNx2OotPollBackoff(Core::System& system, u32 imm) {
     }
 
     const s64 now = NowNs();
+    const s64 cpu_now = ThreadCpuNs(system);
     const s64 max_sleep = MaxSleepNs();
-    const s64 min_sleep = std::min(kMinSleepNs, max_sleep);
+    const s64 min_sleep = (std::min)(kMinSleepNs, max_sleep);
     s64 sleep_ns = 0;
     bool first = false;
     bool do_log = false;
@@ -360,25 +388,50 @@ bool CallNx2OotPollBackoff(Core::System& system, u32 imm) {
         std::scoped_lock lock{g_mutex};
         if (view.outcome != Outcome::Frame) {
             Slot& slot = FindSlot(view.manager);
-            const s64 walk = slot.resume_ns != 0 ? now - slot.resume_ns : 0;
+            const s64 wall_walk = slot.resume_ns != 0 ? now - slot.resume_ns : 0;
+            const s64 cpu_walk = slot.resume_cpu_ns != 0 ? cpu_now - slot.resume_cpu_ns : 0;
             // The ring moved under the walk (an entry completed and another came in).
             if (view.outcome == Outcome::Sleep && slot.resume_ns != 0 &&
                 (slot.head != view.head || slot.count != view.count)) {
                 view.outcome = Outcome::ListChanged;
             }
             if (view.outcome == Outcome::Sleep) {
+                const u32 streak = ++slot.idle_walks;
                 sleep_ns = min_sleep;
-                if (walk > 0 && walk <= kStaleWalkNs) {
-                    sleep_ns = std::clamp(walk * kWalkFactor, min_sleep, max_sleep);
+                if (wall_walk > 0 && wall_walk <= kStaleWalkNs) {
+                    const s64 walk =
+                        (cpu_walk > 0 && cpu_walk < wall_walk) ? cpu_walk : wall_walk;
+                    s64 cap_ns = max_sleep;
+                    if (streak == 1) {
+                        cap_ns = (std::min)(kFirstIdleMaxSleepNs, max_sleep);
+                    } else if (streak == 2) {
+                        cap_ns = (std::min)(kSecondIdleMaxSleepNs, max_sleep);
+                    }
+                    const s64 raw_floor = walk >= kHeavyWalkThresholdNs
+                                              ? (streak >= 3 ? kHeavySteadyMinSleepNs
+                                                             : kHeavyWalkMinSleepNs)
+                                              : min_sleep;
+                    const s64 floor_ns = (std::min)(raw_floor, cap_ns);
+                    sleep_ns = std::clamp(walk * kWalkFactor, floor_ns, cap_ns);
                     ++g_stats.measured;
                     g_stats.walk_ns += walk;
                 }
                 ++g_stats.slept;
                 g_stats.sleep_ns += sleep_ns;
             } else {
+                const bool ring_changed =
+                    slot.resume_ns == 0 || slot.head != view.head || slot.count != view.count;
                 slot.resume_ns = now;
+                slot.resume_cpu_ns = cpu_now;
                 slot.head = view.head;
                 slot.count = view.count;
+                if (ring_changed || view.outcome != Outcome::Progress) {
+                    slot.idle_walks = 0;
+                    slot.unchanged_progress = 0;
+                } else if (slot.unchanged_progress < kMaxUnchangedProgressResets) {
+                    ++slot.unchanged_progress;
+                    slot.idle_walks = 0;
+                }
             }
         }
         ++g_stats.outcomes[static_cast<size_t>(view.outcome)];
@@ -406,12 +459,12 @@ bool CallNx2OotPollBackoff(Core::System& system, u32 imm) {
 
     if (sleep_ns > 0) {
         const s64 slice = SliceNs();
+        bool early = false;
         if (slice == 0 || sleep_ns <= slice) {
             SleepThread(system, sleep_ns);
         } else {
             // Ends at the planned time (not slice count) so preemption doesn't stretch it.
             const s64 until = NowNs() + sleep_ns;
-            bool early = false;
             for (s64 left = sleep_ns; left > 0; left = until - NowNs()) {
                 SleepThread(system, (std::min)(left, slice));
                 ManagerFields fields{};
@@ -425,10 +478,6 @@ bool CallNx2OotPollBackoff(Core::System& system, u32 imm) {
                     break;
                 }
             }
-            if (early) {
-                std::scoped_lock lock{g_mutex};
-                ++g_stats.woke_early;
-            }
         }
         // The next walk starts now: remember when, and the ring it starts from.
         ManagerFields after{};
@@ -436,11 +485,20 @@ bool CallNx2OotPollBackoff(Core::System& system, u32 imm) {
         const u32 head = ok ? after.head : view.head;
         const u32 count = ok ? after.count : view.count;
         const s64 resume = NowNs();
+        const s64 resume_cpu = ThreadCpuNs(system);
         std::scoped_lock lock{g_mutex};
+        if (early) {
+            ++g_stats.woke_early;
+        }
         Slot& slot = FindSlot(view.manager);
         slot.resume_ns = resume;
+        slot.resume_cpu_ns = resume_cpu;
         slot.head = head;
         slot.count = count;
+        if (early || head != view.head || count != view.count) {
+            slot.idle_walks = 0;
+            slot.unchanged_progress = 0;
+        }
     }
     return true;
 }

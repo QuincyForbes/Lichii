@@ -551,9 +551,13 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     // EXP42: single-level, single-layer render targets can come from (and go back to) the pool.
     constexpr VkImageUsageFlags attachment_usage =
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    constexpr u64 MinPooledTexelBytes = u64{16} << 10;
+    const u64 min_guest_bytes = u64{image_ci.extent.width} * image_ci.extent.height *
+                                VideoCore::Surface::BytesPerBlock(info.format);
     if (pool_key != nullptr && !unbacked && image_ci.imageType == VK_IMAGE_TYPE_2D &&
         image_ci.mipLevels == 1 && image_ci.arrayLayers == 1 &&
-        image_ci.samples == VK_SAMPLE_COUNT_1_BIT && (image_ci.usage & attachment_usage) != 0) {
+        image_ci.samples == VK_SAMPLE_COUNT_1_BIT && (image_ci.usage & attachment_usage) != 0 &&
+        min_guest_bytes >= MinPooledTexelBytes) {
         *pool_key = ImagePoolKey{
             .valid = true,
             .flags = image_ci.flags,
@@ -1527,11 +1531,10 @@ void TextureCacheRuntime::EraseResolveShadow(VkImage msaa_image) {
 void TextureCacheRuntime::BarrierFeedbackLoop() {
     // The draw samples the bound depth/stencil image: ending the pass makes what earlier draws
     // of the pass wrote to it visible. If none of them wrote it, there is nothing to make
-    // visible (Eglantine bdaf482d3f). Off unless EDEN_NX2_DEPTH_READ_KEEP_PASS=1: depth clears
-    // recorded inside an open pass (RasterizerVulkan::Clear) do not note their write yet.
+    // visible (Eglantine bdaf482d3f). EDEN_NX2_DEPTH_READ_KEEP_PASS=0 forces the break.
     static const bool keep_pass = [] {
         const char* const value = std::getenv("EDEN_NX2_DEPTH_READ_KEEP_PASS");
-        return value != nullptr && value[0] == '1';
+        return value == nullptr || value[0] != '0';
     }();
     if (keep_pass && scheduler.IsRenderPassActive() && !scheduler.RenderPassWroteDepthStencil()) {
         return;
@@ -2951,8 +2954,7 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
     });
     const VkImage dst_image = dst.Handle();
     const VkImage src_image = src.Handle();
-    scheduler.RequestOutsideRenderPassKeepClear(std::array{dst_image, src_image});
-    scheduler.Record([dst_image, src_image, aspect_mask, vk_copies](vk::CommandBuffer cmdbuf) {
+    auto record_copy = [dst_image, src_image, aspect_mask, vk_copies](vk::CommandBuffer cmdbuf) {
         RangedBarrierRange dst_range;
         RangedBarrierRange src_range;
         for (const VkImageCopy& copy : vk_copies) {
@@ -3027,7 +3029,21 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
                                vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, nullptr, nullptr,
                                post_barriers);
-    });
+    };
+    const bool fresh_dst = dst.JustTransitioned(scheduler.CurrentTick(), scheduler.WorkRecords());
+    const bool can_hoist = fresh_dst && !scheduler.RenderPassHasStores() &&
+                           !scheduler.RenderPassTouches(src_image) &&
+                           !scheduler.RenderPassTouches(dst_image);
+    if (can_hoist && scheduler.CanRecordBeforePass()) {
+        scheduler.RecordBeforePass(std::move(record_copy));
+        dst.NoteInitialTransition(scheduler.CurrentTick(), scheduler.WorkRecords());
+        return;
+    }
+    if (can_hoist && scheduler.IsRenderPassActive() && !scheduler.HasDeferredWaitForIdle()) {
+        scheduler.WantSplitBeforeCurrentPass();
+    }
+    scheduler.RequestOutsideRenderPassKeepClear(std::array{dst_image, src_image});
+    scheduler.Record(std::move(record_copy));
 }
 
 void TextureCacheRuntime::CopyImageMSAA(Image& dst, Image& src,
@@ -3603,7 +3619,8 @@ vk::Image TextureCacheRuntime::TakePooledImage(const ImagePoolKey& key) {
 }
 
 void TextureCacheRuntime::PoolImage(const ImagePoolKey& key, vk::Image image, u64 bytes) {
-    if (!key.valid || !image || bytes > ImagePoolMaxBytes) {
+    const u64 cap = ImagePoolCap();
+    if (!key.valid || !image || bytes > cap) {
         return;
     }
     image_pool.push_back(PooledImage{
@@ -3614,15 +3631,25 @@ void TextureCacheRuntime::PoolImage(const ImagePoolKey& key, vk::Image image, u6
     });
     image_pool_bytes += bytes;
     ++image_pool_given;
-    TrimImagePool(ImagePoolCap());
+    TrimImagePool(cap);
 }
 
-u64 TextureCacheRuntime::ImagePoolCap() {
-    return VideoCore::Nx2Debug::Experiment(42) >= 2 ? ImagePoolMaxBytesDedicated : ImagePoolMaxBytes;
+u64 TextureCacheRuntime::ImagePoolCap() const {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    return ImagePoolMaxBytes;
+#else
+    if (VideoCore::Nx2Debug::Experiment(42) < 2 && !device.IsMoltenVK()) {
+        return ImagePoolMaxBytes;
+    }
+    const u64 vram_eighth = GetDeviceLocalMemory() / 8;
+    return (std::min)(ImagePoolMaxBytesDedicated, (std::max)(ImagePoolMaxBytes, vram_eighth));
+#endif
 }
 
 void TextureCacheRuntime::TrimImagePool(u64 max_bytes) {
-    while (!image_pool.empty() && image_pool_bytes > max_bytes) {
+    const size_t max_entries = max_bytes == 0 ? size_t{0} : ImagePoolMaxEntries;
+    while (!image_pool.empty() &&
+           (image_pool_bytes > max_bytes || image_pool.size() > max_entries)) {
         image_pool_bytes -= image_pool.front().bytes;
         image_pool.pop_front();
         ++image_pool_evicted;
@@ -3674,9 +3701,15 @@ void TextureCacheRuntime::TickFrame() {
         // Host memory pressure is only signalled on iOS (shared memory: the OS low-memory warning
         // or the process nearing its limit).
         const u32 host_pressure = Common::PlatformEvents::MemoryPressureGeneration();
+        bool budget_tight = false;
+        if (image_pool_frame % 30 == 0 && CanReportMemoryUsage()) {
+            const u64 budget = GetDeviceMemoryBudget();
+            const u64 used = GetDeviceMemoryUsage();
+            budget_tight = budget != 0 && (used >= budget || budget - used < (u64{512} << 20));
+        }
         const bool short_of_memory = pressure != image_pool_seen_pressure ||
                                      failed != image_pool_seen_failed ||
-                                     host_pressure != image_pool_seen_host_pressure;
+                                     host_pressure != image_pool_seen_host_pressure || budget_tight;
         image_pool_seen_pressure = pressure;
         image_pool_seen_failed = failed;
         image_pool_seen_host_pressure = host_pressure;
@@ -3744,6 +3777,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
             UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
                 SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
             true, &runtime_, &original_pool_key, &from_pool);
+        needs_pool_zero = from_pool;
     }
     if (OutOfMemory()) {
         return;
@@ -3824,28 +3858,29 @@ Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBas
 
 void Image::ReleaseToPool() {
     using VideoCommon::ImageFlagBits;
-    if (runtime == nullptr || VideoCore::Nx2Debug::Experiment(42) == 0) {
+    if (runtime == nullptr || VideoCore::Nx2Debug::Experiment(42) == 0 ||
+        sparse_layers.allocator != nullptr) {
         return;
     }
-    constexpr ImageFlagBits unusual = ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
-                                      ImageFlagBits::SparseTiles | ImageFlagBits::UnwrittenSparse |
-                                      ImageFlagBits::Unbacked;
+    // ImageFlagBits::Sparse marks non-contiguous guest page mappings on standard VMA-backed NVN
+    // render targets (JoinImages); only host sparse / unbacked VkImages are excluded here.
+    constexpr ImageFlagBits unusual = ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+                                      ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked;
     if (True(flags & unusual)) {
         return;
     }
-    constexpr u64 MinPooledBytes = u64{256} << 10;
-    const auto give = [this](vk::Image& image, const ImagePoolKey& key) {
-        if (!key.valid || !image || image.IsUnbacked()) {
+    constexpr u64 MinPooledBytes = u64{16} << 10;
+    constexpr VkImageCreateFlags sparse_create_flags =
+        VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
+    const bool allow_dedicated =
+        VideoCore::Nx2Debug::Experiment(42) >= 2 || runtime->device.IsMoltenVK();
+    const auto give = [this, allow_dedicated](vk::Image& image, const ImagePoolKey& key) {
+        if (!key.valid || (key.flags & sparse_create_flags) != 0 || !image || image.IsUnbacked()) {
             return;
         }
-        // Memory placed in host memory over budget is freed as before. Dedicated allocations
-        // (block 0) too with EXP42=1; EXP42=2 pools them as well (2026-11-10: in the Stalchild
-        // fight 2,295 images a 600 frames asked the pool and only 309 were ever given back, the
-        // big render targets such as a 1280x720 one remade up to 282 times being dedicated).
-        // The image keeps its own allocation either way.
         const vk::Image::MemoryBlock block = image.GetMemoryBlock();
         const bool dedicated = block.block == 0;
-        if ((dedicated && VideoCore::Nx2Debug::Experiment(42) < 2) || block.size < MinPooledBytes ||
+        if ((dedicated && !allow_dedicated) || block.size < MinPooledBytes ||
             !image.IsDeviceLocal()) {
             return;
         }
@@ -3914,6 +3949,7 @@ void Image::AllocateComputeUnswizzleBuffer(u32 max_slices) {
 
 void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                          std::span<const VideoCommon::BufferImageCopy> copies) {
+    needs_pool_zero = false;
     // TODO: Move this to another API
     if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
         runtime->InvalidateResolveShadow(Handle());
@@ -3985,10 +4021,10 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
         return;
     }
 
-    scheduler->RequestOutsideRenderPassOperationContext();
     auto vk_copies = TransformBufferImageCopies(copies, offset, aspect_mask);
     const VkBuffer src_buffer = buffer;
     const VkImage vk_image = *original_image;
+    scheduler->RequestOutsideRenderPassKeepClear(std::span<const VkImage>{&vk_image, 1});
     const VkImageAspectFlags vk_aspect_mask = aspect_mask;
     const bool was_initialized = std::exchange(initialized, true);
 
@@ -4010,6 +4046,7 @@ void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImag
         const bool was_initialized = std::exchange(initialized, true);
         if (!was_initialized ||
             (initial_upload_tick == tick && initial_upload_records == records)) {
+            needs_pool_zero = false;
             auto vk_copies = TransformBufferImageCopies(copies, map.offset, aspect_mask);
             const VkBuffer src_buffer = map.buffer;
             const VkImage vk_image = *original_image;
@@ -6285,7 +6322,59 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
 }
 
 void TextureCacheRuntime::TransitionImageLayout(Image& image) {
+    const bool zero_pooled = image.TakePoolZeroNeeded();
     if (!image.ExchangeInitialization()) {
+        const VkImage vk_image = image.Handle();
+        const VkImageAspectFlags aspect = image.AspectMask();
+        const VkImageSubresourceRange range{
+            .aspectMask = aspect,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        };
+        if (zero_pooled) {
+            scheduler.RecordUploadOnly([vk_image, aspect, range](vk::CommandBuffer upload_cmdbuf) {
+                const VkImageMemoryBarrier to_clear{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_NONE,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = vk_image,
+                    .subresourceRange = range,
+                };
+                const VkImageMemoryBarrier to_general{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = vk_image,
+                    .subresourceRange = range,
+                };
+                upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, to_clear);
+                if ((aspect & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
+                    upload_cmdbuf.ClearColorImage(vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                                  VkClearColorValue{}, range);
+                } else {
+                    upload_cmdbuf.ClearDepthStencilImage(
+                        vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VkClearDepthStencilValue{}, range);
+                }
+                upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, to_general);
+            });
+            image.NoteInitialTransition(scheduler.CurrentTick(), scheduler.WorkRecords());
+            return;
+        }
         VkImageMemoryBarrier barrier{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
@@ -6295,14 +6384,8 @@ void TextureCacheRuntime::TransitionImageLayout(Image& image) {
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = image.Handle(),
-            .subresourceRange{
-                .aspectMask = image.AspectMask(),
-                .baseMipLevel = 0,
-                .levelCount = VK_REMAINING_MIP_LEVELS,
-                .baseArrayLayer = 0,
-                .layerCount = VK_REMAINING_ARRAY_LAYERS,
-            },
+            .image = vk_image,
+            .subresourceRange = range,
         };
         if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::BeforePassAdaptive)) {
             scheduler.RecordUploadOnly([barrier](vk::CommandBuffer upload_cmdbuf) {

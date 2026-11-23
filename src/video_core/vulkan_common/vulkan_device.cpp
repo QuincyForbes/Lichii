@@ -2009,15 +2009,25 @@ void Device::RemoveUnsuitableExtensions() {
                                VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     }
 
+    // VK_KHR_spirv_1_4 is core in Vulkan 1.2+, and SPV_EXT_mesh_shader requires SPIR-V 1.4+.
+    if (instance_version >= VK_API_VERSION_1_2) {
+        extensions.spirv_1_4 = true;
+    }
+
     // VK_EXT_mesh_shader: Switch 2 titles draw some geometry with task and mesh programs. Only
     // the two stages are used; the multiview, shading rate and query features need more.
     features.mesh_shader.multiviewMeshShader = VK_FALSE;
     features.mesh_shader.primitiveFragmentShadingRateMeshShader = VK_FALSE;
     features.mesh_shader.meshShaderQueries = VK_FALSE;
-    extensions.mesh_shader = features.mesh_shader.taskShader && features.mesh_shader.meshShader;
+    extensions.mesh_shader = features.mesh_shader.taskShader && features.mesh_shader.meshShader &&
+                             SupportedSpirvVersion() >= 0x00010400U;
+    const char* const native_mesh_env = std::getenv("EDEN_NX2_NATIVE_MESH");
+    const bool force_native_mesh = native_mesh_env != nullptr && native_mesh_env[0] == '1';
+    const bool force_disable_mesh = native_mesh_env != nullptr && native_mesh_env[0] == '0';
     // The use_mesh_shaders setting or EDEN_NX2_FORCE_MESH_FALLBACK=1: leave VK_EXT_mesh_shader
     // disabled, so task/mesh draws take the compute fallback a device without it uses.
-    if (extensions.mesh_shader && !Settings::values.use_mesh_shaders.GetValue()) {
+    if (extensions.mesh_shader && !force_native_mesh &&
+        !Settings::values.use_mesh_shaders.GetValue()) {
         LOG_INFO(Render_Vulkan, "Mesh shaders turned off in the settings: VK_EXT_mesh_shader "
                                 "disabled");
         extensions.mesh_shader = false;
@@ -2028,17 +2038,15 @@ void Device::RemoveUnsuitableExtensions() {
         extensions.mesh_shader = false;
     }
     if (extensions.mesh_shader) {
-        const char* const native_mesh_env = std::getenv("EDEN_NX2_NATIVE_MESH");
-        const bool force_native = native_mesh_env != nullptr && native_mesh_env[0] == '1';
         const VkDriverId driver_id = GetDriverID();
         const bool amd_driver = driver_id == VK_DRIVER_ID_MESA_RADV ||
                                 driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
                                 driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE;
-        if (!force_native && (amd_driver || IsMoltenVK())) {
+        if (force_disable_mesh || (!force_native_mesh && amd_driver)) {
             LOG_INFO(Render_Vulkan,
-                     "Disabling VK_EXT_mesh_shader by default on {} (use compute mesh fallback; "
+                     "Disabling VK_EXT_mesh_shader on {} (use compute mesh fallback; "
                      "set EDEN_NX2_NATIVE_MESH=1 to override)",
-                     IsMoltenVK() ? "MoltenVK" : "AMD driver");
+                     force_disable_mesh ? "EDEN_NX2_NATIVE_MESH=0" : "AMD driver");
             extensions.mesh_shader = false;
         }
     }

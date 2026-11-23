@@ -31,6 +31,20 @@
 #if defined(__APPLE__) && TARGET_OS_IPHONE
 #include "common/ios_jit.h"
 #endif
+#if defined(ARCHITECTURE_arm64)
+#include "dynarmic/backend/arm64/fastmem.h"
+
+namespace Dynarmic::Backend::Arm64 {
+struct JitHotWriteCallbacks {
+    std::uintptr_t ctx_ptr = 0;
+    std::uintptr_t writes_base = 0;
+    std::array<std::uintptr_t, 5> write_fns{};
+    bool preserve_all_abi = false;
+};
+void RegisterJitHotWrite(const u64* tpidrro_el0, const JitHotWriteCallbacks& cb);
+void UnregisterJitHotWrite(const u64* tpidrro_el0) noexcept;
+} // namespace Dynarmic::Backend::Arm64
+#endif
 #include "common/cpu_features.h"
 #include "common/perf_report.h"
 #include "common/settings.h"
@@ -39,10 +53,12 @@
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
+#include "core/gpu_dirty_memory_manager.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc/svc_thread_yield.h"
 #include "dynarmic/interface/A64/config.h"
 #include "dynarmic/interface/jit_stats.h"
+#include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2_spikes.h"
 
 namespace Core {
@@ -346,15 +362,32 @@ u32 JitEvictSliceBytes() {
     return bytes;
 }
 
+#if defined(ARCHITECTURE_arm64)
+u32 JitStoreFaultLimit() {
+    static const u32 limit = [] {
+        constexpr u32 DefaultStoreFaultLimit = 8;
+        if (const char* const value = std::getenv("EDEN_NX2_JIT_STORE_FAULTS"); value && value[0] != '\0') {
+            return u32(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 1U << 20));
+        }
+        return DefaultStoreFaultLimit;
+    }();
+    return limit;
+}
+#endif
+
 JitFaultPolicy GetJitFaultPolicy() {
     static const JitFaultPolicy policy = [] {
+#if defined(ARCHITECTURE_arm64)
+        constexpr u32 DefaultLoadFaultLimit = 4;
+#else
         constexpr u32 DefaultLoadFaultLimit = 0;
+#endif
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         JitFaultPolicy result{Common::IosJit::FaultSharedMarkers(),
                               u8((std::min)(Common::IosJit::FaultBlockAfter(), 255U)),
                               DefaultLoadFaultLimit};
-#elif defined(__APPLE__) && defined(ARCHITECTURE_arm64)
-        JitFaultPolicy result{true, 2, DefaultLoadFaultLimit};
+#elif defined(ARCHITECTURE_arm64)
+        JitFaultPolicy result{true, 0, DefaultLoadFaultLimit};
 #else
         JitFaultPolicy result{false, 0, DefaultLoadFaultLimit};
 #endif
@@ -378,10 +411,89 @@ DynarmicCallbacks64::DynarmicCallbacks64(ArmDynarmic64& parent, Kernel::KProcess
     , m_check_memory_access{m_debugger_enabled || !Settings::values.cpuopt_ignore_memory_aborts.GetValue()}
 {}
 
+namespace {
+
+inline u64 LoadLeValue(const u8* src, std::size_t size) noexcept {
+    switch (size) {
+    case sizeof(u64): {
+        u64 v64{};
+        std::memcpy(&v64, src, sizeof(u64));
+        return v64;
+    }
+    case sizeof(u32): {
+        u32 v32{};
+        std::memcpy(&v32, src, sizeof(u32));
+        return v32;
+    }
+    case sizeof(u16): {
+        u16 v16{};
+        std::memcpy(&v16, src, sizeof(u16));
+        return v16;
+    }
+    case sizeof(u8): {
+        u8 v8{};
+        std::memcpy(&v8, src, sizeof(u8));
+        return v8;
+    }
+    default:
+        UNREACHABLE();
+    }
+}
+
+inline void StoreLeValue(u8* dst, u64 value, std::size_t size) noexcept {
+    switch (size) {
+    case sizeof(u64):
+        std::memcpy(dst, &value, sizeof(u64));
+        break;
+    case sizeof(u32): {
+        const u32 v32 = static_cast<u32>(value);
+        std::memcpy(dst, &v32, sizeof(u32));
+        break;
+    }
+    case sizeof(u16): {
+        const u16 v16 = static_cast<u16>(value);
+        std::memcpy(dst, &v16, sizeof(u16));
+        break;
+    }
+    case sizeof(u8): {
+        const u8 v8 = static_cast<u8>(value);
+        std::memcpy(dst, &v8, sizeof(u8));
+        break;
+    }
+    default:
+        UNREACHABLE();
+    }
+}
+
+} // Anonymous namespace
+
 Common::PerfReport::SlowAccess DynarmicCallbacks64::ClassifySlowAccess(u64 vaddr, size_t size) const {
     using Common::PerfReport::SlowAccess;
-    if ((vaddr & Core::Memory::YUZU_PAGEMASK) + size > Core::Memory::YUZU_PAGESIZE) {
+    const u64 masked = vaddr & 0xffffffffffffULL;
+    if ((masked & Core::Memory::YUZU_PAGEMASK) + size > Core::Memory::YUZU_PAGESIZE) {
         return SlowAccess::PageCross;
+    }
+    const auto plain_or_past = [&] {
+        return (m_fastmem_bits != 0 && m_fastmem_bits < 64 && (vaddr >> m_fastmem_bits) != 0)
+                   ? SlowAccess::PastArena
+                   : SlowAccess::Plain;
+    };
+    if (const auto* const hot_core = m_hot_core) {
+        const u64 page = masked & ~u64{Core::Memory::YUZU_PAGEMASK};
+        const auto& hot_w = hot_core->WriteSlot(page);
+        if (hot_w.vaddr_page == page) {
+            if (hot_w.rasterizer_cached) {
+                if (m_memory.RasterizerWriteGenerationRelaxed() == hot_w.mem_gen) {
+                    return SlowAccess::GpuTracked;
+                }
+            } else if (m_memory.FastWriteGenerationRelaxed() == hot_w.mem_gen) {
+                return plain_or_past();
+            }
+        }
+        const auto& hot_r = hot_core->ReadSlot(page);
+        if (hot_r.vaddr_page == page && m_memory.FastReadGenerationRelaxed() == hot_r.mem_gen) {
+            return hot_r.rasterizer_cached ? SlowAccess::GpuTracked : plain_or_past();
+        }
     }
     if (m_page_table == nullptr || (m_page_table_bits < 64 && (vaddr >> m_page_table_bits) != 0)) {
         return SlowAccess::Unmapped;
@@ -396,10 +508,7 @@ Common::PerfReport::SlowAccess DynarmicCallbacks64::ClassifySlowAccess(u64 vaddr
     case Common::PageType::Memory:
         break;
     }
-    if (m_fastmem_bits != 0 && m_fastmem_bits < 64 && (vaddr >> m_fastmem_bits) != 0) {
-        return SlowAccess::PastArena;
-    }
-    return SlowAccess::Plain;
+    return plain_or_past();
 }
 
 template <typename F>
@@ -443,18 +552,61 @@ u64 DynarmicCallbacks64::MemoryReadExclusive(u64 vaddr, size_t size) {
 }
 
 u64 DynarmicCallbacks64::ReadValue(u64 vaddr, size_t size) {
+    const u64 masked = vaddr & 0xffffffffffffULL;
+    const u64 page = masked & ~u64{Core::Memory::YUZU_PAGEMASK};
+    const u64 offset = masked & u64{Core::Memory::YUZU_PAGEMASK};
+    const bool in_page = offset + size <= Core::Memory::YUZU_PAGESIZE;
     if (!m_check_memory_access) {
-        const u64 masked = vaddr & 0xffffffffffffULL;
-        const u64 page = masked & ~u64{Core::Memory::YUZU_PAGEMASK};
-        const u64 offset = masked & u64{Core::Memory::YUZU_PAGEMASK};
-        if (page == m_hot_read_page && offset + size <= Core::Memory::YUZU_PAGESIZE &&
-            m_memory.FastReadGeneration() == m_hot_read_gen) {
-            u64 value{};
-            std::memcpy(&value, m_hot_read_ptr + offset, size);
-            return value;
+        const u64 rgen = m_memory.FastReadGenerationRelaxed();
+        if (in_page) {
+            if (page == m_hot_read_page && rgen == m_hot_read_gen) {
+                return LoadLeValue(m_hot_read_ptr + offset, size);
+            }
+            if (auto* const hot_core = m_hot_core) {
+                const auto& hot = hot_core->ReadSlot(page);
+                if (page == hot.vaddr_page && rgen == hot.mem_gen &&
+                    (!hot.uses_map_gen ||
+                     (hot_core->dev_mem != nullptr &&
+                      hot_core->dev_mem->MappingGeneration() == hot.map_gen))) {
+                    if (!hot.uses_map_gen) {
+                        m_hot_read_page = page;
+                        m_hot_read_ptr = hot.host_page;
+                        m_hot_read_gen = rgen;
+                    }
+                    return LoadLeValue(hot.host_page + offset, size);
+                }
+            }
+        } else if (masked + size <= 0x1000000000000ULL) {
+            if (auto* const hot_core = m_hot_core) {
+                const u64 next_page = page + Core::Memory::YUZU_PAGESIZE;
+                const auto& hot0 = hot_core->ReadSlot(page);
+                const auto& hot1 = hot_core->ReadSlot(next_page);
+                if (page == hot0.vaddr_page && next_page == hot1.vaddr_page &&
+                    rgen == hot0.mem_gen && rgen == hot1.mem_gen) {
+                    const bool map_ok = (!hot0.uses_map_gen && !hot1.uses_map_gen) || [&] {
+                        if (hot_core->dev_mem == nullptr) {
+                            return false;
+                        }
+                        const u64 mgen = hot_core->dev_mem->MappingGeneration();
+                        return (!hot0.uses_map_gen || mgen == hot0.map_gen) &&
+                               (!hot1.uses_map_gen || mgen == hot1.map_gen);
+                    }();
+                    if (map_ok) {
+                        if (hot0.host_page + Core::Memory::YUZU_PAGESIZE == hot1.host_page) {
+                            return LoadLeValue(hot0.host_page + offset, size);
+                        }
+                        std::array<u8, sizeof(u64)> bytes{};
+                        const std::size_t first =
+                            static_cast<std::size_t>(Core::Memory::YUZU_PAGESIZE - offset);
+                        std::memcpy(bytes.data(), hot0.host_page + offset, first);
+                        std::memcpy(bytes.data() + first, hot1.host_page, size - first);
+                        return LoadLeValue(bytes.data(), size);
+                    }
+                }
+            }
         }
-    } else {
-        CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Read);
+    } else if (!CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Read)) {
+        return 0;
     }
     u64 value{};
     switch (size) {
@@ -481,33 +633,125 @@ u64 DynarmicCallbacks64::ReadValue(u64 vaddr, size_t size) {
             return value;
         }
     }
-    if (!m_check_memory_access &&
-        ((vaddr & u64{Core::Memory::YUZU_PAGEMASK}) + size <= Core::Memory::YUZU_PAGESIZE)) {
-        if (m_memory.TryCacheCleanReadPage(vaddr, m_hot_read_ptr, m_hot_read_gen)) {
-            m_hot_read_page = (vaddr & 0xffffffffffffULL) & ~u64{Core::Memory::YUZU_PAGEMASK};
+    if (!m_check_memory_access) {
+        const std::size_t core_index = m_parent.m_core_index;
+        if (auto* const hot_core = m_hot_core) {
+            if (in_page) {
+                auto& hot = hot_core->ReadSlot(page);
+                if (m_memory.TryCacheHotReadPage(core_index, vaddr, hot) && !hot.uses_map_gen) {
+                    m_hot_read_page = page;
+                    m_hot_read_ptr = hot.host_page;
+                    m_hot_read_gen = hot.mem_gen;
+                }
+            } else if (masked + size <= 0x1000000000000ULL) {
+                const u64 next_page = page + Core::Memory::YUZU_PAGESIZE;
+                static_cast<void>(
+                    m_memory.TryCacheHotReadPage(core_index, vaddr, hot_core->ReadSlot(page)));
+                auto& hot1 = hot_core->ReadSlot(next_page);
+                if (m_memory.TryCacheHotReadPage(core_index, next_page, hot1) &&
+                    !hot1.uses_map_gen) {
+                    m_hot_read_page = next_page;
+                    m_hot_read_ptr = hot1.host_page;
+                    m_hot_read_gen = hot1.mem_gen;
+                }
+            }
         }
     }
     return value;
 }
+
 Dynarmic::A64::Vector DynarmicCallbacks64::Read128Value(u64 vaddr) {
+    const u64 masked = vaddr & 0xffffffffffffULL;
+    const u64 page = masked & ~u64{Core::Memory::YUZU_PAGEMASK};
+    const u64 offset = masked & u64{Core::Memory::YUZU_PAGEMASK};
+    const bool in_page = offset + 16 <= Core::Memory::YUZU_PAGESIZE;
     if (!m_check_memory_access) {
-        const u64 masked = vaddr & 0xffffffffffffULL;
-        const u64 page = masked & ~u64{Core::Memory::YUZU_PAGEMASK};
-        const u64 offset = masked & u64{Core::Memory::YUZU_PAGEMASK};
-        if (page == m_hot_read_page && offset + 16 <= Core::Memory::YUZU_PAGESIZE &&
-            m_memory.FastReadGeneration() == m_hot_read_gen) {
-            Dynarmic::A64::Vector out{};
-            std::memcpy(&out, m_hot_read_ptr + offset, sizeof(out));
-            return out;
+        const u64 rgen = m_memory.FastReadGenerationRelaxed();
+        if (in_page) {
+            if (page == m_hot_read_page && rgen == m_hot_read_gen) {
+                Dynarmic::A64::Vector out{};
+                std::memcpy(&out, m_hot_read_ptr + offset, sizeof(out));
+                return out;
+            }
+            if (auto* const hot_core = m_hot_core) {
+                const auto& hot = hot_core->ReadSlot(page);
+                if (page == hot.vaddr_page && rgen == hot.mem_gen &&
+                    (!hot.uses_map_gen ||
+                     (hot_core->dev_mem != nullptr &&
+                      hot_core->dev_mem->MappingGeneration() == hot.map_gen))) {
+                    if (!hot.uses_map_gen) {
+                        m_hot_read_page = page;
+                        m_hot_read_ptr = hot.host_page;
+                        m_hot_read_gen = rgen;
+                    }
+                    Dynarmic::A64::Vector out{};
+                    std::memcpy(&out, hot.host_page + offset, sizeof(out));
+                    return out;
+                }
+            }
+        } else if (masked + 16 <= 0x1000000000000ULL) {
+            if (auto* const hot_core = m_hot_core) {
+                const u64 next_page = page + Core::Memory::YUZU_PAGESIZE;
+                const auto& hot0 = hot_core->ReadSlot(page);
+                const auto& hot1 = hot_core->ReadSlot(next_page);
+                if (page == hot0.vaddr_page && next_page == hot1.vaddr_page &&
+                    rgen == hot0.mem_gen && rgen == hot1.mem_gen) {
+                    const bool map_ok = (!hot0.uses_map_gen && !hot1.uses_map_gen) || [&] {
+                        if (hot_core->dev_mem == nullptr) {
+                            return false;
+                        }
+                        const u64 mgen = hot_core->dev_mem->MappingGeneration();
+                        return (!hot0.uses_map_gen || mgen == hot0.map_gen) &&
+                               (!hot1.uses_map_gen || mgen == hot1.map_gen);
+                    }();
+                    if (map_ok) {
+                        Dynarmic::A64::Vector out{};
+                        if (hot0.host_page + Core::Memory::YUZU_PAGESIZE == hot1.host_page) {
+                            std::memcpy(&out, hot0.host_page + offset, sizeof(out));
+                        } else {
+                            auto* const dst = reinterpret_cast<u8*>(&out);
+                            const std::size_t first =
+                                static_cast<std::size_t>(Core::Memory::YUZU_PAGESIZE - offset);
+                            std::memcpy(dst, hot0.host_page + offset, first);
+                            std::memcpy(dst + first, hot1.host_page, sizeof(out) - first);
+                        }
+                        return out;
+                    }
+                }
+            }
         }
-    } else {
-        CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Read);
+    } else if (!CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Read)) {
+        return {};
     }
     const Dynarmic::A64::Vector out = m_memory.Read128(vaddr);
-    if (!m_check_memory_access &&
-        ((vaddr & u64{Core::Memory::YUZU_PAGEMASK}) + 16 <= Core::Memory::YUZU_PAGESIZE)) {
-        if (m_memory.TryCacheCleanReadPage(vaddr, m_hot_read_ptr, m_hot_read_gen)) {
-            m_hot_read_page = (vaddr & 0xffffffffffffULL) & ~u64{Core::Memory::YUZU_PAGEMASK};
+    if ((out[0] | out[1]) == 0) {
+        if (auto& unmapped = Core::Memory::UnmappedReadFlag(); unmapped != 0) {
+            unmapped = 0;
+            return out;
+        }
+    }
+    if (!m_check_memory_access) {
+        const std::size_t core_index = m_parent.m_core_index;
+        if (auto* const hot_core = m_hot_core) {
+            if (in_page) {
+                auto& hot = hot_core->ReadSlot(page);
+                if (m_memory.TryCacheHotReadPage(core_index, vaddr, hot) && !hot.uses_map_gen) {
+                    m_hot_read_page = page;
+                    m_hot_read_ptr = hot.host_page;
+                    m_hot_read_gen = hot.mem_gen;
+                }
+            } else if (masked + 16 <= 0x1000000000000ULL) {
+                const u64 next_page = page + Core::Memory::YUZU_PAGESIZE;
+                static_cast<void>(
+                    m_memory.TryCacheHotReadPage(core_index, vaddr, hot_core->ReadSlot(page)));
+                auto& hot1 = hot_core->ReadSlot(next_page);
+                if (m_memory.TryCacheHotReadPage(core_index, next_page, hot1) &&
+                    !hot1.uses_map_gen) {
+                    m_hot_read_page = next_page;
+                    m_hot_read_ptr = hot1.host_page;
+                    m_hot_read_gen = hot1.mem_gen;
+                }
+            }
         }
     }
     return out;
@@ -553,18 +797,139 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     return instruction;
 }
 
-void DynarmicCallbacks64::WriteValue(u64 vaddr, u64 value, std::size_t size) {
-    if (!m_check_memory_access) {
-        const u64 masked = vaddr & 0xffffffffffffULL;
-        const u64 page = masked & ~u64{Core::Memory::YUZU_PAGEMASK};
-        const u64 offset = masked & u64{Core::Memory::YUZU_PAGEMASK};
-        if (page == m_hot_write.vaddr_page && offset + size <= Core::Memory::YUZU_PAGESIZE &&
-            m_memory.FastWriteGeneration() == m_hot_write.mem_gen) {
-            if (!m_hot_write.rasterizer_cached ||
-                m_memory.TryCollectHotWrite(m_parent.m_core_index, offset, size, m_hot_write)) {
-                std::memcpy(m_hot_write.host_page + offset, &value, size);
+void DynarmicCallbacks64::WriteBytesInPage(u64 vaddr, u64 page, u64 offset, const u8* src,
+                                           std::size_t size) {
+    const std::size_t core_index = m_parent.m_core_index;
+    const u64 granule_mask = (u64{1} << (offset >> 6)) | (u64{1} << ((offset + size - 1) >> 6));
+    auto* const hot_core = m_hot_core;
+    auto& hot = hot_core->WriteSlot(page);
+    if (page == hot.vaddr_page) {
+        if (!hot.rasterizer_cached) {
+            const u64 wgen = m_memory.FastWriteGenerationRelaxed();
+            if (wgen == hot.mem_gen) {
+                m_hot_write_page = page;
+                m_hot_write_ptr = hot.host_page;
+                m_hot_write_gen = wgen;
+                std::memcpy(hot.host_page + offset, src, size);
                 return;
             }
+        } else {
+            if ((hot.collected_granules & granule_mask) == granule_mask &&
+                m_memory.RasterizerWriteGenerationRelaxed() == hot.mem_gen &&
+                Core::g_write_answer_epoch.load(std::memory_order_relaxed) == hot.answer_epoch &&
+                hot_core->dev_mem != nullptr &&
+                hot_core->dev_mem->MappingGeneration() == hot.map_gen) {
+                const u64 gather_ep = hot_core->GatherEpoch();
+                if (gather_ep == hot.gather_epoch) {
+                    Core::g_collected_write_pages.Mark(hot.daddr_page, 1);
+                    std::memcpy(hot.host_page + offset, src, size);
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    if (hot_core->GatherEpoch() == gather_ep) {
+                        return;
+                    }
+                }
+            }
+            if (m_memory.TryCollectHotWrite(core_index, offset, size, granule_mask, hot)) {
+                std::memcpy(hot.host_page + offset, src, size);
+                return;
+            }
+        }
+    }
+    if (m_memory.WriteCoreInPage(core_index, vaddr, src, size, granule_mask, hot) &&
+        !hot.rasterizer_cached) {
+        m_hot_write_page = page;
+        m_hot_write_ptr = hot.host_page;
+        m_hot_write_gen = hot.mem_gen;
+    }
+}
+
+void DynarmicCallbacks64::WriteValue(u64 vaddr, u64 value, std::size_t size) {
+    const u64 masked = vaddr & 0xffffffffffffULL;
+    const u64 page = masked & ~u64{Core::Memory::YUZU_PAGEMASK};
+    const u64 offset = masked & u64{Core::Memory::YUZU_PAGEMASK};
+    const bool in_page = offset + size <= Core::Memory::YUZU_PAGESIZE;
+    if (!m_check_memory_access) {
+        const u64 wgen = m_memory.FastWriteGenerationRelaxed();
+        if (in_page) {
+            if (page == m_hot_write_page && wgen == m_hot_write_gen) {
+                StoreLeValue(m_hot_write_ptr + offset, value, size);
+                return;
+            }
+            if (auto* const hot_core = m_hot_core) {
+                auto& hot = hot_core->WriteSlot(page);
+                const u64 granule_mask =
+                    (u64{1} << (offset >> 6)) | (u64{1} << ((offset + size - 1) >> 6));
+                if (page == hot.vaddr_page) {
+                    if (!hot.rasterizer_cached) {
+                        if (wgen == hot.mem_gen) {
+                            m_hot_write_page = page;
+                            m_hot_write_ptr = hot.host_page;
+                            m_hot_write_gen = wgen;
+                            StoreLeValue(hot.host_page + offset, value, size);
+                            return;
+                        }
+                    } else {
+                        if ((hot.collected_granules & granule_mask) == granule_mask &&
+                            m_memory.RasterizerWriteGenerationRelaxed() == hot.mem_gen &&
+                            Core::g_write_answer_epoch.load(std::memory_order_relaxed) ==
+                                hot.answer_epoch &&
+                            hot_core->dev_mem != nullptr &&
+                            hot_core->dev_mem->MappingGeneration() == hot.map_gen) {
+                            const u64 gather_ep = hot_core->GatherEpoch();
+                            if (gather_ep == hot.gather_epoch) {
+                                Core::g_collected_write_pages.Mark(hot.daddr_page, 1);
+                                StoreLeValue(hot.host_page + offset, value, size);
+                                std::atomic_thread_fence(std::memory_order_seq_cst);
+                                if (hot_core->GatherEpoch() == gather_ep) {
+                                    return;
+                                }
+                            }
+                        }
+                        if (m_memory.TryCollectHotWrite(m_parent.m_core_index, offset, size,
+                                                        granule_mask, hot)) {
+                            StoreLeValue(hot.host_page + offset, value, size);
+                            return;
+                        }
+                    }
+                }
+                std::array<u8, sizeof(u64)> bytes{};
+                StoreLeValue(bytes.data(), value, size);
+                if (m_memory.WriteCoreInPage(m_parent.m_core_index, vaddr, bytes.data(), size,
+                                             granule_mask, hot) &&
+                    !hot.rasterizer_cached) {
+                    m_hot_write_page = page;
+                    m_hot_write_ptr = hot.host_page;
+                    m_hot_write_gen = hot.mem_gen;
+                }
+                return;
+            }
+        } else if (auto* const hot_core = m_hot_core;
+                   hot_core != nullptr && masked + size <= 0x1000000000000ULL) {
+            const u64 next_page = page + Core::Memory::YUZU_PAGESIZE;
+            const auto& hot0 = hot_core->WriteSlot(page);
+            const auto& hot1 = hot_core->WriteSlot(next_page);
+            if (page == hot0.vaddr_page && next_page == hot1.vaddr_page &&
+                !hot0.rasterizer_cached && !hot1.rasterizer_cached &&
+                wgen == hot0.mem_gen && wgen == hot1.mem_gen) {
+                if (hot0.host_page + Core::Memory::YUZU_PAGESIZE == hot1.host_page) {
+                    StoreLeValue(hot0.host_page + offset, value, size);
+                } else {
+                    std::array<u8, sizeof(u64)> bytes{};
+                    StoreLeValue(bytes.data(), value, size);
+                    const std::size_t first =
+                        static_cast<std::size_t>(Core::Memory::YUZU_PAGESIZE - offset);
+                    std::memcpy(hot0.host_page + offset, bytes.data(), first);
+                    std::memcpy(hot1.host_page, bytes.data() + first, size - first);
+                }
+                return;
+            }
+            std::array<u8, sizeof(u64)> bytes{};
+            StoreLeValue(bytes.data(), value, size);
+            const std::size_t first =
+                static_cast<std::size_t>(Core::Memory::YUZU_PAGESIZE - offset);
+            WriteBytesInPage(vaddr, page, offset, bytes.data(), first);
+            WriteBytesInPage(vaddr + first, next_page, 0, bytes.data() + first, size - first);
+            return;
         }
     } else if (!CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Write)) {
         return;
@@ -576,33 +941,97 @@ void DynarmicCallbacks64::WriteValue(u64 vaddr, u64 value, std::size_t size) {
     case sizeof(u8): m_memory.Write8(vaddr, u8(value)); break;
     default: UNREACHABLE();
     }
-    if (!m_check_memory_access &&
-        ((vaddr & u64{Core::Memory::YUZU_PAGEMASK}) + size <= Core::Memory::YUZU_PAGESIZE)) {
-        static_cast<void>(m_memory.TryCacheHotWritePage(m_parent.m_core_index, vaddr, m_hot_write));
-    }
 }
 
 void DynarmicCallbacks64::Write128Value(u64 vaddr, Dynarmic::A64::Vector value) {
+    const u64 masked = vaddr & 0xffffffffffffULL;
+    const u64 page = masked & ~u64{Core::Memory::YUZU_PAGEMASK};
+    const u64 offset = masked & u64{Core::Memory::YUZU_PAGEMASK};
+    const bool in_page = offset + 16 <= Core::Memory::YUZU_PAGESIZE;
     if (!m_check_memory_access) {
-        const u64 masked = vaddr & 0xffffffffffffULL;
-        const u64 page = masked & ~u64{Core::Memory::YUZU_PAGEMASK};
-        const u64 offset = masked & u64{Core::Memory::YUZU_PAGEMASK};
-        if (page == m_hot_write.vaddr_page && offset + 16 <= Core::Memory::YUZU_PAGESIZE &&
-            m_memory.FastWriteGeneration() == m_hot_write.mem_gen) {
-            if (!m_hot_write.rasterizer_cached ||
-                m_memory.TryCollectHotWrite(m_parent.m_core_index, offset, 16, m_hot_write)) {
-                std::memcpy(m_hot_write.host_page + offset, &value, sizeof(value));
+        const u64 wgen = m_memory.FastWriteGenerationRelaxed();
+        if (in_page) {
+            if (page == m_hot_write_page && wgen == m_hot_write_gen) {
+                std::memcpy(m_hot_write_ptr + offset, &value, sizeof(value));
                 return;
             }
+            if (auto* const hot_core = m_hot_core) {
+                auto& hot = hot_core->WriteSlot(page);
+                const u64 granule_mask =
+                    (u64{1} << (offset >> 6)) | (u64{1} << ((offset + 15) >> 6));
+                if (page == hot.vaddr_page) {
+                    if (!hot.rasterizer_cached) {
+                        if (wgen == hot.mem_gen) {
+                            m_hot_write_page = page;
+                            m_hot_write_ptr = hot.host_page;
+                            m_hot_write_gen = wgen;
+                            std::memcpy(hot.host_page + offset, &value, sizeof(value));
+                            return;
+                        }
+                    } else {
+                        if ((hot.collected_granules & granule_mask) == granule_mask &&
+                            m_memory.RasterizerWriteGenerationRelaxed() == hot.mem_gen &&
+                            Core::g_write_answer_epoch.load(std::memory_order_relaxed) ==
+                                hot.answer_epoch &&
+                            hot_core->dev_mem != nullptr &&
+                            hot_core->dev_mem->MappingGeneration() == hot.map_gen) {
+                            const u64 gather_ep = hot_core->GatherEpoch();
+                            if (gather_ep == hot.gather_epoch) {
+                                Core::g_collected_write_pages.Mark(hot.daddr_page, 1);
+                                std::memcpy(hot.host_page + offset, &value, sizeof(value));
+                                std::atomic_thread_fence(std::memory_order_seq_cst);
+                                if (hot_core->GatherEpoch() == gather_ep) {
+                                    return;
+                                }
+                            }
+                        }
+                        if (m_memory.TryCollectHotWrite(m_parent.m_core_index, offset, 16,
+                                                        granule_mask, hot)) {
+                            std::memcpy(hot.host_page + offset, &value, sizeof(value));
+                            return;
+                        }
+                    }
+                }
+                if (m_memory.WriteCoreInPage(m_parent.m_core_index, vaddr,
+                                             reinterpret_cast<const u8*>(&value), sizeof(value),
+                                             granule_mask, hot) &&
+                    !hot.rasterizer_cached) {
+                    m_hot_write_page = page;
+                    m_hot_write_ptr = hot.host_page;
+                    m_hot_write_gen = hot.mem_gen;
+                }
+                return;
+            }
+        } else if (auto* const hot_core = m_hot_core;
+                   hot_core != nullptr && masked + 16 <= 0x1000000000000ULL) {
+            const u64 next_page = page + Core::Memory::YUZU_PAGESIZE;
+            const auto& hot0 = hot_core->WriteSlot(page);
+            const auto& hot1 = hot_core->WriteSlot(next_page);
+            if (page == hot0.vaddr_page && next_page == hot1.vaddr_page &&
+                !hot0.rasterizer_cached && !hot1.rasterizer_cached &&
+                wgen == hot0.mem_gen && wgen == hot1.mem_gen) {
+                if (hot0.host_page + Core::Memory::YUZU_PAGESIZE == hot1.host_page) {
+                    std::memcpy(hot0.host_page + offset, &value, sizeof(value));
+                } else {
+                    const auto* const src = reinterpret_cast<const u8*>(&value);
+                    const std::size_t first =
+                        static_cast<std::size_t>(Core::Memory::YUZU_PAGESIZE - offset);
+                    std::memcpy(hot0.host_page + offset, src, first);
+                    std::memcpy(hot1.host_page, src + first, sizeof(value) - first);
+                }
+                return;
+            }
+            const auto* const src = reinterpret_cast<const u8*>(&value);
+            const std::size_t first =
+                static_cast<std::size_t>(Core::Memory::YUZU_PAGESIZE - offset);
+            WriteBytesInPage(vaddr, page, offset, src, first);
+            WriteBytesInPage(vaddr + first, next_page, 0, src + first, sizeof(value) - first);
+            return;
         }
     } else if (!CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Write)) {
         return;
     }
     m_memory.Write128(vaddr, value);
-    if (!m_check_memory_access &&
-        ((vaddr & u64{Core::Memory::YUZU_PAGEMASK}) + 16 <= Core::Memory::YUZU_PAGESIZE)) {
-        static_cast<void>(m_memory.TryCacheHotWritePage(m_parent.m_core_index, vaddr, m_hot_write));
-    }
 }
 
 void DynarmicCallbacks64::MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std::size_t size) {
@@ -790,16 +1219,58 @@ void DynarmicCallbacks64::CallSVC(u32 svc) {
     ++m_svcs;
     ++m_svc_counts[svc & 0xFF];
     ++m_svcs_pending;
-    if (svc == 0x0BU && !m_debugger_enabled) {
+    if (!m_debugger_enabled) {
         auto& jit = *m_parent.m_jit;
-        u64 spin_hash = 0;
-        spin_hash = Kernel::Svc::HashYieldSpinWord(spin_hash, jit.GetPC());
-        spin_hash = Kernel::Svc::HashYieldSpinWord(spin_hash, jit.GetSP());
-        for (size_t i = 19; i <= 29; ++i) {
-            spin_hash = Kernel::Svc::HashYieldSpinWord(spin_hash, jit.GetRegister(i));
+        bool handled = false;
+        u64 fast_x0 = 0;
+        bool writes_x0 = false;
+        switch (svc) {
+        case 0x0BU: {
+            const s64 ns = static_cast<s64>(jit.GetRegister(0));
+            if (ns <= 0 && ns >= -2) {
+                u64 spin_hash = 0;
+                if (Kernel::Svc::YieldBackoffEnabled()) {
+                    spin_hash = Kernel::Svc::HashYieldSpinWord(0, jit.GetPC());
+                    spin_hash = Kernel::Svc::HashYieldSpinWord(spin_hash, jit.GetSP());
+                    for (size_t i = 19; i <= 29; ++i) {
+                        spin_hash = Kernel::Svc::HashYieldSpinWord(spin_hash, jit.GetRegister(i));
+                    }
+                }
+                handled = Kernel::Svc::TryFastFutileYield64(m_parent.m_system, ns, spin_hash);
+            }
+            break;
         }
-        if (Kernel::Svc::TryFastFutileYield64(
-                m_parent.m_system, static_cast<s64>(jit.GetRegister(0)), spin_hash)) {
+        case 0x10U:
+            handled = Kernel::Svc::TryFastGetCurrentProcessorNumber64(m_parent.m_system, &fast_x0);
+            writes_x0 = true;
+            break;
+        case 0x1AU:
+            handled = Kernel::Svc::TryFastArbitrateLock64(
+                m_parent.m_system, static_cast<u32>(jit.GetRegister(0)), jit.GetRegister(1),
+                static_cast<u32>(jit.GetRegister(2)), &fast_x0);
+            writes_x0 = true;
+            break;
+        case 0x34U:
+            handled = Kernel::Svc::TryFastWaitForAddress64(
+                m_parent.m_system, jit.GetRegister(0), static_cast<u32>(jit.GetRegister(1)),
+                static_cast<s64>(jit.GetRegister(2)), static_cast<s64>(jit.GetRegister(3)),
+                &fast_x0);
+            writes_x0 = true;
+            break;
+        case 0x35U:
+            handled = Kernel::Svc::TryFastSignalToAddress64(
+                m_parent.m_system, jit.GetRegister(0), static_cast<u32>(jit.GetRegister(1)),
+                static_cast<s32>(jit.GetRegister(2)), static_cast<s32>(jit.GetRegister(3)),
+                &fast_x0);
+            writes_x0 = true;
+            break;
+        default:
+            break;
+        }
+        if (handled) {
+            if (writes_x0) {
+                jit.SetRegister(0, fast_x0);
+            }
             jit.ClearExclusiveState();
             m_parent.m_exclusive_monitor.ClearExclusive(m_parent.m_core_index);
             if (m_svcs_pending >= 1024) {
@@ -913,6 +1384,9 @@ void DynarmicCallbacks64::ReturnException(u64 pc, Dynarmic::HaltReason hr) {
 }
 
 void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_space_bits) {
+#if defined(ARCHITECTURE_arm64)
+    Dynarmic::Backend::Arm64::UnregisterJitHotWrite(&m_cb->m_tpidrro_el0);
+#endif
     Dynarmic::A64::UserConfig config;
 
     // Callbacks
@@ -1006,9 +1480,15 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 #endif
     const JitFaultPolicy fault_policy = GetJitFaultPolicy();
     config.code_cache_evict_slice = JitEvictSliceBytes();
-    config.fastmem_shared_markers = fault_policy.shared_markers;
+    config.fastmem_shared_markers = page_table != nullptr && fault_policy.shared_markers;
     config.fastmem_block_after_faults = fault_policy.block_after_faults;
     config.fastmem_load_fault_limit = fault_policy.load_fault_limit;
+#if defined(ARCHITECTURE_arm64)
+    Dynarmic::Backend::Arm64::FastmemManager::SetDefaultStoreFaultLimit(
+        Settings::values.cpu_accuracy.GetValue() == Settings::CpuAccuracy::Paranoid
+            ? 0U
+            : JitStoreFaultLimit());
+#endif
     config.inline_exclusives = InlineExclusives();
 
     // Allow memory fault handling to work
@@ -1162,10 +1642,17 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_pointer &&
         GetInteger(kernel_table.GetAliasRegionStart()) <
             (u64{1} << (std::min)(config.fastmem_address_space_bits, std::uint32_t{63}));
+#if defined(__APPLE__) && TARGET_OS_IPHONE
     config.inline_page_table_fallback =
         pt_fallback != nullptr
             ? pt_fallback[0] != '0'
             : !(Settings::values.cpuopt_compact_jit_code.GetValue() && alias_in_arena);
+#else
+    // Desktop has a 512 MiB per-core code cache: keep the cold bounds-miss page-table fallback so
+    // accesses above a sub-39-bit fastmem arena run inline instead of calling into C++.
+    static_cast<void>(alias_in_arena);
+    config.inline_page_table_fallback = pt_fallback == nullptr || pt_fallback[0] != '0';
+#endif
     // arm64 hosts, also cpuopt_compact_jit_code (EDEN_NX2_JIT_PT_CALLS=1/0 overrides): loads and
     // stores that left fastmem (after a fault: 2.7k-71k a second on the phone) call one shared
     // page table walk instead of emitting it inline (65 bytes per access, against 29 with
@@ -1180,17 +1667,6 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // than paying a shared BLR call + register save/restore on every post-fault access.
     config.page_table_lookup_calls = pt_calls != nullptr && pt_calls[0] != '0';
 #endif
-#if defined(ARCHITECTURE_arm64)
-    if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
-        static const bool backedge_halt = Nx2EnvOn("EDEN_NX2_JIT_BACKEDGE_HALT");
-        config.halt_check_on_back_edges = backedge_halt && !config.enable_cycle_counting;
-        static const u32 dispatch_bits = Nx2DispatchBits();
-        config.fast_dispatch_table_bits = dispatch_bits;
-        static const bool native_atomics = Nx2EnvOn("EDEN_NX2_JIT_ATOMICS");
-        config.native_lse_atomics = native_atomics && config.fastmem_exclusive_access &&
-            config.HasOptimization(Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor);
-    }
-#endif
 #if defined(ARCHITECTURE_x86_64)
     // x86-64 is TSO: LDAPR/LDAR/LDAXR need no locked RMW (STLR keeps XCHG), and DMB xxLD/xxST
     // order nothing TSO does not already order. Ocarina of Time has ~68k LDAPRB sites (static
@@ -1201,6 +1677,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.tso_ordered_loads = true;
         config.elide_ld_st_barriers = true;
     }
+#endif
+#if defined(ARCHITECTURE_x86_64) || defined(ARCHITECTURE_arm64)
     // The JIT spilled ~9% of its instructions to stack slots in Ocarina of Time's hot code while
     // callee-saved GPRs sat empty. EDEN_NX2_JIT_SPILL_GPR=0 turns it off.
     static const bool spill_to_gpr = Nx2EnvOn("EDEN_NX2_JIT_SPILL_GPR");
@@ -1217,15 +1695,15 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         static const bool scratch_copy = Nx2EnvOn("EDEN_NX2_JIT_SCRATCH_COPY");
         config.scratch_copy_to_free_reg = scratch_copy;
         // ldr/str [xN, #imm]: the immediate goes into the fastmem addressing mode instead of a
-        // separate LEA (and often a register copy). EDEN_NX2_JIT_FOLD_ADDR=0 turns it off.
+        // separate LEA/ADD (and often a register copy). EDEN_NX2_JIT_FOLD_ADDR=0 turns it off.
         static const bool fold_addr = Nx2EnvOn("EDEN_NX2_JIT_FOLD_ADDR");
         config.fold_address_offsets = fold_addr;
         // W-register writes and zero-extends of values a 32-bit instruction produced skip the
-        // second `mov r32, r32`. EDEN_NX2_JIT_ZEXT=0 turns it off.
+        // second zero-extend. EDEN_NX2_JIT_ZEXT=0 turns it off.
         static const bool zext = Nx2EnvOn("EDEN_NX2_JIT_ZEXT");
         config.elide_redundant_zext = zext;
-        // Unlinked exits jump to one shared stub per target: 5/6-byte patch sites instead of
-        // 22/23 bytes plus an inline exit stub. EDEN_NX2_JIT_COMPACT_EXITS=0 turns it off.
+        // Unlinked exits jump to one shared stub per target: smaller patch sites instead of an
+        // inline exit stub. EDEN_NX2_JIT_COMPACT_EXITS=0 turns it off.
         static const bool compact_exits = Nx2EnvOn("EDEN_NX2_JIT_COMPACT_EXITS");
         config.compact_block_exits = compact_exits;
         // Fault/abort paths, atomic fallbacks and exit stubs go to a cold region at the end of
@@ -1267,6 +1745,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         return value != nullptr && value[0] != 0 && !(value[0] == '0' && value[1] == 0);
     }();
     config.jit_counters = jit_map;
+#endif
+#if defined(ARCHITECTURE_x86_64)
     // Diagnostic, x64: EDEN_NX2_JIT_EXCLUSIVE_CALLBACKS=1 sends LDXR/STXR through the memory
     // callbacks and the global monitor as the arm64 backend does (LSE atomics stay native).
     static const bool exclusive_callbacks = [] {
@@ -1290,8 +1770,37 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.untrapped_read_bitmap_ptr =
             reinterpret_cast<std::uintptr_t>(m_cb->m_memory.JitReadTrapStatePtr());
     }
-    // EDEN_NX2_PERF_MEMCB=0 keeps the perf report but drops the callback breakdown.
-    static const bool slow_breakdown = Nx2EnvOn("EDEN_NX2_PERF_MEMCB");
+    if (page_table != nullptr) {
+        m_cb->m_memory.PrepareHotCores();
+        m_cb->m_hot_core = m_cb->m_memory.HotCore(m_core_index);
+    } else {
+        m_cb->m_hot_core = nullptr;
+    }
+#if defined(ARCHITECTURE_arm64)
+    if (!m_cb->m_check_memory_access && config.page_table != nullptr &&
+        m_cb->m_hot_core != nullptr &&
+        Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid &&
+        Nx2EnvOn("EDEN_NX2_JIT_PT_HOT_WRITE")) {
+        std::array<std::uintptr_t, 5> write_fns{};
+        bool preserve_all_abi = false;
+        if (m_cb->m_memory.PopulateJitHotWrite(m_core_index, m_cb->m_jit_hot_write_ctx, write_fns,
+                                               preserve_all_abi)) {
+            Dynarmic::Backend::Arm64::RegisterJitHotWrite(
+                &m_cb->m_tpidrro_el0,
+                Dynarmic::Backend::Arm64::JitHotWriteCallbacks{
+                    .ctx_ptr = reinterpret_cast<std::uintptr_t>(&m_cb->m_jit_hot_write_ctx),
+                    .writes_base = reinterpret_cast<std::uintptr_t>(m_cb->m_hot_core->writes.data()),
+                    .write_fns = write_fns,
+                    .preserve_all_abi = preserve_all_abi,
+                });
+        }
+    }
+#endif
+    // Opt-in via EDEN_NX2_PERF_MEMCB=1: per-callback page classification and block sampling.
+    static const bool slow_breakdown = [] {
+        const char* const value = std::getenv("EDEN_NX2_PERF_MEMCB");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
     m_cb->m_slow_breakdown = Common::PerfReport::Enabled() && slow_breakdown;
     m_cb->m_page_table = page_table;
     m_cb->m_page_table_bits = std::uint32_t(address_space_bits);
@@ -1301,6 +1810,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
 void ArmDynarmic64::FlushGuestEvents() {
     if (!Common::PerfReport::Enabled()) {
+        m_cb->m_svcs_pending = 0;
         return;
     }
     DynarmicCallbacks64& cb = *m_cb;
@@ -1323,23 +1833,25 @@ void ArmDynarmic64::FlushGuestEvents() {
     flush(cb.m_slow_reads, Common::PerfReport::GuestSlowReads);
     flush(cb.m_slow_writes, Common::PerfReport::GuestSlowWrites);
     // Like the SVC counts, the breakdown is added every 1024 SVCs, not at every return.
-    auto& slow = Common::PerfReport::g_slow_access;
-    for (size_t store = 0; store < 2 && cb.m_svcs_pending == 0; ++store) {
-        if (u64& runs = cb.m_slow_page_runs[store]; runs != 0) {
-            slow.tracked_page_runs[store].fetch_add(runs, std::memory_order_relaxed);
-            runs = 0;
-        }
-        for (size_t reason = 0; reason < Common::PerfReport::SlowAccessCount; ++reason) {
-            if (u64& calls = cb.m_slow_calls[store][reason]; calls != 0) {
-                slow.calls[store][reason].fetch_add(calls, std::memory_order_relaxed);
-                calls = 0;
+    if (cb.m_slow_breakdown && cb.m_svcs_pending == 0) {
+        auto& slow = Common::PerfReport::g_slow_access;
+        for (size_t store = 0; store < 2; ++store) {
+            if (u64& runs = cb.m_slow_page_runs[store]; runs != 0) {
+                slow.tracked_page_runs[store].fetch_add(runs, std::memory_order_relaxed);
+                runs = 0;
             }
-            if (u64& timed = cb.m_slow_timed[store][reason]; timed != 0) {
-                slow.timed[store][reason].fetch_add(timed, std::memory_order_relaxed);
-                slow.timed_ns[store][reason].fetch_add(cb.m_slow_timed_ns[store][reason],
-                                                       std::memory_order_relaxed);
-                timed = 0;
-                cb.m_slow_timed_ns[store][reason] = 0;
+            for (size_t reason = 0; reason < Common::PerfReport::SlowAccessCount; ++reason) {
+                if (u64& calls = cb.m_slow_calls[store][reason]; calls != 0) {
+                    slow.calls[store][reason].fetch_add(calls, std::memory_order_relaxed);
+                    calls = 0;
+                }
+                if (u64& timed = cb.m_slow_timed[store][reason]; timed != 0) {
+                    slow.timed[store][reason].fetch_add(timed, std::memory_order_relaxed);
+                    slow.timed_ns[store][reason].fetch_add(cb.m_slow_timed_ns[store][reason],
+                                                           std::memory_order_relaxed);
+                    timed = 0;
+                    cb.m_slow_timed_ns[store][reason] = 0;
+                }
             }
         }
     }
@@ -1409,7 +1921,14 @@ ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProc
     });
 }
 
-ArmDynarmic64::~ArmDynarmic64() = default;
+ArmDynarmic64::~ArmDynarmic64() {
+    m_jit.reset();
+#if defined(ARCHITECTURE_arm64)
+    if (m_cb) {
+        Dynarmic::Backend::Arm64::UnregisterJitHotWrite(&m_cb->m_tpidrro_el0);
+    }
+#endif
+}
 
 void ArmDynarmic64::SetTpidrroEl0(u64 value) {
     m_cb->m_tpidrro_el0 = value;

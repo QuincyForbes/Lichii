@@ -204,7 +204,11 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
         }
     }
     case InfoType::ThreadTickCount: {
-        constexpr u64 num_cpus = 4;
+        const auto& current_process = GetCurrentProcess(system.Kernel());
+        const u64 num_cpus =
+            (current_process.IsSwitch2() || (current_process.GetCoreMask() >> 4) != 0)
+                ? Core::Hardware::NUM_CPU_CORES
+                : 4;
         if (info_sub_id != 0xFFFFFFFFFFFFFFFF && info_sub_id >= num_cpus) {
             LOG_ERROR(Kernel_SVC, "Core count is out of range, expected {} but got {}", num_cpus, info_sub_id);
             R_THROW(ResultInvalidCombination);

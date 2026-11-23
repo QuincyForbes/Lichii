@@ -303,18 +303,21 @@ bool IsPrimitiveRestartSupported(const Device& device, VkPrimitiveTopology topol
              device.IsPatchListPrimitiveRestartSupported()));
 }
 
-/// Before a dispatch: earlier writes visible to it, its indirect arguments included.
+/// Before a dispatch: earlier writes visible to it, its indirect arguments and WAW/WAR included.
 void RecordDispatchBarrier(vk::CommandBuffer cmdbuf) {
-    static constexpr VkMemoryBarrier READ_BARRIER{
+    static constexpr VkMemoryBarrier READ_WRITE_BARRIER{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .pNext = nullptr,
-        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                         VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
+                         VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT |
+                         VK_ACCESS_MEMORY_WRITE_BIT,
     };
     cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
                            VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                           0, READ_BARRIER);
+                           0, READ_WRITE_BARRIER);
 }
 
 /// EDEN_NX2_DISPATCH_CHAIN: a guest dispatch recorded right after another one with only bindings
@@ -334,34 +337,50 @@ bool DispatchChainEnabled(const Device& device) {
     return mode == 2 || (mode == 1 && device.IsMoltenVK());
 }
 
-/// EDEN_NX2_MVK_POST_DISPATCH_BARRIER: after each guest dispatch (and its byte-addressed shadow
-/// copy-back), a full memory barrier from compute and transfer to every later stage. Vulkan only
-/// orders a dispatch's writes before the next render pass (COMPUTE -> ALL_GRAPHICS at
-/// BeginRenderPass) and before the next dispatch; MoltenVK maps those stage masks onto its own
-/// Metal barrier stages, and resources reached through argument buffers with a residency set are
-/// not hazard-tracked by Metal, so a gap there reads stale froxel/probe/luminance data (OoT's
-/// Kokiri Forest blew out on MoltenVK while the native Metal backend, whose encoders Metal
-/// orders, was right). Default on for MoltenVK; =0 off; =force on every driver (A/B). It also
-/// ends a dispatch chain (EDEN_NX2_DISPATCH_CHAIN), which is off by default.
-bool PostDispatchBarrierEnabled(const Device& device) {
+/// EDEN_NX2_MVK_POST_DISPATCH_BARRIER: on MoltenVK, Scheduler flushes compute_writes_pending with
+/// a full barrier when leaving compute (BeginRenderPass, SplitBeforeNextPass, and outside-pass
+/// operations), while consecutive hazard-free dispatches share one Metal compute encoder through
+/// ComputeDispatchChain. =every or =force emits a barrier after every individual dispatch (A/B);
+/// =0 disables the extra MoltenVK post-compute barrier.
+bool ImmediatePostDispatchBarrierEnabled(const Device& device) {
     static const int mode = [] {
         const char* value = std::getenv("EDEN_NX2_MVK_POST_DISPATCH_BARRIER");
-        if (value != nullptr && value[0] == '0') {
+        if (value == nullptr) {
+            return 1;
+        }
+        if (value[0] == '0') {
             return 0;
         }
-        return value != nullptr && std::string_view{value} == "force" ? 2 : 1;
+        const std::string_view sv{value};
+        if (sv == "force") {
+            return 3;
+        }
+        if (sv == "every") {
+            return 2;
+        }
+        return 1;
     }();
-    const bool enabled = mode == 2 || (mode == 1 && device.IsMoltenVK());
-    static const bool logged = [enabled] {
-        LOG_INFO(Render_Vulkan, "Post-dispatch compute barrier (EDEN_NX2_MVK_POST_DISPATCH_BARRIER) {}",
-                 enabled ? "on" : "off");
+    const bool immediate = mode == 3 || (mode == 2 && device.IsMoltenVK());
+    const bool deferred = mode == 1 && device.IsMoltenVK();
+    static const bool logged = [immediate, deferred] {
+        LOG_INFO(Render_Vulkan,
+                 "Post-dispatch compute barrier (EDEN_NX2_MVK_POST_DISPATCH_BARRIER) {}",
+                 immediate ? "every dispatch" : (deferred ? "deferred" : "off"));
         return true;
     }();
     (void)logged;
+    return immediate;
+}
+
+bool DispatchBeforePassEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_DISPATCH_BEFORE_PASS");
+        return value == nullptr || value[0] != '0';
+    }();
     return enabled;
 }
 
-void RecordPostDispatchBarrier(vk::CommandBuffer cmdbuf) {
+void RecordPostDispatchBarrier(vk::CommandBuffer cmdbuf, bool mesh_supported = false) {
     static constexpr VkMemoryBarrier POST_BARRIER{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .pNext = nullptr,
@@ -371,14 +390,16 @@ void RecordPostDispatchBarrier(vk::CommandBuffer cmdbuf) {
     };
     // ALL_COMMANDS plus the explicit stages, so a translation that maps only individual
     // stage bits still waits in the vertex, fragment, indirect and transfer stages.
+    VkPipelineStageFlags dst_stages =
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+        VK_PIPELINE_STAGE_TRANSFER_BIT;
+    if (mesh_supported) {
+        dst_stages |= VK_PIPELINE_STAGE_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT;
+    }
     cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
-                               VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
-                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                               VK_PIPELINE_STAGE_TRANSFER_BIT,
-                           0, POST_BARRIER);
+                           dst_stages, 0, POST_BARRIER);
 }
 
 bool DynamicStateCacheEnabled() {
@@ -1675,10 +1696,12 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     *source, sizeof(u32), VideoCommon::ObtainBufferSynchronize::FullSynchronize,
                     VideoCommon::ObtainBufferOperation::DoNothing);
+                buffer->MarkUsage(offset, sizeof(u32));
                 gpu_count.emplace(buffer->Handle(), offset);
                 // The count comes from a dispatch before: make its writes visible to the draw's
-                // indirect read (once per batch of dispatches; it ends a render pass).
-                if (std::exchange(compute_since_count_barrier, false)) {
+                // indirect read when no pass-opening COMPUTE_TO_GRAPHICS barrier has run yet.
+                if (std::exchange(compute_since_count_barrier, false) &&
+                    !scheduler.IsRenderPassActive()) {
                     static constexpr VkMemoryBarrier COUNT_BARRIER{
                         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                         .pNext = nullptr,
@@ -1687,7 +1710,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                                          VK_ACCESS_TRANSFORM_FEEDBACK_COUNTER_READ_BIT_EXT |
                                          VK_ACCESS_MEMORY_READ_BIT,
                     };
-                    scheduler.RequestOutsideRenderPassOperationContext();
+                    scheduler.RequestOutsideRenderPassKeepClear();
                     scheduler.Record([](vk::CommandBuffer cmdbuf) {
                         cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
                                                VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
@@ -2560,13 +2583,15 @@ void RasterizerVulkan::Clear(u32 layer_count) {
             pending_native_work = false;
         }
     }
-    scheduler.FlushExpiredDeferred();
+    if (!scheduler.RenderPassMatches(framebuffer)) {
+        scheduler.FlushExpiredDeferred();
+    }
+    const u64 target_key =
+        ((regs.rt_control.count != 0 ? regs.rt[0].Address() : 0ULL) ^
+         ((regs.zeta_enable ? regs.zeta.Address() : 0ULL) * 0x9e3779b97f4a7c15ULL)) |
+        1ULL;
+    scheduler.NoteTargetKey(target_key);
     if (!can_defer_clear) {
-        const u64 target_key =
-            (regs.rt[0].Address() ^
-             ((regs.zeta_enable ? regs.zeta.Address() : 0ULL) * 0x9e3779b97f4a7c15ULL)) |
-            1ULL;
-        scheduler.NoteTargetKey(target_key);
         if (!scheduler.RenderPassMatches(framebuffer)) {
             if (!scheduler.SplitBeforeTargetSwitch(framebuffer) &&
                 !scheduler.IsRenderPassActive()) {
@@ -2643,6 +2668,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         ds_value.depthStencil.stencil = regs.clear_stencil;
         scheduler.DeferDepthStencilClear(framebuffer, ds_value);
     } else {
+        scheduler.NoteDepthStencilWrite();
         scheduler.Record([clear_depth = regs.clear_depth, clear_stencil = regs.clear_stencil,
                           clear_rect, aspect_flags](vk::CommandBuffer cmdbuf) {
             VkClearAttachment attachment;
@@ -2714,7 +2740,7 @@ bool RasterizerVulkan::ShouldSkipDispatchBarrier(
         Common::PerfReport::Add(Common::PerfReport::DispatchBarriersSkipped);
         return true;
     }
-    if (!may_chain || PostDispatchBarrierEnabled(device) ||
+    if (!may_chain || ImmediatePostDispatchBarrierEnabled(device) ||
         !VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ComputeBarrierElide)) {
         dispatch_chain.Reset();
         return false;
@@ -2749,18 +2775,6 @@ void RasterizerVulkan::DispatchCompute() {
     ++nx2_dispatch_serial;
     if (InvalidateBeforeUse()) {
         gpu.InvalidateGPUCache();
-    }
-    if (submit_while_waited && scheduler.IsRenderPassActive() &&
-        scheduler.DrawsSinceSubmit() >= submit_waited_draws &&
-        Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
-        VideoCommon::GpuSplit::OnBackThread() &&
-        (VideoCommon::GpuSplit::Get().FrontWaitsForBack() ||
-         (scheduler.DrawsSinceSubmit() >= submit_idle_draws && scheduler.GpuCaughtUp()))) {
-        scheduler.RequestOutsideRenderPassOperationContext();
-        if (SubmitWhileWaited()) {
-            draw_counter = 0;
-            pending_native_work = false;
-        }
     }
     scheduler.FlushExpiredDeferred();
     FlushWork();
@@ -2805,6 +2819,33 @@ void RasterizerVulkan::DispatchCompute() {
                                               pipeline->ShaderHash())) {
         return;
     }
+    const Shader::Info& shader_info = pipeline->Info();
+    const bool may_hoist_before_pass =
+        DispatchBeforePassEnabled() && scheduler.IsRenderPassActive() &&
+        !scheduler.HasDeferredWaitForIdle() && !scheduler.RenderPassHasStores() &&
+        !scheduler.StorageWritesUnordered() &&
+        (maxwell3d == nullptr || maxwell3d->regs.transform_feedback_enabled == 0) &&
+        !frame_dump.Capturing() && !flash_watch.WatchesPasses() &&
+        shader_info.image_buffer_descriptors.empty() &&
+        std::ranges::all_of(shader_info.image_descriptors, [](const auto& desc) {
+            return desc.is_written && !desc.is_byte_addressed;
+        });
+    if (submit_while_waited && scheduler.IsRenderPassActive() &&
+        scheduler.DrawsSinceSubmit() >= submit_waited_draws &&
+        Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+        VideoCommon::GpuSplit::OnBackThread() &&
+        (VideoCommon::GpuSplit::Get().FrontWaitsForBack() ||
+         (scheduler.DrawsSinceSubmit() >= submit_idle_draws && scheduler.GpuCaughtUp()))) {
+        if (may_hoist_before_pass) {
+            scheduler.DispatchWork(true);
+        } else {
+            scheduler.RequestOutsideRenderPassOperationContext();
+            if (SubmitWhileWaited()) {
+                draw_counter = 0;
+                pending_native_work = false;
+            }
+        }
+    }
     if (VideoCommon::FeatureCensus::Enabled()) {
         VideoCommon::FeatureCensus::NoteDispatch(
             pipeline->ShaderHash(), kepler_compute->GetIndirectComputeAddress().has_value());
@@ -2812,23 +2853,7 @@ void RasterizerVulkan::DispatchCompute() {
     std::scoped_lock buffer_lock{buffer_cache.mutex};
     std::scoped_lock texture_lock{texture_cache.mutex};
     std::optional<ByteAddressedShadow> byte_addressed_shadow;
-    // Command list pages the dispatch writes are copied for the split's front right after it.
-    buffer_cache.Nx2BeginWriterTrace(pipeline->ShaderHash());
-    buffer_cache.Nx2CollectListCopies(true);
-    SCOPE_EXIT {
-        buffer_cache.Nx2CollectListCopies(false);
-        buffer_cache.Nx2EndWriterTrace();
-        if (byte_addressed_shadow) {
-            texture_cache_runtime.RetireByteAddressedShadow(*byte_addressed_shadow);
-        }
-    };
     const auto indirect_address = kepler_compute->GetIndirectComputeAddress();
-    if (buffer_cache.Nx2TracingBufferDependencies() && indirect_address) {
-        if (const auto address = gpu_memory->GpuToCpuAddress(*indirect_address)) {
-            buffer_cache.Nx2TraceBufferInput(*address, 12,
-                                             VideoCommon::BufferDependencyTrace::Input::Indirect);
-        }
-    }
     const auto oot_pass = VideoCommon::FindOcarinaUpscalePass(native_key, pipeline->ShaderHash());
     const bool can_replace =
         OcarinaTemporalEnabled() &&
@@ -2845,14 +2870,67 @@ void RasterizerVulkan::DispatchCompute() {
     const bool marking_effects = oot_effects_frame == render_trace_frame &&
                                  OcarinaTemporalEnabled() && !indirect_address &&
                                  !frame_dump.Capturing();
+    bool try_before_pass = may_hoist_before_pass && !can_replace && !can_bilinear &&
+                           !marking_effects && scheduler.IsRenderPassActive();
+    if (try_before_pass && !shader_info.storage_buffers_descriptors.empty() &&
+        (shader_info.stores_global_memory ||
+         std::ranges::any_of(shader_info.storage_buffers_descriptors,
+                             &Shader::StorageBufferDescriptor::is_written))) {
+        buffer_cache.SetComputeUniformBufferState(0, nullptr);
+        buffer_cache.UnbindComputeStorageBuffers();
+        buffer_cache.UnbindComputeTextureBuffers();
+        size_t ssbo_idx = 0;
+        for (const auto& desc : shader_info.storage_buffers_descriptors) {
+            buffer_cache.BindComputeStorageBuffer(ssbo_idx++, desc.cbuf_index, desc.cbuf_offset,
+                                                  desc.is_written, desc.indirect_offset,
+                                                  desc.write_extent);
+        }
+        buffer_cache.UpdateComputeBuffers();
+        buffer_cache.ForEachBoundBuffer(
+            true, [&](u32, bool storage, u32, bool written, const auto&, u32 bound_size,
+                      const Buffer* host, u32 host_offset) {
+                if (!try_before_pass || !storage || bound_size == 0 ||
+                    (!written && !shader_info.stores_global_memory)) {
+                    return;
+                }
+                if (host == nullptr || host->IsRegionUsed(host_offset, bound_size)) {
+                    try_before_pass = false;
+                }
+            });
+        buffer_cache.UnbindComputeStorageBuffers();
+        if (!scheduler.IsRenderPassActive()) {
+            try_before_pass = false;
+        }
+    }
+    // Command list pages the dispatch writes are copied for the split's front right after it.
+    buffer_cache.Nx2BeginWriterTrace(pipeline->ShaderHash());
+    buffer_cache.Nx2CollectListCopies(true);
+    SCOPE_EXIT {
+        buffer_cache.Nx2CollectListCopies(false);
+        buffer_cache.Nx2EndWriterTrace();
+        if (byte_addressed_shadow) {
+            texture_cache_runtime.RetireByteAddressedShadow(*byte_addressed_shadow);
+        }
+    };
+    if (buffer_cache.Nx2TracingBufferDependencies() && indirect_address) {
+        if (const auto address = gpu_memory->GpuToCpuAddress(*indirect_address)) {
+            buffer_cache.Nx2TraceBufferInput(*address, 12,
+                                             VideoCommon::BufferDependencyTrace::Input::Indirect);
+        }
+    }
+    const u64 tick_before_cfg = scheduler.CurrentTick();
+    const u64 records_before_cfg = scheduler.WorkRecords();
+    const bool want_deferred_bind =
+        can_replace || can_bilinear || marking_effects || try_before_pass;
     ComputePipeline::BindCommand deferred_bind;
     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
                              texture_cache, texture_cache_runtime, byte_addressed_shadow,
-                             can_replace || can_bilinear || marking_effects ? &deferred_bind
-                                                                            : nullptr)) {
+                             want_deferred_bind ? &deferred_bind : nullptr)) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
+    const u64 tick_after_cfg = scheduler.CurrentTick();
+    const u64 records_after_cfg = scheduler.WorkRecords();
     if (VideoCommon::GpuSplit::RecordingDispatch()) {
         // EXP10: the buffer cache recorded the buffers the dispatch marks written; add its
         // images and the indirect arguments ObtainBuffer drops the GPU-written state of.
@@ -2918,6 +2996,75 @@ void RasterizerVulkan::DispatchCompute() {
                               {qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z},
                               indirect_address, indirect_grid);
     }
+    const auto can_hoist_images = [&]() {
+        if (!try_before_pass || !scheduler.IsRenderPassActive() ||
+            byte_addressed_shadow.has_value() || buffer_cache.HasPendingNx2ListCopies()) {
+            return false;
+        }
+        for (const auto& entry : pipeline->SampledImages()) {
+            if (!entry.id || entry.id == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                continue;
+            }
+            const ImageView& view = texture_cache.GetImageView(entry.id);
+            if (!view.IsBuffer() && view.BackingImage() != nullptr &&
+                scheduler.RenderPassTouches(view.ImageHandle())) {
+                return false;
+            }
+        }
+        for (const VideoCommon::ImageViewId id : pipeline->WrittenImages()) {
+            if (!id || id == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                continue;
+            }
+            const ImageView& view = texture_cache.GetImageView(id);
+            const Image* const backing = view.BackingImage();
+            const VkImage image_handle = view.ImageHandle();
+            if (backing == nullptr || scheduler.RenderPassTouches(image_handle)) {
+                return false;
+            }
+            bool freshly_transitioned = false;
+            if (tick_before_cfg == tick_after_cfg && records_after_cfg >= records_before_cfg) {
+                const u64 max_scan = std::min<u64>(records_after_cfg - records_before_cfg, 256);
+                const u64 scan_begin = records_after_cfg - max_scan;
+                for (u64 r = scan_begin; r <= records_after_cfg; ++r) {
+                    if (backing->JustTransitioned(tick_after_cfg, r)) {
+                        freshly_transitioned = true;
+                        break;
+                    }
+                }
+                if (!freshly_transitioned && scan_begin > records_before_cfg &&
+                    backing->JustTransitioned(tick_after_cfg, records_before_cfg)) {
+                    freshly_transitioned = true;
+                }
+            }
+            if (!freshly_transitioned) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto leave_render_pass_keep_clear = [&] {
+        if (scheduler.DeferredClearFramebufferHandle() == VK_NULL_HANDLE) {
+            if (scheduler.IsRenderPassActive()) {
+                scheduler.RequestOutsideRenderPassOperationContext();
+            }
+            return;
+        }
+        boost::container::small_vector<VkImage, 16> touched;
+        for (const auto& entry : pipeline->BoundImages()) {
+            if (!entry.id || entry.id == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                continue;
+            }
+            const ImageView& view = texture_cache.GetImageView(entry.id);
+            if (!view.IsBuffer() && view.BackingImage() != nullptr) {
+                touched.push_back(view.ImageHandle());
+            }
+        }
+        if (byte_addressed_shadow) {
+            touched.push_back(byte_addressed_shadow->original);
+        }
+        scheduler.RequestOutsideRenderPassKeepClear(touched);
+    };
+    const bool mesh_supported = device.IsExtMeshShaderSupported();
     if (indirect_address) {
         // DispatchIndirect
         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
@@ -2925,22 +3072,52 @@ void RasterizerVulkan::DispatchCompute() {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         buffer->MarkUsage(offset, 12);
+        if (can_hoist_images()) {
+            if (scheduler.CanRecordBeforePass()) {
+                Common::PerfReport::Add(Common::PerfReport::Dispatches);
+                scheduler.RecordBeforePass(
+                    [pipeline, bind = std::move(deferred_bind), indirect_buffer = buffer->Handle(),
+                     indirect_offset = offset, mesh_supported](vk::CommandBuffer cmdbuf) {
+                        RecordDispatchBarrier(cmdbuf);
+                        if (bind) {
+                            bind(cmdbuf);
+                        }
+                        if (!pipeline->IsBound()) {
+                            return;
+                        }
+                        cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
+                        RecordPostDispatchBarrier(cmdbuf, mesh_supported);
+                    });
+                scheduler.TraceComputePipeline(pipeline->ShaderHash());
+                dispatch_chain.Reset();
+                NoteWriterDeps(*pipeline);
+                return;
+            }
+            if (scheduler.IsRenderPassActive() && !scheduler.HasDeferredWaitForIdle()) {
+                scheduler.WantSplitBeforeCurrentPass();
+            }
+        }
         NoteDispatchDeps(*pipeline);
-        scheduler.RequestOutsideRenderPassOperationContext();
+        leave_render_pass_keep_clear();
         scheduler.NoteComputeWrites();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
         const ComputeAccessRange indirect_range{
             buffer->CpuAddr() + offset,
             buffer->CpuAddr() + offset + 12,
         };
+        const bool plain_indirect = !byte_addressed_shadow && !want_deferred_bind;
         const bool skip_barrier{
-            ShouldSkipDispatchBarrier(*pipeline, !byte_addressed_shadow, indirect_range)};
+            ShouldSkipDispatchBarrier(*pipeline, plain_indirect, indirect_range)};
         scheduler.Record([this, pipeline, byte_addressed_shadow, skip_barrier,
-                          post_barrier = PostDispatchBarrierEnabled(device),
+                          bind = std::move(deferred_bind), mesh_supported,
+                          post_barrier = ImmediatePostDispatchBarrierEnabled(device),
                           indirect_buffer = buffer->Handle(),
                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
             if (!skip_barrier) {
                 RecordDispatchBarrier(cmdbuf);
+            }
+            if (bind) {
+                bind(cmdbuf);
             }
             if (!pipeline->IsBound()) {
                 return;
@@ -2955,10 +3132,13 @@ void RasterizerVulkan::DispatchCompute() {
                 TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
             }
             if (post_barrier) {
-                RecordPostDispatchBarrier(cmdbuf);
+                RecordPostDispatchBarrier(cmdbuf, mesh_supported);
             }
         });
-        if (!byte_addressed_shadow) {
+        if (want_deferred_bind) {
+            scheduler.InvalidateState();
+        }
+        if (plain_indirect) {
             scheduler.NoteDispatchRecorded(pipeline);
         }
         compute_since_count_barrier = true;
@@ -2971,8 +3151,34 @@ void RasterizerVulkan::DispatchCompute() {
     if (dim[0] > max_dim[0] || dim[1] > max_dim[1] || dim[2] > max_dim[2]) {
         return;
     }
+    if (can_hoist_images()) {
+        if (scheduler.CanRecordBeforePass()) {
+            Common::PerfReport::Add(Common::PerfReport::Dispatches);
+            scheduler.RecordBeforePass(
+                [pipeline, dim, bind = std::move(deferred_bind),
+                 mesh_supported](vk::CommandBuffer cmdbuf) {
+                    RecordDispatchBarrier(cmdbuf);
+                    if (bind) {
+                        bind(cmdbuf);
+                    }
+                    if (!pipeline->IsBound()) {
+                        return;
+                    }
+                    cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
+                    RecordPostDispatchBarrier(cmdbuf, mesh_supported);
+                });
+            scheduler.TraceComputePipeline(pipeline->ShaderHash());
+            dispatch_chain.Reset();
+            NoteWriterDeps(*pipeline);
+            TryOcarinaUpscale(*pipeline, native_key, false);
+            return;
+        }
+        if (scheduler.IsRenderPassActive() && !scheduler.HasDeferredWaitForIdle()) {
+            scheduler.WantSplitBeforeCurrentPass();
+        }
+    }
     NoteDispatchDeps(*pipeline);
-    scheduler.RequestOutsideRenderPassOperationContext();
+    leave_render_pass_keep_clear();
     scheduler.NoteComputeWrites();
     if (can_replace || can_bilinear) {
         // Upscaler evaluation may be recorded next, before the dispatch: the barrier goes first.
@@ -3021,13 +3227,13 @@ void RasterizerVulkan::DispatchCompute() {
         pipeline->CanReplaceOcarinaUpscale()) {
         NoteOcarinaScene(*pipeline, replacement != nullptr, bilinear);
     }
-    const bool plain_dispatch{!can_replace && !can_bilinear && !byte_addressed_shadow &&
-                              !marking_effects};
+    const bool plain_dispatch{!want_deferred_bind && !byte_addressed_shadow};
     const bool skip_barrier{ShouldSkipDispatchBarrier(*pipeline, plain_dispatch)};
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind),
                       barrier_recorded = can_replace || can_bilinear || skip_barrier, replacement,
-                      bilinear,
-                      post_barrier = PostDispatchBarrierEnabled(device)](vk::CommandBuffer cmdbuf) {
+                      bilinear, mesh_supported,
+                      post_barrier =
+                          ImmediatePostDispatchBarrierEnabled(device)](vk::CommandBuffer cmdbuf) {
         if (!barrier_recorded) {
             RecordDispatchBarrier(cmdbuf);
         }
@@ -3052,10 +3258,10 @@ void RasterizerVulkan::DispatchCompute() {
             TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
         }
         if (post_barrier) {
-            RecordPostDispatchBarrier(cmdbuf);
+            RecordPostDispatchBarrier(cmdbuf, mesh_supported);
         }
     });
-    if (can_replace || can_bilinear || marking_effects) {
+    if (want_deferred_bind) {
         // The deferred native binding may follow DLSS's command buffer bindings.
         scheduler.InvalidateState();
     }
@@ -3157,10 +3363,9 @@ void RasterizerVulkan::NoteWriterDeps(const ComputePipeline& pipeline) {
 
 
 void RasterizerVulkan::SubmitNx2ListCopies(u64 writer) {
-    // Coalesced while GpuBehind() via DeferFlush (matching Metal's SubmitListCopies): when the
-    // front actually waits on a copy (~5% of copies), WaitSubmittedTick wakes GPUBack immediately.
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick(), writer) &&
-        (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush) ||
+        (VideoCommon::GpuSplit::Get().FrontWaitsForBack() ||
+         VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush) ||
          !scheduler.DeferFlush())) {
         VideoCommon::Nx2Profile::FlushOriginTag tag{VideoCommon::Nx2Profile::FlushOrigin::ListCopy};
         scheduler.Flush();
@@ -3357,6 +3562,11 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         }
     }
     if (!skip_buffers && buffer_cache.FlushesOnCpuRead()) {
+        if (fast_path) {
+            if (const auto fast_area = buffer_cache.TryFastGetFlushArea(addr, size)) {
+                return *fast_area;
+            }
+        }
         const u64 lock_begin = ReadStats::NowNs();
         std::scoped_lock lock{buffer_cache.mutex};
         ReadStats::Add(ReadStats::g_counters.buffer_lock_ns, ReadStats::NowNs() - lock_begin);
@@ -3372,6 +3582,25 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         .preemtive = true,
     };
     return new_area;
+}
+
+bool RasterizerVulkan::IsCleanReadTrapPage(DAddr page_addr) {
+    if (texture_cache.page_filter.Any(page_addr, Core::DEVICE_PAGESIZE) &&
+        (!TextureReadFilter() ||
+         texture_cache.MayHaveGpuModifiedImages(page_addr, Core::DEVICE_PAGESIZE))) {
+        return false;
+    }
+    return buffer_cache.IsPageCleanForFastRead(page_addr);
+}
+
+std::optional<VideoCore::RasterizerDownloadArea> RasterizerVulkan::TryFastCleanRead(
+    DAddr page_begin, u64 page_bytes) {
+    if (texture_cache.page_filter.Any(page_begin, page_bytes) &&
+        (!TextureReadFilter() ||
+         texture_cache.MayHaveGpuModifiedImages(page_begin, page_bytes))) {
+        return std::nullopt;
+    }
+    return buffer_cache.TryFastGetFlushAreaForDisarmed(page_begin, page_bytes);
 }
 
 bool RasterizerVulkan::LandDownloadForCpuRead(DAddr addr, u64 size, u64 tick) {
@@ -3513,6 +3742,13 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
         const char* value = std::getenv("EDEN_NX2_WRITE_FASTPATH");
         return value == nullptr || value[0] != '0';
     }();
+    if (fast_path && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+        !texture_cache.page_filter.Any(addr, size) &&
+        !pipeline_cache.page_filter.Any(addr, size) &&
+        buffer_cache.TryFastOnCpuWrite(addr, size)) {
+        Tegra::Nx2NoteDeferredCodeWrite(addr, size);
+        return true;
+    }
     const bool handoff = fast_path && VideoCommon::Nx2WriteHandoff::Enabled() &&
                          Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
                          !Tegra::Nx2MayBeGpuWritten(addr, size) &&
@@ -3732,8 +3968,10 @@ void RasterizerVulkan::WaitForIdle() {
         const char* value = std::getenv("EDEN_NX2_WFI_DEFER");
         return value == nullptr || value[0] != '0';
     }();
-    // Inside a render pass whose draws wrote no storage buffers or transform feedback, keep the
-    // pass open and emit the full memory barrier when the pass ends.
+    // Inside a pure rasterization render pass with no unordered storage writes or transform
+    // feedback, EndRenderPass and CheckFeedbackLoop already order attachment writes (as Metal's
+    // WaitForIdle does); keeping deferred_wfi_stages clear leaves before_pass_cmdbuf open for
+    // subsequent buffer and image uploads instead of breaking and reopening the pass.
     if (wfi_defer && scheduler.IsRenderPassActive() && !scheduler.StorageWritesUnordered() &&
         !scheduler.RenderPassHasStores() && maxwell3d &&
         maxwell3d->regs.transform_feedback_enabled == 0) {
@@ -6165,9 +6403,7 @@ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 
     boost::container::small_vector<std::pair<DAddr, size_t>, 4> gpu_written_dest;
     const bool copied =
         buffer_cache.DMACopy(src_address, dest_address, amount, false, &gpu_written_dest);
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) &&
-        (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush) ||
-         !scheduler.DeferFlush())) {
+    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) && !scheduler.DeferFlush()) {
         VideoCommon::Nx2Profile::FlushOriginTag tag{VideoCommon::Nx2Profile::FlushOrigin::ListCopy};
         scheduler.Flush();
     }

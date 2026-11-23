@@ -147,6 +147,9 @@ public:
     void NotePassDraw() noexcept {
         ++pass_draws;
     }
+    [[nodiscard]] u32 PassDraws() const noexcept {
+        return pass_draws;
+    }
     void TraceGraphicsPipeline(const std::array<u64, 6>& hashes);
     void TraceComputePipeline(u64 hash);
     /// Worker thread, inside a recorded command: timestamps one draw or dispatch of a sampled
@@ -219,6 +222,12 @@ public:
     void NoteTargetKey(u64 target_key) noexcept {
         pending_target_key = target_key;
     }
+    [[nodiscard]] u64 PendingTargetKey() const noexcept {
+        return pending_target_key;
+    }
+    [[nodiscard]] u64 ActiveTargetKey() const noexcept {
+        return state.target_key;
+    }
 
     /// Passes on that framebuffer split as SplitBeforeNextPass whatever their size (an emulated
     /// mesh draw or mid-pass buffer copy ended one). Kept in a set-associative cache.
@@ -238,6 +247,12 @@ public:
     /// nothing in the pass used so far (see BeforePassSerial).
     [[nodiscard]] bool CanRecordBeforePass() const noexcept {
         return before_pass_open && !HasDeferredWaitForIdle();
+    }
+    /// Outside an active render pass after SplitBeforeNextPass: work recorded with
+    /// RecordBeforePass runs immediately before the upcoming render pass (including its
+    /// realized deferred clear).
+    [[nodiscard]] bool CanRecordBeforeNextPass() const noexcept {
+        return before_pass_split && !HasDeferredWaitForIdle();
     }
 
     /// Changes at every render pass: a buffer marked with an older serial was not used since
@@ -327,6 +342,16 @@ public:
 
     /// Whether the active render pass is the one RequestRenderpass(framebuffer) would keep.
     bool RenderPassMatches(const Framebuffer* framebuffer) const;
+
+    /// Whether `image` is one of the attachments of the currently active render pass.
+    [[nodiscard]] bool RenderPassTouches(VkImage image) const noexcept {
+        if (!IsRenderPassActive() || image == VK_NULL_HANDLE) {
+            return false;
+        }
+        return std::find(renderpass_images.begin(),
+                         renderpass_images.begin() + num_renderpass_images,
+                         image) != renderpass_images.begin() + num_renderpass_images;
+    }
 
     /// Update the pipeline to the current execution context.
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
