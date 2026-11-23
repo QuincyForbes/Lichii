@@ -26,6 +26,7 @@
 #include "common/platform_events.h"
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/buffer_cache/download_coalesce.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
 #include "video_core/buffer_cache/storage_buffer_size.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
@@ -1026,9 +1027,21 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
         }
     }
     ForEachBufferInRange(device_addr, size, [&](BufferId, Buffer& buffer) {
+        const DAddr buffer_end = buffer.CpuAddr() + buffer.SizeBytes();
         const DAddr start = (std::max)(device_addr, buffer.CpuAddr());
-        const DAddr end = (std::min)(device_addr + size, buffer.CpuAddr() + buffer.SizeBytes());
+        DAddr end = (std::min)(device_addr + size, buffer_end);
         if (start < end) {
+            if constexpr (USE_MEMORY_MAPS) {
+                constexpr u64 SMALL_DOWNLOAD_COALESCE_TRIGGER = 64_KiB;
+                constexpr u64 MAX_COALESCED_DOWNLOAD_BYTES = 256_KiB;
+                if (size <= SMALL_DOWNLOAD_COALESCE_TRIGGER &&
+                    memory_tracker.IsRegionGpuModified(start, end - start)) {
+                    end = CoalesceContiguousDownloadEnd(start, end, buffer_end,
+                                                        Core::DEVICE_PAGESIZE,
+                                                        MAX_COALESCED_DOWNLOAD_BYTES,
+                                                        gpu_modified_ranges);
+                }
+            }
             DownloadBufferMemory(buffer, start, end - start);
         }
     });
@@ -4934,8 +4947,8 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
                 if (!past_sync) {
                     return Nx2ListRead::NeedsSync;
                 }
-                return entry.synced_writes == entry.writes ? Nx2ListRead::Synced
-                                                           : Nx2ListRead::Unknown;
+                // Past the sync the back noted every write the list can see: fall through to
+                // synced_writes / current(entry) without forcing a flush and Scheduler::Finish.
             }
             // Pages the CPU writes the lists of (GPU-written once, long before) stay synced, and
             // with EXP40 & 1 a list on none of the words GPU work wrote since the page was flushed
