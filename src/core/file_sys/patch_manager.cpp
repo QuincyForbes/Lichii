@@ -556,6 +556,21 @@ constexpr std::array OOT_TEXTURE_POOL_RECORDS{
     BuiltinPatchRecord{0x3C462C0, OOT_TEXTURE_POOL_CAVE, OOT_TEXTURE_POOL_CAVE_ORIGINAL},
 };
 
+bool OotPresentNoWaitEnabled() {
+    static const bool enabled = OotEnvSwitch("EDEN_NX2_OOT_PRESENT_NOWAIT", false);
+    return enabled;
+}
+
+// The presentation thread polls its frame's NVN event (nvnEventGetValue through blr x8, then
+// cmp w0, #1) and sleeps ~1.6 ms between looks until the GPU finishes the frame. Opt-in via
+// EDEN_NX2_OOT_PRESENT_NOWAIT=1 (ported from Longshot #588 / conongnang/Lichii eabdfc7aeb).
+constexpr std::array<u8, 4> OOT_PRESENT_POLL_ORIGINAL{0x00, 0x01, 0x3F, 0xD6}; // blr x8
+constexpr std::array<u8, 4> OOT_PRESENT_POLL_READY{0x20, 0x00, 0x80, 0x52};    // mov w0, #1
+constexpr std::array OOT_PRESENT_NOWAIT_RECORDS{
+    BuiltinPatchRecord{0x57049C, OOT_PRESENT_POLL_READY, OOT_PRESENT_POLL_ORIGINAL},
+    BuiltinPatchRecord{0x57052C, OOT_PRESENT_POLL_READY, OOT_PRESENT_POLL_ORIGINAL},
+};
+
 constexpr std::string_view OOT_GAME = "The Legend of Zelda: Ocarina of Time";
 
 constexpr std::array BUILTIN_PATCHES{
@@ -759,6 +774,20 @@ constexpr std::array BUILTIN_PATCHES{
         .effect = "Fixes that hang; uses a little more memory.",
         .chosen = OotTexturePoolEnabled,
         .chosen_by = "default (always on)",
+    },
+    BuiltinPatch{
+        .name = "Present Without GPU Wait (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = OOT_PRESENT_NOWAIT_RECORDS,
+        .kind = BuiltinPatchKind::Performance,
+        .game = OOT_GAME,
+        .description = "Presents each frame without polling for GPU completion (opt-in via "
+                       "EDEN_NX2_OOT_PRESENT_NOWAIT=1).",
+        .effect = "Lets the game start the next frame sooner while the GPU finishes this one.",
+        .chosen = OotPresentNoWaitEnabled,
+        .chosen_by = "EDEN_NX2_OOT_PRESENT_NOWAIT",
     },
 };
 

@@ -363,7 +363,7 @@ u32 JitEvictSliceBytes() {
 }
 
 #if defined(ARCHITECTURE_arm64)
-u32 JitStoreFaultLimit() {
+static u32 JitStoreFaultLimit() {
     static const u32 limit = [] {
         constexpr u32 DefaultStoreFaultLimit = 8;
         if (const char* const value = std::getenv("EDEN_NX2_JIT_STORE_FAULTS"); value && value[0] != '\0') {

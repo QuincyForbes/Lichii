@@ -340,6 +340,10 @@ public:
         return state.renderpass != VK_NULL_HANDLE;
     }
 
+    bool IsBetweenRenderPasses() const {
+        return state.renderpass == VK_NULL_HANDLE && deferred_clear.framebuffer == nullptr;
+    }
+
     /// Whether the active render pass is the one RequestRenderpass(framebuffer) would keep.
     bool RenderPassMatches(const Framebuffer* framebuffer) const;
 

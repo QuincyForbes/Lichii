@@ -1479,6 +1479,24 @@ private:
     /// PreflushAging, every 60 frames: drops the marks of blocks the CPU stopped reading.
     void Nx2AgePreflushBlocks();
 
+    struct FindMemo {
+        u64 page{~u64{0}};
+        u64 deletions{};
+        DAddr begin{};
+        DAddr end{};
+        BufferId buffer_id{};
+        bool sparse_compatible{};
+    };
+    std::array<FindMemo, 256> find_memos{};
+    struct SingleRangeMemo {
+        const Tegra::MemoryManager* memory{};
+        u64 map_serial{};
+        GPUVAddr gpu_addr{};
+        u32 size{};
+    };
+    std::array<SingleRangeMemo, 64> single_ranges{};
+    u64 buffer_deletions{};
+
     static constexpr u64 NX2_PREFLUSH_BLOCK_BITS = 12; ///< 4 KiB blocks (device pages)
     static constexpr u64 NX2_PREFLUSH_LINE_BITS = 6;   ///< 64-byte cachelines (64 per 4 KiB block)
     static_assert((u64{1} << NX2_PREFLUSH_BLOCK_BITS) == Core::DEVICE_PAGESIZE);

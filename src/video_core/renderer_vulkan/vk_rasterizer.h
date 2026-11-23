@@ -236,7 +236,7 @@ private:
     /// guest memory, when the pipeline proves it. Holds buffer_cache.mutex.
     void Nx2ProveNonWriterDraw(const GraphicsPipeline& pipeline);
 
-    void FlushWork();
+    void FlushWork(bool ends_pass = false);
     /// Nx2Perf submit_while_waited, at FlushWork's dispatch check: submits the recorded draws
     /// when the front waits for the back or the host GPU has caught up. True when it submitted.
     bool SubmitWhileWaited();
