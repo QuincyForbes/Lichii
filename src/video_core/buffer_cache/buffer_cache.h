@@ -1401,7 +1401,11 @@ bool BufferCache<P>::DMACopy(
         src_buffer.MarkUsage(copy.src_offset, copy.size);
         dest_buffer.MarkUsage(copy.dst_offset, copy.size);
     }
-    runtime.CopyBuffer(dest_buffer, src_buffer, copies, true, can_reorder);
+    if constexpr (requires { runtime.CopyBuffer(dest_buffer, src_buffer, copies, true, can_reorder); }) {
+        runtime.CopyBuffer(dest_buffer, src_buffer, copies, true, can_reorder);
+    } else {
+        runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
+    }
     if (gpu_written_dest) {
         *gpu_written_dest = tmp_intervals;
     }
@@ -5322,7 +5326,11 @@ bool BufferCache<P>::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
         if (!can_reorder) {
             new_buffer.MarkUsage(copies[0].dst_offset, copies[0].size);
         }
-        runtime.CopyBuffer(new_buffer, overlap, copies, true, can_reorder);
+        if constexpr (requires { runtime.CopyBuffer(new_buffer, overlap, copies, true, can_reorder); }) {
+            runtime.CopyBuffer(new_buffer, overlap, copies, true, can_reorder);
+        } else {
+            runtime.CopyBuffer(new_buffer, overlap, copies, true);
+        }
     } else {
         new_buffer.MarkUsage(copies[0].dst_offset, copies[0].size);
         VideoCommon::Churn::Add(VideoCommon::Churn::BufferJoinsSkipped);
