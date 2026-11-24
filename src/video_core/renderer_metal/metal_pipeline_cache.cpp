@@ -12,6 +12,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -235,11 +236,19 @@ Object SharedLibrary(const Device& device, const std::string& source, std::strin
     if (owner) {
         std::string build_error;
         Object library = CreateLibrary(device, source, build_error);
+        const bool transient_xpc =
+            !library && build_error.find("XPC_ERROR_CONNECTION_INTERRUPTED") != std::string::npos;
         {
             std::scoped_lock lock{entry->mutex};
             entry->library = std::move(library);
             entry->error = build_error;
             entry->done = true;
+        }
+        if (transient_xpc) {
+            std::scoped_lock lock{state.mutex};
+            if (const auto it = state.cache.find(key); it != state.cache.end() && it->second == entry) {
+                state.cache.erase(it);
+            }
         }
         entry->done_cv.notify_all();
     }
@@ -309,7 +318,15 @@ u32 AsyncPipelineThreads() {
         if (VideoCommon::AsyncTranslateMode() != 1) {
             return 0U;
         }
-        const u32 automatic = (std::max)(std::thread::hardware_concurrency(), 2U) - 1;
+        const u32 hardware = (std::max)(std::thread::hardware_concurrency(), 2U) - 1;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        // iOS shares 2 performance cores and an out-of-process MTLCompilerService XPC daemon;
+        // 5 concurrent shader compilations caused XPC_ERROR_CONNECTION_INTERRUPTED and VA/malloc
+        // spikes while loading Kokiri Forest. Default to 2 workers on iOS.
+        const u32 automatic = (std::min)(hardware, 2U);
+#else
+        const u32 automatic = hardware;
+#endif
         const char* value = std::getenv("EDEN_NX2_METAL_ASYNC_PIPELINES");
         if (value == nullptr || value[0] == '\0') {
             value = std::getenv("EDEN_NX2_ASYNC_TRANSLATE_THREADS");
@@ -987,11 +1004,22 @@ void* ComputePipeline::State(const Device& device) {
     if (program.function) {
         state = CreateComputePipelineState(device, program.function.Get(), error, archive,
                                            wg_threads, program.immutable_buffer_mask);
-        ReleaseSource(program);
+        if (state) {
+            ReleaseSource(program);
+        }
     }
     program.function.Reset();
     program.library.Reset();
     if (!state) {
+        const bool transient_xpc = error.find("XPC_ERROR_CONNECTION_INTERRUPTED") != std::string::npos;
+        if (transient_xpc && xpc_retries < 2) {
+            ++xpc_retries;
+            LOG_WARNING(Render_Metal,
+                        "Metal: compute {:016x} hit transient XPC interruption (attempt {}); retrying",
+                        key.unique_hash, xpc_retries);
+            return nullptr;
+        }
+        ReleaseSource(program);
         program.reduction_variants = false;
         failed = true;
         static std::atomic<u32> logged{};
@@ -2560,17 +2588,26 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     auto it = graphics_cache.find(graphics_key);
     if (it == graphics_cache.end()) {
         std::unique_ptr<GraphicsPipeline> made;
-        if (builders) {
-            bool pending = false;
-            made = BuildInBackground(pending);
-            if (pending) {
-                current_pipeline = nullptr;
-                building = true;
-                refusal = "pipeline still building";
-                return nullptr;
+        try {
+            if (builders) {
+                bool pending = false;
+                made = BuildInBackground(pending);
+                if (pending) {
+                    current_pipeline = nullptr;
+                    building = true;
+                    refusal = "pipeline still building";
+                    return nullptr;
+                }
+            } else {
+                made = CreateGraphicsPipeline();
             }
-        } else {
-            made = CreateGraphicsPipeline();
+        } catch (const std::bad_alloc&) {
+            LOG_ERROR(Render_Metal,
+                      "Metal: out of memory queuing graphics pipeline {:016x}; skipping draw",
+                      graphics_key.Hash());
+            current_pipeline = nullptr;
+            refusal = "out of memory";
+            return nullptr;
         }
         made ? ++graphics_made : ++refused;
         if (made) {

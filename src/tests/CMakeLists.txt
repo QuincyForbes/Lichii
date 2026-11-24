@@ -14,6 +14,7 @@ add_executable(tests
     video_core/metal_work_policy.cpp
     video_core/vulkan_overlay_filter.cpp
     common/addon_config.cpp
+    common/library_exceptions.cpp
     common/settings_migration.cpp
     video_core/astc_decompress.cpp
     video_core/unswizzle_workers.cpp

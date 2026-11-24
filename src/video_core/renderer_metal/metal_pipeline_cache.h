@@ -410,6 +410,7 @@ private:
     PipelineArchive* archive{};
     bool failed{};
     bool used{};
+    u8 xpc_retries{};
 };
 
 class PipelineCache : public VideoCommon::ShaderCache {

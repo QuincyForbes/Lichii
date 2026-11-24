@@ -374,7 +374,7 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
     const bool compact_layout = guarded_fastmem_layout && compact_layout_enabled;
 
     const bool fastmem_short =
-        !guarded_fastmem_layout && force_pack_layout && arena_short &&
+        !guarded_fastmem_layout && (pack_layout_enabled || force_pack_layout) && arena_short &&
         GetInteger(alloc_start) < fastmem_end;
     const bool hot_first = fastmem_short &&
                            GetInteger(alloc_start) + needed_size > fastmem_end &&
@@ -432,10 +432,15 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
             alias_rnd = kmap_rnd + RegionAlignment;
         }
     } else if (hot_first) {
-        heap_rnd = RegionAlignment;
-        stack_rnd = 2 * RegionAlignment;
-        alias_rnd = 3 * RegionAlignment;
-        kmap_rnd = 4 * RegionAlignment;
+        // Place stack (2 GiB), kernel map (clamped to 1 GiB for TLS/static mappings), and then the
+        // heap (bottom ~10-11 GiB falls inside a 16 GiB fastmem arena) before alias.
+        if (kernel_map_region_size > size_t{1_GiB}) {
+            kernel_map_region_size = size_t{1_GiB};
+        }
+        stack_rnd = RegionAlignment;
+        kmap_rnd = 2 * RegionAlignment;
+        heap_rnd = 3 * RegionAlignment;
+        alias_rnd = 4 * RegionAlignment;
     } else if (enable_aslr) {
         alias_rnd = KSystemControl::GenerateRandomRange(0, remaining_size / RegionAlignment) * RegionAlignment;
         heap_rnd = KSystemControl::GenerateRandomRange(0, remaining_size / RegionAlignment) * RegionAlignment;

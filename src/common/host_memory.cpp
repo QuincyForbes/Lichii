@@ -1053,9 +1053,19 @@ public:
                 }
             }
             // Even with extended-virtual-addressing iOS hands out far less than the 512 GiB a 39-bit
-            // guest spans, so take the largest power of two it grants: guest addresses above it
-            // take dynarmic's page table path.
+            // guest spans, so take the largest power of two it grants while keeping enough VA
+            // headroom for malloc, Metal, JIT, and shader compilation. Without headroom, 14 GiB
+            // guest backing + 32 GiB fastmem fills nearly all ~51 GiB of iOS VA and malloc() fails
+            // with KERN_NO_SPACE -> std::bad_alloc once Metal + malloc grow past ~4-5 GiB.
             constexpr size_t MinGuestSpace = size_t{1} << 32;
+#if TARGET_OS_IPHONE
+            static const size_t ios_va_headroom = [] {
+                const char* const value = std::getenv("EDEN_NX2_IOS_VA_HEADROOM_GIB");
+                const unsigned long gib =
+                    (value != nullptr && value[0] != '\0') ? std::strtoul(value, nullptr, 10) : 12UL;
+                return static_cast<size_t>(gib) << 30;
+            }();
+#endif
             vm_address_t virtual_address = 0;
             size_t guest_space = virtual_size - HugePageSize;
             while (true) {
@@ -1063,6 +1073,26 @@ public:
                             VM_FLAGS_ANYWHERE, MACH_PORT_NULL, 0, FALSE, VM_PROT_NONE,
                             VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
                 if (kr == KERN_SUCCESS) {
+#if TARGET_OS_IPHONE
+                    if (ios_va_headroom > 0 && guest_space / 2 >= MinGuestSpace) {
+                        vm_address_t probe = 0;
+                        const kern_return_t probe_kr = vm_map(
+                            mach_task_self(), &probe, ios_va_headroom, 0, VM_FLAGS_ANYWHERE,
+                            MACH_PORT_NULL, 0, FALSE, VM_PROT_NONE, VM_PROT_NONE, VM_INHERIT_NONE);
+                        if (probe_kr == KERN_SUCCESS) {
+                            vm_deallocate(mach_task_self(), probe, ios_va_headroom);
+                            break;
+                        }
+                        vm_deallocate(mach_task_self(), virtual_address,
+                                      guest_space + HugePageSize);
+                        virtual_address = 0;
+                        LOG_INFO(HW_Memory,
+                                 "fastmem: {} GiB arena leaves under {} GiB VA headroom; halving",
+                                 guest_space >> 30, ios_va_headroom >> 30);
+                        guest_space /= 2;
+                        continue;
+                    }
+#endif
                     break;
                 }
                 LOG_INFO(HW_Memory, "fastmem: reserving {} GiB of guest address space failed: {}",
