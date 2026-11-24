@@ -1110,6 +1110,10 @@ private:
     /// Returns true if the current clear parameters clear the whole image of a given image view
     [[nodiscard]] bool IsFullClear(ImageViewId id);
 
+    /// Returns true if the current clear covers the full bound attachment (ignoring RenderSubExtent
+    /// and multi-level/multi-layer backing), for recurring-target classification.
+    [[nodiscard]] bool IsAttachmentFullClear(ImageViewId id);
+
     /// UpdateRenderTargets(true): records a full clear on the targets the clear writes (the
     /// colour target it names, the depth target when depth is cleared), for ClassifyDrawTargets.
     void NoteFullClears();

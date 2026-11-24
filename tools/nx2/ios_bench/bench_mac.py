@@ -373,7 +373,7 @@ def run_request(config, device, request, out_dir, jit="stikdebug", trace=False, 
     traced = False
     gone_since = None
     while time.monotonic() - start < timeout:
-        time.sleep(10)
+        time.sleep(3)
         status = read_remote_json(device, bundle, f"{BENCH}/status.json", scratch)
         fresh = status and status.get("pid") == pid and status != before
         if fresh:

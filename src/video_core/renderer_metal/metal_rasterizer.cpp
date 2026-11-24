@@ -8384,10 +8384,15 @@ bool RasterizerMetal::DrawMayBeSkipped() {
     }
     const auto& regs = maxwell3d->regs;
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
+    const auto targets =
+        (mode == 2 && native) ? texture_cache.ClassifyDrawTargets() : VideoCommon::DrawTargets{};
+    const bool recurring = (mode != 2 || !native) ||
+                           targets.kind == VideoCommon::DrawTargetClass::Recurring;
+    bool writes_color = true;
     if (native) {
         const u32 color_count =
             (std::min)(static_cast<u32>(regs.rt_control.count), static_cast<u32>(NUM_RT));
-        bool writes_color = false;
+        writes_color = false;
         for (u32 index = 0; index < color_count; ++index) {
             const auto& rt = regs.rt[index];
             if (rt.Address() == 0 || rt.format == Tegra::RenderTargetFormat::NONE) {
@@ -8399,20 +8404,43 @@ bool RasterizerMetal::DrawMayBeSkipped() {
                 break;
             }
         }
-        if (!writes_color) {
+        // Depth-only / shadow-map draws targeting a recurring (cleared-every-frame) target can be
+        // skipped while their pipeline builds in the background instead of freezing GPUBack for
+        // 300-750 ms per new shadow caster (EDEN_NX2_METAL_ASYNC_DEPTH=0 restores blocking).
+        static const bool async_depth = [] {
+            const char* const value = std::getenv("EDEN_NX2_METAL_ASYNC_DEPTH");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (!writes_color && (!async_depth || !recurring)) {
             skip_decision = false;
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_DEBUG(Render_Metal,
+                          "Metal async hold: depth-only target class={} {}x{} fmt={} addr={:#x}",
+                          static_cast<u32>(targets.kind), targets.width, targets.height,
+                          static_cast<u32>(targets.format), targets.gpu_addr);
+            }
             return false;
         }
     }
-    bool recurring = true;
-    if (mode == 2 && native) {
-        recurring = texture_cache.ClassifyDrawTargets().kind ==
-                    VideoCommon::DrawTargetClass::Recurring;
-    }
-    const bool depth_enabled = regs.zeta_enable != 0 && regs.depth_test_enable != 0;
-    const u32 elements = maxwell3d->draw_manager.draw_state.draw_element_count;
+    const bool depth_enabled = regs.zeta_enable != 0;
+    const u32 raw_elements = maxwell3d->draw_manager.draw_state.draw_element_count;
+    // Indirect draws leave draw_element_count == 0, and mesh draws put the workgroup count
+    // (often 1-6 groups generating hundreds of triangles) in draw_element_count.
+    const u32 elements = (raw_elements == 0 || regs.IsMeshEnabled()) ? 100U : raw_elements;
     skip_decision = Vulkan::CanDiscardPendingDraw(native, depth_enabled, elements, elements,
                                                   mode != 0, recurring);
+    if (!skip_decision) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_DEBUG(Render_Metal,
+                      "Metal async hold: native={} class={} {}x{} fmt={} writes_color={} "
+                      "depth={} raw_elem={} mesh={}",
+                      native, static_cast<u32>(targets.kind), targets.width, targets.height,
+                      static_cast<u32>(targets.format), writes_color, depth_enabled, raw_elements,
+                      regs.IsMeshEnabled());
+        }
+    }
     return skip_decision;
 }
 

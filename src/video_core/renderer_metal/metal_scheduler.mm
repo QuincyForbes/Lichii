@@ -11190,10 +11190,11 @@ void Scheduler::ResolvePassTimes() {
                                                     : std::string{},
                            record.draws, timed[i].ms);
     }
+    const u64 gpu_now = state.completion->gpu_ns.load(std::memory_order_relaxed);
     const f64 frame_ms =
-        static_cast<f64>(state.completion->gpu_ns.load(std::memory_order_relaxed) -
-                         state.pass_gpu_ns_before) /
-        1e6;
+        gpu_now >= state.pass_gpu_ns_before
+            ? static_cast<f64>(gpu_now - state.pass_gpu_ns_before) / 1e6
+            : 0.0;
     state.pass_times_line =
         fmt::format("{} render passes ({} timed) take {:.2f} ms of GPU time, the frame's command "
                     "buffers {:.2f} ms | passes: {} | since boot: {} kernels ahead after other "

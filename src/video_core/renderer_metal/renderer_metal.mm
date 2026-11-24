@@ -1253,7 +1253,36 @@ void RendererMetal::Composite(std::span<const Tegra::FramebufferConfig> framebuf
 
     @autoreleasepool {
         RenderScreenshot(framebuffers);
-        const auto& layout = render_window.GetFramebufferLayout();
+        Layout::FramebufferLayout layout = render_window.GetFramebufferLayout();
+#if TARGET_OS_IPHONE
+        // Cap the iOS present drawable short side to 1080p (default 1080, EDEN_NX2_IOS_PRESENT_MAX_H=0
+        // keeps native 3x Retina). On 2868x1320 iPhones this maps 16:9 games 1:1 to 1920x1080,
+        // eliminating a redundant 2nd Spatial MetalFX pass and 33% of present pixel fill/heat.
+        static const u32 ios_present_max_h = [] {
+            const char* const value = std::getenv("EDEN_NX2_IOS_PRESENT_MAX_H");
+            if (value == nullptr || value[0] == '\0') {
+                return u32{1080};
+            }
+            return static_cast<u32>(std::strtoul(value, nullptr, 10));
+        }();
+        const u32 short_side = (std::min)(layout.width, layout.height);
+        if (ios_present_max_h >= 480 && short_side > ios_present_max_h) {
+            const f64 scale = static_cast<f64>(ios_present_max_h) / static_cast<f64>(short_side);
+            const auto scale_u32 = [scale](u32 v) {
+                return (std::max)(u32{1}, static_cast<u32>(static_cast<f64>(v) * scale + 0.5)) &
+                       ~u32{1};
+            };
+            layout.width = (std::max)(u32{2}, scale_u32(layout.width));
+            layout.height = (std::max)(u32{2}, scale_u32(layout.height));
+            layout.screen.left = static_cast<u32>(static_cast<f64>(layout.screen.left) * scale + 0.5);
+            layout.screen.right = (std::min)(
+                layout.width, static_cast<u32>(static_cast<f64>(layout.screen.right) * scale + 0.5));
+            layout.screen.top = static_cast<u32>(static_cast<f64>(layout.screen.top) * scale + 0.5);
+            layout.screen.bottom = (std::min)(
+                layout.height,
+                static_cast<u32>(static_cast<f64>(layout.screen.bottom) * scale + 0.5));
+        }
+#endif
         if (!framebuffers.empty()) {
             const auto& guest = framebuffers.front();
             const bool cropped = !guest.crop_rect.IsEmpty();

@@ -28,11 +28,9 @@ namespace {
 /// macOS 26/27's MTLBinaryArchive FlatBuffers serializer is O(N^2) per archive; capping each shard
 /// at 128 pipelines (~5-12 MiB) keeps serializeToURL under ~150 ms and load under ~5 ms per shard.
 constexpr u32 MaxPipelinesPerShard = 128;
-constexpr u32 MaxArchiveShards = 64;
+constexpr u32 MaxArchiveShards = 128;
 /// Any legacy monolithic archive larger than 64 MiB is discarded so Open() never hangs.
 constexpr u64 MaxValidShardFileBytes = 64ULL << 20;
-/// Pre-existing shard files >= 4 MiB are treated as sealed on load so new additions start a fresh shard.
-constexpr u64 SealedShardFileBytes = 4ULL << 20;
 
 std::filesystem::path ShardPath(const std::filesystem::path& base_path, size_t shard_index) {
     if (shard_index == 0) {
@@ -69,6 +67,7 @@ struct PipelineArchive::Impl {
     std::deque<std::function<bool(void*)>> adds;
     std::thread add_thread;
     bool adding = false;
+    bool save_requested = false;
     bool stop = false;
 
     void RebuildLookupArrayLocked() {
@@ -93,7 +92,7 @@ struct PipelineArchive::Impl {
             last.sealed = true;
         }
         if (shards.size() >= MaxArchiveShards) {
-            return shards.empty() ? nullptr : &shards.back();
+            return nullptr;
         }
         NSError* error = nil;
         id<MTLBinaryArchive> created =
@@ -157,21 +156,34 @@ void PipelineArchive::DeferAdd(std::function<bool(void* archive_handle)> add) {
                 pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
                 for (;;) {
                     std::function<bool(void*)> next;
+                    bool do_save = false;
                     {
                         std::unique_lock thread_lock{impl->add_mutex};
                         impl->adding = false;
-                        if (impl->adds.empty()) {
+                        if (impl->adds.empty() && !impl->save_requested) {
                             impl->idle_cv.notify_all();
                         }
-                        impl->add_cv.wait(thread_lock,
-                                          [this] { return impl->stop || !impl->adds.empty(); });
+                        impl->add_cv.wait(thread_lock, [this] {
+                            return impl->stop || !impl->adds.empty() || impl->save_requested;
+                        });
                         if (impl->adds.empty()) {
-                            impl->idle_cv.notify_all();
-                            return;
+                            if (impl->save_requested) {
+                                impl->save_requested = false;
+                                impl->adding = true;
+                                do_save = true;
+                            } else {
+                                impl->idle_cv.notify_all();
+                                return;
+                            }
+                        } else {
+                            next = std::move(impl->adds.front());
+                            impl->adds.pop_front();
+                            impl->adding = true;
                         }
-                        next = std::move(impl->adds.front());
-                        impl->adds.pop_front();
-                        impl->adding = true;
+                    }
+                    if (do_save) {
+                        SaveUnlocked();
+                        continue;
                     }
                     bool added = false;
                     @autoreleasepool {
@@ -205,7 +217,9 @@ void PipelineArchive::DeferAdd(std::function<bool(void* archive_handle)> add) {
 
 void PipelineArchive::FlushAdds() {
     std::unique_lock lock{impl->add_mutex};
-    impl->idle_cv.wait(lock, [this] { return impl->adds.empty() && !impl->adding; });
+    impl->idle_cv.wait(lock, [this] {
+        return impl->adds.empty() && !impl->adding && !impl->save_requested;
+    });
 }
 
 bool PipelineArchive::Open(const Device& device, const std::filesystem::path& path,
@@ -220,8 +234,8 @@ bool PipelineArchive::Open(const Device& device, const std::filesystem::path& pa
     }
     Save();
     read_only.store(read_only_mode, std::memory_order_relaxed);
-    std::scoped_lock lock{mutex};
     std::unique_lock build_lock{build_mutex};
+    std::scoped_lock lock{mutex};
     @autoreleasepool {
         impl->lookup_array = nil;
         impl->shards.clear();
@@ -309,8 +323,8 @@ bool PipelineArchive::Open(const Device& device, const std::filesystem::path& pa
     return true;
 }
 
-void PipelineArchive::Save() {
-    FlushAdds();
+void PipelineArchive::SaveUnlocked() {
+    std::unique_lock build_lock{build_mutex};
     std::scoped_lock lock{mutex};
     if (!dirty) {
         return;
@@ -321,7 +335,6 @@ void PipelineArchive::Save() {
         if (!impl->base_path.empty()) {
             std::filesystem::create_directories(impl->base_path.parent_path(), ec);
         }
-        std::unique_lock build_lock{build_mutex};
         size_t written_shards = 0;
         for (Impl::Shard& shard : impl->shards) {
             if (!shard.dirty || shard.archive == nil || shard.url == nil) {
@@ -355,6 +368,10 @@ void PipelineArchive::Save() {
                                                       options:NSDataReadingMappedAlways
                                                         error:nil];
             shard.dirty = false;
+            // On iOS 26 / Metal 3, mutating and re-serializing the same MTLBinaryArchive instance a
+            // second time SIGSEGVs inside Metal (serializeToURL:). Seal after every successful save
+            // so future pipelines start a fresh shard and no archive is ever serialized twice.
+            shard.sealed = true;
             ++written_shards;
         }
         dirty = false;
@@ -367,6 +384,25 @@ void PipelineArchive::Save() {
                          .count());
         }
     }
+}
+
+void PipelineArchive::Save() {
+    FlushAdds();
+    SaveUnlocked();
+}
+
+void PipelineArchive::DeferSave() {
+    if (read_only.load(std::memory_order_relaxed)) {
+        return;
+    }
+    {
+        std::scoped_lock lock{impl->add_mutex};
+        if (impl->stop || !impl->add_thread.joinable()) {
+            return;
+        }
+        impl->save_requested = true;
+    }
+    impl->add_cv.notify_one();
 }
 
 void* PipelineArchive::Handle() const noexcept {

@@ -8268,6 +8268,27 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
         // same guest data, which is uploaded from guest memory instead.
         return;
     }
+    // A full-extent copy into a target every frame (e.g. half-res depth downsample) overwrites it
+    // just like a full clear, so recurring-target classification does not treat it as persistent.
+    {
+        const u64 render_frame = RenderFrame();
+        for (const ImageCopy& copy : copies) {
+            const u32 mip_w = (std::max)(1U, dst.info.size.width >> copy.dst_subresource.base_level);
+            const u32 mip_h =
+                (std::max)(1U, dst.info.size.height >> copy.dst_subresource.base_level);
+            if (copy.dst_offset.x == 0 && copy.dst_offset.y == 0 &&
+                copy.extent.width >= mip_w && copy.extent.height >= mip_h) {
+                if (dst.last_clear_frame != render_frame) {
+                    if (dst.drawn_since_clear) {
+                        dst.previous_clear_frame = dst.last_clear_frame;
+                    }
+                    dst.last_clear_frame = render_frame;
+                }
+                dst.drawn_since_clear = false;
+                break;
+            }
+        }
+    }
     const bool is_rescaled = True(src.flags & ImageFlagBits::Rescaled);
     if (is_rescaled) {
         ASSERT(True(dst.flags & ImageFlagBits::Rescaled));
@@ -8437,6 +8458,22 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
 }
 
 template <class P>
+bool TextureCache<P>::IsAttachmentFullClear(ImageViewId id) {
+    if (!id) {
+        return true;
+    }
+    const ImageViewBase& image_view = slot_image_views[id];
+    const Extent3D size = image_view.size;
+    const auto& regs = maxwell3d->regs;
+    if (regs.clear_control.use_scissor == 0) {
+        return true;
+    }
+    const auto& scissor = regs.scissor_test[0];
+    return scissor.min_x == 0 && scissor.min_y == 0 && scissor.max_x >= size.width &&
+           scissor.max_y >= size.height;
+}
+
+template <class P>
 void TextureCache<P>::NoteFullClears() {
     const auto& clear = maxwell3d->regs.clear_surface;
     const bool color = clear.R || clear.G || clear.B || clear.A;
@@ -8446,7 +8483,7 @@ void TextureCache<P>::NoteFullClears() {
             return;
         }
         const ImageViewBase& view = slot_image_views[view_id];
-        if (view.IsBuffer() || !IsFullClear(view_id)) {
+        if (view.IsBuffer() || !IsAttachmentFullClear(view_id)) {
             return;
         }
         ImageBase& image = slot_images[view.image_id];
@@ -8484,7 +8521,7 @@ DrawTargets TextureCache<P>::ClassifyDrawTargets() {
             if (bound && bound != NULL_IMAGE_VIEW_ID && !slot_image_views[bound].IsBuffer()) {
                 image = &slot_images[slot_image_views[bound].image_id];
             }
-        } else if (const ImageId image_id = FindImage(info, gpu_addr, RelaxedOptions{});
+        } else if (const ImageId image_id = FindImage(info, gpu_addr, RelaxedOptions::RenderTarget);
                    image_id) {
             image = &slot_images[image_id];
         }
@@ -8510,10 +8547,15 @@ DrawTargets TextureCache<P>::ClassifyDrawTargets() {
         if (gpu_addr == 0 || rt.format == Tegra::RenderTargetFormat::NONE) {
             continue;
         }
+        const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : index];
+        if (mask.R == 0 && mask.G == 0 && mask.B == 0 && mask.A == 0) {
+            continue;
+        }
         const ImageInfo info(rt, regs.anti_alias_samples_mode);
         take(render_targets.color_buffer_ids[index], info, gpu_addr, info.format);
     }
-    if (regs.zeta_enable && regs.zeta.Address() != 0) {
+    const bool writes_depth = regs.depth_write_enabled != 0 || regs.stencil_enable != 0;
+    if (regs.zeta_enable && regs.zeta.Address() != 0 && (writes_depth || !any_target)) {
         const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
         take(render_targets.depth_buffer_id, info, regs.zeta.Address(), info.format);
     }

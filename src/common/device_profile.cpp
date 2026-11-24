@@ -321,8 +321,8 @@ void RecommendApple(const Device& device, Profile& p) {
          "was four to six small blocks each, 237 MiB of 16-64 byte blocks plus 155 MiB of tables "
          "in Kokiri (iPhone18,2 malloc census, build 71)."});
     p.tuning.push_back(
-        {"EDEN_NX2_FENCE_FLUSH_US", "2000", "2 ms",
-         "The game's fences are submitted together within 2 ms instead of each in a command "
+        {"EDEN_NX2_FENCE_FLUSH_US", "3000", "3 ms",
+         "The game's fences are submitted together within 3 ms instead of each in a command "
          "buffer of its own: an iPhone18,2 ran 76-95 command buffers a frame in Kokiri (IPA "
          "138), the title screen 7. PC phone sim: 59 -> 21 a frame, no more flashes in Kokiri "
          "(flash watch). Experiments > Submit at Every Fence turns it off."});
@@ -353,13 +353,14 @@ void RecommendApple(const Device& device, Profile& p) {
          "runnable the loop kept a performance core busy. Experiments > Polling Threads Yield "
          "turns it off."});
     p.tuning.push_back(
-        {"EDEN_NX2_IDLE_HOLD_US", "500", "0.5 ms",
-         "The GPU thread, out of commands, keeps deferred work asleep for up to 0.5 ms while the "
+        {"EDEN_NX2_IDLE_HOLD_US", "1500", "1.5 ms",
+         "The GPU thread, out of commands, keeps deferred work asleep for up to 1.5 ms while the "
          "GPU still runs what it was handed earlier, so the next commands share its command "
-         "buffer: 17-20 of an iPhone18,2's 34-37 command buffers a frame in Kokiri were handed "
-         "over by the idle thread (IPA 179). PC phone sim: those 3.0 -> 0.9 a frame, 21.1 -> "
-         "19.6 command buffers, frame rate unchanged. Experiments > GPU Thread Submits When "
-         "Idle turns it off."});
+         "buffer instead of splitting frames into ~15 tiny submissions."});
+    p.tuning.push_back(
+        {"EDEN_NX2_TIMING_SPIN_US", "0", "Sleep only",
+         "Disables HostTiming's busy-spin wait margin on iOS: on 2-P-core iPhones, HostTiming "
+         "spent 15-18% of a performance core spinning in PauseHint()."});
 }
 
 void RecommendDesktop(const Device& device, Profile& p) {

@@ -61,8 +61,12 @@ public:
     /// Waits for all queued DeferAdd jobs to finish.
     void FlushAdds();
 
-    /// Writes the archive when pipelines were added since it was opened or last saved.
+    /// Writes the archive synchronously when pipelines were added since it was opened or last saved.
     void Save();
+
+    /// Queues an asynchronous Save() onto the background MetalArchive thread so mid-game TickFrame
+    /// never blocks GPUBack while serializing binary archive shards.
+    void DeferSave();
 
     /// The active writable MTLBinaryArchive (id<MTLBinaryArchive>), or null when closed.
     [[nodiscard]] void* Handle() const noexcept;
@@ -93,6 +97,7 @@ public:
     [[nodiscard]] Counts Totals() const noexcept;
 
 private:
+    void SaveUnlocked();
     struct Impl;
     std::unique_ptr<Impl> impl;
     mutable std::mutex mutex;

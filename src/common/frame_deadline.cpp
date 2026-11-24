@@ -124,7 +124,15 @@ u64 Ticks(u64 ns) {
     return timebase.numer == 0 ? ns : ns * timebase.denom / timebase.numer;
 }
 
+// XNU rejects THREAD_TIME_CONSTRAINT_POLICY periods above 50 ms (KERN_INVALID_ARGUMENT = 4),
+// and declaring a 50 ms (20 FPS) period during a brief frame dip signals iOS power management
+// to step down SoC/GPU clocks into a self-reinforcing 20-22 FPS spiral. Never declare slower
+// than 30 FPS (33.3 ms).
+constexpr u64 MaxPeriodNs = 33'333'334;
+
 void Declare(Member& member, u64 computation_ns, u64 period_ns) {
+    period_ns = (std::min)(period_ns, MaxPeriodNs);
+    computation_ns = ClampComputation(computation_ns, period_ns);
     thread_time_constraint_policy_data_t policy{};
     policy.period = static_cast<u32>(Ticks(period_ns));
     policy.computation = static_cast<u32>(Ticks(computation_ns));
@@ -216,11 +224,13 @@ u32 Roles() {
 }
 
 void SetPeriodNs(u64 period_ns) {
-    g_period_ns.store(period_ns, std::memory_order_relaxed);
+    g_period_ns.store(period_ns == 0 ? 0 : (std::min)(period_ns, MaxPeriodNs),
+                      std::memory_order_relaxed);
 }
 
 void NoteFrame() {
-    // An unpaced game has no period of its own: the frame time measured, in whole 60 Hz refreshes.
+    // An unpaced game has no period of its own: the frame time measured, in whole 60 Hz refreshes
+    // (clamped to 30-60 FPS so transient dips never tell iOS to target 20 FPS).
     constexpr u64 RefreshNs = 16'666'667;
     if (Roles() == 0) {
         return;
@@ -229,14 +239,14 @@ void NoteFrame() {
     const u64 last = g_last_frame_ns.exchange(now, std::memory_order_relaxed);
     if (last != 0 && now > last) {
         const u64 old = g_measured_ns.load(std::memory_order_relaxed);
-        const u64 frame_ns = (std::min<u64>)(now - last, 6 * RefreshNs);
+        const u64 frame_ns = (std::min<u64>)(now - last, 2 * RefreshNs);
         g_measured_ns.store(old == 0 ? frame_ns : (old * 31 + frame_ns) / 32,
                             std::memory_order_relaxed);
     }
     if ((g_frame.fetch_add(1, std::memory_order_relaxed) + 1) % Window::Size == 0) {
         const u64 refreshes =
             (g_measured_ns.load(std::memory_order_relaxed) + RefreshNs / 2) / RefreshNs;
-        g_fallback_period_ns.store((std::max<u64>)(refreshes, 1) * RefreshNs,
+        g_fallback_period_ns.store(std::clamp<u64>(refreshes, 1, 2) * RefreshNs,
                                    std::memory_order_relaxed);
     }
 }

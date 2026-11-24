@@ -457,303 +457,63 @@ struct GuestMemoryFileSection: View {
     }
 }
 
-/// One toggle row for a `UiText.ExperimentEntry`.
-private struct ExperimentToggleRow: View {
-    @ObservedObject private var platform = PlatformCenter.shared
-    let entry: UiText.ExperimentEntry
-    @State private var changedWhileRunning = false
-
-    var body: some View {
-        let _ = platform.experimentsRevision
-        let availability = platform.experimentAvailability(entry.id)
-        let overriddenReason: String? = {
-            if case .overridden(let reason) = availability { return reason }
-            return nil
-        }()
-        let toggleBinding = Binding<Bool>(
-            get: {
-                _ = platform.experimentsRevision
-                return platform.isExperimentEnabled(entry.id)
-            },
-            set: { value in
-                platform.setExperiment(entry.id, enabled: value)
-                if Bridge.emuState.inGame || Bridge.emuState == .booting {
-                    changedWhileRunning = true
-                }
-            }
-        )
-        VStack(alignment: .leading, spacing: 4) {
-            Toggle(entry.label, isOn: toggleBinding)
-                .disabled(overriddenReason != nil)
-            if let overriddenReason, !overriddenReason.isEmpty {
-                Label(overriddenReason, systemImage: "info.circle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if changedWhileRunning, Bridge.emuState.inGame || Bridge.emuState == .booting {
-                Label(UiText.text("note.applies_next_boot"), systemImage: "arrow.clockwise")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-}
-
-/// Opt-in switches of the platform layer, audio mixing and the per-device defaults, generated
-/// from `common/ui_catalog`. Keeps the main screen focused on genuinely useful mobile toggles and
-/// moves developer/regression-bisect switches into a dedicated sub-page.
+/// Device options, audio mixing, guest memory file, and remote telemetry.
+/// Low-level bisect and experimental regression switches are intentionally omitted so the UI
+/// stays clean and fast; all per-device optimizations are applied automatically.
 struct ExperimentsView: View {
     @ObservedObject private var platform = PlatformCenter.shared
-    @State private var query = ""
-
-    /// Curated user-facing mobile toggles shown directly on the main Experiments page.
-    /// Every other catalog entry is a developer bisect / "revert to old behavior" switch tucked
-    /// inside DeveloperExperimentsView (and still searchable from here).
-    static let featuredMobileIds: [String] = [
-        "nup_in_memory",
-        "chunked_guest",
-        "metal_temporal_off",
-        "oot_game_upscale",
-        "metal_pace_arrival",
-        "poll_yield",
-        "guest_cores_first",
-    ]
-    static let featuredMobileSet: Set<String> = Set(featuredMobileIds)
-
-    private func matchingExperiments(in section: String) -> [UiText.ExperimentEntry] {
-        let items = UiText.experiments(in: section).filter { entry in
-            if case .hidden = platform.experimentAvailability(entry.id) {
-                return false
-            }
-            return true
-        }
-        guard !query.isEmpty else { return items }
-        return items.filter {
-            $0.label.localizedCaseInsensitiveContains(query) ||
-                $0.id.localizedCaseInsensitiveContains(query)
-        }
-    }
-
-    private var featuredMobileEntries: [UiText.ExperimentEntry] {
-        let byId = Dictionary(uniqueKeysWithValues: UiText.allExperiments.map { ($0.id, $0) })
-        return Self.featuredMobileIds.compactMap { id in
-            guard let entry = byId[id] else { return nil }
-            if case .hidden = platform.experimentAvailability(id) {
-                return nil
-            }
-            return entry
-        }
-    }
-
-    private var activeDeveloperOverrideCount: Int {
-        UiText.allExperiments.filter { entry in
-            entry.id != "file_guest" && !Self.featuredMobileSet.contains(entry.id) &&
-                platform.isExperimentEnabled(entry.id)
-        }.count
-    }
-
-    private var unavailableSearchLines: [String] {
-        guard !query.isEmpty else { return [] }
-        return UiText.allExperiments.compactMap { entry -> String? in
-            guard entry.label.localizedCaseInsensitiveContains(query) ||
-                    entry.id.localizedCaseInsensitiveContains(query),
-                  case .hidden(let reason) = platform.experimentAvailability(entry.id) else {
-                return nil
-            }
-            return "\(entry.label): \(reason)"
-        }
-    }
-
-    private var showsGuestMemoryFile: Bool {
-        guard !query.isEmpty else { return true }
-        return UiText.experimentLabel("file_guest").localizedCaseInsensitiveContains(query) ||
-            "file_guest".localizedCaseInsensitiveContains(query)
-    }
 
     var body: some View {
         let _ = platform.experimentsRevision
         List {
-            if showsGuestMemoryFile {
-                GuestMemoryFileSection()
+            GuestMemoryFileSection()
+
+            Section {
+                Toggle(UiText.text("experiments.mix_audio"), isOn: $platform.mixWithOtherAudio)
+            } header: {
+                Text(UiText.text("experiments.audio.title"))
+            } footer: {
+                Text(UiText.text("experiments.audio.footer"))
             }
 
-            if query.isEmpty {
-                let featured = featuredMobileEntries
-                if !featured.isEmpty {
-                    Section {
-                        ForEach(featured) { entry in
-                            ExperimentToggleRow(entry: entry)
-                        }
-                    } header: {
-                        Text("Mobile Options")
-                    } footer: {
-                        Text("Useful per-device and per-game toggles. Everything else is already tuned automatically for your device; leave off unless testing a specific game.")
-                    }
+            Section {
+                Toggle("Live Debug Server (Wi-Fi)", isOn: Binding(
+                    get: {
+                        _ = platform.experimentsRevision
+                        return platform.debugServerEnabled
+                    },
+                    set: { platform.debugServerEnabled = $0 }
+                ))
+                if platform.debugServerEnabled {
+                    let ip = platform.localIpAddress
+                    LabeledContent("Endpoint", value: ip.isEmpty ? "port 6545" : "\(ip):6545")
+                        .font(.caption.monospaced())
                 }
+            } header: {
+                Text("Remote Testing & Telemetry")
+            } footer: {
+                Text("Lets a Mac on the same Wi-Fi read live FPS, screenshots and logs from the next game start (port 6545). Off by default.")
+            }
 
+            if let defaults = PlatformCenter.deviceDefaults {
                 Section {
-                    Toggle(UiText.text("experiments.mix_audio"), isOn: $platform.mixWithOtherAudio)
-                } header: {
-                    Text(UiText.text("experiments.audio.title"))
-                } footer: {
-                    Text(UiText.text("experiments.audio.footer"))
-                }
-
-                Section {
-                    Toggle("Live Debug Server (Wi-Fi)", isOn: Binding(
-                        get: {
-                            _ = platform.experimentsRevision
-                            return platform.debugServerEnabled
-                        },
-                        set: { platform.debugServerEnabled = $0 }
-                    ))
-                    if platform.debugServerEnabled {
-                        let ip = platform.localIpAddress
-                        LabeledContent("Endpoint", value: ip.isEmpty ? "port 6545" : "\(ip):6545")
-                            .font(.caption.monospaced())
-                    }
-                } header: {
-                    Text("Remote Testing & Telemetry")
-                } footer: {
-                    Text("Lets a Mac on the same Wi-Fi read live FPS, screenshots and logs from the next game start (port 6545). Off by default.")
-                }
-
-                Section {
+                    LabeledContent("Tier", value: PlatformCenter.text(defaults.tier_name))
                     NavigationLink {
-                        DeveloperExperimentsView(excludedIds: Self.featuredMobileSet)
+                        RecommendedSettingsView()
                     } label: {
-                        HStack {
-                            Label("Developer & Bisect Overrides", systemImage: "wrench.and.screwdriver")
-                            Spacer()
-                            let active = activeDeveloperOverrideCount
-                            if active > 0 {
-                                Text("\(active) active")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.orange)
-                            }
-                        }
+                        SettingsRowLabel(
+                            title: UiText.text("page.recommended"),
+                            systemImage: "wand.and.stars",
+                            color: Theme.badgeColor(for: "recommended")
+                        )
                     }
+                } header: {
+                    Text(UiText.text("section.device"))
                 } footer: {
-                    Text("Low-level switches that disable optimizations or revert renderer/CPU paths for regression bisecting. Turning them on usually reduces speed.")
-                }
-
-                if let defaults = PlatformCenter.deviceDefaults {
-                    Section {
-                        LabeledContent("Tier", value: PlatformCenter.text(defaults.tier_name))
-                        NavigationLink {
-                            RecommendedSettingsView()
-                        } label: {
-                            SettingsRowLabel(
-                                title: UiText.text("page.recommended"),
-                                systemImage: "wand.and.stars",
-                                color: Theme.badgeColor(for: "recommended")
-                            )
-                        }
-                    } header: {
-                        Text(UiText.text("section.device"))
-                    } footer: {
-                        Text(PlatformCenter.text(defaults.note))
-                    }
-                }
-            } else {
-                ForEach(UiText.experimentSections, id: \.self) { section in
-                    let items = matchingExperiments(in: section)
-                    if !items.isEmpty {
-                        Section {
-                            ForEach(items) { entry in
-                                ExperimentToggleRow(entry: entry)
-                            }
-                        } header: {
-                            Text(UiText.text("experiments.\(section).title"))
-                        }
-                    }
-                }
-
-                let unavailable = unavailableSearchLines
-                if !unavailable.isEmpty {
-                    let backendName = SettingsCatalog.currentChoiceLabel(of: "backend") ??
-                        (Theme.isPad ? "iPadOS" : "iOS")
-                    Section {
-                    } header: {
-                        Text(UiText.format("search.unavailable", backendName))
-                    } footer: {
-                        Text(unavailable.joined(separator: "\n"))
-                    }
+                    Text(PlatformCenter.text(defaults.note))
                 }
             }
         }
         .navigationTitle(UiText.text("page.experiments"))
-        .searchable(text: $query, prompt: UiText.text("search.settings"))
-    }
-}
-
-/// All low-level developer and regression-bisect switches, tucked away from the main Experiments
-/// screen with a one-tap reset.
-private struct DeveloperExperimentsView: View {
-    @ObservedObject private var platform = PlatformCenter.shared
-    let excludedIds: Set<String>
-    @State private var query = ""
-    @State private var confirmReset = false
-
-    private func matching(in section: String) -> [UiText.ExperimentEntry] {
-        UiText.experiments(in: section).filter { entry in
-            guard entry.id != "file_guest", !excludedIds.contains(entry.id) else { return false }
-            if case .hidden = platform.experimentAvailability(entry.id) {
-                return false
-            }
-            if query.isEmpty { return true }
-            return entry.label.localizedCaseInsensitiveContains(query) ||
-                entry.id.localizedCaseInsensitiveContains(query)
-        }
-    }
-
-    private var activeCount: Int {
-        UiText.allExperiments.filter { entry in
-            entry.id != "file_guest" && !excludedIds.contains(entry.id) &&
-                platform.isExperimentEnabled(entry.id)
-        }.count
-    }
-
-    var body: some View {
-        let _ = platform.experimentsRevision
-        List {
-            if activeCount > 0 {
-                Section {
-                    Button("Reset All Developer Overrides (\(activeCount))", role: .destructive) {
-                        confirmReset = true
-                    }
-                }
-            }
-
-            ForEach(UiText.experimentSections, id: \.self) { section in
-                let items = matching(in: section)
-                if !items.isEmpty {
-                    Section {
-                        ForEach(items) { entry in
-                            ExperimentToggleRow(entry: entry)
-                        }
-                    } header: {
-                        Text(UiText.text("experiments.\(section).title"))
-                    } footer: {
-                        if query.isEmpty {
-                            Text(UiText.text("experiments.\(section).footer"))
-                        }
-                    }
-                }
-            }
-        }
-        .navigationTitle("Developer Overrides")
-        .navigationBarTitleDisplayMode(.inline)
-        .searchable(text: $query, prompt: "Filter developer switches")
-        .confirmationDialog("Reset all developer and bisect overrides?",
-                            isPresented: $confirmReset, titleVisibility: .visible) {
-            Button("Reset All", role: .destructive) {
-                platform.resetDeveloperExperiments(keeping: excludedIds)
-            }
-        } message: {
-            Text("Restores all developer overrides to their defaults. Your mobile options and guest memory file setting stay untouched.")
-        }
     }
 }

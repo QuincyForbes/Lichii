@@ -217,6 +217,20 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
         if (supervisor_call) {
             // Perform call.
             Svc::Call(system, interface->GetSvcNumber());
+            // No-halt SVC fastpath (karimalsalah/guarana#325+#326): if the SVC left this thread
+            // runnable on the same host core with no interrupt pending, continue the JIT loop in
+            // place instead of round-tripping through MultiCoreRunGuestThread (cuts ~25-78k/s
+            // scheduler round trips in Switch 2 titles). Same-core gate prevents racing if the
+            // scheduler migrated the thread inside Svc::Call.
+            static const bool svc_fastpath = [] {
+                const char* const value = std::getenv("EDEN_NX2_SVC_FASTPATH");
+                return value == nullptr || value[0] != '0';
+            }();
+            if (svc_fastpath && !m_is_single_core && !IsInterrupted() &&
+                thread->GetState() == ThreadState::Runnable &&
+                &kernel.CurrentPhysicalCore() == this) {
+                continue;
+            }
             return;
         }
 

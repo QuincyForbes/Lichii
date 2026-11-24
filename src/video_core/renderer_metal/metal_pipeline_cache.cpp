@@ -320,10 +320,10 @@ u32 AsyncPipelineThreads() {
         }
         const u32 hardware = (std::max)(std::thread::hardware_concurrency(), 2U) - 1;
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-        // iOS shares 2 performance cores and an out-of-process MTLCompilerService XPC daemon;
-        // 5 concurrent shader compilations caused XPC_ERROR_CONNECTION_INTERRUPTED and VA/malloc
-        // spikes while loading Kokiri Forest. Default to 2 workers on iOS.
-        const u32 automatic = (std::min)(hardware, 2U);
+        // iOS shares 2 performance cores and 4 efficiency cores plus an out-of-process
+        // MTLCompilerService XPC daemon; 3 background builders keep shader pop-in fast without
+        // causing the 5-worker XPC/VA spikes seen earlier.
+        const u32 automatic = (std::min)(hardware, 3U);
 #else
         const u32 automatic = hardware;
 #endif
@@ -1115,6 +1115,7 @@ PipelineCache::~PipelineCache() {
     builders.reset();
     ClearSharedLibraryCache();
     files.SaveUsed();
+    files.Wait();
     msl_cache.Save();
     archive.Save();
 }
@@ -1171,8 +1172,12 @@ void PipelineCache::TickFrame() {
     }
     if (now - archive_saved > std::chrono::minutes{1}) {
         archive_saved = now;
-        msl_cache.Save();
-        archive.Save();
+        if (files.IsOpen()) {
+            files.Queue([this] { msl_cache.Save(); });
+        } else {
+            msl_cache.Save();
+        }
+        archive.DeferSave();
     }
     frame_count.fetch_add(1, std::memory_order_relaxed);
     EvictUnusedPipelines();
@@ -2816,7 +2821,7 @@ void* PipelineCache::RenderState(GraphicsPipeline& pipeline, RenderPipelineDesc&
     building_state = false;
     static const bool async_states = [] {
         const char* const value = std::getenv("EDEN_NX2_METAL_ASYNC_STATES");
-        return value != nullptr && value[0] == '1';
+        return value == nullptr || value[0] != '0';
     }();
     if (!builders) {
         return pipeline.RenderState(device, desc, reducing);
