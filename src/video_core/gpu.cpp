@@ -162,6 +162,9 @@ struct GPU::Impl {
     }
 
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
+        if (shutting_down.load(std::memory_order_acquire)) {
+            return;
+        }
         for (auto& manager : system.GetGPUDirtyMemoryManager()) {
             manager.ForEachPending(callback);
         }
@@ -307,7 +310,7 @@ struct GPU::Impl {
             channel_list.clear();
         }
         std::unique_lock lk{sync_mutex};
-        shutting_down.store(true, std::memory_order::relaxed);
+        shutting_down.store(true, std::memory_order::release);
         sync_cv.notify_all();
     }
 
@@ -842,6 +845,9 @@ bool GPU::HasPendingCPUWrites(DAddr addr, u64 size) {
 }
 
 void GPU::ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
+    if (!impl) {
+        return;
+    }
     impl->ForEachPendingCpuWrite(callback);
 }
 

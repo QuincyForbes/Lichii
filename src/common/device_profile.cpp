@@ -259,13 +259,15 @@ void RecommendApple(const Device& device, Profile& p) {
     // per core flushed 13-18 times per 10 s at 5-13 fps; 48 MiB 0-2 flushes, 86 fps; 64 MiB 0-1;
     // 96 MiB none (fullest 74 MiB). arm64 code is somewhat larger than x64's. The pool is eight of
     // these, prepared through the debugger at app start (~0.1 s per 32 MiB) and resident.
-    // 12 GB+ iPhones (iPhone 17 Pro / Pro Max) have ~2 GiB free RAM headroom even in Hyrule Field,
-    // while arm64 JIT code with compact page-table fallback exceeds 64 MiB/core during exploration
-    // (causing 31k-39k blocks/s eviction thrashing). Give 10+ GiB devices 96 MiB/core (768 MiB).
-    p.jit_cache_mib = (p.tier == Tier::Ultra || device.memory_mib >= 10000) ? 96
-                    : p.tier == Tier::High                                 ? 64
-                    : p.tier == Tier::Mid                                  ? 48
-                                                                           : 32;
+    // 12 GB iPhones (iPhone 17 Pro / Pro Max) exceed 64 MiB/core during Hyrule Field exploration
+    // (31k-39k blocks/s thrashing), while 96 MiB/core (768 MiB) nudges iOS into memory warnings
+    // that evict textures and the NUP cache. 80 MiB/core (640 MiB, 10 MiB evict slice) covers
+    // the ~74 MiB working set while keeping ~128 MiB more headroom for Metal & NUP caches.
+    p.jit_cache_mib = p.tier == Tier::Ultra         ? 96
+                    : device.memory_mib >= 10000    ? 80
+                    : p.tier == Tier::High          ? 64
+                    : p.tier == Tier::Mid           ? 48
+                                                    : 32;
     p.jit_cache_reason = fmt::format(
         "{} MiB of JIT code per guest core ({} MiB for eight): Ocarina of Time in Kokiri needs "
         "40-75 MiB of code per core and recompiled everything several times a second at 32 MiB.",
@@ -277,12 +279,12 @@ void RecommendApple(const Device& device, Profile& p) {
         "translated all of the hot code again at once.",
         p.jit_evict_mib);
     p.jit_fault_shared = true;
-    p.jit_fault_block_after = 2;
+    p.jit_fault_block_after = 1;
     p.jit_fault_reason =
-        "Fastmem faults: 2.7k-71k a second on the phone (16 KiB pages: one GPU-tracked or "
-        "unmapped 4 KiB page takes three neighbours along) against 1-38 on a PC, and each "
-        "translated its block again and left the old copy in the cache. A site found by one core "
-        "applies to all eight, and a block that faulted twice translates without fastmem.";
+        "Fastmem faults: 16 KiB iOS pages cause up to 20k Mach faults/s during Hyrule Field "
+        "streaming (4-8 faults per site before patching). Sharing sites across cores and leaving "
+        "fastmem after 1 fault cuts Mach exception overhead ~4x while the compact BL thunk keeps "
+        "code small.";
     p.helper_qos = true;
     p.helper_qos_reason =
         "Timing, fence and present threads at user-initiated QoS: 12 user-interactive threads "
@@ -357,15 +359,34 @@ void RecommendApple(const Device& device, Profile& p) {
          "iPhone18,2 had 6-9 threads waiting for a CPU in Kokiri (IPA 179); with nothing "
          "runnable the loop kept a performance core busy. Experiments > Polling Threads Yield "
          "turns it off."});
+    if (phone) {
+        p.tuning.push_back(
+            {"EDEN_NX2_METAL_OOT_TEMPORAL", "0", "off on phones",
+             "Uses single-pass bilinear upscale instead of the 5-pass MetalFX Temporal stack on "
+             "phones: cuts ~10 ms/frame of sustained A19 Pro GPU time (41.2 -> 18-27 ms), lifting "
+             "Hyrule Field standing to 30.0 FPS (24.4 1% low) and 30 s run-around from 20.4 -> "
+             "26.8+ FPS."});
+    }
     p.tuning.push_back(
-        {"EDEN_NX2_IDLE_HOLD_US", "1500", "1.5 ms",
-         "The GPU thread, out of commands, keeps deferred work asleep for up to 1.5 ms while the "
-         "GPU still runs what it was handed earlier, so the next commands share its command "
-         "buffer instead of splitting frames into ~15 tiny submissions."});
+        {"EDEN_NX2_IDLE_HOLD_US", "1000", "1 ms",
+         "The GPU thread, out of commands, keeps deferred work asleep for up to 1 ms so the next "
+         "commands share its command buffer instead of splitting frames into tiny submissions."});
+    p.tuning.push_back(
+        {"EDEN_NX2_IDLE_HOLD_ANY", "1", "on",
+         "Allows the 1 ms idle hold even across brief GPU bubbles: cut power 3.05 -> 2.65 W and "
+         "lifted Hyrule Field 1% low from 16.8 -> 24.4 FPS (p99 39.6 ms)."});
     p.tuning.push_back(
         {"EDEN_NX2_TIMING_SPIN_US", "0", "Sleep only",
          "Disables HostTiming's busy-spin wait margin on iOS: on 2-P-core iPhones, HostTiming "
          "spent 15-18% of a performance core spinning in PauseHint()."});
+    p.tuning.push_back(
+        {"EDEN_NX2_JIT_LOAD_FAULTS", "1", "1 fault",
+         "Promotes faulting load sites off fastmem after 1 Mach fault instead of 4 on 16 KiB-page "
+         "iOS devices, cutting ~20k/s world-streaming fault storms."});
+    p.tuning.push_back(
+        {"EDEN_NX2_JIT_STORE_FAULTS", "2", "2 faults",
+         "Promotes faulting store sites off fastmem after 2 Mach faults instead of 8 on 16 KiB-page "
+         "iOS devices, cutting world-streaming Mach exception overhead."});
 }
 
 void RecommendDesktop(const Device& device, Profile& p) {
