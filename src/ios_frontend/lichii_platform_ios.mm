@@ -215,28 +215,45 @@ void ExcludeCachesFromBackup() {
                             isDirectory:YES];
     NSError* ns_error = nil;
     if (![url setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:&ns_error]) {
+        const char* desc = ns_error != nil ? ns_error.localizedDescription.UTF8String : nullptr;
         LOG_WARNING(Frontend, "iOS: could not exclude {} from backups: {}", cache.string(),
-                    ns_error.localizedDescription.UTF8String);
+                    desc != nullptr ? desc : "unknown");
     }
 }
 
 void ApplyAudioSession() {
     AVAudioSession* session = [AVAudioSession sharedInstance];
-    NSError* error = nil;
+    const auto log_err = [](const char* step, NSError* err) {
+        if (err == nil) {
+            return;
+        }
+        const char* desc = err.localizedDescription.UTF8String;
+        LOG_WARNING(Frontend, "iOS: audio session ({}): {}", step,
+                    desc != nullptr ? desc : "unknown");
+    };
     const AVAudioSessionCategoryOptions options =
         g_audio_mix.load() ? AVAudioSessionCategoryOptionMixWithOthers
                            : static_cast<AVAudioSessionCategoryOptions>(0);
-    [session setCategory:AVAudioSessionCategoryPlayback
-                    mode:AVAudioSessionModeDefault
-                 options:options
-                   error:&error];
-    [session setPreferredSampleRate:48000 error:&error];
-    if (const double ms = g_audio_buffer_ms.load(); ms > 0) {
-        [session setPreferredIOBufferDuration:ms / 1000.0 error:&error];
+    NSError* error = nil;
+    if (![session setCategory:AVAudioSessionCategoryPlayback
+                         mode:AVAudioSessionModeDefault
+                      options:options
+                        error:&error]) {
+        log_err("category", error);
     }
-    [session setActive:YES error:&error];
-    if (error != nil) {
-        LOG_WARNING(Frontend, "iOS: audio session: {}", error.localizedDescription.UTF8String);
+    error = nil;
+    if (![session setPreferredSampleRate:48000 error:&error]) {
+        log_err("sample rate", error);
+    }
+    if (const double ms = g_audio_buffer_ms.load(); ms > 0) {
+        error = nil;
+        if (![session setPreferredIOBufferDuration:ms / 1000.0 error:&error]) {
+            log_err("buffer duration", error);
+        }
+    }
+    error = nil;
+    if (![session setActive:YES error:&error]) {
+        log_err("activate", error);
     }
 }
 
@@ -341,9 +358,18 @@ void InstallObservers() {
           LOG_INFO(Frontend, "iOS: audio interrupted");
           Emit(LICHII_PLATFORM_EVENT_AUDIO_INTERRUPTION_BEGAN);
       } else {
-          LOG_INFO(Frontend, "iOS: audio interruption ended");
-          NSError* error = nil;
-          [[AVAudioSession sharedInstance] setActive:YES error:&error];
+          const auto options = static_cast<AVAudioSessionInterruptionOptions>(
+              [note.userInfo[AVAudioSessionInterruptionOptionKey] unsignedIntegerValue]);
+          LOG_INFO(Frontend, "iOS: audio interruption ended (should_resume={})",
+                   (options & AVAudioSessionInterruptionOptionShouldResume) != 0);
+          if ((options & AVAudioSessionInterruptionOptionShouldResume) != 0) {
+              NSError* error = nil;
+              if (![[AVAudioSession sharedInstance] setActive:YES error:&error] && error != nil) {
+                  const char* desc = error.localizedDescription.UTF8String;
+                  LOG_WARNING(Frontend, "iOS: reactivating audio session failed: {}",
+                              desc != nullptr ? desc : "unknown");
+              }
+          }
           Emit(LICHII_PLATFORM_EVENT_AUDIO_INTERRUPTION_ENDED);
       }
     });
@@ -450,7 +476,13 @@ void lichii_platform_set_playing(int playing) {
 }
 
 void lichii_platform_configure_audio(int mix_with_others, double io_buffer_ms) {
-    g_audio_mix.store(mix_with_others != 0);
+    if (mix_with_others >= 0) {
+        g_audio_mix.store(mix_with_others != 0);
+    } else {
+        @autoreleasepool {
+            g_audio_mix.store([[NSUserDefaults standardUserDefaults] boolForKey:@"mixWithOtherAudio"]);
+        }
+    }
     if (io_buffer_ms > 0) {
         g_audio_buffer_ms.store(std::clamp(io_buffer_ms, 2.0, 100.0));
     }

@@ -1082,7 +1082,7 @@ void RendererMetal::Impl::RunAsyncPresentWorker() {
                     pass_color0.texture = dst_tex;
                     reusable_pass.renderTargetWidth = dst_w;
                     reusable_pass.renderTargetHeight = dst_h;
-                    const id<MTLRenderCommandEncoder> __unsafe_unretained enc =
+                    const id<MTLRenderCommandEncoder> enc =
                         [cb renderCommandEncoderWithDescriptor:reusable_pass];
                     pass_color0.texture = nil;
                     if (enc != nil) {

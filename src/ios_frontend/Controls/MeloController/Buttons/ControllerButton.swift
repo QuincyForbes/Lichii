@@ -11,8 +11,8 @@ import UIKit
 import SwiftUI
 
 
-final class ControllerTouchRouter {
-    static let shared = ControllerTouchRouter()
+public final class ControllerTouchRouter {
+    public static let shared = ControllerTouchRouter()
     private init() {}
 
     private final class WeakTarget {
@@ -38,6 +38,18 @@ final class ControllerTouchRouter {
             owners[touch] = nil
         }
         if cancellingPress { view.cancelPress() }
+    }
+
+    public func cancelAll() {
+        let activeViews = Array(owners.values)
+        owners.removeAll()
+        tracked.removeAll()
+        for view in activeViews {
+            view.cancelPress()
+        }
+        for box in targets.values {
+            box.view?.cancelPress()
+        }
     }
 
     // MARK: Touch handling
@@ -82,10 +94,8 @@ final class ControllerTouchRouter {
 
             guard let candidateWindow = candidate.window,
                   window == nil || candidateWindow === window,
-                  !candidate.isHidden,
-                  candidate.isUserInteractionEnabled,
                   candidate.acceptsSlide,
-                  candidate.alpha > 0.01 else { continue }
+                  Self.isEffectivelyVisibleAndInteractive(candidate, in: candidateWindow) else { continue }
 
             let frame = candidate.convert(candidate.bounds, to: nil)
             guard frame.width > 0, frame.height > 0 else { continue }
@@ -105,6 +115,20 @@ final class ControllerTouchRouter {
 
         for key in stale { targets[key] = nil }
         return best
+    }
+
+    private static func isEffectivelyVisibleAndInteractive(_ view: UIView, in window: UIWindow) -> Bool {
+        var current: UIView? = view
+        while let v = current {
+            if v.isHidden || v.alpha <= 0.01 || !v.isUserInteractionEnabled {
+                return false
+            }
+            if v === window {
+                return true
+            }
+            current = v.superview
+        }
+        return false
     }
 }
 

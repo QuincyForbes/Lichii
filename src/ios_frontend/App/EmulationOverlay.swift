@@ -50,6 +50,7 @@ enum EmulationOverlay {
                         }
                     }
             })
+            settings.isModalInPresentation = true
             presenter.present(settings, animated: true)
         })
         menu.addAction(UIAlertAction(title: "Quit to Library", style: .destructive) { _ in

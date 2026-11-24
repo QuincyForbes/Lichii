@@ -125,6 +125,7 @@ struct LogViewer: View {
     @State private var share: ShareItem?
     @State private var loading = true
     @State private var issuesOnly = false
+    @State private var loadGeneration = 0
 
     /// The viewer reads the tail; the share sheet always sends the whole file.
     private static let maxBytes: UInt64 = 2 << 20
@@ -133,10 +134,10 @@ struct LogViewer: View {
         ScrollViewReader { proxy in
             ScrollView([.vertical, .horizontal]) {
                 LazyVStack(alignment: .leading, spacing: 1) {
-                    ForEach(shown.indices, id: \.self) { index in
-                        Text(shown[index].text)
+                    ForEach(Array(shown.enumerated()), id: \.offset) { index, line in
+                        Text(line.text)
                             .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(shown[index].color)
+                            .foregroundStyle(line.color)
                             .textSelection(.enabled)
                             .fixedSize()
                             .id(index)
@@ -186,7 +187,7 @@ struct LogViewer: View {
         .navigationTitle(log.name)
         .navigationBarTitleDisplayMode(.inline)
         .onAppear(perform: load)
-        .task(id: FilterKey(query: query, issuesOnly: issuesOnly, count: lines.count)) {
+        .task(id: FilterKey(query: query, issuesOnly: issuesOnly, generation: loadGeneration)) {
             // Typing waits for a pause; the filter runs off the main thread.
             if !query.isEmpty {
                 try? await Task.sleep(nanoseconds: 200_000_000)
@@ -202,7 +203,7 @@ struct LogViewer: View {
     private struct FilterKey: Equatable {
         let query: String
         let issuesOnly: Bool
-        let count: Int
+        let generation: Int
     }
 
     private static func filter(_ lines: [LogLine], query: String, issuesOnly: Bool) async -> [LogLine] {
@@ -232,7 +233,10 @@ struct LogViewer: View {
             return text.split(separator: "\n", omittingEmptySubsequences: false).map { LogLine(String($0)) }
         }) { result in
             lines = result
-            shown = result
+            if query.isEmpty && !issuesOnly {
+                shown = result
+            }
+            loadGeneration += 1
             loading = false
         }
     }

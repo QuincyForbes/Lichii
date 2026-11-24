@@ -11,8 +11,10 @@
 #include <cstdio>
 #include <dlfcn.h>
 #include <mach/mach.h>
+#include <mutex>
 #include <string>
 #include <sys/utsname.h>
+#include <unordered_set>
 
 namespace IosSupport {
 
@@ -116,26 +118,74 @@ bool CanOpenScheme(const char* scheme) {
 }
 
 bool OpenUrl(const char* url) {
+    if (url == nullptr || url[0] == '\0') {
+        return false;
+    }
     @autoreleasepool {
-        NSURL* target = [NSURL URLWithString:[NSString stringWithUTF8String:url]];
+        NSString* str = [NSString stringWithUTF8String:url];
+        NSURL* target = str != nil ? [NSURL URLWithString:str] : nil;
         if (target == nil) {
             return false;
         }
-        [[UIApplication sharedApplication] openURL:target options:@{} completionHandler:nil];
+        auto open = ^{
+            [[UIApplication sharedApplication] openURL:target options:@{} completionHandler:nil];
+        };
+        if ([NSThread isMainThread]) {
+            open();
+        } else {
+            dispatch_async(dispatch_get_main_queue(), open);
+        }
         return true;
     }
 }
 
+namespace {
+std::mutex g_bg_task_mutex;
+std::unordered_set<std::uint64_t> g_active_bg_tasks;
+} // namespace
+
 std::uint64_t BeginBackgroundTask(const char* name) {
     @autoreleasepool {
-        __block UIBackgroundTaskIdentifier task = UIBackgroundTaskInvalid;
-        task = [[UIApplication sharedApplication]
-            beginBackgroundTaskWithName:[NSString stringWithUTF8String:name]
-                      expirationHandler:^{
-                          [[UIApplication sharedApplication] endBackgroundTask:task];
-                          task = UIBackgroundTaskInvalid;
-                      }];
-        return task == UIBackgroundTaskInvalid ? 0 : static_cast<std::uint64_t>(task);
+        NSString* task_name = (name != nullptr && name[0] != '\0')
+                                  ? [NSString stringWithUTF8String:name]
+                                  : @"lichii-bg";
+        auto begin = ^std::uint64_t {
+            __block UIBackgroundTaskIdentifier task = UIBackgroundTaskInvalid;
+            task = [[UIApplication sharedApplication]
+                beginBackgroundTaskWithName:task_name
+                          expirationHandler:^{
+                              const UIBackgroundTaskIdentifier expired = task;
+                              task = UIBackgroundTaskInvalid;
+                              if (expired == UIBackgroundTaskInvalid) {
+                                  return;
+                              }
+                              bool should_end = false;
+                              {
+                                  std::scoped_lock lk{g_bg_task_mutex};
+                                  should_end =
+                                      g_active_bg_tasks.erase(static_cast<std::uint64_t>(expired)) >
+                                      0;
+                              }
+                              if (should_end) {
+                                  [[UIApplication sharedApplication] endBackgroundTask:expired];
+                              }
+                          }];
+            if (task == UIBackgroundTaskInvalid) {
+                return 0;
+            }
+            const auto id = static_cast<std::uint64_t>(task);
+            std::scoped_lock lk{g_bg_task_mutex};
+            g_active_bg_tasks.insert(id);
+            return id;
+        };
+        if ([NSThread isMainThread]) {
+            return begin();
+        }
+        __block std::uint64_t result = 0;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            result = begin();
+        });
+        return result;
     }
 }
 
@@ -143,8 +193,24 @@ void EndBackgroundTask(std::uint64_t task) {
     if (task == 0) {
         return;
     }
-    @autoreleasepool {
-        [[UIApplication sharedApplication] endBackgroundTask:static_cast<UIBackgroundTaskIdentifier>(task)];
+    bool should_end = false;
+    {
+        std::scoped_lock lk{g_bg_task_mutex};
+        should_end = g_active_bg_tasks.erase(task) > 0;
+    }
+    if (!should_end) {
+        return;
+    }
+    auto end = ^{
+        @autoreleasepool {
+            [[UIApplication sharedApplication]
+                endBackgroundTask:static_cast<UIBackgroundTaskIdentifier>(task)];
+        }
+    };
+    if ([NSThread isMainThread]) {
+        end();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), end);
     }
 }
 
@@ -291,6 +357,9 @@ static void LichiiStyle(UIView* view) {
 }
 - (void)moveTo:(CGPoint)p {
     const CGFloat r = self.bounds.size.width / 2;
+    if (r <= 0) {
+        return;
+    }
     CGFloat dx = (p.x - r) / r;
     CGFloat dy = (p.y - r) / r;
     const CGFloat len = sqrt(dx * dx + dy * dy);

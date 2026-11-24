@@ -22,7 +22,8 @@ struct AddonsView: View {
     }
     @State private var addons: [ContentBridge.Addon] = []
     @State private var dlc: [ContentBridge.DLC] = []
-    @State private var importer: AddonsTab?
+    @State private var importerKind: AddonsTab = .updates
+    @State private var showImporter = false
     @State private var progress: Double?
     @State private var busy = false
     @State private var alert: ContentAlert?
@@ -70,7 +71,8 @@ struct AddonsView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
-                    importer = tab
+                    importerKind = tab
+                    showImporter = true
                 } label: {
                     Label(tab == .mods ? "Add Mods" : "Install Packages", systemImage: "plus")
                 }
@@ -79,11 +81,10 @@ struct AddonsView: View {
         }
         .onAppear(perform: reload)
         .refreshable { reload() }
-        .fileImporter(isPresented: Binding(get: { importer != nil }, set: { if !$0 { importer = nil } }),
-                      allowedContentTypes: importer == .mods ? ContentTypes.mods : ContentTypes.packages,
+        .fileImporter(isPresented: $showImporter,
+                      allowedContentTypes: importerKind == .mods ? ContentTypes.mods : ContentTypes.packages,
                       allowsMultipleSelection: true) { result in
-            let target = importer
-            importer = nil
+            let target = importerKind
             guard case .success(let urls) = result, !urls.isEmpty else { return }
             if target == .mods {
                 installMods(urls)
@@ -96,9 +97,9 @@ struct AddonsView: View {
         }
         .confirmationDialog(removalTitle, isPresented: Binding(get: { removal != nil },
                                                               set: { if !$0 { removal = nil } }),
-                            titleVisibility: .visible) {
+                            titleVisibility: .visible, presenting: removal) { item in
             Button("Remove", role: .destructive) {
-                if let removal { remove(removal) }
+                remove(item)
                 removal = nil
             }
         }

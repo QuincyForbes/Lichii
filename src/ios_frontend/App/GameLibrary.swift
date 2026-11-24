@@ -74,7 +74,7 @@ final class GameLibrary: ObservableObject {
     // second during an import); they only change with the games and the play dates.
     private var sortedGames: (sort: LibrarySort, query: String, games: [Game])?
     private var recentGames: [Game]?
-    private lazy var documentsPrefix = Bridge.documentsDir.standardizedFileURL.path + "/"
+    private lazy var documentsPrefix = Bridge.documentsDir.resolvingSymlinksInPath().standardizedFileURL.path + "/"
 
     init() {
         if let stored = UserDefaults.standard.dictionary(forKey: playedKey) as? [String: Date] {
@@ -90,6 +90,15 @@ final class GameLibrary: ObservableObject {
     func reload(then completion: (() -> Void)? = nil) {
         if let completion {
             scanWaiters.append(completion)
+        }
+        // lichii_game_read is only safe while no game is booting or running.
+        let emuState = Bridge.emuState
+        if emuState.inGame || emuState == .booting {
+            rescanPending = true
+            let waiters = scanWaiters
+            scanWaiters = []
+            waiters.forEach { $0() }
+            return
         }
         guard !isScanning else {
             rescanPending = true
@@ -123,6 +132,13 @@ final class GameLibrary: ObservableObject {
         }
     }
 
+    /// Runs a scan if one was deferred while a game was booting or running.
+    func reloadIfPending() {
+        guard rescanPending, !isScanning else { return }
+        rescanPending = false
+        reload()
+    }
+
     /// For pull to refresh: returns when the scan is done.
     func refresh() async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -138,18 +154,21 @@ final class GameLibrary: ObservableObject {
                                    message: "Lichii was not allowed to read \(url.lastPathComponent).")
             return
         }
-        if linkedFolders.contains(where: { $0.standardizedFileURL == url.standardizedFileURL }) {
+        if linkedFolders.contains(where: {
+            $0.resolvingSymlinksInPath().standardizedFileURL == url.resolvingSymlinksInPath().standardizedFileURL
+        }) {
             url.stopAccessingSecurityScopedResource()
             reload()
             return
         }
-        accessedFolders.insert(url)
         guard let bookmark = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil,
                                                    relativeTo: nil) else {
+            url.stopAccessingSecurityScopedResource()
             notice = LibraryNotice(title: "Link a Folder",
                                    message: "Could not remember \(url.lastPathComponent).")
             return
         }
+        accessedFolders.insert(url)
         var bookmarks = UserDefaults.standard.array(forKey: foldersKey) as? [Data] ?? []
         bookmarks.append(bookmark)
         UserDefaults.standard.set(bookmarks, forKey: foldersKey)
@@ -158,11 +177,12 @@ final class GameLibrary: ObservableObject {
     }
 
     func unlinkFolder(_ url: URL) {
+        let target = url.resolvingSymlinksInPath().standardizedFileURL
         let bookmarks = (UserDefaults.standard.array(forKey: foldersKey) as? [Data] ?? []).filter { data in
             var stale = false
             let resolved = try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil,
                                     bookmarkDataIsStale: &stale)
-            return resolved?.standardizedFileURL != url.standardizedFileURL
+            return resolved?.resolvingSymlinksInPath().standardizedFileURL != target
         }
         UserDefaults.standard.set(bookmarks, forKey: foldersKey)
         if accessedFolders.remove(url) != nil {
@@ -174,6 +194,7 @@ final class GameLibrary: ObservableObject {
 
     private func resolveFolders() {
         var refreshed: [Data] = []
+        var seen = Set<String>()
         for data in UserDefaults.standard.array(forKey: foldersKey) as? [Data] ?? [] {
             var stale = false
             guard let url = try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil,
@@ -181,6 +202,11 @@ final class GameLibrary: ObservableObject {
                   url.startAccessingSecurityScopedResource() else {
                 // A folder that is offline right now (a drive, a cloud volume) stays linked.
                 refreshed.append(data)
+                continue
+            }
+            let canonical = url.resolvingSymlinksInPath().standardizedFileURL.path
+            if !seen.insert(canonical).inserted {
+                url.stopAccessingSecurityScopedResource()
                 continue
             }
             accessedFolders.insert(url)
@@ -249,7 +275,7 @@ final class GameLibrary: ObservableObject {
     /// A game Lichii doesn't own: it lives in a linked folder (the user's own files) rather than
     /// in the app's Documents.
     func isLinked(_ game: Game) -> Bool {
-        !game.containerURL.standardizedFileURL.path.hasPrefix(documentsPrefix)
+        !game.containerURL.resolvingSymlinksInPath().standardizedFileURL.path.hasPrefix(documentsPrefix)
     }
 
     /// Deletes the game's file from the app's Documents. Linked games are only hidden (hide).
@@ -320,9 +346,13 @@ final class GameLibrary: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 guard let self, let entry = current.get() else { continue }
-                let size = Self.diskSize(URL(fileURLWithPath: entry.0))
+                let path = entry.0
+                let base = entry.1
+                let size = await Task.detached(priority: .utility) {
+                    Self.diskSize(URL(fileURLWithPath: path))
+                }.value
                 if let total = self.importProgress?.total {
-                    self.importProgress?.copied = min(total, entry.1 + size)
+                    self.importProgress?.copied = min(total, base + size)
                 }
             }
         }
@@ -330,17 +360,18 @@ final class GameLibrary: ObservableObject {
             let sizes = urls.map { url in withSecurityScope(url) { Self.diskSize(url) } }
             let total = sizes.reduce(0, +)
             let free = (try? destination.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
-                .volumeAvailableCapacityForImportantUsage ?? 0
+                .volumeAvailableCapacityForImportantUsage
             var failures: [String] = []
             var imported: [URL] = []
-            if total > 0, free > 0, UInt64(free) < total {
+            if total > 0, let free, free >= 0, UInt64(free) < total {
                 failures.append("Not enough free space: the import needs \(total.byteCount) and \(UInt64(free).byteCount) is free. Link a Folder plays games from Files without copying them.")
             } else {
                 await MainActor.run { self.importProgress?.total = total }
                 var done: UInt64 = 0
                 for (index, url) in urls.enumerated() {
                     let target = destination.appendingPathComponent(url.lastPathComponent)
-                    if target.standardizedFileURL.path == url.standardizedFileURL.path {
+                    if target.resolvingSymlinksInPath().standardizedFileURL.path ==
+                        url.resolvingSymlinksInPath().standardizedFileURL.path {
                         done += sizes[index]
                         continue
                     }
@@ -397,10 +428,14 @@ final class GameLibrary: ObservableObject {
 
     /// Imported items the scan found no game in: encrypted dumps without keys, or other files.
     private func reportUnreadable(_ targets: [URL]) {
-        let paths = games.map(\.path)
+        let paths = games.map(\.path) + Array(hiddenPaths)
         let unreadable = targets.filter { target in
-            let path = target.path
-            return !paths.contains { $0 == path || $0.hasPrefix(path + "/") }
+            let path = target.resolvingSymlinksInPath().standardizedFileURL.path
+            let raw = target.path
+            return !paths.contains { p in
+                let std = URL(fileURLWithPath: p).resolvingSymlinksInPath().standardizedFileURL.path
+                return p == raw || p.hasPrefix(raw + "/") || std == path || std.hasPrefix(path + "/")
+            }
         }
         guard !unreadable.isEmpty else { return }
         let text = "\(unreadable.map(\.lastPathComponent).joined(separator: ", ")): Lichii found no game it can read. Encrypted Switch 1 dumps need your keys (Settings › Keys & Firmware); other files aren't games."
@@ -430,13 +465,16 @@ final class GameLibrary: ObservableObject {
 
     /// Bytes in a file, or in every file below a folder.
     nonisolated static func diskSize(_ url: URL) -> UInt64 {
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey]
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .fileSizeKey]
         guard let values = try? url.resourceValues(forKeys: keys) else { return 0 }
         guard values.isDirectory == true else { return UInt64(values.fileSize ?? 0) }
         var total: UInt64 = 0
         let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: Array(keys))
         while let item = enumerator?.nextObject() as? URL {
-            total += UInt64((try? item.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+            let rv = try? item.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            if rv?.isRegularFile == true {
+                total += UInt64(rv?.fileSize ?? 0)
+            }
         }
         return total
     }
@@ -709,7 +747,7 @@ private enum LibraryMetadataStore {
 
         // Remove stale cache entries for deleted files inside the app's own Documents folder.
         let staleKeys = manifest.entries.keys.filter { key in
-            let stdPath = URL(fileURLWithPath: key).standardizedFileURL.path
+            let stdPath = URL(fileURLWithPath: key).resolvingSymlinksInPath().standardizedFileURL.path
             return stdPath.hasPrefix(documentsPrefix) && !seen.contains(key)
         }
         if !staleKeys.isEmpty {

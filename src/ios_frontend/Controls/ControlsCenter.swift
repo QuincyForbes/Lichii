@@ -30,14 +30,23 @@ final class ControlsCenter: ObservableObject {
     /// The on-screen controller hides while a controller drives player 1.
     var hideTouchWithController: Bool {
         get { UserDefaults.standard.object(forKey: "hideTouchWithController") as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: "hideTouchWithController"); updateTouchVisibility() }
+        set {
+            objectWillChange.send()
+            UserDefaults.standard.set(newValue, forKey: "hideTouchWithController")
+            updateTouchVisibility()
+        }
     }
 
     var showTouchControls: Bool {
         get { UserDefaults.standard.object(forKey: "showTouchControls") as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: "showTouchControls"); updateTouchVisibility() }
+        set {
+            objectWillChange.send()
+            UserDefaults.standard.set(newValue, forKey: "showTouchControls")
+            updateTouchVisibility()
+        }
     }
 
+    private var started = false
     private(set) weak var gameWindow: UIWindow?
     private var overlay: OverlayController?
     private var ticker: CADisplayLink?
@@ -53,6 +62,8 @@ final class ControlsCenter: ObservableObject {
     // MARK: - App hooks
 
     func appStarted() {
+        guard !started else { return }
+        started = true
         ControllerDiagnostics.sink = { lichii_controls_log($0) }
         PhysicalControllers.shared.start()
         ExternalDisplay.shared.start()
@@ -77,6 +88,9 @@ final class ControlsCenter: ObservableObject {
 
     /// Releases everything the on-screen controller holds; toggled buttons show released again.
     func releaseTouch() {
+        overlay?.cancelActiveTouches()
+        ControllerTouchRouter.shared.cancelAll()
+        JoystickDPadPoint.shared.reset()
         lichii_controls_release_touch()
         NotificationCenter.default.post(name: .lichiiTouchReleased, object: nil)
     }
@@ -86,18 +100,13 @@ final class ControlsCenter: ObservableObject {
         gameRunning = true
         editingLayout = false
         menuOpen = false
+        resumeAfterMenu = false
         ControllerDiagnostics.reset()
         let overlay = overlay ?? OverlayController()
         self.overlay = overlay
+        overlay.interactive = false
         attachOverlay(to: ExternalDisplay.shared.controlsWindow ?? window)
-        let tap = UITapGestureRecognizer(target: overlay, action: #selector(OverlayController.threeFingerTap))
-        tap.numberOfTouchesRequired = 3
-        tap.cancelsTouchesInView = false
-        // Releases reach the controls at once instead of after the tap fails.
-        tap.delaysTouchesEnded = false
-        window.gestureRecognizers?.filter { ($0 as? UITapGestureRecognizer)?.numberOfTouchesRequired == 3 }
-            .forEach(window.removeGestureRecognizer)
-        window.addGestureRecognizer(tap)
+        installThreeFingerTap(on: window)
         OrientationManager.shared.apply()
         ExternalDisplay.shared.gameStarted(window)
         PhysicalControllers.shared.updateDeviceMotion()
@@ -107,6 +116,19 @@ final class ControlsCenter: ObservableObject {
         if Bridge.emuState == .paused {
             openMenu(resumeOnClose: true)
         }
+    }
+
+    func installThreeFingerTap(on window: UIWindow) {
+        guard let overlay else { return }
+        let tap = UITapGestureRecognizer(target: overlay, action: #selector(OverlayController.threeFingerTap))
+        tap.numberOfTouchesRequired = 3
+        tap.cancelsTouchesInView = false
+        // Releases reach the controls at once instead of after the tap fails.
+        tap.delaysTouchesEnded = false
+        tap.delegate = overlay
+        window.gestureRecognizers?.filter { ($0 as? UITapGestureRecognizer)?.numberOfTouchesRequired == 3 }
+            .forEach(window.removeGestureRecognizer)
+        window.addGestureRecognizer(tap)
     }
 
     func handle(event: Int32) {
@@ -129,11 +151,13 @@ final class ControlsCenter: ObservableObject {
         menuOpen = false
         editingLayout = false
         manuallyPaused = false
+        resumeAfterMenu = false
         ticker?.invalidate()
         ticker = nil
         releaseTouch()
         PhysicalControllers.shared.stopRumble()
         PhysicalControllers.shared.updateDeviceMotion()
+        overlay?.interactive = false
         overlay?.detach()
         ExternalDisplay.shared.gameEnded()
         gameWindow = nil
@@ -150,7 +174,7 @@ final class ControlsCenter: ObservableObject {
     /// `resumeOnClose`: the game was paused for it (an interruption, a controller that went away)
     /// and runs again when the menu closes.
     func openMenu(resumeOnClose: Bool = false) {
-        guard gameRunning, !menuOpen else { return }
+        guard gameRunning, !menuOpen, !editingLayout else { return }
         releaseTouch()
         let running = Bridge.emuState == .running
         resumeAfterMenu = running || resumeOnClose
@@ -463,14 +487,35 @@ final class OverlayController: NSObject {
     }
 
     func detach() {
+        container.cancelAllTouches()
         guard host.parent != nil else { return }
         host.willMove(toParent: nil)
         container.removeFromSuperview()
         host.removeFromParent()
     }
 
+    func cancelActiveTouches() {
+        container.cancelAllTouches()
+    }
+
     @objc func threeFingerTap() {
         ControlsCenter.shared.openMenu()
+    }
+}
+
+extension OverlayController: UIGestureRecognizerDelegate {
+    nonisolated func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        MainActor.assumeIsolated {
+            // Avoid accidental menu opens from 3-finger claw-grip gameplay on on-screen controls.
+            if ControlsCenter.shared.touchControlsVisible && !ControlsCenter.shared.menuOpen &&
+                !ControlsCenter.shared.editingLayout {
+                let pt = touch.location(in: container)
+                if container.control(at: pt) != nil {
+                    return false
+                }
+            }
+            return true
+        }
     }
 }
 
@@ -482,6 +527,9 @@ final class PassthroughView: UIView {
     var interactive = false {
         didSet {
             if interactive != oldValue {
+                if interactive {
+                    cancelAllTouches()
+                }
                 invalidateTargets()
             }
         }
@@ -531,6 +579,11 @@ final class PassthroughView: UIView {
         if let defaultsObserver {
             NotificationCenter.default.removeObserver(defaultsObserver)
         }
+    }
+
+    func cancelAllTouches() {
+        owners.removeAll()
+        lastHit = nil
     }
 
     func invalidateTargets() {

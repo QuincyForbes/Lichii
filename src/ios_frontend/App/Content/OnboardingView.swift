@@ -49,7 +49,8 @@ struct OnboardingView: View {
     @EnvironmentObject private var library: GameLibrary
     @ObservedObject private var files = SystemFilesModel.shared
     @State private var page: OnboardingPage = .welcome
-    @State private var importer: OnboardingPage?
+    @State private var importerKind: OnboardingPage = .keys
+    @State private var showImporter = false
     @ObservedObject private var app = AppController.shared
     @State private var forward = true
 
@@ -90,11 +91,10 @@ struct OnboardingView: View {
                 if page == .jit { move(1) }
             }
         }
-        .fileImporter(isPresented: Binding(get: { importer != nil }, set: { if !$0 { importer = nil } }),
+        .fileImporter(isPresented: $showImporter,
                       allowedContentTypes: allowedTypes,
-                      allowsMultipleSelection: importer != .firmware) { result in
-            let target = importer
-            importer = nil
+                      allowsMultipleSelection: importerKind != .firmware) { result in
+            let target = importerKind
             guard case .success(let urls) = result, !urls.isEmpty else { return }
             switch target {
             case .keys: files.importKeys(urls)
@@ -106,10 +106,18 @@ struct OnboardingView: View {
         .alert(item: $files.alert) { alert in
             Alert(title: Text(alert.title), message: Text(alert.message))
         }
+        .alert(item: $library.notice) { notice in
+            Alert(title: Text(notice.title), message: Text(notice.message))
+        }
+    }
+
+    private func openImporter(_ kind: OnboardingPage) {
+        importerKind = kind
+        showImporter = true
     }
 
     private var allowedTypes: [UTType] {
-        switch importer {
+        switch importerKind {
         case .firmware: return ContentTypes.firmware
         case .games: return ImportTypes.games
         default: return ContentTypes.keys
@@ -137,7 +145,7 @@ struct OnboardingView: View {
             StatusRow(title: "title.keys", ok: files.keys?.titleKeys == true,
                       detail: files.keys.map { "\($0.titleKeyCount) title keys" }, optional: true)
             ActionButton(title: files.keysReady ? "Import Again" : "Import Keys", busy: files.busy) {
-                importer = .keys
+                openImporter(.keys)
             }
         }
     }
@@ -155,7 +163,7 @@ struct OnboardingView: View {
             } else {
                 ActionButton(title: files.firmwareReady ? "Install Again" : "Install Firmware",
                              busy: files.busy) {
-                    importer = .firmware
+                    openImporter(.firmware)
                 }
                 .disabled(!files.keysReady)
                 if !files.keysReady {
@@ -191,7 +199,7 @@ struct OnboardingView: View {
                 ImportProgressBanner(progress: progress)
             }
             ActionButton(title: UiText.text("library.import"), busy: false) {
-                importer = .games
+                openImporter(.games)
             }
             Text("\(library.games.count) game\(library.games.count == 1 ? "" : "s") in the library")
                 .font(.footnote).foregroundStyle(.secondary)

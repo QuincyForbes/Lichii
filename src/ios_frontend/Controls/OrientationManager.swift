@@ -32,12 +32,16 @@ final class OrientationManager: ObservableObject {
             UserDefaults.standard.set(mode.rawValue, forKey: "gameOrientation")
             if mode == .locked {
                 lockedMask = Self.mask(for: currentInterfaceOrientation)
+                UserDefaults.standard.set(Int(lockedMask.rawValue), forKey: "gameOrientationLockedMask")
             }
             apply()
         }
     }
 
-    private var lockedMask: UIInterfaceOrientationMask = .landscape
+    private var lockedMask: UIInterfaceOrientationMask = {
+        let saved = UserDefaults.standard.integer(forKey: "gameOrientationLockedMask")
+        return saved != 0 ? UIInterfaceOrientationMask(rawValue: UInt(saved)) : .landscape
+    }()
 
     private var isPhone: Bool { UIDevice.current.userInterfaceIdiom == .phone }
 
@@ -56,7 +60,7 @@ final class OrientationManager: ObservableObject {
     }
 
     func apply() {
-        guard let window = ControlsCenter.shared.gameWindow else { return }
+        guard let window = ExternalDisplay.shared.activePhoneWindow ?? ControlsCenter.shared.gameWindow else { return }
         lichii_controls_set_orientations(UInt32(mask.rawValue))
         window.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
         window.windowScene?.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { _ in }
@@ -68,7 +72,15 @@ final class OrientationManager: ObservableObject {
     }
 
     private var currentInterfaceOrientation: UIInterfaceOrientation {
-        ControlsCenter.shared.gameWindow?.windowScene?.interfaceOrientation ?? .landscapeRight
+        if let scene = ExternalDisplay.shared.activePhoneWindow?.windowScene {
+            return scene.interfaceOrientation
+        }
+        if let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive }) {
+            return scene.interfaceOrientation
+        }
+        return .landscapeRight
     }
 
     private static func mask(for orientation: UIInterfaceOrientation) -> UIInterfaceOrientationMask {

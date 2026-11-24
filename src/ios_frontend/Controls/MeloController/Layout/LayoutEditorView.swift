@@ -47,6 +47,7 @@ struct LayoutEditorView: View {
 
     var gameId: String?
     var gameName: String?
+    var dismissOnDone: Bool = true
 
     private var gameTitle: String? {
         guard let gameId = gameId else { return nil }
@@ -77,8 +78,10 @@ struct LayoutEditorView: View {
             toolbar
 
             HStack(alignment: .top, spacing: 10) {
-                inspector
-                    .frame(maxWidth: 360, alignment: .leading)
+                ScrollView(.vertical, showsIndicators: false) {
+                    inspector
+                }
+                .frame(maxWidth: 360, alignment: .leading)
 
                 Spacer(minLength: 0)
 
@@ -135,7 +138,9 @@ struct LayoutEditorView: View {
                 saveLayout()
                 clearSelection()
                 isEditing = false
-                dismiss()
+                if dismissOnDone {
+                    dismiss()
+                }
             } label: {
                 Text("Done")
                     .font(.footnote.weight(.semibold))

@@ -10,8 +10,8 @@
 import SwiftUI
 import Foundation
 
-class JoystickDPadPoint: ObservableObject {
-    static var shared = JoystickDPadPoint()
+public class JoystickDPadPoint: ObservableObject {
+    public static var shared = JoystickDPadPoint()
     @Published var joystickDpadPoint: (x: Double, y: Double) = (0, 0)
     @Published var currentlyPressed: Set<VirtualControllerButton> = []
     @Published var isJoystickActive: Bool = false
@@ -29,25 +29,28 @@ class JoystickDPadPoint: ObservableObject {
         recomputeDPad(controller: controller)
     }
 
+    public func reset() {
+        currentlyPressed.removeAll()
+        joystickDpadPoint = (0, 0)
+        isJoystickActive = false
+    }
+
     private func recomputeDPad(controller: any Controller) {
-        // Y axis
-        if currentlyPressed.contains(.dPadUp) {
-            joystickDpadPoint.y = -1
-        } else if currentlyPressed.contains(.dPadDown) {
-            joystickDpadPoint.y = 1
-        } else {
-            joystickDpadPoint.y = 0
+        let up = currentlyPressed.contains(.dPadUp)
+        let down = currentlyPressed.contains(.dPadDown)
+        let left = currentlyPressed.contains(.dPadLeft)
+        let right = currentlyPressed.contains(.dPadRight)
+
+        var y: Double = (up == down) ? 0 : (up ? -1 : 1)
+        var x: Double = (left == right) ? 0 : (left ? -1 : 1)
+
+        if x != 0 && y != 0 {
+            let invSqrt2 = 1.0 / 2.0.squareRoot()
+            x *= invSqrt2
+            y *= invSqrt2
         }
 
-        // X axis
-        if currentlyPressed.contains(.dPadLeft) {
-            joystickDpadPoint.x = -1
-        } else if currentlyPressed.contains(.dPadRight) {
-            joystickDpadPoint.x = 1
-        } else {
-            joystickDpadPoint.x = 0
-        }
-
-        controller.joystickMoved(position: CGPoint(x: joystickDpadPoint.x, y: joystickDpadPoint.y), right: false)
+        joystickDpadPoint = (x, y)
+        controller.joystickMoved(position: CGPoint(x: x, y: y), right: false)
     }
 }

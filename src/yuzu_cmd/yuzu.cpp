@@ -838,7 +838,7 @@ static std::optional<SDL_AppResult> IosAppIterate(SdlState* state) {
         }
         return SDL_APP_CONTINUE;
     }
-    if (cancel && state->pending_launch) {
+    if (cancel && (state->pending_launch || IosFrontend::GetState() == LICHII_EMU_WAITING_FOR_JIT)) {
         state->pending_launch.reset();
         IosFrontend::SetState(LICHII_EMU_IDLE);
     }
@@ -1258,7 +1258,8 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     lichii_platform_init();
     // Audio: playback session with a 20 ms hardware buffer and a larger SDL device buffer; the
     // default small buffer underran whenever a frame took longer than usual (audible skips).
-    lichii_platform_configure_audio(0, 20.0);
+    // Pass -1 for mix_with_others so the user's mixWithOtherAudio preference is honoured at boot.
+    lichii_platform_configure_audio(-1, 20.0);
     SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
     SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "1024");
     // Controllers come through Apple's GameController framework. SDL's HIDAPI layer on iOS only

@@ -61,8 +61,9 @@ private struct PadRow: View {
 /// Mapping screen for one controller; saved for its model.
 struct PadSettingsView: View {
     let pad: PhysicalPad
+    @ObservedObject private var controllers = PhysicalControllers.shared
+    @Environment(\.dismiss) private var dismiss
     @State private var profile: PadProfile
-    private let controllers = PhysicalControllers.shared
 
     init(pad: PhysicalPad) {
         self.pad = pad
@@ -125,9 +126,15 @@ struct PadSettingsView: View {
             }
         }
         .navigationTitle(pad.name)
+        .onChange(of: controllers.pads.map(\.id)) { _, ids in
+            if !ids.contains(pad.id) {
+                dismiss()
+            }
+        }
     }
 
     private func save() {
+        guard controllers.pads.contains(where: { $0.id == pad.id }) else { return }
         controllers.save(profile, for: pad)
     }
 

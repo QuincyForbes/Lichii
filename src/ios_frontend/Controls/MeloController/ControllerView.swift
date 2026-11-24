@@ -120,6 +120,7 @@ public struct ControllerView: View {
 
 
     @State private var layout: LayoutConfig = LayoutConfig()
+    @State private var hasLoadedLayout = false
 
     public var body: some View {
         ZStack {
@@ -143,7 +144,7 @@ public struct ControllerView: View {
             }
             .onChange(of: controllerHandler.isPortrait) { portrait in
                 // Lichii: portrait and landscape keep separate layouts.
-                if isEditing {
+                if isEditing && hasLoadedLayout {
                     LayoutManager.shared.save(layout, for: gameId)
                 }
                 LayoutManager.shared.portrait = portrait
@@ -169,7 +170,8 @@ public struct ControllerView: View {
                         selectedButton: $selectedButton,
                         selectedJoystick: $selectedJoystick,
                         gameId: gameId,
-                        gameName: gameName
+                        gameName: gameName,
+                        dismissOnDone: onEditingChanged == nil
                     )
                     .zIndex(1)
                 } else {
@@ -212,6 +214,7 @@ public struct ControllerView: View {
 
     private func loadLayout() {
         layout = LayoutManager.shared.load(for: gameId)
+        hasLoadedLayout = true
     }
 
     private var portraitLayout: some View {

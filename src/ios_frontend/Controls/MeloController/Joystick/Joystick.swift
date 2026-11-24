@@ -40,6 +40,8 @@ final class JoystickView: UIView, ControllerTouchTarget {
     private var origin: CGPoint?
     private var pendingStart: CGPoint?
     private var pendingHold: DispatchWorkItem?
+    private var pendingTapRelease: DispatchWorkItem?
+    private var pendingTapQuadrant: FaceQuadrant?
     private var heldQuadrant: FaceQuadrant?
 
     private var stickCenter: CGPoint { origin ?? CGPoint(x: bounds.midX, y: bounds.midY) }
@@ -75,11 +77,43 @@ final class JoystickView: UIView, ControllerTouchTarget {
     override init(frame: CGRect) {
         super.init(frame: frame)
         setup()
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleTouchReleased), name: .lichiiTouchReleased, object: nil)
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         setup()
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleTouchReleased), name: .lichiiTouchReleased, object: nil)
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        pendingHold?.cancel()
+        pendingTapRelease?.cancel()
+        if let q = pendingTapQuadrant {
+            pendingTapQuadrant = nil
+            onFaceButton?(q, false)
+        }
+    }
+
+    @objc private func handleTouchReleased() {
+        cancelPendingTapRelease(releaseNow: false)
+        if activeTouch != nil || heldQuadrant != nil || pendingStart != nil {
+            finishTouch(cancelled: true)
+        }
+    }
+
+    private func cancelPendingTapRelease(releaseNow: Bool) {
+        pendingTapRelease?.cancel()
+        pendingTapRelease = nil
+        if let q = pendingTapQuadrant {
+            pendingTapQuadrant = nil
+            if releaseNow {
+                onFaceButton?(q, false)
+            }
+        }
     }
 
     private func setup() {
@@ -209,10 +243,17 @@ final class JoystickView: UIView, ControllerTouchTarget {
             cancelPending()
             activeTouch = nil
             if !cancelled, let quadrant = quadrant(for: start) {
+                cancelPendingTapRelease(releaseNow: true)
                 onFaceButton?(quadrant, true)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
-                    self?.onFaceButton?(quadrant, false)
+                pendingTapQuadrant = quadrant
+                let releaseItem = DispatchWorkItem { [weak self] in
+                    guard let self, self.pendingTapQuadrant == quadrant else { return }
+                    self.pendingTapRelease = nil
+                    self.pendingTapQuadrant = nil
+                    self.onFaceButton?(quadrant, false)
                 }
+                pendingTapRelease = releaseItem
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: releaseItem)
             }
         } else {
             endTracking()

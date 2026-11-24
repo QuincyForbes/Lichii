@@ -98,6 +98,7 @@ struct SettingsView: View {
     @State private var ready = false
     @State private var query = ""
     @State private var showReset = false
+    @State private var resetPreview = ""
     @State private var showAdvanced = false
     @State private var generation = 0
 
@@ -143,7 +144,10 @@ struct SettingsView: View {
                         }
                     }
                     Section {
-                        Button(UiText.text("reset.button"), role: .destructive) { showReset = true }
+                        Button(UiText.text("reset.button"), role: .destructive) {
+                            resetPreview = overrideSummary
+                            showReset = true
+                        }
                     } footer: {
                         Text(UiText.text("reset.footer"))
                     }
@@ -152,6 +156,11 @@ struct SettingsView: View {
                                         perGame: false)
                 } else {
                     GlobalSettingsRoot(splitSidebar: false)
+                }
+            } else if game != nil {
+                Section {
+                    Text("Game settings can't be edited while another game is booting or running.")
+                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -172,13 +181,16 @@ struct SettingsView: View {
                 PlatformCenter.shared.bumpSettings()
             }
         } message: {
-            Text(overrideSummary)
+            Text(resetPreview)
         }
         .onAppear(perform: open)
         .onDisappear(perform: close)
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
-            // Global changes survive the app being closed from the app switcher.
-            if game == nil {
+            // Changes survive the app being closed from the app switcher.
+            if let game, ready {
+                lichii_settings_end_game()
+                ready = lichii_settings_begin_game(game.programId)
+            } else if game == nil {
                 lichii_settings_save()
             }
         }
@@ -584,6 +596,7 @@ struct SettingRow: View {
     @State private var useGlobal: Bool
     /// Why the last change didn't stick.
     @State private var refusal: String?
+    @State private var resetToken = 0
 
     init(item: SettingItem, perGame: Bool) {
         self.item = item
@@ -671,14 +684,14 @@ struct SettingRow: View {
         case .int, .float:
             if item.ranged, item.maximum > item.minimum, item.maximum - item.minimum <= 5000 {
                 NumberSlider(item: item, value: value, commit: commit)
-                    .id(value)
+                    .id("\(value)#\(resetToken)")
             } else {
                 TextRow(label: item.label, value: value, numeric: true, commit: commit)
-                    .id(value)
+                    .id("\(value)#\(resetToken)")
             }
         case .string:
             TextRow(label: item.label, value: value, numeric: false, commit: commit)
-                .id(value)
+                .id("\(value)#\(resetToken)")
         }
     }
 
@@ -690,10 +703,15 @@ struct SettingRow: View {
         value = item.value()
         if !accepted {
             refusal = perGame ? "This setting can't be changed per game." : "Lichii didn't accept this value."
+            resetToken += 1
         } else if !matches(value, newValue) {
             refusal = rejectionText(for: newValue)
+            resetToken += 1
         } else {
             refusal = nil
+        }
+        if !perGame {
+            lichii_settings_save()
         }
         PlatformCenter.shared.bumpSettings()
     }

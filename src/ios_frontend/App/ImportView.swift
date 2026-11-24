@@ -18,18 +18,12 @@ enum KeepAwake {
     private static var owners: Set<String> = []
 
     static func set(_ awake: Bool, for owner: String) {
-        let before = !owners.isEmpty
         if awake {
             owners.insert(owner)
         } else {
             owners.remove(owner)
         }
-        let after = !owners.isEmpty
-        guard before != after else { return }
-        // A running game keeps its own idle timer setting (lichii_platform_set_playing).
-        if !Bridge.emuState.inGame {
-            UIApplication.shared.isIdleTimerDisabled = after
-        }
+        UIApplication.shared.isIdleTimerDisabled = !owners.isEmpty
     }
 }
 

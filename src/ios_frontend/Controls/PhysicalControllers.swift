@@ -114,14 +114,15 @@ final class PhysicalControllers: ObservableObject {
         let slot = lichii_pad_connect(kind)
         guard slot >= 0 else { return }
         let pad = PhysicalPad(controller: controller, slot: slot, kind: kind)
-        if let profile = profile(for: pad) {
-            apply(profile, to: pad)
+        let savedProfile = profile(for: pad)
+        if let savedProfile {
+            apply(savedProfile, to: pad, preserveIfOccupied: true)
         }
         controller.playerIndex = GCControllerPlayerIndex(rawValue: Int(pad.player)) ?? .indexUnset
         controller.handlerQueue = inputQueue
         bind(pad)
-        setUpMotion(pad, enabled: profile(for: pad)?.motion ?? true)
-        if profile(for: pad)?.rumble ?? true {
+        setUpMotion(pad, enabled: savedProfile?.motion ?? true)
+        if savedProfile?.rumble ?? true {
             pad.rumble = RumbleController(controller: controller)
         }
         pads.append(pad)
@@ -136,11 +137,49 @@ final class PhysicalControllers: ObservableObject {
         let player = pad.player
         pad.rumble?.stop()
         pad.rumble = nil
-        controller.motion?.valueChangedHandler = nil
+        unbind(controller)
+        if let motion = controller.motion {
+            motion.valueChangedHandler = nil
+            if motion.sensorsRequireManualActivation {
+                motion.sensorsActive = false
+            }
+        }
         lichii_pad_disconnect(pad.slot)
         lichii_post_event(Int32(LICHII_EVENT_CONTROLLERS_CHANGED.rawValue))
         updateDeviceMotion()
         ControlsCenter.shared.controllerDisconnected(pad.name, drovePlayer: player >= 0)
+    }
+
+    private nonisolated func unbind(_ controller: GCController) {
+        guard let gamepad = controller.extendedGamepad else { return }
+        let buttons: [GCControllerButtonInput?] = [
+            gamepad.buttonA, gamepad.buttonB, gamepad.buttonX, gamepad.buttonY,
+            gamepad.leftShoulder, gamepad.rightShoulder,
+            gamepad.leftThumbstickButton, gamepad.rightThumbstickButton,
+            gamepad.buttonMenu, gamepad.buttonOptions, gamepad.buttonHome,
+            gamepad.dpad.up, gamepad.dpad.down, gamepad.dpad.left, gamepad.dpad.right,
+        ]
+        for b in buttons {
+            b?.pressedChangedHandler = nil
+        }
+        gamepad.leftThumbstick.valueChangedHandler = nil
+        gamepad.rightThumbstick.valueChangedHandler = nil
+        gamepad.leftTrigger.valueChangedHandler = nil
+        gamepad.rightTrigger.valueChangedHandler = nil
+        if let xbox = gamepad as? GCXboxGamepad {
+            xbox.paddleButton1?.pressedChangedHandler = nil
+            xbox.paddleButton2?.pressedChangedHandler = nil
+            xbox.paddleButton3?.pressedChangedHandler = nil
+            xbox.paddleButton4?.pressedChangedHandler = nil
+            xbox.buttonShare?.pressedChangedHandler = nil
+        }
+        if let dualSense = gamepad as? GCDualSenseGamepad {
+            dualSense.touchpadButton.pressedChangedHandler = nil
+        }
+        if let dualShock = gamepad as? GCDualShockGamepad {
+            dualShock.touchpadButton.pressedChangedHandler = nil
+        }
+        controller.physicalInputProfile.buttons[GCInputButtonShare]?.pressedChangedHandler = nil
     }
 
     private static func kind(of controller: GCController) -> Int32 {
@@ -224,20 +263,29 @@ final class PhysicalControllers: ObservableObject {
         guard let motion = pad.controller.motion else { return }
         guard enabled else {
             motion.valueChangedHandler = nil
+            if motion.sensorsRequireManualActivation {
+                motion.sensorsActive = false
+            }
             return
         }
         if motion.sensorsRequireManualActivation {
             motion.sensorsActive = true
         }
+        pad.lastMotion = 0
         let slot = pad.slot
         motion.valueChangedHandler = { [weak pad] m in
             guard let pad else { return }
+            guard lichii_emu_state() == Int32(LICHII_EMU_RUNNING.rawValue) else {
+                pad.lastMotion = 0
+                return
+            }
             let now = ProcessInfo.processInfo.systemUptime
-            let delta = pad.lastMotion == 0 ? 1.0 / 60.0 : now - pad.lastMotion
+            let rawDelta = pad.lastMotion == 0 ? 1.0 / 60.0 : now - pad.lastMotion
+            let delta = min(max(rawDelta, 0.001), 0.05)
             pad.lastMotion = now
             // Controller axes -> Switch axes (MeloNX's mapping); gyro in turns per second.
             let turns = 1.0 / (2.0 * Double.pi)
-            lichii_pad_motion(slot, UInt64(max(delta, 0) * 1_000_000),
+            lichii_pad_motion(slot, UInt64(delta * 1_000_000),
                               Float(m.rotationRate.x * turns), Float(m.rotationRate.z * turns),
                               Float(-m.rotationRate.y * turns),
                               Float(-m.acceleration.x), Float(-m.acceleration.z), Float(m.acceleration.y))
@@ -246,8 +294,11 @@ final class PhysicalControllers: ObservableObject {
 
     /// Device motion for player 1 while the game runs and no controller with sensors drives it.
     func updateDeviceMotion() {
+        let controllerDrivesMotion = pads.contains { pad in
+            pad.player == 0 && pad.hasMotion && (profile(for: pad)?.motion ?? true)
+        }
         let wanted = deviceMotionEnabled && ControlsCenter.shared.gameRunning &&
-            Bridge.emuState == .running && !pads.contains { $0.player == 0 && $0.hasMotion }
+            Bridge.emuState == .running && !controllerDrivesMotion
         if wanted == motionManager.isDeviceMotionActive { return }
         guard wanted else {
             motionManager.stopDeviceMotionUpdates()
@@ -255,18 +306,19 @@ final class PhysicalControllers: ObservableObject {
         }
         guard motionManager.isDeviceMotionAvailable else { return }
         motionManager.deviceMotionUpdateInterval = 1.0 / 60.0
-        deviceMotionTime = 0
+        DeviceMotionClock.reset()
         motionManager.startDeviceMotionUpdates(to: motionOperations, withHandler: deviceMotionHandler)
     }
 
     fileprivate nonisolated static func submitDeviceMotion(_ m: CMDeviceMotion) {
+        let deltaUs = DeviceMotionClock.step(timestamp: m.timestamp)
         let accel = SIMD3<Double>(-(m.gravity.x + m.userAcceleration.x),
                                   -(m.gravity.y + m.userAcceleration.y),
                                   -(m.gravity.z + m.userAcceleration.z))
         let gyro = SIMD3<Double>(m.rotationRate.x, -m.rotationRate.y, -m.rotationRate.z)
         let (a, g) = remapToSwitch(accel: accel, gyro: gyro, orientation: DeviceOrientation.current)
         let turns = 1.0 / (2.0 * Double.pi)
-        lichii_controls_motion(0, UInt64(1_000_000 / 60),
+        lichii_controls_motion(0, deltaUs,
                                Float(g.x * turns), Float(g.y * turns), Float(g.z * turns),
                                Float(a.x), Float(a.y), Float(a.z))
     }
@@ -360,7 +412,7 @@ final class PhysicalControllers: ObservableObject {
     }
 
     func save(_ profile: PadProfile, for pad: PhysicalPad) {
-        apply(profile, to: pad)
+        apply(profile, to: pad, preserveIfOccupied: false)
         var profiles = loadProfiles()
         profiles[pad.profileKey] = profile
         if let data = try? JSONEncoder().encode(profiles) {
@@ -377,6 +429,7 @@ final class PhysicalControllers: ObservableObject {
         pad.objectWillChange.send()
         objectWillChange.send()
         updateDeviceMotion()
+        ControlsCenter.shared.updateTouchVisibility()
     }
 
     func forget(_ pad: PhysicalPad) {
@@ -392,11 +445,17 @@ final class PhysicalControllers: ObservableObject {
         }
         lichii_pad_set_trigger_threshold(pad.slot, 0.30)
         lichii_pad_set_swap_sticks(pad.slot, false)
+        if pad.rumble == nil {
+            pad.rumble = RumbleController(controller: pad.controller)
+        }
+        setUpMotion(pad, enabled: true)
         pad.objectWillChange.send()
         objectWillChange.send()
+        updateDeviceMotion()
+        ControlsCenter.shared.updateTouchVisibility()
     }
 
-    private func apply(_ profile: PadProfile, to pad: PhysicalPad) {
+    private func apply(_ profile: PadProfile, to pad: PhysicalPad, preserveIfOccupied: Bool) {
         for (element, target) in profile.mapping.enumerated() where element < Int(LICHII_PAD_ELEMENT_COUNT.rawValue) {
             lichii_pad_set_mapping(pad.slot, Int32(element), target)
         }
@@ -407,8 +466,34 @@ final class PhysicalControllers: ObservableObject {
         lichii_pad_set_trigger_threshold(pad.slot, profile.triggerThreshold)
         lichii_pad_set_swap_sticks(pad.slot, profile.swapSticks)
         if let player = profile.player {
-            lichii_pad_set_player(pad.slot, player)
+            let occupied = preserveIfOccupied && player >= 0 &&
+                pads.contains { $0.slot != pad.slot && $0.player == player }
+            if !occupied {
+                lichii_pad_set_player(pad.slot, player)
+            }
         }
+    }
+}
+
+/// Thread-safe timestamp tracker for CoreMotion deltas.
+private enum DeviceMotionClock {
+    private static let lock = NSLock()
+    private static var lastTimestamp: TimeInterval = 0
+
+    static func reset() {
+        lock.lock()
+        lastTimestamp = 0
+        lock.unlock()
+    }
+
+    static func step(timestamp: TimeInterval) -> UInt64 {
+        lock.lock()
+        let prev = lastTimestamp
+        lastTimestamp = timestamp
+        lock.unlock()
+        let raw = prev == 0 ? 1.0 / 60.0 : timestamp - prev
+        let clamped = min(max(raw, 0.001), 0.05)
+        return UInt64(clamped * 1_000_000)
     }
 }
 
@@ -435,7 +520,8 @@ enum DeviceOrientation {
 
     @MainActor
     static func update() {
-        let scene = ControlsCenter.shared.gameWindow?.windowScene ??
+        let scene = ExternalDisplay.shared.activePhoneWindow?.windowScene ??
+            ControlsCenter.shared.gameWindow?.windowScene ??
             UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
         let orientation: UIDeviceOrientation
         // Interface left/right are the device's right/left (the home side).

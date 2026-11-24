@@ -240,9 +240,20 @@ struct UncleanExitView: View {
         session.fileGuest != true && fileGuestWasOff
     }
 
+    private var resolutionKey: String {
+        if session.programId != 0,
+           !"resolution_setup".withCString({ lichii_settings_applies($0, session.programId) }),
+           let gameKey = SettingsCatalog.all.first(where: {
+               $0.game == session.programId && $0.key.hasSuffix("_resolution")
+           })?.key {
+            return gameKey
+        }
+        return "resolution_setup"
+    }
+
     private var lowerResolution: QuickSettings.Choice? {
-        let choices = QuickSettings.choices("resolution_setup")
-        let current = QuickSettings.string("resolution_setup")
+        let choices = QuickSettings.choices(resolutionKey)
+        let current = QuickSettings.string(resolutionKey)
         guard let index = choices.firstIndex(where: { $0.value == current }), index > 0 else { return nil }
         return choices[index - 1]
     }
@@ -272,7 +283,7 @@ struct UncleanExitView: View {
                         Label("Resolution set to \(loweredTo)", systemImage: "checkmark")
                     } else if let lower = lowerResolution {
                         Button {
-                            QuickSettings.set("resolution_setup", lower.value)
+                            QuickSettings.set(resolutionKey, lower.value)
                             loweredTo = lower.name
                         } label: {
                             Label("Lower the Resolution to \(lower.name)",
@@ -299,6 +310,7 @@ struct ShaderCacheView: View {
     @Environment(\.dismiss) private var dismiss
     let game: Game
     @State private var bytes: UInt64?
+    @State private var clearing = false
     @State private var confirm = false
     @State private var status: String?
 
@@ -307,7 +319,7 @@ struct ShaderCacheView: View {
             Section {
                 LabeledContent("Size", value: bytes.map { $0.byteCount } ?? "...")
                 Button("Clear Shader Cache", role: .destructive) { confirm = true }
-                    .disabled(bytes == 0 || !PlatformCenter.canClearShaderCache(game.programId))
+                    .disabled((bytes ?? 0) == 0 || clearing || !PlatformCenter.canClearShaderCache(game.programId))
             } footer: {
                 Text(PlatformCenter.canClearShaderCache(game.programId)
                      ? "The game builds its shaders again the next time it runs, with some stutter while it does."
@@ -327,9 +339,13 @@ struct ShaderCacheView: View {
         .confirmationDialog("Clear the shader cache of \(game.title)?", isPresented: $confirm,
                             titleVisibility: .visible) {
             Button("Clear", role: .destructive) {
-                let removed = PlatformCenter.clearShaderCache(game.programId)
-                status = removed < 0 ? "Could not clear the shader cache." : "Removed \(removed) files."
-                Task { await refresh() }
+                clearing = true
+                Task {
+                    let removed = await PlatformCenter.clearShaderCacheAsync(game.programId)
+                    status = removed < 0 ? "Could not clear the shader cache." : "Removed \(removed) files."
+                    await refresh()
+                    clearing = false
+                }
             }
         }
         .task { await refresh() }
@@ -343,6 +359,7 @@ struct ShaderCacheView: View {
 /// Global shader cache size and "clear all" in the settings.
 struct ShaderCacheSettingsSection: View {
     @State private var bytes: UInt64?
+    @State private var clearing = false
     @State private var confirm = false
 
     var body: some View {
@@ -355,7 +372,7 @@ struct ShaderCacheSettingsSection: View {
                     .foregroundStyle(.secondary)
             }
             Button("Clear All Shader Caches", role: .destructive) { confirm = true }
-                .disabled(bytes == 0 || !PlatformCenter.canClearShaderCache(0))
+                .disabled((bytes ?? 0) == 0 || clearing || !PlatformCenter.canClearShaderCache(0))
         } header: {
             Text(UiText.text("page.storage"))
         } footer: {
@@ -364,8 +381,12 @@ struct ShaderCacheSettingsSection: View {
         .confirmationDialog("Clear the shader caches of every game?", isPresented: $confirm,
                             titleVisibility: .visible) {
             Button("Clear All", role: .destructive) {
-                PlatformCenter.clearShaderCache(0)
-                Task { bytes = await PlatformCenter.shaderCacheBytes(0) }
+                clearing = true
+                Task {
+                    _ = await PlatformCenter.clearShaderCacheAsync(0)
+                    bytes = await PlatformCenter.shaderCacheBytes(0)
+                    clearing = false
+                }
             }
         }
         .task { bytes = await PlatformCenter.shaderCacheBytes(0) }

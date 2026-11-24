@@ -32,6 +32,7 @@ final class SystemFilesModel: ObservableObject {
     var firmwareReady: Bool { firmware?.present == true && firmware?.corrupted == false }
 
     func importKeys(_ urls: [URL]) {
+        guard !busy else { return }
         busy = true
         ContentBridge.run({ () -> (LichiiKeyResult, String) in
             guard let staging = makeStagingDirectory() else {
@@ -57,6 +58,7 @@ final class SystemFilesModel: ObservableObject {
             guard let self else { return }
             busy = false
             refresh()
+            AppController.shared.library.reload()
             let (code, message) = result
             switch code {
             case LICHII_KEYS_OK:
@@ -75,6 +77,7 @@ final class SystemFilesModel: ObservableObject {
     }
 
     func installFirmware(_ url: URL) {
+        guard !busy else { return }
         busy = true
         progress = 0
         cancelFlag.set(false)
@@ -111,11 +114,14 @@ final class SystemFilesModel: ObservableObject {
     }
 
     func removeKeys() {
+        guard !busy else { return }
         _ = lichii_content_remove_keys()
         refresh()
+        AppController.shared.library.reload()
     }
 
     func removeFirmware() {
+        guard !busy else { return }
         if !lichii_content_remove_firmware() {
             alert = ContentAlert(title: "Firmware", message: "Stop the game before removing firmware.")
         }
@@ -132,7 +138,7 @@ final class SystemFilesModel: ObservableObject {
             alert = ContentAlert(title: "Mii Maker", message: "Stop the running game first.")
             return
         }
-        app.showLaunch = true
+        app.prepareAppletLaunch()
         if Bridge.jitState == .waiting {
             app.requestJitIfNeeded(automatic: false)
         }
@@ -155,7 +161,8 @@ enum ContentTypes {
 
 struct KeysFirmwareView: View {
     @ObservedObject private var model = SystemFilesModel.shared
-    @State private var importer: Importer?
+    @State private var importerKind: Importer = .keys
+    @State private var showImporter = false
     @State private var confirmRemoveKeys = false
     @State private var confirmRemoveFirmware = false
 
@@ -173,7 +180,8 @@ struct KeysFirmwareView: View {
                 StatusRow(title: "title.keys", ok: model.keys?.titleKeys == true,
                           detail: model.keys.map { "\($0.titleKeyCount) title keys" }, optional: true)
                 Button {
-                    importer = .keys
+                    importerKind = .keys
+                    showImporter = true
                 } label: {
                     Label("Import Keys...", systemImage: "key")
                 }
@@ -195,7 +203,8 @@ struct KeysFirmwareView: View {
                     }
                 }
                 Button {
-                    importer = .firmware
+                    importerKind = .firmware
+                    showImporter = true
                 } label: {
                     Label("Install Firmware...", systemImage: "cpu")
                 }
@@ -221,18 +230,17 @@ struct KeysFirmwareView: View {
 
             Section {
                 Button("Remove Keys", role: .destructive) { confirmRemoveKeys = true }
-                    .disabled(model.keys?.prodKeys != true)
+                    .disabled(model.busy || (model.keys?.prodKeys != true && model.keys?.titleKeys != true))
                 Button("Remove Firmware", role: .destructive) { confirmRemoveFirmware = true }
-                    .disabled(model.firmware?.present != true)
+                    .disabled(model.busy || model.firmware?.present != true)
             }
         }
         .navigationTitle(UiText.text("page.keys_firmware"))
         .onAppear { model.refresh() }
-        .fileImporter(isPresented: Binding(get: { importer != nil }, set: { if !$0 { importer = nil } }),
-                      allowedContentTypes: importer == .firmware ? ContentTypes.firmware : ContentTypes.keys,
-                      allowsMultipleSelection: importer == .keys) { result in
-            let kind = importer
-            importer = nil
+        .fileImporter(isPresented: $showImporter,
+                      allowedContentTypes: importerKind == .firmware ? ContentTypes.firmware : ContentTypes.keys,
+                      allowsMultipleSelection: importerKind == .keys) { result in
+            let kind = importerKind
             guard case .success(let urls) = result, !urls.isEmpty else { return }
             if kind == .firmware {
                 model.installFirmware(urls[0])

@@ -66,17 +66,15 @@ struct ProfilesView: View {
         }
         .confirmationDialog("Delete \(deleting?.name ?? "")?",
                             isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
-                            titleVisibility: .visible) {
+                            titleVisibility: .visible, presenting: deleting) { profile in
             Button("Delete", role: .destructive) {
-                if let profile = deleting {
-                    if !profile.uuid.withCString({ lichii_content_delete_profile($0) }) {
-                        alert = ContentAlert(title: "Users", message: "This user could not be deleted.")
-                    }
+                if !profile.uuid.withCString({ lichii_content_delete_profile($0) }) {
+                    alert = ContentAlert(title: "Users", message: "This user could not be deleted.")
                 }
                 deleting = nil
                 reload()
             }
-        } message: {
+        } message: { _ in
             Text("The user's save files stay on disk.")
         }
         .alert(item: $alert) { alert in
@@ -187,6 +185,7 @@ private struct ProfileEditor: View {
 
     /// Square 256x256 JPEG, the size the console's avatars use.
     static func avatarJPEG(_ image: UIImage) -> Data? {
+        guard image.size.width > 0, image.size.height > 0 else { return nil }
         let side: CGFloat = 256
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1

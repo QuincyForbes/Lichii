@@ -137,10 +137,16 @@ final class AppController: ObservableObject {
         guard launched else { return }
         buildingShaders = buildShaders
         showLaunch = true
-        if Bridge.jitState == .waiting {
+        if !buildShaders && Bridge.jitState == .waiting {
             jitRequested = false
             requestJitIfNeeded(automatic: false)
         }
+    }
+
+    func prepareAppletLaunch() {
+        currentGame = nil
+        buildingShaders = false
+        showLaunch = true
     }
 
     func cancelLaunch() {
@@ -148,6 +154,7 @@ final class AppController: ObservableObject {
         if Bridge.emuState == .booting {
             cancellingBoot = true
         } else {
+            buildingShaders = false
             showLaunch = false
         }
     }
@@ -179,10 +186,10 @@ final class AppController: ObservableObject {
     /// imported.
     private func open(_ text: String) {
         guard !text.isEmpty else { return }
-        if let url = URL(string: text), url.scheme == "lichii" {
+        if let url = URL(string: text), url.scheme?.lowercased() == "lichii" {
             let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?
-                .queryItems?.first { $0.name == "id" }?.value?.uppercased()
-            guard url.host == "game", let id else { return }
+                .queryItems?.first { $0.name.lowercased() == "id" }?.value?.uppercased()
+            guard url.host?.lowercased() == "game", let id else { return }
             // On a cold start the first scan is still running.
             library.reload { [weak self] in
                 guard let self else { return }
@@ -195,7 +202,13 @@ final class AppController: ObservableObject {
             }
             return
         }
-        let file = text.hasPrefix("file://") ? URL(string: text) : URL(fileURLWithPath: text)
+        let file: URL?
+        if text.lowercased().hasPrefix("file://") {
+            file = URL(string: text) ??
+                text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed).flatMap(URL.init(string:))
+        } else {
+            file = URL(fileURLWithPath: text)
+        }
         if let file {
             library.importItems([file])
         }
@@ -219,6 +232,7 @@ final class AppController: ObservableObject {
                 buildingShaders = false
                 reportBuiltShaders(game: currentGame)
             }
+            library.reloadIfPending()
         case .failed:
             buildingShaders = false
             showLibrary()

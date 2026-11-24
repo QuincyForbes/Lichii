@@ -201,10 +201,13 @@ final class PerformanceOverlayMonitor: ObservableObject {
                 if next != reading {
                     reading = next
                 }
-            } else if !state.inGame, reading.active {
-                var next = reading
-                next.active = false
-                reading = next
+            } else if !state.inGame {
+                history.removeAll()
+                if reading.active {
+                    var next = reading
+                    next.active = false
+                    reading = next
+                }
             }
         }
     }
@@ -280,8 +283,9 @@ final class PerformanceOverlayMonitor: ObservableObject {
     }
 
     private func upscaler(_ snapshot: LichiiPerfSnapshot) -> String {
-        if QuickSettings.canonical("upscaler") == "MetalFx" {
-            return UiText.choiceLabel("upscaler", "MetalFx") ?? ""
+        let selected = QuickSettings.canonical("upscaler")
+        if selected == "MetalFx" || selected == "Fsr3" || selected == "Fsr4" {
+            return UiText.choiceLabel("upscaler", selected) ?? selected
         }
         if snapshot.game_dlss_network {
             return UiText.text("overlay.game_dlss")

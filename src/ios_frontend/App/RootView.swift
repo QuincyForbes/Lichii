@@ -66,13 +66,20 @@ struct RootView: View {
             Text("These settings differ from what \(prompt.device) should use:\n\n\(prompt.summary)\n\nSettings > \(UiText.text("page.recommended")) has the reasons and the button for later.")
         }
         .onAppear(perform: offerRecommended)
+        .onChange(of: platform.uncleanExit != nil) { _, showing in
+            if !showing {
+                offerRecommended()
+            }
+        }
     }
 
     /// Once per device: an earlier install's settings (or a config migrated from them) can be far
     /// from what the phone needs; one iPhone ran Ocarina of Time at full textures and the game's
     /// resolution that way and reached critical memory pressure.
     private func offerRecommended() {
-        guard recommendedPrompt == nil, !Bridge.emuState.inGame, lichii_recommended_differences() > 0 else { return }
+        guard recommendedPrompt == nil, !Bridge.emuState.inGame,
+              platform.uncleanExit == nil, Onboarding.completed,
+              lichii_recommended_differences() > 0 else { return }
         let loaded = RecommendedSettings.load()
         guard !loaded.device.isEmpty, promptedDevice != loaded.device else { return }
         let changes = loaded.values.filter(\.differs)

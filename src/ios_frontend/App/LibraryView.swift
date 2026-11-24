@@ -444,7 +444,9 @@ struct GameInfoView: View {
                 }
                 Button {
                     dismiss()
-                    app.launch(game)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        MainActor.assumeIsolated { app.launch(game) }
+                    }
                 } label: {
                     Label("Play", systemImage: "play.fill")
                 }

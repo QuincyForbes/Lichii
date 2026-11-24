@@ -118,6 +118,7 @@ enum IconCache {
         } else {
             try? FileManager.default.removeItem(at: url)
         }
+        evictAll()
     }
 
     static func removeDiskIcon(forPath path: String) {
@@ -191,6 +192,7 @@ struct GameIcon: View {
     var size: CGFloat = 120
     var fills = false
     @State private var loaded: UIImage?
+    @State private var reloadToken = 0
 
     var body: some View {
         Group {
@@ -207,7 +209,7 @@ struct GameIcon: View {
             }
         }
         .accessibilityHidden(true)
-        .task(id: game) {
+        .task(id: "\(game.id)#\(reloadToken)") {
             loaded = await IconCache.load(game)
         }
         .onDisappear {
@@ -215,6 +217,9 @@ struct GameIcon: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .lichiiIconsEvicted)) { _ in
             loaded = nil
+            if !Bridge.emuState.inGame {
+                reloadToken += 1
+            }
         }
     }
 

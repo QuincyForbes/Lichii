@@ -77,7 +77,8 @@ final class PlatformCenter: ObservableObject {
     /// Every LichiiEvent of the app bridge.
     func handle(appEvent event: Int32) {
         if event == Int32(LICHII_EVENT_GAME_WINDOW_READY.rawValue) {
-            GameSession.begin(AppController.shared.currentGame)
+            GameSession.begin(AppController.shared.currentGame,
+                              background: UIApplication.shared.applicationState == .background)
             memoryHintShown = nil
             flashThermalBadge()
             return
@@ -86,17 +87,22 @@ final class PlatformCenter: ObservableObject {
         switch Bridge.emuState {
         case .waitingForJit:
             lichii_platform_reset_shader_progress()
+        case .booting:
+            GameSession.begin(AppController.shared.currentGame,
+                              background: UIApplication.shared.applicationState == .background)
+            KeepAwake.set(true, for: "playing")
         case .running:
             lichii_platform_set_playing(1)
+            KeepAwake.set(true, for: "playing")
         case .paused:
-            // The screen may lock while the game waits.
+            // The screen may lock while the game waits (unless an import/install holds KeepAwake).
             lichii_platform_set_playing(0)
+            KeepAwake.set(false, for: "playing")
         case .idle, .failed:
             pausedForLifecycle = false
             lichii_platform_set_playing(0)
+            KeepAwake.set(false, for: "playing")
             GameSession.end()
-        case .booting:
-            break
         }
     }
 
@@ -249,10 +255,13 @@ final class PlatformCenter: ObservableObject {
         }.value
     }
 
-    /// Not while that game (or, for 0, any game) runs.
+    /// Not while that game (or, for 0, any game) boots or runs.
     static func canClearShaderCache(_ programId: UInt64) -> Bool {
+        if Bridge.emuState == .booting {
+            return false
+        }
         let running = lichii_emu_program_id()
-        return programId == 0 ? !Bridge.emuState.inGame && Bridge.emuState != .booting
+        return programId == 0 ? !Bridge.emuState.inGame
                               : running != programId
     }
 
@@ -260,6 +269,13 @@ final class PlatformCenter: ObservableObject {
     static func clearShaderCache(_ programId: UInt64) -> Int32 {
         guard canClearShaderCache(programId) else { return -1 }
         return lichii_platform_clear_shader_cache(programId)
+    }
+
+    static func clearShaderCacheAsync(_ programId: UInt64) async -> Int32 {
+        guard canClearShaderCache(programId) else { return -1 }
+        return await Task.detached(priority: .userInitiated) {
+            lichii_platform_clear_shader_cache(programId)
+        }.value
     }
 
     // MARK: - Experiments & Settings Reactivity
@@ -373,10 +389,22 @@ struct GameSession: Codable, Identifiable {
 
     private static let key = "runningGameSession"
 
-    @MainActor static func begin(_ game: Game?) {
-        let session = GameSession(title: game?.title ?? "The game", programId: lichii_emu_program_id(),
-                                  resolution: QuickSettings.string("resolution_setup"), started: Date(),
-                                  fileGuest: GuestMemoryFile.enabled)
+    @MainActor static func begin(_ game: Game?, background: Bool = false) {
+        let existing = load()
+        let pid = lichii_emu_program_id()
+        let title: String = game?.title ?? existing?.title ?? "The game"
+        let programId: UInt64 = pid != 0 ? pid : (game?.programId ?? existing?.programId ?? 0)
+        let started: Date = existing?.started ?? Date()
+        let memoryWarning: Bool = existing?.memoryWarning ?? false
+        let session = GameSession(
+            title: title,
+            programId: programId,
+            resolution: QuickSettings.string("resolution_setup"),
+            started: started,
+            background: background,
+            memoryWarning: memoryWarning,
+            fileGuest: GuestMemoryFile.enabled
+        )
         save(session)
     }
 

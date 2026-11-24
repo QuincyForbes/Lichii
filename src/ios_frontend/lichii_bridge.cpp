@@ -910,6 +910,7 @@ void lichii_settings_set_use_global(const char* key, bool use_global) {
 void lichii_settings_save(void) {
     SaveGlobalConfig();
     if (g_state.load() != LICHII_EMU_BOOTING && System().IsPoweredOn()) {
+        KeepIosOverrides();
         System().ApplySettings();
     }
 }
@@ -1056,6 +1057,8 @@ static bool Launch(const char* path, bool build_only) {
         state == LICHII_EMU_PAUSED) {
         return false;
     }
+    g_cancel_request.store(false);
+    g_stop_request.store(false);
     VideoCommon::ShaderWarm::RequestBuildOnly(build_only);
     {
         std::scoped_lock lock{g_mutex};
@@ -1266,6 +1269,9 @@ constexpr std::size_t kVirtualPorts[] = {0, 8};
 } // Anonymous namespace
 
 void lichii_input_button(int32_t button, bool pressed) {
+    if (g_host.input == nullptr) {
+        return;
+    }
     if (auto* pad = Input().GetVirtualGamepad()) {
         for (const std::size_t port : kVirtualPorts) {
             pad->SetButtonState(port, button, pressed);
@@ -1274,6 +1280,9 @@ void lichii_input_button(int32_t button, bool pressed) {
 }
 
 void lichii_input_stick(int32_t stick, float x, float y) {
+    if (g_host.input == nullptr) {
+        return;
+    }
     if (auto* pad = Input().GetVirtualGamepad()) {
         for (const std::size_t port : kVirtualPorts) {
             pad->SetStickPosition(port, stick, x, y);
@@ -1282,22 +1291,39 @@ void lichii_input_stick(int32_t stick, float x, float y) {
 }
 
 void lichii_input_touch_down(uint32_t finger, float x, float y) {
-    Input().GetTouchScreen()->TouchPressed(x, y, finger);
+    if (g_host.input != nullptr) {
+        if (auto* touch = Input().GetTouchScreen()) {
+            touch->TouchPressed(x, y, finger);
+        }
+    }
 }
 
 void lichii_input_touch_move(uint32_t finger, float x, float y) {
-    Input().GetTouchScreen()->TouchMoved(x, y, finger);
+    if (g_host.input != nullptr) {
+        if (auto* touch = Input().GetTouchScreen()) {
+            touch->TouchMoved(x, y, finger);
+        }
+    }
 }
 
 void lichii_input_touch_up(uint32_t finger) {
-    Input().GetTouchScreen()->TouchReleased(finger);
+    if (g_host.input != nullptr) {
+        if (auto* touch = Input().GetTouchScreen()) {
+            touch->TouchReleased(finger);
+        }
+    }
 }
 
 void lichii_input_release_all(void) {
+    if (g_host.input == nullptr) {
+        return;
+    }
     if (auto* pad = Input().GetVirtualGamepad()) {
         pad->ResetControllers();
     }
-    Input().GetTouchScreen()->ReleaseAllTouch();
+    if (auto* touch = Input().GetTouchScreen()) {
+        touch->ReleaseAllTouch();
+    }
 }
 
 } // extern "C"

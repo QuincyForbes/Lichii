@@ -180,6 +180,7 @@ std::uint8_t* MapWritableAlias(std::uint8_t* rx, std::size_t bytes, std::string&
     }
     kr = vm_protect(mach_task_self(), alias, bytes, FALSE, VM_PROT_READ | VM_PROT_WRITE);
     if (kr != KERN_SUCCESS) {
+        vm_deallocate(mach_task_self(), alias, bytes);
         error = std::string("vm_protect(RW) of the JIT alias failed: ") + mach_error_string(kr);
         return nullptr;
     }
@@ -194,7 +195,6 @@ std::uint8_t* MapWritableAlias(std::uint8_t* rx, std::size_t bytes, std::string&
 bool AcquireThroughDebugger(std::size_t bytes) {
     g_prepared = 0;
     g_footprint_before_pool = FootprintMib();
-    SetState(State::Acquiring);
     std::vector<Region> regions;
     std::string error;
     while (g_prepared < bytes) {
@@ -202,15 +202,18 @@ bool AcquireThroughDebugger(std::size_t bytes) {
         auto* rx = static_cast<std::uint8_t*>(Jit26PrepareRegion(nullptr, chunk));
         if (rx == nullptr) {
             if (regions.empty()) {
-                SetState(State::Waiting);
                 return false;
             }
             error = "the debugger stopped answering after " +
                     std::to_string(g_prepared.load() >> 20) + " MiB of JIT memory";
             break;
         }
+        if (regions.empty()) {
+            SetState(State::Acquiring);
+        }
         std::uint8_t* rw = MapWritableAlias(rx, chunk, error);
         if (rw == nullptr) {
+            vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(rx), chunk);
             break;
         }
         regions.push_back(Region{rx, rw, chunk, 0});
@@ -222,6 +225,10 @@ bool AcquireThroughDebugger(std::size_t bytes) {
     // through its URL scheme).
     Jit26Detach();
     if (!error.empty()) {
+        for (const Region& r : regions) {
+            vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(r.rw), r.size);
+            vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(r.rx), r.size);
+        }
         SetFailed(error);
         return true;
     }

@@ -70,7 +70,7 @@ final class ExternalDisplay: ObservableObject {
     }
 
     private func sceneConnected(_ scene: UIWindowScene) {
-        guard Self.isExternal(scene) else { return }
+        guard Self.isExternal(scene), externalScene == nil else { return }
         externalScene = scene
         externalScreen = scene.screen
         connected = true
@@ -79,7 +79,7 @@ final class ExternalDisplay: ObservableObject {
 
     private func sceneDisconnected(_ scene: UIWindowScene) {
         guard scene === externalScene else { return }
-        moveGameBack()
+        moveGameBack(reattach: ControlsCenter.shared.gameRunning)
         externalScene = nil
         externalScreen = nil
         connected = false
@@ -87,7 +87,7 @@ final class ExternalDisplay: ObservableObject {
 
     /// Apps without a scene manifest get screens instead of scenes.
     private func screenConnected(_ screen: UIScreen) {
-        guard screen != UIScreen.main, externalScene == nil else { return }
+        guard screen != UIScreen.main, externalScene == nil, externalScreen == nil else { return }
         screen.overscanCompensation = .none
         externalScreen = screen
         connected = true
@@ -95,6 +95,7 @@ final class ExternalDisplay: ObservableObject {
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
                 let shared = ExternalDisplay.shared
+                guard shared.externalScreen === screen else { return }
                 if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
                     .first(where: { $0.screen == screen }) {
                     shared.externalScene = scene
@@ -106,10 +107,15 @@ final class ExternalDisplay: ObservableObject {
 
     private func screenDisconnected(_ screen: UIScreen) {
         guard screen == externalScreen else { return }
-        moveGameBack()
+        moveGameBack(reattach: ControlsCenter.shared.gameRunning)
         externalScreen = nil
         externalScene = nil
         connected = false
+    }
+
+    /// The phone window currently showing the controls (or the game window when not on TV).
+    var activePhoneWindow: UIWindow? {
+        controlsWindow ?? gameWindow
     }
 
     func gameStarted(_ window: UIWindow) {
@@ -119,13 +125,14 @@ final class ExternalDisplay: ObservableObject {
     }
 
     func gameEnded() {
-        moveGameBack()
+        moveGameBack(reattach: false)
         gameWindow = nil
         originalScene = nil
     }
 
     private func moveGameOut() {
         guard enabled, connected, let gameWindow, controlsWindow == nil else { return }
+        ControlsCenter.shared.releaseTouch()
         if let externalScene {
             gameWindow.windowScene = externalScene
         } else if let externalScreen {
@@ -142,15 +149,17 @@ final class ExternalDisplay: ObservableObject {
         } else {
             phone = UIWindow(frame: UIScreen.main.bounds)
         }
-        let root = UIViewController()
+        let root = ExternalControlsHostController()
         root.view.backgroundColor = .black
         phone.rootViewController = root
         phone.makeKeyAndVisible()
         controlsWindow = phone
         ControlsCenter.shared.attachOverlay(to: phone)
+        ControlsCenter.shared.installThreeFingerTap(on: phone)
+        OrientationManager.shared.apply()
     }
 
-    private func moveGameBack() {
+    private func moveGameBack(reattach: Bool = true) {
         guard let phone = controlsWindow else { return }
         controlsWindow = nil
         if let gameWindow {
@@ -160,9 +169,23 @@ final class ExternalDisplay: ObservableObject {
                 gameWindow.screen = UIScreen.main
             }
             gameWindow.frame = gameWindow.screen.bounds
-            gameWindow.makeKeyAndVisible()
-            ControlsCenter.shared.attachOverlay(to: gameWindow)
+            if reattach {
+                gameWindow.makeKeyAndVisible()
+                ControlsCenter.shared.attachOverlay(to: gameWindow)
+            }
         }
         phone.isHidden = true
+        phone.rootViewController = nil
+        phone.windowScene = nil
+    }
+}
+
+/// Hosts the on-screen controls on the phone while the game renders to an external display,
+/// respecting orientation lock and hiding the status bar / home indicator.
+private final class ExternalControlsHostController: UIViewController {
+    override var prefersStatusBarHidden: Bool { true }
+    override var prefersHomeIndicatorAutoHidden: Bool { true }
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
+        OrientationManager.shared.mask
     }
 }

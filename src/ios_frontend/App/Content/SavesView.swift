@@ -70,12 +70,12 @@ struct SavesView: View {
         }
         .confirmationDialog("Replace the current save with this archive?",
                             isPresented: Binding(get: { pendingImport != nil }, set: { if !$0 { pendingImport = nil } }),
-                            titleVisibility: .visible) {
+                            titleVisibility: .visible, presenting: pendingImport) { url in
             Button("Import", role: .destructive) {
-                if let url = pendingImport { importSave(url) }
+                importSave(url)
                 pendingImport = nil
             }
-        } message: {
+        } message: { _ in
             Text("Export the current save first if you want to keep it.")
         }
         .confirmationDialog("Delete the save data of \(game.title)?", isPresented: $confirmDelete,

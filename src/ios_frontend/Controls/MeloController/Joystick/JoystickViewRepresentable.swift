@@ -19,15 +19,18 @@ struct JoystickViewRepresentable: UIViewRepresentable {
     var deferTaps = false
     /// Only then is `showBackground` written: each write redraws the whole controller.
     var hidesButtons = true
+    var alwaysShowBackground = false
 
     init(controller: any Controller, right: Bool, showBackground: Binding<Bool>,
-         floating: Bool = false, deferTaps: Bool = false, hidesButtons: Bool = true) {
+         floating: Bool = false, deferTaps: Bool = false, hidesButtons: Bool = true,
+         alwaysShowBackground: Bool = false) {
         self.right = right
         self._showBackground = showBackground
         self.controller = controller
         self.floating = floating
         self.deferTaps = deferTaps
         self.hidesButtons = hidesButtons
+        self.alwaysShowBackground = alwaysShowBackground
     }
 
     func makeUIView(context: Context) -> JoystickView {
@@ -48,6 +51,7 @@ struct JoystickViewRepresentable: UIViewRepresentable {
         view.right = right
         view.floating = floating
         view.deferTaps = deferTaps
+        view.background = alwaysShowBackground
 
         view.onPositionChanged = { newPosition in
             controller.joystickMoved(position: newPosition, right: right)

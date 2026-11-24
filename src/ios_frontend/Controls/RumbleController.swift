@@ -15,14 +15,37 @@ final class RumbleController {
     private final class HapticChannel {
         private let engine: CHHapticEngine
         private let eventDuration: TimeInterval
+        private let queue: DispatchQueue
         private var lowPlayer: CHHapticPatternPlayer?
         private var highPlayer: CHHapticPatternPlayer?
         private var running = false
+        private var lastLow: Float = 0
+        private var lastLowHz: Float = 160
+        private var lastHigh: Float = 0
+        private var lastHighHz: Float = 320
+        private var lastMultiplier: Float = 1
 
-        init?(engine: CHHapticEngine?, eventDuration: TimeInterval) {
+        init?(engine: CHHapticEngine?, eventDuration: TimeInterval, queue: DispatchQueue) {
             guard let engine else { return nil }
             self.engine = engine
             self.eventDuration = eventDuration
+            self.queue = queue
+            engine.stoppedHandler = { [weak self] _ in
+                queue.async { [weak self] in
+                    guard let self else { return }
+                    self.running = false
+                    self.lowPlayer = nil
+                    self.highPlayer = nil
+                }
+            }
+            engine.resetHandler = { [weak self] in
+                queue.async { [weak self] in
+                    guard let self else { return }
+                    self.running = false
+                    self.lowPlayer = nil
+                    self.highPlayer = nil
+                }
+            }
         }
 
         private func start() {
@@ -31,6 +54,7 @@ final class RumbleController {
                 try createPlayers()
                 running = true
             } catch {
+                running = false
                 lowPlayer = nil
                 highPlayer = nil
             }
@@ -43,13 +67,18 @@ final class RumbleController {
                 try highPlayer?.stop(atTime: CHHapticTimeImmediate)
                 try engine.start()
                 try createPlayers()
+                try send(low: lastLow, lowHz: lastLowHz, high: lastHigh, highHz: lastHighHz,
+                         multiplier: lastMultiplier)
             } catch {
+                running = false
                 lowPlayer = nil
                 highPlayer = nil
             }
         }
 
         func stop() {
+            lastLow = 0
+            lastHigh = 0
             guard running else { return }
             running = false
             try? lowPlayer?.stop(atTime: CHHapticTimeImmediate)
@@ -60,10 +89,16 @@ final class RumbleController {
         }
 
         func update(low: Float, lowHz: Float, high: Float, highHz: Float, multiplier: Float) {
+            lastLow = low
+            lastLowHz = lowHz
+            lastHigh = high
+            lastHighHz = highHz
+            lastMultiplier = multiplier
             if !running {
                 guard low > 0 || high > 0 else { return }
                 start()
             }
+            guard running else { return }
             do {
                 try send(low: low, lowHz: lowHz, high: high, highHz: highHz, multiplier: multiplier)
             } catch {
@@ -139,16 +174,16 @@ final class RumbleController {
         let localities = haptics.supportedLocalities
         if localities.contains(.leftHandle), localities.contains(.rightHandle) {
             leftChannel = HapticChannel(engine: haptics.createEngine(withLocality: .leftHandle),
-                                        eventDuration: eventDuration)
+                                        eventDuration: eventDuration, queue: queue)
             rightChannel = HapticChannel(engine: haptics.createEngine(withLocality: .rightHandle),
-                                         eventDuration: eventDuration)
+                                         eventDuration: eventDuration, queue: queue)
         }
         if leftChannel == nil || rightChannel == nil {
             leftChannel = nil
             rightChannel = nil
             for locality in [GCHapticsLocality.handles, .default, .all] where localities.contains(locality) {
                 fallbackChannel = HapticChannel(engine: haptics.createEngine(withLocality: locality),
-                                                eventDuration: eventDuration)
+                                                eventDuration: eventDuration, queue: queue)
                 if fallbackChannel != nil { break }
             }
         }
@@ -160,25 +195,37 @@ final class RumbleController {
         guard CHHapticEngine.capabilitiesForHardware().supportsHaptics,
               let engine = try? CHHapticEngine() else { return nil }
         multiplier = deviceMultiplier
-        fallbackChannel = HapticChannel(engine: engine, eventDuration: eventDuration)
+        fallbackChannel = HapticChannel(engine: engine, eventDuration: eventDuration, queue: queue)
         guard fallbackChannel != nil else { return nil }
     }
 
     deinit {
-        restartTimer?.invalidate()
-        leftChannel?.stop()
-        rightChannel?.stop()
-        fallbackChannel?.stop()
+        if let timer = restartTimer {
+            restartTimer = nil
+            if Thread.isMainThread {
+                timer.invalidate()
+            } else {
+                DispatchQueue.main.async { timer.invalidate() }
+            }
+        }
+        let left = leftChannel
+        let right = rightChannel
+        let fallback = fallbackChannel
+        queue.async {
+            left?.stop()
+            right?.stop()
+            fallback?.stop()
+        }
     }
 
     private func scheduleRestarts() {
         guard restartTimer == nil else { return }
         let timer = Timer(timeInterval: eventDuration - 1, repeats: true) { [weak self] _ in
             guard let self, self.enginesOn else { return }
-            self.queue.async {
-                self.leftChannel?.restart()
-                self.rightChannel?.restart()
-                self.fallbackChannel?.restart()
+            self.queue.async { [weak self] in
+                self?.leftChannel?.restart()
+                self?.rightChannel?.restart()
+                self?.fallbackChannel?.restart()
             }
         }
         timer.tolerance = 0.5
@@ -205,32 +252,40 @@ final class RumbleController {
         }
         guard !Self.same(value, last) else { return }
         last = value
-        queue.async { [self] in
-            if let leftChannel, let rightChannel {
+        let mult = multiplier
+        queue.async { [weak self] in
+            guard let self else { return }
+            if let leftChannel = self.leftChannel, let rightChannel = self.rightChannel {
                 leftChannel.update(low: value.left_low, lowHz: value.left_low_hz,
-                                   high: value.left_high, highHz: value.left_high_hz, multiplier: multiplier)
+                                   high: value.left_high, highHz: value.left_high_hz, multiplier: mult)
                 rightChannel.update(low: value.right_low, lowHz: value.right_low_hz,
-                                    high: value.right_high, highHz: value.right_high_hz, multiplier: multiplier)
+                                    high: value.right_high, highHz: value.right_high_hz, multiplier: mult)
             } else {
-                fallbackChannel?.update(
+                self.fallbackChannel?.update(
                     low: max(value.left_low, value.right_low),
                     lowHz: Self.weighted(value.left_low_hz, value.left_low, value.right_low_hz, value.right_low, 160),
                     high: max(value.left_high, value.right_high),
                     highHz: Self.weighted(value.left_high_hz, value.left_high, value.right_high_hz, value.right_high, 320),
-                    multiplier: multiplier)
+                    multiplier: mult)
             }
         }
     }
 
     private func stopEngines() {
-        restartTimer?.invalidate()
-        restartTimer = nil
+        if let timer = restartTimer {
+            restartTimer = nil
+            if Thread.isMainThread {
+                timer.invalidate()
+            } else {
+                DispatchQueue.main.async { timer.invalidate() }
+            }
+        }
         guard enginesOn else { return }
         enginesOn = false
-        queue.async { [self] in
-            leftChannel?.stop()
-            rightChannel?.stop()
-            fallbackChannel?.stop()
+        queue.async { [weak self] in
+            self?.leftChannel?.stop()
+            self?.rightChannel?.stop()
+            self?.fallbackChannel?.stop()
         }
     }
 

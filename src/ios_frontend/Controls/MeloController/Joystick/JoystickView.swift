@@ -86,7 +86,8 @@ struct EditableJoystickView: View {
             JoystickViewRepresentable(controller: controller, right: iscool, showBackground: $showBackground,
                                       floating: layout.joysticks[id]?.floating ?? JoystickLayout.defaultFloating(right: iscool),
                                       deferTaps: overFaceButtons,
-                                      hidesButtons: layout.joysticks[id]?.hide ?? false)
+                                      hidesButtons: layout.joysticks[id]?.hide ?? false,
+                                      alwaysShowBackground: layout.joysticks[id]?.background ?? false)
                 .frame(width: 160, height: 160)
                 .scaleEffect((layout.joysticks[id]?.scale ?? 1.0) * controllerScale)
                 .offset(layout.joysticks[id]?.offset ?? .zero)

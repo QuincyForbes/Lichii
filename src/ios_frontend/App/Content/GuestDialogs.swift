@@ -120,8 +120,8 @@ enum GuestDialogs {
             field.clearButtonMode = .whileEditing
         }
         let okTitle = (request.okText?.isEmpty == false) ? request.okText! : "OK"
-        let ok = UIAlertAction(title: okTitle, style: .default) { _ in
-            var text = alert.textFields?.first?.text ?? ""
+        let ok = UIAlertAction(title: okTitle, style: .default) { [weak alert] _ in
+            var text = alert?.textFields?.first?.text ?? ""
             if maxLength > 0, text.count > maxLength {
                 text = String(text.prefix(maxLength))
             }
@@ -133,9 +133,9 @@ enum GuestDialogs {
                 respond(id, accepted: false, text: nil)
             })
         }
-        let validate = {
-            let count = alert.textFields?.first?.text?.count ?? 0
-            ok.isEnabled = count >= minLength && (maxLength == 0 || count <= maxLength)
+        let validate: () -> Void = { [weak alert, weak ok] in
+            let count = alert?.textFields?.first?.text?.count ?? 0
+            ok?.isEnabled = count >= minLength && (maxLength == 0 || count <= maxLength)
         }
         validate()
         if let field = alert.textFields?.first {
@@ -161,9 +161,31 @@ enum GuestDialogs {
         present(alert, id: id)
     }
 
-    private static func present(_ alert: UIAlertController, id: UInt64) {
+    private static func present(_ alert: UIAlertController, id: UInt64, attempt: Int = 0) {
         guard let presenter = topViewController() else {
             // Nothing on screen to present from: give the game its default answer.
+            respond(id, accepted: true, text: alert.textFields?.first?.text)
+            return
+        }
+        // If the presenter is currently dismissing or presenting another controller, UIKit would
+        // silently drop this alert and hang the waiting guest applet. Wait for the transition.
+        if presenter.presentedViewController != nil || presenter.isBeingPresented || presenter.isBeingDismissed {
+            if let coordinator = presenter.transitionCoordinator {
+                coordinator.animate(alongsideTransition: nil) { _ in
+                    MainActor.assumeIsolated {
+                        present(alert, id: id, attempt: attempt + 1)
+                    }
+                }
+                return
+            }
+            if attempt < 20 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    MainActor.assumeIsolated {
+                        present(alert, id: id, attempt: attempt + 1)
+                    }
+                }
+                return
+            }
             respond(id, accepted: true, text: alert.textFields?.first?.text)
             return
         }
