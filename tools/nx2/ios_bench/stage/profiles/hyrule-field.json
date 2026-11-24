@@ -4,7 +4,7 @@
   "save": {"name": "hyrule-field", "slot": 5, "restore_owner_save": true},
   "experiments": [],
   "env": {},
-  "settings": {},
+  "settings": {"cpu_backend": "0"},
   "jit": {"provider": "stikdebug", "timeout_s": 180},
   "thermal": {"max_state": 1, "wait_s": 600},
   "boot_timeout_s": 600,
