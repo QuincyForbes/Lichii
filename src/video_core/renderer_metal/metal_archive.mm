@@ -276,12 +276,10 @@ bool PipelineArchive::Open(const Device& device, const std::filesystem::path& pa
             shard.mapped_data = mapped;
             shard.path = shard_path;
             shard.has_data = true;
-            // Allow appending to the final small shard (< 4 MiB); seal older shards so they are
-            // never rewritten.
-            if (!impl->shards.empty()) {
-                impl->shards.back().sealed = true;
-            }
-            shard.sealed = fsize >= SealedShardFileBytes;
+            // Treat every pre-loaded shard as sealed so MTLBinaryArchive never overwrites a file
+            // it opened with descriptor.url (in-place serializeToURL on an opened shard SIGSEGV'd
+            // inside Metal on iOS 26 during shutdown). New pipelines always go into a fresh shard.
+            shard.sealed = true;
             impl->shards.push_back(std::move(shard));
             total_loaded_bytes += fsize;
             ++loaded_shards;
@@ -331,10 +329,26 @@ void PipelineArchive::Save() {
             }
             NSError* error = nil;
             shard.mapped_data = nil;
-            if (![shard.archive serializeToURL:shard.url error:&error]) {
+            // Serialize to a temporary sibling file and atomically rename so Metal never truncates
+            // or corrupts an existing archive file while another mapping/handle references it.
+            std::filesystem::path tmp_path = shard.path;
+            tmp_path += ".tmp";
+            const std::string tmp_utf8 = tmp_path.string();
+            NSURL* const tmp_url =
+                [NSURL fileURLWithPath:[NSString stringWithUTF8String:tmp_utf8.c_str()]];
+            if (![shard.archive serializeToURL:tmp_url error:&error]) {
+                std::filesystem::remove(tmp_path, ec);
                 LOG_WARNING(Render_Metal, "Metal: archive shard {} not written: {}",
                             shard.path.string(),
                             error != nil ? error.localizedDescription.UTF8String : "no reason");
+                continue;
+            }
+            std::error_code rename_ec;
+            std::filesystem::rename(tmp_path, shard.path, rename_ec);
+            if (rename_ec) {
+                std::filesystem::remove(tmp_path, ec);
+                LOG_WARNING(Render_Metal, "Metal: archive shard {} rename failed: {}",
+                            shard.path.string(), rename_ec.message());
                 continue;
             }
             shard.mapped_data = [NSData dataWithContentsOfURL:shard.url

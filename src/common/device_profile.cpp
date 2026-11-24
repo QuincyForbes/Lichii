@@ -292,6 +292,13 @@ void RecommendApple(const Device& device, Profile& p) {
          "Texture upload scratch over 16 MiB is freed at the next frame instead of kept for up to "
          "256 frames: two 64 MiB malloc blocks in Kokiri (iPhone18,2 malloc census); a large "
          "texture allocates it again."});
+    if (p.tier == Tier::High || p.tier == Tier::Ultra) {
+        p.tuning.push_back(
+            {"EDEN_NX2_STAGING_SUBMIT_MIB", "48", "48 MiB",
+             "Raises the mid-frame staging commit threshold from 24 to 48 MiB on 12+ GB devices: "
+             "Hyrule Field uploads ~25-30 MiB/frame and otherwise forced an extra early command "
+             "buffer commit on every single frame (255/255 frames on iPhone18,2)."});
+    }
     p.tuning.push_back(
         {"EDEN_NX2_TQ_ARRAYS", "1", "on",
          "Texture quality also reduces array textures: Ocarina of Time's two 90-layer terrain "
