@@ -2326,6 +2326,21 @@ void Device::ReleaseCustomBorderColorSamplers(size_t count) const {
 }
 
 u64 Device::GetDeviceMemoryUsage() const {
+    // Mvii7/Dozer#88: cache the driver memory-budget query for 50 ms (EDEN_NX2_MEMORY_QUERY_MS=0
+    // queries every call) to avoid repeated kernel driver queries on every frame/allocation.
+    static const s64 query_ns = [] {
+        const char* value = std::getenv("EDEN_NX2_MEMORY_QUERY_MS");
+        return (value != nullptr ? std::strtoll(value, nullptr, 10) : s64{50}) * 1'000'000;
+    }();
+    const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    if (query_ns > 0) {
+        const s64 queried_ns = memory_usage_queried_ns.load(std::memory_order_acquire);
+        if (queried_ns != 0 && now_ns - queried_ns < query_ns) {
+            return memory_usage.load(std::memory_order_relaxed);
+        }
+    }
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
     physical.GetMemoryProperties(&budget);
@@ -2337,6 +2352,8 @@ u64 Device::GetDeviceMemoryUsage() const {
     for (const size_t heap : valid_heap_memory) {
         result += AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
     }
+    memory_usage.store(result, std::memory_order_relaxed);
+    memory_usage_queried_ns.store(now_ns, std::memory_order_release);
     return result;
 }
 

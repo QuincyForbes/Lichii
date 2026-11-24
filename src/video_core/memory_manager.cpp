@@ -19,6 +19,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_zero_check.h"
 #include "common/nx2_poll.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_page_table.h"
@@ -746,6 +747,63 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
         MemoryOperation(base, copy_amount, false, mapped_normal, set_to_zero, set_to_zero);
     };
     MemoryOperation(gpu_src_addr, size, true, mapped_big, set_to_zero, read_short_pages);
+}
+
+bool MemoryManager::IsZeroUnsafe(GPUVAddr gpu_addr, std::size_t size) const {
+    if (size == 0 || !IsWithinGPUAddressRange(gpu_addr) || size > address_space_size - gpu_addr) {
+        return true;
+    }
+    // Most non-zero images show it in their first bytes: bail before walking page tables.
+    std::array<u8, 256> head;
+    const std::size_t head_size = std::min(size, head.size());
+    ReadBlockUnsafe(gpu_addr, head.data(), head_size);
+    if (!Common::IsAllZero(head.data(), head_size)) {
+        return false;
+    }
+    if (size <= head_size) {
+        return true;
+    }
+    bool zero = true;
+    std::vector<u8> scratch;
+    auto reads_zero = [](std::size_t, std::size_t, std::size_t) {};
+    auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t amount) {
+        if (!zero) {
+            return;
+        }
+        const u32 page_frame = AtomicLoad(page_table[page_index], std::memory_order_relaxed);
+        const DAddr dev_addr = (DAddr(page_frame) << cpu_page_bits) + offset;
+        if (const u8* physical = memory.GetPointer<u8>(dev_addr)) [[likely]] {
+            zero = Common::IsAllZero(physical, amount);
+        }
+    };
+    auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t amount) {
+        if (!zero) {
+            return;
+        }
+        const DAddr dev_addr = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
+        u8* const physical =
+            IsBigPageContinuous(page_index) ? memory.GetPointer<u8>(dev_addr) : nullptr;
+        if (physical != nullptr) [[likely]] {
+            zero = Common::IsAllZero(physical, amount);
+        } else {
+            scratch.resize(amount);
+            memory.ReadBlockUnsafe(dev_addr, scratch.data(), amount);
+            zero = Common::IsAllZero(scratch.data(), amount);
+        }
+    };
+    if (!has_big_pages) {
+        MemoryOperation(gpu_addr, size, false, mapped_normal, reads_zero, reads_zero);
+        return zero;
+    }
+    auto short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t amount) {
+        if (!zero) {
+            return;
+        }
+        const GPUVAddr base = (page_index << big_page_bits) + offset;
+        MemoryOperation(base, amount, false, mapped_normal, reads_zero, reads_zero);
+    };
+    MemoryOperation(gpu_addr, size, true, mapped_big, reads_zero, short_pages);
+    return zero;
 }
 
 void MemoryManager::ReadBlock(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which) const {

@@ -862,14 +862,18 @@ bool IsValidEntry(const Tegra::MemoryManager& gpu_memory, const TICEntry& config
 boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
     std::span<const u8> input, std::span<u8> output, Tegra::Texture::UnswizzleWorker* worker) {
-    const size_t guest_size_bytes = input.size_bytes();
+    const bool layout_only = output.empty();
+    const size_t guest_size_bytes =
+        layout_only ? CalculateGuestSizeInBytes(info) : input.size_bytes();
     const u32 bpp_log2 = BytesPerBlockLog2(info.format);
     const Extent2D tile_size = DefaultBlockSize(info.format);
     const Extent3D size = info.size;
 
     if (info.type == ImageType::Linear) {
-        ASSERT(output.size_bytes() >= guest_size_bytes);
-        gpu_memory.ReadBlockUnsafe(gpu_addr, output.data(), guest_size_bytes);
+        if (!layout_only) {
+            ASSERT(output.size_bytes() >= guest_size_bytes);
+            gpu_memory.ReadBlockUnsafe(gpu_addr, output.data(), guest_size_bytes);
+        }
 
         ASSERT((info.pitch >> bpp_log2) << bpp_log2 == info.pitch);
         return {{
@@ -924,6 +928,11 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
         size_t guest_layer_offset = 0;
 
         for (s32 layer = 0; layer < info.resources.layers; ++layer) {
+            if (layout_only) {
+                guest_layer_offset += layer_stride;
+                host_offset += host_bytes_per_layer;
+                continue;
+            }
             // Guest data shorter than the layout says (unmapped tail, a layout guessed for the
             // memory): what lies past it stays as it is rather than being read out of bounds.
             const size_t src_begin = guest_offset + guest_layer_offset;

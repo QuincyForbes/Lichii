@@ -70,7 +70,7 @@ public:
         std::scoped_lock lk{mutex};
         NoteRemaps(gpu_address, cpu_address, size);
         TrimMappings(gpu_address, size);
-        mappings.push_back({gpu_address, cpu_address, size, handle, offset});
+        mappings.emplace(gpu_address, Mapping{gpu_address, cpu_address, size, handle, offset});
         for (auto& [owner, listener] : listeners) {
             listener.map(gpu_address, cpu_address, size);
         }
@@ -152,7 +152,7 @@ public:
                      ReleaseListener release_listener = {}, SparseListener sparse_listener = {},
                      BackListener back_listener = {}, TileListener tile_listener = {}) {
         std::scoped_lock lk{mutex};
-        for (const auto& m : mappings) {
+        for (const auto& [addr, m] : mappings) {
             listener(m.gpu_address, m.cpu_address, m.size);
         }
         if (sparse_listener) {
@@ -247,10 +247,13 @@ public:
 
     std::optional<u64> GpuAddressOf(u32 handle, u64 offset) {
         std::scoped_lock lk{mutex};
+        if (handle == 0) {
+            return std::nullopt;
+        }
         for (auto it = mappings.rbegin(); it != mappings.rend(); ++it) {
-            if (handle != 0 && it->handle == handle && offset >= it->offset &&
-                offset - it->offset < it->size) {
-                return it->gpu_address + (offset - it->offset);
+            const Mapping& m = it->second;
+            if (m.handle == handle && offset >= m.offset && offset - m.offset < m.size) {
+                return m.gpu_address + (offset - m.offset);
             }
         }
         return std::nullopt;
@@ -260,11 +263,13 @@ public:
         std::optional<u64> cpu_address;
         {
             std::scoped_lock lk{mutex};
-            for (const auto& mapping : mappings) {
+            auto it = mappings.upper_bound(gpu_address);
+            if (it != mappings.begin()) {
+                --it;
+                const Mapping& mapping = it->second;
                 if (gpu_address >= mapping.gpu_address &&
                     gpu_address - mapping.gpu_address < mapping.size) {
                     cpu_address = mapping.cpu_address + (gpu_address - mapping.gpu_address);
-                    break;
                 }
             }
         }
@@ -309,8 +314,19 @@ private:
     // now show other memory: noted for queued command lists (Nx2CommandMemoryReleases). The same
     // mapping made again changes nothing.
     void NoteRemaps(u64 gpu_address, u64 cpu_address, u64 size) {
+        if (size == 0 || mappings.empty()) {
+            return;
+        }
         const u64 end = gpu_address + size;
-        for (const auto& m : mappings) {
+        auto it = mappings.lower_bound(gpu_address);
+        if (it != mappings.begin()) {
+            auto prev = std::prev(it);
+            if (prev->second.gpu_address + prev->second.size > gpu_address) {
+                it = prev;
+            }
+        }
+        for (; it != mappings.end() && it->first < end; ++it) {
+            const Mapping& m = it->second;
             const u64 start = std::max(m.gpu_address, gpu_address);
             const u64 stop = std::min(m.gpu_address + m.size, end);
             if (start < stop && m.cpu_address + (start - m.gpu_address) !=
@@ -322,29 +338,39 @@ private:
 
     // Drops [gpu_address, +size) from the recorded mappings, keeping the parts outside it.
     void TrimMappings(u64 gpu_address, u64 size) {
+        if (size == 0 || mappings.empty()) {
+            return;
+        }
         const u64 end = gpu_address + size;
-        std::vector<Mapping> kept;
-        kept.reserve(mappings.size() + 1);
-        for (const auto& m : mappings) {
-            const u64 m_end = m.gpu_address + m.size;
-            if (m_end <= gpu_address || m.gpu_address >= end) {
-                kept.push_back(m);
-                continue;
-            }
-            if (m.gpu_address < gpu_address) {
-                kept.push_back({m.gpu_address, m.cpu_address, gpu_address - m.gpu_address,
-                                m.handle, m.offset});
-            }
-            if (m_end > end) {
-                kept.push_back({end, m.cpu_address + (end - m.gpu_address), m_end - end,
-                                m.handle, m.offset + (end - m.gpu_address)});
+        auto it = mappings.lower_bound(gpu_address);
+        if (it != mappings.begin()) {
+            auto prev = std::prev(it);
+            if (prev->second.gpu_address + prev->second.size > gpu_address) {
+                it = prev;
             }
         }
-        mappings = std::move(kept);
+        std::vector<Mapping> tail_pieces;
+        while (it != mappings.end() && it->first < end) {
+            const Mapping m = it->second;
+            const u64 m_end = m.gpu_address + m.size;
+            if (m.gpu_address < gpu_address) {
+                it->second.size = gpu_address - m.gpu_address;
+                ++it;
+            } else {
+                it = mappings.erase(it);
+            }
+            if (m_end > end) {
+                tail_pieces.push_back({end, m.cpu_address + (end - m.gpu_address), m_end - end,
+                                       m.handle, m.offset + (end - m.gpu_address)});
+            }
+        }
+        for (const auto& piece : tail_pieces) {
+            mappings.emplace(piece.gpu_address, piece);
+        }
     }
 
     std::mutex mutex;
-    std::vector<Mapping> mappings;
+    std::map<u64, Mapping> mappings; ///< Non-overlapping mappings keyed by gpu_address
     std::map<u64, u64> sparse_regions; ///< GPU address -> size
     std::map<const void*, Listeners> listeners;
 };

@@ -88,6 +88,7 @@ add_library(
     nx2_address_wait.cpp
     nx2_address_wait.h
     nx2_poll.h
+    nx2_zero_check.h
     frame_deadline.cpp
     frame_deadline.h
     dynamic_library.cpp

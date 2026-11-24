@@ -5078,6 +5078,25 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         return;
     }
 
+    // Mvii7/Dozer#90: new render targets over all-zero guest memory unswizzle to zeros, so skip
+    // copying and CPU unswizzling when the guest range is all zero (EDEN_NX2_ZERO_UPLOAD=0 disables).
+    static const bool zero_upload_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_ZERO_UPLOAD");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (False(image.flags & ImageFlagBits::Converted) && zero_upload_enabled &&
+        image.guest_size_bytes > 0 && gpu_memory->IsZeroUnsafe(gpu_addr, image.guest_size_bytes)) {
+        const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, {}, {});
+        if (!copies.empty()) {
+            const size_t zero_bytes = copies.back().buffer_offset + copies.back().buffer_size;
+            if (zero_bytes <= mapped_span.size_bytes()) {
+                std::memset(mapped_span.data(), 0, zero_bytes);
+                image.UploadMemory(staging, copies);
+                return;
+            }
+        }
+    }
+
     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(
         *gpu_memory, gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
     if (True(image.flags & ImageFlagBits::Converted)) {
