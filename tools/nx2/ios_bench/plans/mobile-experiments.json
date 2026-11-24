@@ -1,0 +1,15 @@
+{
+  "name": "mobile-experiments",
+  "base_profile": "hyrule-field",
+  "repeats": 1,
+  "cool_between_s": 90,
+  "runs": [
+    {"label": "baseline", "experiments": []},
+    {"label": "guest_cores_first", "experiments": ["guest_cores_first"]},
+    {"label": "poll_yield", "experiments": ["poll_yield"]},
+    {"label": "nup_in_memory", "experiments": ["nup_in_memory"]},
+    {"label": "metal_temporal_off", "experiments": ["metal_temporal_off"]},
+    {"label": "oot_game_upscale", "experiments": ["oot_game_upscale"]},
+    {"label": "metal_pace_arrival", "experiments": ["metal_pace_arrival"]}
+  ]
+}

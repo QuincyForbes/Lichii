@@ -8,6 +8,7 @@
 #import <UIKit/UIKit.h>
 
 #include <algorithm>
+#include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -15,8 +16,10 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
+#include <ifaddrs.h>
 #include <mach/mach.h>
 #include <mutex>
+#include <net/if.h>
 #include <os/proc.h>
 #include <string>
 #include <sys/mman.h>
@@ -509,6 +512,42 @@ uint64_t lichii_platform_footprint_mib(void) {
 
 int lichii_platform_max_fps(void) {
     return g_info.max_fps;
+}
+
+void lichii_platform_local_ip(char* out, size_t out_size) {
+    if (out == nullptr || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    struct ifaddrs* ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) != 0 || ifaddr == nullptr) {
+        return;
+    }
+    char fallback[INET_ADDRSTRLEN] = {};
+    for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+        if ((ifa->ifa_flags & IFF_UP) == 0 || (ifa->ifa_flags & IFF_LOOPBACK) != 0) {
+            continue;
+        }
+        char buf[INET_ADDRSTRLEN] = {};
+        const auto* sin = reinterpret_cast<const struct sockaddr_in*>(ifa->ifa_addr);
+        if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) == nullptr) {
+            continue;
+        }
+        if (ifa->ifa_name != nullptr && std::strcmp(ifa->ifa_name, "en0") == 0) {
+            std::snprintf(out, out_size, "%s", buf);
+            break;
+        }
+        if (fallback[0] == '\0') {
+            std::snprintf(fallback, sizeof(fallback), "%s", buf);
+        }
+    }
+    freeifaddrs(ifaddr);
+    if (out[0] == '\0' && fallback[0] != '\0') {
+        std::snprintf(out, out_size, "%s", fallback);
+    }
 }
 
 } // extern "C"

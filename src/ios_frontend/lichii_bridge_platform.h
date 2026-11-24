@@ -216,6 +216,12 @@ int lichii_platform_file_guest_storage(LichiiFileGuestStorage* out);
 /// Writes "iOS app: <message>" to the log (HW_Memory, Info): app-side memory decisions.
 void lichii_platform_log_memory(const char* message);
 
+/// Opt-in LAN debug server (0.0.0.0:6545) for live Mac/AI inspection over Wi-Fi.
+int lichii_platform_debug_server(void);
+void lichii_platform_set_debug_server(int enabled);
+/// Writes the device's local Wi-Fi IPv4 address (e.g. "192.168.1.42") into `out`, or "" if none.
+void lichii_platform_local_ip(char* out, size_t out_size);
+
 #ifdef __cplusplus
 }
 #endif

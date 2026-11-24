@@ -304,6 +304,32 @@ final class PlatformCenter: ObservableObject {
         experimentsRevision += 1
     }
 
+    var debugServerEnabled: Bool {
+        get { lichii_platform_debug_server() != 0 }
+        set {
+            lichii_platform_set_debug_server(newValue ? 1 : 0)
+            experimentsRevision += 1
+        }
+    }
+
+    var localIpAddress: String {
+        var buffer = [CChar](repeating: 0, count: 64)
+        buffer.withUnsafeMutableBufferPointer { buf in
+            lichii_platform_local_ip(buf.baseAddress, buf.count)
+        }
+        return String(cString: buffer)
+    }
+
+    /// Resets every developer/bisect experiment switch while keeping user-facing settings intact.
+    func resetDeveloperExperiments(keeping userIds: Set<String>) {
+        for entry in UiText.allExperiments where !userIds.contains(entry.id) && entry.id != "file_guest" {
+            if isExperimentEnabled(entry.id) {
+                entry.id.withCString { lichii_platform_set_experiment($0, 0) }
+            }
+        }
+        experimentsRevision += 1
+    }
+
     func experimentAvailability(_ id: String) -> ExperimentAvailability {
         var buffer = [CChar](repeating: 0, count: 256)
         let state = id.withCString { name in

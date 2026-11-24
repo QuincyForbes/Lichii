@@ -93,7 +93,13 @@ std::optional<Endpoint> ParseEndpoint(std::string_view text, std::string& error)
     if (host == "localhost") {
         host = "127.0.0.1";
     }
-    if (host != "127.0.0.1" && host != "::1") {
+    const bool lan_allowed = [] {
+        const char* const value = std::getenv("EDEN_NX2_DEBUG_SERVER_LAN");
+        return value != nullptr && value[0] == '1';
+    }();
+    const bool is_loopback = host == "127.0.0.1" || host == "::1";
+    const bool is_lan_any = lan_allowed && (host == "0.0.0.0" || host == "::");
+    if (!is_loopback && !is_lan_any) {
         error = fmt::format("host {} is not loopback; only 127.0.0.1, ::1 and localhost are allowed",
                             host);
         return std::nullopt;

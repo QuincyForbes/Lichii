@@ -1,0 +1,16 @@
+{
+  "note": "Boots Ocarina of Time from title screen into the newest Hyrule Field autosave (slot_05).",
+  "steps": [
+    {"wait_running": true},
+    {"wait_quiet_s": 4},
+    {"wait_s": 4},
+    {"press": "A", "hold_ms": 150, "after_ms": 2000},
+    {"press": "A", "hold_ms": 150, "after_ms": 2000},
+    {"press": "A", "hold_ms": 150, "after_ms": 2000},
+    {"press": "A", "hold_ms": 150, "after_ms": 2000},
+    {"press": "A", "hold_ms": 150, "after_ms": 2000},
+    {"wait_s": 15},
+    {"wait_quiet_s": 6},
+    {"mark": "hyrule_field"}
+  ]
+}

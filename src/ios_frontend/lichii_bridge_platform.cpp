@@ -332,6 +332,11 @@ void ApplyCpuExperiments() {
 }
 
 void ApplyExperiments() {
+    if (lichii_platform_experiment("lan_debug_server")) {
+        setenv("EDEN_NX2_DEBUG_SERVER_LAN", "1", 1);
+        setenv("EDEN_NX2_DEBUG_SERVER", "0.0.0.0:6545", 0);
+        LOG_WARNING(Frontend, "iOS: live debug server enabled on 0.0.0.0:6545");
+    }
     if (lichii_platform_experiment("untagged_guest")) {
         setenv("LICHII_IOS_UNTAGGED_GUEST", "1", 0);
         LOG_WARNING(Frontend, "iOS: experiment untagged_guest on");
@@ -1094,6 +1099,24 @@ void lichii_platform_log_memory(const char* message) {
     if (message != nullptr) {
         LOG_INFO(HW_Memory, "iOS app: {}", message);
     }
+}
+
+int lichii_platform_debug_server(void) {
+    return lichii_platform_experiment("lan_debug_server");
+}
+
+void lichii_platform_set_debug_server(int enabled) {
+    const bool on = enabled != 0;
+    LichiiPlatform::SetExperimentFile("lan_debug_server", on);
+    if (on) {
+        setenv("EDEN_NX2_DEBUG_SERVER_LAN", "1", 1);
+        setenv("EDEN_NX2_DEBUG_SERVER", "0.0.0.0:6545", 1);
+    } else {
+        unsetenv("EDEN_NX2_DEBUG_SERVER_LAN");
+        unsetenv("EDEN_NX2_DEBUG_SERVER");
+    }
+    LOG_INFO(Frontend, "iOS: live debug server turned {} (from the next game start)",
+             on ? "on" : "off");
 }
 
 } // extern "C"
