@@ -332,7 +332,8 @@ void ApplyCpuExperiments() {
 }
 
 void ApplyExperiments() {
-    if (lichii_platform_experiment("lan_debug_server")) {
+    if (Common::FS::Exists(Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) /
+                           "experiments" / "lan_debug_server")) {
         setenv("EDEN_NX2_DEBUG_SERVER_LAN", "1", 1);
         setenv("EDEN_NX2_DEBUG_SERVER", "0.0.0.0:6545", 0);
         LOG_WARNING(Frontend, "iOS: live debug server enabled on 0.0.0.0:6545");
@@ -1102,7 +1103,10 @@ void lichii_platform_log_memory(const char* message) {
 }
 
 int lichii_platform_debug_server(void) {
-    return lichii_platform_experiment("lan_debug_server");
+    return Common::FS::Exists(Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) /
+                              "experiments" / "lan_debug_server")
+               ? 1
+               : 0;
 }
 
 void lichii_platform_set_debug_server(int enabled) {

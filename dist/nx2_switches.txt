@@ -27,6 +27,10 @@ EDEN_NX2_FENCE_BATCH=1
 # Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
 #EDEN_NX2_RESETFIX=0
 
+# Live JSON-RPC debug server (default loopback 127.0.0.1:6545; set _LAN=1 to allow 0.0.0.0:6545 on Wi-Fi).
+#EDEN_NX2_DEBUG_SERVER=127.0.0.1:6545
+#EDEN_NX2_DEBUG_SERVER_LAN=1
+
 # Drop reactive-flushing read traps on Switch 2 programs (opt-in; can reduce FPS from 29 to 24 in MKW).
 #EDEN_NX2_NO_REACTIVE=1
 
