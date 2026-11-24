@@ -1630,19 +1630,27 @@ void FastmemEmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::In
     ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, value_idx, use_fpr, ordered, live_caller_save, inline_save, use_pt_fallback, bounds_miss, fallback, end, fastmem_location] {
         if (use_pt_fallback) {
             code.l(*bounds_miss);
-            const bool use_cross_page = CanInlineCrossPage<bitsize>(ctx, ordered);
-            SharedLabel cross_page = use_cross_page ? GenSharedLabel() : SharedLabel{};
-            UntrappedCachedReadLabels pt_cached;
-            const auto [Xpt_base, Xpt_offset] = InlinePageTableEmitVAddrLookup<bitsize>(
-                code, ctx, Xaddr, fallback, true, &pt_cached, use_cross_page ? &cross_page : nullptr);
-            EmitMemoryLdr<bitsize>(code, value_idx, Xpt_base, Xpt_offset, ordered, false, use_fpr);
-            code.B(*end);
-            EmitUntrappedCachedReadCheck(code, ctx, Xaddr, pt_cached, fallback);
-            if (use_cross_page) {
-                code.l(*cross_page);
-                EmitCrossPageContiguousLookup<bitsize>(code, ctx, Xaddr, fallback);
-                EmitMemoryLdr<bitsize>(code, value_idx, Xscratch0, Xaddr, ordered, false, use_fpr);
+            if (ctx.conf.page_table_lookup_calls) {
+                code.MOV(Xscratch0, Xaddr);
+                EmitRelocation(code, ctx, PageTableReadLookupLinkTarget(bitsize));
+                code.CBZ(Xscratch0, *fallback);
+                EmitLoadAt<bitsize>(code, value_idx, Xscratch0, ordered, use_fpr);
                 code.B(*end);
+            } else {
+                const bool use_cross_page = CanInlineCrossPage<bitsize>(ctx, ordered);
+                SharedLabel cross_page = use_cross_page ? GenSharedLabel() : SharedLabel{};
+                UntrappedCachedReadLabels pt_cached;
+                const auto [Xpt_base, Xpt_offset] = InlinePageTableEmitVAddrLookup<bitsize>(
+                    code, ctx, Xaddr, fallback, true, &pt_cached, use_cross_page ? &cross_page : nullptr);
+                EmitMemoryLdr<bitsize>(code, value_idx, Xpt_base, Xpt_offset, ordered, false, use_fpr);
+                code.B(*end);
+                EmitUntrappedCachedReadCheck(code, ctx, Xaddr, pt_cached, fallback);
+                if (use_cross_page) {
+                    code.l(*cross_page);
+                    EmitCrossPageContiguousLookup<bitsize>(code, ctx, Xaddr, fallback);
+                    EmitMemoryLdr<bitsize>(code, value_idx, Xscratch0, Xaddr, ordered, false, use_fpr);
+                    code.B(*end);
+                }
             }
         }
 
@@ -1834,26 +1842,34 @@ void FastmemEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::I
     ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, value_idx, use_fpr, ordered, live_caller_save, inline_save, use_pt_fallback, bounds_miss, fallback, end, fastmem_location] {
         if (use_pt_fallback) {
             code.l(*bounds_miss);
-            const bool use_cross_page = CanInlineCrossPage<bitsize>(ctx, ordered);
-            const auto hot_write = CanEmitHotCachedWrite<bitsize>(ctx, ordered)
-                                       ? FindJitHotWrite(ctx.conf.tpidrro_el0)
-                                       : std::nullopt;
-            SharedLabel cross_page = use_cross_page ? GenSharedLabel() : SharedLabel{};
-            SharedLabel marked_write;
-            const auto [Xpt_base, Xpt_offset] = InlinePageTableEmitVAddrLookup<bitsize>(
-                code, ctx, Xaddr, fallback, true, nullptr, use_cross_page ? &cross_page : nullptr,
-                true, hot_write ? &marked_write : nullptr);
-            EmitMemoryStr<bitsize>(code, value_idx, Xpt_base, Xpt_offset, ordered, false, use_fpr);
-            code.B(*end);
-            if (hot_write) {
-                EmitHotCachedWriteCheck<bitsize>(code, ctx, Xaddr, value_idx, use_fpr, live_caller_save,
-                                                 *hot_write, marked_write, SharedLabel{}, fallback, end, false);
-            }
-            if (use_cross_page) {
-                code.l(*cross_page);
-                EmitCrossPageContiguousLookup<bitsize>(code, ctx, Xaddr, fallback);
-                EmitMemoryStr<bitsize>(code, value_idx, Xscratch0, Xaddr, ordered, false, use_fpr);
+            if (ctx.conf.page_table_lookup_calls) {
+                code.MOV(Xscratch0, Xaddr);
+                EmitRelocation(code, ctx, PageTableLookupLinkTarget(bitsize));
+                code.CBZ(Xscratch0, *fallback);
+                EmitStoreAt<bitsize>(code, value_idx, Xscratch0, ordered, use_fpr);
                 code.B(*end);
+            } else {
+                const bool use_cross_page = CanInlineCrossPage<bitsize>(ctx, ordered);
+                const auto hot_write = CanEmitHotCachedWrite<bitsize>(ctx, ordered)
+                                           ? FindJitHotWrite(ctx.conf.tpidrro_el0)
+                                           : std::nullopt;
+                SharedLabel cross_page = use_cross_page ? GenSharedLabel() : SharedLabel{};
+                SharedLabel marked_write;
+                const auto [Xpt_base, Xpt_offset] = InlinePageTableEmitVAddrLookup<bitsize>(
+                    code, ctx, Xaddr, fallback, true, nullptr, use_cross_page ? &cross_page : nullptr,
+                    true, hot_write ? &marked_write : nullptr);
+                EmitMemoryStr<bitsize>(code, value_idx, Xpt_base, Xpt_offset, ordered, false, use_fpr);
+                code.B(*end);
+                if (hot_write) {
+                    EmitHotCachedWriteCheck<bitsize>(code, ctx, Xaddr, value_idx, use_fpr, live_caller_save,
+                                                     *hot_write, marked_write, SharedLabel{}, fallback, end, false);
+                }
+                if (use_cross_page) {
+                    code.l(*cross_page);
+                    EmitCrossPageContiguousLookup<bitsize>(code, ctx, Xaddr, fallback);
+                    EmitMemoryStr<bitsize>(code, value_idx, Xscratch0, Xaddr, ordered, false, use_fpr);
+                    code.B(*end);
+                }
             }
         }
 

@@ -1636,7 +1636,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // left ~85,000 accesses a second past the arena.
     static const char* const pt_fallback = std::getenv("EDEN_NX2_JIT_PT_FALLBACK");
     // Only with that layout: the alias region (the busiest one past the heap) starting inside the
-    // arena.
+    // arena. When alias lies above a 16 GiB fastmem arena, inline_page_table_fallback stays on
+    // and uses the compact 20-byte shared page_table_lookup_calls thunk instead of 30M/s C++
+    // callbacks or the 128-byte inline walk.
     const auto& kernel_table = m_cb->m_process->GetPageTable().GetBasePageTable();
     const bool alias_in_arena =
         config.fastmem_pointer &&

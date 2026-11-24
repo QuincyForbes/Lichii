@@ -64,9 +64,9 @@ TEST_CASE("iPhone 17 Pro Max gets the phone profile", "[device_profile]") {
     CHECK(Value(profile, "guest_memory_file") == "On");
     CHECK(Value(profile, "auto_cool") == "On");
     CHECK(Value(profile, "guest_wait_backoff") == "On");
-    CHECK(profile.jit_cache_mib == 64);
+    CHECK(profile.jit_cache_mib == 96);
     CHECK_FALSE(profile.jit_cache_reason.empty());
-    CHECK(profile.jit_evict_mib == 8);
+    CHECK(profile.jit_evict_mib == 12);
     CHECK(profile.jit_fault_block_after == 2);
     CHECK(profile.helper_qos);
     // Every value has its reason.

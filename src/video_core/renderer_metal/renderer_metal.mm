@@ -826,7 +826,9 @@ bool RendererMetal::Impl::DrawLayers(std::span<const Tegra::FramebufferConfig> f
                 spatial_upscaled = true;
             }
         }
-        if (passes_enabled && !spatial_upscaled && PresentPasses::HasWindowShader(filter) &&
+        const bool one_to_one = src_width == screen_width && src_height == screen_height;
+        if (passes_enabled && !spatial_upscaled && !one_to_one &&
+            PresentPasses::HasWindowShader(filter) &&
             present.DrawWindow(
                 passes_source, filter, target, target_format,
                 {layout.width, layout.height},

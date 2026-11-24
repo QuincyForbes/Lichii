@@ -320,10 +320,10 @@ u32 AsyncPipelineThreads() {
         }
         const u32 hardware = (std::max)(std::thread::hardware_concurrency(), 2U) - 1;
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-        // iOS shares 2 performance cores and 4 efficiency cores plus an out-of-process
-        // MTLCompilerService XPC daemon; 3 background builders keep shader pop-in fast without
-        // causing the 5-worker XPC/VA spikes seen earlier.
-        const u32 automatic = (std::min)(hardware, 3U);
+        // iOS shares 2 performance cores and an out-of-process MTLCompilerService XPC daemon;
+        // 3+ concurrent shader compilations caused XPC_ERROR_CONNECTION_INTERRUPTED spikes when
+        // entering new world sectors. Default to 2 workers on iOS.
+        const u32 automatic = (std::min)(hardware, 2U);
 #else
         const u32 automatic = hardware;
 #endif

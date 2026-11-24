@@ -8386,8 +8386,19 @@ bool RasterizerMetal::DrawMayBeSkipped() {
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
     const auto targets =
         (mode == 2 && native) ? texture_cache.ClassifyDrawTargets() : VideoCommon::DrawTargets{};
-    const bool recurring = (mode != 2 || !native) ||
-                           targets.kind == VideoCommon::DrawTargetClass::Recurring;
+    const bool depth_enabled = regs.zeta_enable != 0;
+    const bool scene_16_9 =
+        targets.width >= 160 && targets.height >= 90 && targets.width * 9 == targets.height * 16;
+    static const bool async_scene = [] {
+        const char* const value = std::getenv("EDEN_NX2_METAL_ASYNC_SCENE");
+        return value == nullptr || value[0] != '0';
+    }();
+    // A newly cleared (FirstTime) 16:9 depth-tested scene target is a transient per-frame scene
+    // buffer (not a 2D LUT, font atlas or square probe), so skip while its pipeline builds.
+    const bool recurring =
+        (mode != 2 || !native) || targets.kind == VideoCommon::DrawTargetClass::Recurring ||
+        (async_scene && depth_enabled && scene_16_9 &&
+         targets.kind == VideoCommon::DrawTargetClass::FirstTime);
     bool writes_color = true;
     if (native) {
         const u32 color_count =
@@ -8404,17 +8415,18 @@ bool RasterizerMetal::DrawMayBeSkipped() {
                 break;
             }
         }
-        // Depth-only / shadow-map draws targeting a recurring (cleared-every-frame) target can be
+        // Depth-only / shadow-map draws targeting a recurring or 16:9 scene depth target can be
         // skipped while their pipeline builds in the background instead of freezing GPUBack for
         // 300-750 ms per new shadow caster (EDEN_NX2_METAL_ASYNC_DEPTH=0 restores blocking).
         static const bool async_depth = [] {
             const char* const value = std::getenv("EDEN_NX2_METAL_ASYNC_DEPTH");
             return value == nullptr || value[0] != '0';
         }();
-        if (!writes_color && (!async_depth || !recurring)) {
+        const bool skippable_depth_target = recurring || (async_scene && scene_16_9);
+        if (!writes_color && (!async_depth || !skippable_depth_target)) {
             skip_decision = false;
             static std::atomic<u32> logged{};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
                 LOG_DEBUG(Render_Metal,
                           "Metal async hold: depth-only target class={} {}x{} fmt={} addr={:#x}",
                           static_cast<u32>(targets.kind), targets.width, targets.height,
@@ -8423,16 +8435,16 @@ bool RasterizerMetal::DrawMayBeSkipped() {
             return false;
         }
     }
-    const bool depth_enabled = regs.zeta_enable != 0;
     const u32 raw_elements = maxwell3d->draw_manager.draw_state.draw_element_count;
     // Indirect draws leave draw_element_count == 0, and mesh draws put the workgroup count
     // (often 1-6 groups generating hundreds of triangles) in draw_element_count.
     const u32 elements = (raw_elements == 0 || regs.IsMeshEnabled()) ? 100U : raw_elements;
+    const bool effective_recurring = recurring || (!writes_color && async_scene && scene_16_9);
     skip_decision = Vulkan::CanDiscardPendingDraw(native, depth_enabled, elements, elements,
-                                                  mode != 0, recurring);
+                                                  mode != 0, effective_recurring);
     if (!skip_decision) {
         static std::atomic<u32> logged{};
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
             LOG_DEBUG(Render_Metal,
                       "Metal async hold: native={} class={} {}x{} fmt={} writes_color={} "
                       "depth={} raw_elem={} mesh={}",

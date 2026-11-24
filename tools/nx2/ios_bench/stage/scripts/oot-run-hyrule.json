@@ -1,0 +1,14 @@
+{
+  "note": "Runs Link across Hyrule Field, turns around, changes direction/location, and sweeps the camera 360 degrees to stress world streaming, JIT, and shader compilation.",
+  "steps": [
+    {"mark": "run_start"},
+    {"stick": "left", "x": 0.0, "y": 1.0, "s": 6},
+    {"stick": "right", "x": 1.0, "y": 0.0, "s": 3},
+    {"stick": "left", "x": 0.7, "y": 0.7, "s": 6},
+    {"stick": "right", "x": -1.0, "y": 0.0, "s": 4},
+    {"stick": "left", "x": -0.6, "y": 0.8, "s": 6},
+    {"stick": "right", "x": 1.0, "y": 0.0, "s": 5},
+    {"wait_ms": 500},
+    {"mark": "run_end"}
+  ]
+}
